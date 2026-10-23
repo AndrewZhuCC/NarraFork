@@ -2,10 +2,12 @@ import { describe, expect, test } from "bun:test";
 import {
 	DEFAULT_SEARCH_SORT,
 	formatSearchTotal,
+	highlightSearchText,
 	normalizeSearchInclude,
 	normalizeSearchRange,
 	normalizeSearchSort,
 	normalizeSearchTab,
+	searchHighlightTerms,
 	searchRangeStart,
 } from "./search-utils";
 
@@ -77,5 +79,27 @@ describe("formatSearchTotal", () => {
 		expect(formatSearchTotal({ total: 12, totalIsLowerBound: false })).toBe("12");
 		expect(formatSearchTotal({ total: 1000, totalIsLowerBound: true })).toBe("1000+");
 		expect(formatSearchTotal(undefined)).toBe("0");
+	});
+});
+
+describe("highlighting", () => {
+	test("highlights each term on its own, longest first, case-insensitively", () => {
+		expect(searchHighlightTerms("  token  Refresh token ")).toEqual(["Refresh", "token"]);
+		const parts = highlightSearchText("Token refreshed: refresh TOKEN", "refresh token");
+		expect(Array.isArray(parts)).toBe(true);
+		const marked = (parts as Array<string | { props: { children: string } }>)
+			.filter((part): part is { props: { children: string } } => typeof part !== "string")
+			.map((part) => part.props.children);
+		expect(marked).toEqual(["Token", "refresh", "refresh", "TOKEN"]);
+	});
+
+	test("treats regex characters in a term literally", () => {
+		expect(highlightSearchText("a.b axb", "a.b")).not.toBe("a.b axb");
+		const parts = highlightSearchText("axb", "a.b");
+		expect(parts).toBe("axb");
+	});
+
+	test("returns the text untouched without terms", () => {
+		expect(highlightSearchText("text", "   ")).toBe("text");
 	});
 });

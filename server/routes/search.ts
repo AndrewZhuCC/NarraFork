@@ -41,6 +41,7 @@ type BaseQuery = {
 	from?: string;
 	to?: string;
 	mine?: string;
+	history?: string;
 	cursor?: string;
 };
 
@@ -61,6 +62,7 @@ function baseOptions(query: BaseQuery, user: { sub: string; role: string }, sign
 		// its own grants.
 		principal: { userId: user.sub, isAdmin: user.role === "admin" },
 		cursor: query.cursor,
+		fullHistory: query.history === "all",
 		signal,
 	};
 }

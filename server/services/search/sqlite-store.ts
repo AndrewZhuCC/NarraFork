@@ -19,9 +19,9 @@
  * file reproduces each one exactly rather than harmonizing them. See the table in
  * `types.ts`. Two specifics worth stating because they look like bugs:
  *
- *   - global search matches the whole sanitized query as ONE quoted phrase (`"a b"`), so it
- *     finds contiguous text and does not do prefix matching. The timeline, Recall and
- *     knowledge paths match each term as a prefix (`"a"* "b"*`).
+ *   - global search matches each term as a prefix (`"a"* "b"*`), like the timeline, Recall
+ *     and knowledge paths; unlike them, a term too short for the trigram index becomes a
+ *     `LIKE` filter on the indexed rows instead of a MATCH term that could never match.
  *   - the substring fallbacks differ on wildcard escaping: knowledge escapes `%`/`_` and
  *     pairs the pattern with `ESCAPE '\'`; the other three do not, so a user-typed `%`
  *     widens their match. Both behaviours are load-bearing for their existing tests.
@@ -38,6 +38,7 @@ import { ValidationError } from "../../lib/errors";
 import { narratorReadableSqlFragment } from "../narrator-acl";
 import { narratorProjectIdText } from "../read/acl-sql";
 import type { SearchStore } from "./port";
+import { globalQueryTerms } from "./query";
 import {
 	type BoundSql,
 	blockScopeSql,
@@ -46,13 +47,7 @@ import {
 	narratorScopeSql,
 	scopeKey,
 } from "./scope";
-import {
-	escapedContains,
-	phraseExpr,
-	prefixExpr,
-	rawContains,
-	snippetCall,
-} from "./sqlite-expressions";
+import { escapedContains, prefixExpr, rawContains, snippetCall } from "./sqlite-expressions";
 import { executeSqliteSearchQuery, type SearchQueryExecutor } from "./sqlite-worker-runner";
 import {
 	type EntitySearchQuery,
@@ -177,14 +172,33 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 	const KNOWLEDGE_ENTRY_COLUMNS = `e.id, e.collection_id, e.title, e.slug, e.tags_json, e.status,
 				  e.created_at, e.updated_at`;
 
+	/**
+	 * What a global query binds: a `MATCH` expression of its indexed terms (each a prefix, all
+	 * required) and one contains-pattern per term the index cannot check. On the substring
+	 * path every term is a pattern. See `globalQueryTerms`.
+	 */
+	function globalNeedles(query: EntitySearchQuery): { match: string | null; likes: string[] } {
+		const { indexed, short } = globalQueryTerms(query.text);
+		if (query.strategy === "index" && indexed.length > 0) {
+			return { match: prefixExpr(indexed.join(" ")), likes: short.map(rawContains) };
+		}
+		return { match: null, likes: [...indexed, ...short].map(rawContains) };
+	}
+
+	/** `AND col LIKE ?` once per pattern; the count is bounded by `MAX_GLOBAL_QUERY_TERMS`. */
+	function likeSql(column: string, count: number): string {
+		return Array.from({ length: count }, () => `AND ${column} LIKE ?`).join(" ");
+	}
+
 	function messageStmt(
 		strategy: "index" | "substring",
 		gated: boolean,
 		sort: EntitySearchQuery["sort"],
 		scope: MessageSearchScope | undefined,
 		filter: BoundSql,
+		likes: number,
 	): QueryTemplate {
-		const key = `messages:${strategy}:${sort ?? "relevance"}:${gated ? "gated" : "all"}:${scopeKey(scope)}:${filter.key}`;
+		const key = `messages:${strategy}:${sort ?? "relevance"}:${gated ? "gated" : "all"}:${scopeKey(scope)}:${filter.key}:${likes}`;
 		return cached(key, () => {
 			const gate = `${gated ? `AND ${NARRATOR_GATE_SQL}` : ""} ${messageScopeSql(scope)} ${filter.sql}`;
 			if (strategy === "index") {
@@ -195,7 +209,7 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 			 JOIN narrator_messages m ON m.rowid = narrator_messages_fts.rowid
 			 JOIN narrators n ON n.id = m.narrator_id
 			 ${PROJECT_JOIN}
-			 WHERE narrator_messages_fts MATCH ? ${gate}
+			 WHERE narrator_messages_fts MATCH ? ${likeSql("m.content_text", likes)} ${gate}
 			 ORDER BY ${sort === "time" ? "m.created_at DESC, m.id ASC" : "rank"} LIMIT ?`;
 			}
 			return `SELECT ${MESSAGE_COLUMNS},
@@ -203,7 +217,7 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 			 FROM narrator_messages m
 			 JOIN narrators n ON n.id = m.narrator_id
 			 ${PROJECT_JOIN}
-			 WHERE m.content_text LIKE ? ${gate}
+			 WHERE 1 = 1 ${likeSql("m.content_text", likes)} ${gate}
 			 ${sort === "time" ? "ORDER BY m.created_at DESC, m.id ASC" : ""} LIMIT ?`;
 		});
 	}
@@ -211,6 +225,10 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 	/**
 	 * Block hits for message search (index path only). The block index is contentless, so these
 	 * rows carry no excerpt; {@link mergeBlockHits} keeps the envelope's where it has one.
+	 *
+	 * Contentless also means a term too short for the index cannot be checked against a block,
+	 * so callers skip block hits for queries that have such terms rather than return blocks
+	 * that may not contain them.
 	 */
 	function messageBlockStmt(
 		gated: boolean,
@@ -239,8 +257,9 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 		sort: EntitySearchQuery["sort"],
 		scope: MessageSearchScope | undefined,
 		filter: BoundSql,
+		likes: number,
 	): QueryTemplate {
-		const key = `narrators:${strategy}:${sort ?? "relevance"}:${gated ? "gated" : "all"}:${scopeKey(scope)}:${filter.key}`;
+		const key = `narrators:${strategy}:${sort ?? "relevance"}:${gated ? "gated" : "all"}:${scopeKey(scope)}:${filter.key}:${likes}`;
 		return cached(key, () => {
 			const gate = `${gated ? `AND ${NARRATOR_GATE_SQL}` : ""} ${narratorScopeSql(scope)} ${filter.sql}`;
 			if (strategy === "index") {
@@ -250,7 +269,7 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 			 FROM narrators_fts
 			 JOIN narrators n ON n.rowid = narrators_fts.rowid
 			 ${PROJECT_JOIN}
-			 WHERE narrators_fts MATCH ? ${gate}
+			 WHERE narrators_fts MATCH ? ${likeSql("n.title", likes)} ${gate}
 			 ORDER BY ${sort === "time" ? "COALESCE(n.updated_at, n.created_at, n.last_message_at) DESC, n.id ASC" : "rank"} LIMIT ?`;
 			}
 			// No snippet column at all on this path: the caller falls back to the title, which is
@@ -258,7 +277,7 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 			return `SELECT ${NARRATOR_COLUMNS}
 			 FROM narrators n
 			 ${PROJECT_JOIN}
-			 WHERE n.title LIKE ? ${gate}
+			 WHERE 1 = 1 ${likeSql("n.title", likes)} ${gate}
 			 ${sort === "time" ? "ORDER BY COALESCE(n.updated_at, n.created_at, n.last_message_at) DESC, n.id ASC" : ""} LIMIT ?`;
 		});
 	}
@@ -514,57 +533,68 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 		const gateValues = gated ? gateParams(query.viewer.userId, NARRATOR_GATE_PARAMS) : [];
 		const filter = filterSql(query.filters, "message");
 		const tail = [...gateValues, ...filter.values, ...extra.values];
-		if (query.strategy !== "index") {
+		const { match, likes } = globalNeedles(query);
+		const contains = likeSql("m.content_text", likes.length);
+		if (match === null) {
 			return {
 				sql: `WITH per_msg AS (
 				SELECT m.id, m.narrator_id, m.created_at, NULL AS r, NULL AS block_id
 				 FROM narrator_messages m
 				 JOIN narrators n ON n.id = m.narrator_id
-				 WHERE m.content_text LIKE ? ${gate} ${messageScopeSql(query.scope)} ${filter.sql} ${extra.sql}
+				 WHERE 1 = 1 ${contains} ${gate} ${messageScopeSql(query.scope)} ${filter.sql} ${extra.sql}
 			)`,
-				values: [rawContains(query.text), ...tail],
+				values: [...likes, ...tail],
 			};
 		}
-		const needle = phraseExpr(query.text);
-		return {
-			sql: `WITH hits AS (
-				SELECT m.id, m.narrator_id, m.created_at, narrator_messages_fts.rank AS r, NULL AS block_id
+		const envelope = `SELECT m.id, m.narrator_id, m.created_at, narrator_messages_fts.rank AS r, NULL AS block_id
 				 FROM narrator_messages_fts
 				 JOIN narrator_messages m ON m.rowid = narrator_messages_fts.rowid
 				 JOIN narrators n ON n.id = m.narrator_id
-				 WHERE narrator_messages_fts MATCH ? ${gate} ${messageScopeSql(query.scope)} ${filter.sql} ${extra.sql}
-				UNION ALL
+				 WHERE narrator_messages_fts MATCH ? ${contains} ${gate} ${messageScopeSql(query.scope)} ${filter.sql} ${extra.sql}`;
+		// Blocks cannot be checked for terms the index cannot tokenize; see messageBlockStmt.
+		const blocks =
+			likes.length > 0
+				? ""
+				: `UNION ALL
 				SELECT m.id, m.narrator_id, m.created_at, narrator_blocks_fts.rank AS r, b.id AS block_id
 				 FROM narrator_blocks_fts
 				 JOIN narrator_blocks b ON b.rowid = narrator_blocks_fts.rowid
 				 JOIN narrator_messages m ON m.id = b.message_id
 				 JOIN narrators n ON n.id = m.narrator_id
-				 WHERE narrator_blocks_fts MATCH ? ${gate} ${blockScopeSql(query.scope)} ${filter.sql} ${extra.sql}
+				 WHERE narrator_blocks_fts MATCH ? ${gate} ${blockScopeSql(query.scope)} ${filter.sql} ${extra.sql}`;
+		return {
+			sql: `WITH hits AS (
+				${envelope}
+				${blocks}
 			), per_msg AS (
 				SELECT id, narrator_id, MAX(created_at) AS created_at, MIN(r) AS r, MIN(block_id) AS block_id
 				 FROM hits GROUP BY id, narrator_id
 			)`,
-			values: [needle, ...tail, needle, ...tail],
+			values: [match, ...likes, ...tail, ...(blocks ? [match, ...tail] : [])],
 		};
 	}
 
 	/** Excerpt for a session hit: FTS5's own on the index path, a window around the first
-	 *  occurrence on the substring path. Returns SQL plus its values, in textual order. */
+	 *  term's first occurrence on the substring path. Returns SQL plus its values, in textual
+	 *  order. */
 	function sessionSnippet(query: EntitySearchQuery): { sql: string; values: string[] } {
-		if (query.strategy === "index") {
+		const { match } = globalNeedles(query);
+		if (match !== null) {
 			return {
 				sql: `(SELECT ${snippetCall("narrator_messages_fts", 0, GLOBAL_SNIPPET)}
 				 FROM narrator_messages_fts
 				 WHERE narrator_messages_fts MATCH ? AND narrator_messages_fts.rowid = m.rowid)`,
-				values: [phraseExpr(query.text)],
+				values: [match],
 			};
 		}
+		const { indexed, short } = globalQueryTerms(query.text);
+		const first = [...indexed, ...short][0] ?? query.text;
 		const at = "instr(lower(m.content_text), lower(?))";
 		return {
 			sql: `CASE WHEN ${at} > ${SUBSTRING_LEAD}
 				 THEN '...' || substr(m.content_text, ${at} - ${SUBSTRING_LEAD}, ${PREVIEW_CHARS})
 				 ELSE substr(m.content_text, 1, ${PREVIEW_CHARS}) END`,
-			values: [query.text, query.text],
+			values: [first, first],
 		};
 	}
 
@@ -602,14 +632,16 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 		async searchMessages(query: EntitySearchQuery): Promise<MessageSearchRow[]> {
 			const gated = !query.viewer.isAdmin;
 			const filter = filterSql(query.filters, "message");
-			const stmt = messageStmt(query.strategy, gated, query.sort, query.scope, filter);
+			const { match, likes } = globalNeedles(query);
+			const strategy = match === null ? "substring" : "index";
+			const stmt = messageStmt(strategy, gated, query.sort, query.scope, filter, likes.length);
 			const options = { signal: query.signal, operation: "searchMessages" };
 			const gate = [
 				...(gated ? gateParams(query.viewer.userId, NARRATOR_GATE_PARAMS) : []),
 				...filter.values,
 			];
-			const needle = query.strategy === "index" ? phraseExpr(query.text) : rawContains(query.text);
-			const rows: RawRow[] = await stmt.all(options, needle, ...gate, query.limit);
+			const needles = match === null ? likes : [match, ...likes];
+			const rows: RawRow[] = await stmt.all(options, ...needles, ...gate, query.limit);
 			const toRow = (row: RawRow): MessageSearchRow => ({
 				id: row.id,
 				narratorId: row.narrator_id ?? null,
@@ -623,13 +655,14 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 				rank: rankOf(row, query.strategy),
 				...(row.block_id ? { blockId: row.block_id } : {}),
 			});
-			if (query.strategy !== "index") return rows.map(toRow);
+			// Blocks cannot be checked for terms the index cannot tokenize; see messageBlockStmt.
+			if (match === null || likes.length > 0) return rows.map(toRow);
 			const blockRows: RawRow[] = await messageBlockStmt(
 				gated,
 				query.sort,
 				query.scope,
 				filter,
-			).all(options, needle, ...gate, query.limit);
+			).all(options, match, ...gate, query.limit);
 			return mergeBlockHits(
 				rows.map(toRow),
 				blockRows.map(toRow),
@@ -644,14 +677,16 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 		async searchNarrators(query: EntitySearchQuery): Promise<NarratorSearchRow[]> {
 			const gated = !query.viewer.isAdmin;
 			const filter = filterSql(query.filters, "narrator");
-			const stmt = narratorStmt(query.strategy, gated, query.sort, query.scope, filter);
+			const { match, likes } = globalNeedles(query);
+			const strategy = match === null ? "substring" : "index";
+			const stmt = narratorStmt(strategy, gated, query.sort, query.scope, filter, likes.length);
 			const options = { signal: query.signal, operation: "searchNarrators" };
 			const gate = [
 				...(gated ? gateParams(query.viewer.userId, NARRATOR_GATE_PARAMS) : []),
 				...filter.values,
 			];
-			const needle = query.strategy === "index" ? phraseExpr(query.text) : rawContains(query.text);
-			const rows: RawRow[] = await stmt.all(options, needle, ...gate, query.limit);
+			const needles = match === null ? likes : [match, ...likes];
+			const rows: RawRow[] = await stmt.all(options, ...needles, ...gate, query.limit);
 			return rows.map((row) => ({
 				id: row.id,
 				title: row.title ?? null,

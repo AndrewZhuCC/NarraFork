@@ -39,6 +39,7 @@ import { AppError, ValidationError } from "../../lib/errors";
 import { narratorReadableSqlFragment } from "../narrator-acl";
 import { narratorProjectIdText } from "../read/acl-sql";
 import type { SearchStore } from "./port";
+import { globalQueryTerms } from "./query";
 import { filterSql, messageScopeSql, narratorScopeSql } from "./scope";
 import {
 	type EntitySearchQuery,
@@ -135,11 +136,19 @@ function escapedContains(text: string): string {
 	return `%${text.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
 }
 
-/** `(col ILIKE $p OR …)` for one phrase needle, or the single-column form. */
-function phraseClause(columns: readonly string[], text: string, params: Params): string {
-	const p = params.add(rawContains(text));
-	const cols = columns.map((c) => `${c} ILIKE ${p}`);
-	return cols.length === 1 ? (cols[0] as string) : `(${cols.join(" OR ")})`;
+/** Global search's terms, the same split the SQLite store uses (see `globalQueryTerms`). */
+function globalTerms(text: string): string[] {
+	const { indexed, short } = globalQueryTerms(text);
+	return [...indexed, ...short];
+}
+
+/**
+ * Global search's match: every term, anywhere in any of the columns. `ILIKE` checks short
+ * terms as well as long ones, so this backend needs no index/filter split.
+ */
+function globalClause(columns: readonly string[], text: string, params: Params): string {
+	const terms = globalTerms(text);
+	return `(${termsClause(columns, terms.length > 0 ? terms : [text], "and", params)})`;
 }
 
 /**
@@ -402,7 +411,7 @@ function sessionHitsCte(query: EntitySearchQuery, params: Params, extra = ""): s
 		: `AND ${gateClause(NARRATOR_GATE_SQL, query.viewer.userId, params)}`;
 	const scope = `${messageScopeSql(query.scope)} ${filterClause(query.filters, "message", params)}`;
 	if (query.strategy === "index") {
-		const where = phraseClause(["f.content_text"], query.text, params);
+		const where = globalClause(["f.content_text"], query.text, params);
 		const rank = rankSql(["f.content_text"], params.add(query.text));
 		return `WITH per_msg AS (
 			SELECT m.id, m.narrator_id, m.created_at, ${rank} AS r, NULL::text AS block_id
@@ -412,12 +421,12 @@ function sessionHitsCte(query: EntitySearchQuery, params: Params, extra = ""): s
 			 WHERE ${where} ${gate} ${scope} ${extra}
 		)`;
 	}
-	const needle = params.add(rawContains(query.text));
+	const contains = globalClause(["m.content_text"], query.text, params);
 	return `WITH per_msg AS (
 		SELECT m.id, m.narrator_id, m.created_at, NULL::double precision AS r, NULL::text AS block_id
 		 FROM narrator_messages m
 		 JOIN narrators n ON n.id = m.narrator_id
-		 WHERE m.content_text ILIKE ${needle} ${gate} ${scope} ${extra}
+		 WHERE ${contains} ${gate} ${scope} ${extra}
 	)`;
 }
 
@@ -436,8 +445,13 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 			const scope = `${messageScopeSql(query.scope)} ${filterClause(query.filters, "message", params)}`;
 			let rows: Row[];
 			if (query.strategy === "index") {
-				const where = phraseClause(["f.content_text"], query.text, params);
-				const snippet = snippetSql("f.content_text", [query.text], GLOBAL_SNIPPET, params);
+				const where = globalClause(["f.content_text"], query.text, params);
+				const snippet = snippetSql(
+					"f.content_text",
+					globalTerms(query.text),
+					GLOBAL_SNIPPET,
+					params,
+				);
 				const rank = rankSql(["f.content_text"], params.add(query.text));
 				rows = await run(
 					`SELECT ${MESSAGE_COLUMNS}, ${snippet} AS snippet, ${rank} AS rank_score
@@ -450,14 +464,14 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 					params,
 				);
 			} else {
-				const needle = params.add(rawContains(query.text));
+				const contains = globalClause(["m.content_text"], query.text, params);
 				rows = await run(
 					`SELECT ${MESSAGE_COLUMNS},
 						substr(m.content_text, 1, ${PREVIEW_CHARS}) AS snippet
 					 FROM narrator_messages m
 					 JOIN narrators n ON n.id = m.narrator_id
 					 ${PROJECT_JOIN}
-					 WHERE m.content_text ILIKE ${needle} ${gate} ${scope}
+					 WHERE ${contains} ${gate} ${scope}
 					 ${query.sort === "time" ? "ORDER BY m.created_at DESC, m.id ASC" : ""} LIMIT ${params.add(query.limit)}`,
 					params,
 				);
@@ -484,8 +498,8 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 			const scope = `${narratorScopeSql(query.scope)} ${filterClause(query.filters, "narrator", params)}`;
 			let rows: Row[];
 			if (query.strategy === "index") {
-				const where = phraseClause(["f.title"], query.text, params);
-				const snippet = snippetSql("f.title", [query.text], GLOBAL_SNIPPET, params);
+				const where = globalClause(["f.title"], query.text, params);
+				const snippet = snippetSql("f.title", globalTerms(query.text), GLOBAL_SNIPPET, params);
 				const rank = rankSql(["f.title"], params.add(query.text));
 				rows = await run(
 					`SELECT ${NARRATOR_COLUMNS}, ${snippet} AS snippet, ${rank} AS rank_score
@@ -499,12 +513,12 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 			} else {
 				// No snippet column on this path, exactly like SQLite: the caller falls back
 				// to the title, the only text this search matches against.
-				const needle = params.add(rawContains(query.text));
+				const contains = globalClause(["n.title"], query.text, params);
 				rows = await run(
 					`SELECT ${NARRATOR_COLUMNS}
 					 FROM narrators n
 					 ${PROJECT_JOIN}
-					 WHERE n.title ILIKE ${needle} ${gate} ${scope}
+					 WHERE ${contains} ${gate} ${scope}
 					 ${query.sort === "time" ? "ORDER BY COALESCE(n.updated_at, n.created_at, n.last_message_at) DESC, n.id ASC" : ""} LIMIT ${params.add(query.limit)}`,
 					params,
 				);
@@ -578,7 +592,7 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 				query.sort === "time"
 					? "created_at DESC, id ASC"
 					: "r IS NULL, r ASC, created_at DESC, id ASC";
-			const snippet = snippetSql("m.content_text", [query.text], GLOBAL_SNIPPET, params);
+			const snippet = snippetSql("m.content_text", globalTerms(query.text), GLOBAL_SNIPPET, params);
 			const offset = Math.max(0, Math.trunc(query.offset ?? 0));
 			const rows = await run(
 				`${cte}, ranked AS (

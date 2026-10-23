@@ -52,13 +52,14 @@ describe("misc APIs", () => {
 				projectId: "p1",
 				from: "2026-10-01T00:00:00.000Z",
 				mine: true,
+				fullHistory: true,
 				cursor: "abc",
 				limit: 20,
 			},
 			["sessions"],
 		);
 		expect(urls[0]).toContain("/search?q=%E4%B8%AD%E6%96%87&sections=sessions%2Cknowledge");
-		for (const absent of ["sort=", "include=", "projectId=", "mine=", "cursor="]) {
+		for (const absent of ["sort=", "include=", "projectId=", "mine=", "history=", "cursor="]) {
 			expect(urls[0]).not.toContain(absent);
 		}
 		const second = new URL(urls[1] as string, "http://x").searchParams;
@@ -69,6 +70,7 @@ describe("misc APIs", () => {
 			projectId: "p1",
 			from: "2026-10-01T00:00:00.000Z",
 			mine: "1",
+			history: "all",
 			cursor: "abc",
 			limit: "20",
 			sections: "sessions",

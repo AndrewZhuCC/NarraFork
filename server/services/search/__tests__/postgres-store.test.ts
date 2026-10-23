@@ -565,6 +565,15 @@ describe("search parity: SQLite FTS5 vs PostgreSQL pg_trgm", () => {
 						["index auth owner", entity("auth", "index", OWNER), ["n1:1", "n2:1"]],
 						["index auth stranger", entity("auth", "index", STRANGER), ["n2:1"]],
 						["substring 充电", entity("充电", "substring"), ["n2:1"]],
+						// Terms match on their own, in any order; a short term filters the indexed ones.
+						[
+							"index terms out of order",
+							entity("middleware auth", "index", OWNER),
+							["n1:1", "n2:1"],
+						],
+						["index terms, one absent", entity("middleware rotate", "index", OWNER), ["n1:1"]],
+						["index term with a short term", entity("三阶段 充电", "index"), ["n2:1"]],
+						["short terms only", entity("充电 你好", "substring"), ["n2:1"]],
 						[
 							"index auth in project p2",
 							{ ...entity("auth", "index", OWNER), filters: { projectId: "p2" } },

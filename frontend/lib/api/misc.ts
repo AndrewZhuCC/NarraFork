@@ -76,6 +76,7 @@ export function searchParams(query: SearchRequest): URLSearchParams {
 	if (query.from) params.set("from", query.from);
 	if (query.to) params.set("to", query.to);
 	if (query.mine) params.set("mine", "1");
+	if (query.fullHistory) params.set("history", "all");
 	if (query.cursor) params.set("cursor", query.cursor);
 	if (query.limit) params.set("limit", String(query.limit));
 	return params;

@@ -117,6 +117,13 @@ describe("global message search with block hits", () => {
 		expect(await messageHits("giraffe")).toEqual([{ id: "tooling", blockId: "tooling-call" }]);
 	});
 
+	it("skips block-only hits when a term is too short for the index to check", async () => {
+		// The block index is contentless, so "长颈" (two characters, no trigram) cannot be
+		// verified against the tool block; the hit is dropped rather than returned unchecked.
+		expect(await messageHits("giraffe")).toEqual([{ id: "tooling", blockId: "tooling-call" }]);
+		expect(await messageHits("giraffe 长颈")).toEqual([]);
+	});
+
 	it("leaves substring matches without a block", async () => {
 		expect(await messageHits("ze", "time")).toEqual([
 			{ id: "native", blockId: undefined },
