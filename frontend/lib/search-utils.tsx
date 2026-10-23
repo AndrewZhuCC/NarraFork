@@ -91,15 +91,27 @@ export function includesSearch(text: unknown, query: string): boolean {
 	return normalizeSearchText(text).includes(normalizedQuery);
 }
 
+/**
+ * Each whitespace-separated query term, longest first so a longer term wins where two
+ * overlap. Search matches terms on their own, so highlighting does too.
+ */
+export function searchHighlightTerms(query: string): string[] {
+	const terms = new Map<string, string>();
+	for (const term of query.trim().split(/\s+/)) {
+		if (term) terms.set(term.toLowerCase(), term);
+	}
+	return [...terms.values()].sort((a, b) => b.length - a.length);
+}
+
 export function highlightSearchText(text: string, query: string): ReactNode {
-	if (!query) return text;
-	const normalizedQuery = query.trim();
-	if (!normalizedQuery) return text;
-	const escaped = normalizedQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-	const parts = text.split(new RegExp(`(${escaped})`, "gi"));
+	const terms = searchHighlightTerms(query ?? "");
+	if (terms.length === 0) return text;
+	const escaped = terms.map((term) => term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+	const parts = text.split(new RegExp(`(${escaped.join("|")})`, "gi"));
 	if (parts.length === 1) return text;
+	const lowered = new Set(terms.map((term) => term.toLowerCase()));
 	return parts.map((part, i) =>
-		part.toLowerCase() === normalizedQuery.toLowerCase() ? (
+		lowered.has(part.toLowerCase()) ? (
 			// biome-ignore lint/suspicious/noArrayIndexKey: stable split output
 			<Mark key={i} color="yellow">
 				{part}

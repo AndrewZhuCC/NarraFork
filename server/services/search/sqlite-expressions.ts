@@ -17,18 +17,6 @@ import type { SnippetFormat } from "./types";
 export type MatchMode = "and" | "or";
 
 /**
- * The whole query as ONE FTS5 phrase.
- *
- * Global search's shape: it finds contiguous text and does NOT prefix-match, so "auth mid"
- * does not find "authentication middleware". That asymmetry with the other three paths is
- * long-standing behaviour their tests are written against, so it is reproduced rather than
- * fixed here — changing recall is a product decision, not a porting one.
- */
-export function phraseExpr(text: string): string {
-	return `"${text}"`;
-}
-
-/**
  * Each whitespace-separated term as a prefix match.
  *
  * The timeline / Recall / knowledge shape. `column` renders FTS5's column filter

@@ -324,51 +324,57 @@ describe("global time search orders the full matching corpus before LIMIT", () =
 	});
 });
 
-describe("global search matches a phrase, the timeline matches prefixes", () => {
+describe("global search and the timeline both match terms as prefixes", () => {
 	/**
-	 * The asymmetry itself, demonstrated on one corpus with one query.
-	 *
-	 * "calibration harness" is contiguous in both rows, so both find it. "calibr harn" is
-	 * contiguous in neither as full words — the timeline's prefix expansion still matches it,
-	 * global search's phrase does not. If someone unified the two shapes, exactly one of these
-	 * two assertions would flip, which is the signal this pair exists to produce.
+	 * Global search used to match the whole query as one contiguous phrase while the timeline
+	 * expanded each term as a prefix. They now agree: "calibr harn" is contiguous in no row as
+	 * whole words, and both still find it.
 	 */
-	it("both find a contiguous phrase", async () => {
-		const global = await searchStore.searchMessages({
-			text: "calibration harness",
+	for (const text of ["calibration harness", "calibr harn", "harness calibration"]) {
+		it(`both find "${text}"`, async () => {
+			const global = await searchStore.searchMessages({
+				text,
+				strategy: "index",
+				limit: 10,
+				viewer: ADMIN,
+			});
+			expect(global.map((r) => r.id)).toEqual(["msg-shape"]);
+
+			const timeline = await searchStore.searchTimeline({
+				narratorId: "narr-shape",
+				text,
+				strategy: "index",
+				limit: 10,
+				inheritedScopes: [],
+			});
+			expect(timeline.map((r) => r.messageId)).toEqual(["msg-shape"]);
+		});
+	}
+
+	it("requires every term", async () => {
+		const rows = await searchStore.searchMessages({
+			text: "calibration nonexistentword",
 			strategy: "index",
 			limit: 10,
 			viewer: ADMIN,
 		});
-		expect(global.map((r) => r.id)).toEqual(["msg-shape"]);
-
-		const timeline = await searchStore.searchTimeline({
-			narratorId: "narr-shape",
-			text: "calibration harness",
-			strategy: "index",
-			limit: 10,
-			inheritedScopes: [],
-		});
-		expect(timeline.map((r) => r.messageId)).toEqual(["msg-shape"]);
+		expect(rows).toEqual([]);
 	});
 
-	it("only the timeline matches truncated terms, because only it expands prefixes", async () => {
-		const global = await searchStore.searchMessages({
-			text: "calibr harn",
-			strategy: "index",
-			limit: 10,
-			viewer: ADMIN,
-		});
-		expect(global).toEqual([]);
+	it("checks terms too short for the index as substrings of the indexed rows", async () => {
+		// "充电" is two characters: the trigram index cannot match it, so it filters the rows
+		// "calibration" selected. A short term absent from the row removes it.
+		const search = (text: string) =>
+			searchStore.searchMessages({ text, strategy: "index", limit: 10, viewer: ADMIN });
+		expect((await search("calibration 充电")).map((r) => r.id)).toEqual(["msg-shape"]);
+		expect(await search("calibration 登录")).toEqual([]);
+	});
 
-		const timeline = await searchStore.searchTimeline({
-			narratorId: "narr-shape",
-			text: "calibr harn",
-			strategy: "index",
-			limit: 10,
-			inheritedScopes: [],
-		});
-		expect(timeline.map((r) => r.messageId)).toEqual(["msg-shape"]);
+	it("matches all-short queries term by term on the substring path", async () => {
+		const search = (text: string) =>
+			searchStore.searchMessages({ text, strategy: "substring", limit: 10, viewer: ADMIN });
+		expect((await search("充电 流程")).map((r) => r.id)).toEqual(["msg-shape"]);
+		expect(await search("充电 登录")).toEqual([]);
 	});
 });
 
@@ -430,24 +436,19 @@ describe("CJK queries", () => {
 		expect(rows.map((r) => r.id)).toEqual(["msg-shape"]);
 	});
 
-	// Two Han characters cannot, which is why the caller must pick the substring path for
-	// them. Asserting both halves: the index genuinely finds nothing, the substring path does.
-	it("needs the substring path for a 2-character CJK term", async () => {
-		const viaIndex = await searchStore.searchMessages({
-			text: "充电",
-			strategy: "index",
-			limit: 10,
-			viewer: ADMIN,
-		});
-		expect(viaIndex).toEqual([]);
-
-		const viaSubstring = await searchStore.searchMessages({
-			text: "充电",
-			strategy: "substring",
-			limit: 10,
-			viewer: ADMIN,
-		});
-		expect(viaSubstring.map((r) => r.id)).toEqual(["msg-shape"]);
+	// Two Han characters cannot form a trigram. Global search never sends such a term to MATCH
+	// (it would silently find nothing): it becomes a substring check, whichever strategy the
+	// caller passed.
+	it("finds a 2-character CJK term on either strategy", async () => {
+		for (const strategy of ["index", "substring"] as const) {
+			const rows = await searchStore.searchMessages({
+				text: "充电",
+				strategy,
+				limit: 10,
+				viewer: ADMIN,
+			});
+			expect(rows.map((r) => r.id)).toEqual(["msg-shape"]);
+		}
 	});
 });
 

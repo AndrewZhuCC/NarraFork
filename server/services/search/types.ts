@@ -12,7 +12,9 @@
  * ------------------------------------
  * Four call sites search text today and they do NOT agree on recall:
  *
- *   - global search (messages / narrators) matches the whole query as ONE PHRASE;
+ *   - global search (messages / narrators) matches each whitespace-separated term as a
+ *     PREFIX, all required; terms too short for the trigram index are checked as substrings
+ *     on the rows the indexed terms select (`globalQueryTerms`);
  *   - the narrator timeline and Recall match each whitespace-separated term as a PREFIX;
  *   - knowledge matches prefixes too, but supports any-term matching and a field restriction;
  *   - the substring fallbacks disagree on wildcard escaping: knowledge escapes `%`/`_` typed

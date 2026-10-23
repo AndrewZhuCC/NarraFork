@@ -1,7 +1,7 @@
 import { db } from "../db";
 import { knowledgeService } from "./knowledge-service";
 import { searchStore } from "./search/backend";
-import { canUseIndex, sanitizeQuery } from "./search/query";
+import { canUseIndex, globalStrategy, sanitizeQuery } from "./search/query";
 import {
 	CONVERSATION_MESSAGE_SCOPE,
 	type EntitySearchQuery,
@@ -142,6 +142,14 @@ export interface NarratorMessageSearchResult {
  */
 function strategyFor(safeQuery: string): SearchStrategy {
 	return canUseIndex(safeQuery) ? "index" : "substring";
+}
+
+/**
+ * The retrieval path for global (session and narrator) search, which matches each term on
+ * its own: the index whenever any term can use it. See `globalQueryTerms`.
+ */
+function globalStrategyFor(safeQuery: string): SearchStrategy {
+	return globalStrategy(safeQuery);
 }
 
 /**
@@ -443,7 +451,7 @@ function entityBase(
 ): Omit<EntitySearchQuery, "limit"> {
 	return {
 		text: safeQuery,
-		strategy: strategyFor(safeQuery),
+		strategy: globalStrategyFor(safeQuery),
 		sort: options.sort ?? "relevance",
 		viewer: options.principal,
 		scope: options.scope ?? CONVERSATION_MESSAGE_SCOPE,
@@ -536,7 +544,7 @@ export const searchService = {
 		const safeQuery = sanitizeQuery(query);
 		if (!safeQuery) return results;
 
-		const strategy = strategyFor(safeQuery);
+		const strategy = globalStrategyFor(safeQuery);
 		// One query object for every entity search: the viewer travels with it, so a branch
 		// cannot accidentally run ungated.
 		const base = {
