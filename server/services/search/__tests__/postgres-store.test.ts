@@ -637,6 +637,40 @@ describe("search parity: SQLite FTS5 vs PostgreSQL pg_trgm", () => {
 							},
 							["m3"],
 						],
+						// A short term filters the indexed one; short terms match apart, in any order.
+						[
+							"index term with a short term",
+							{
+								narratorId: "n2",
+								text: "三阶段 充电",
+								strategy: "index",
+								limit: 20,
+								inheritedScopes: [],
+							},
+							["m3"],
+						],
+						[
+							"index term with an absent short term",
+							{
+								narratorId: "n2",
+								text: "middleware 充电",
+								strategy: "index",
+								limit: 20,
+								inheritedScopes: [],
+							},
+							[],
+						],
+						[
+							"short terms apart",
+							{
+								narratorId: "n2",
+								text: "充电 你好",
+								strategy: "substring",
+								limit: 20,
+								inheritedScopes: [],
+							},
+							["m3"],
+						],
 						[
 							"inherited scope (child sees ancestor refs below the bound)",
 							{

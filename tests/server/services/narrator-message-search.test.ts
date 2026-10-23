@@ -134,6 +134,31 @@ describe("searchNarratorMessages", () => {
 		expect(results.map((r) => r.messageId)).toEqual(["m1"]);
 	});
 
+	it("narrows an indexed term by a 2-char term the index cannot match", async () => {
+		seedNarrator("n1");
+		insertMessage({ id: "m1", narratorId: "n1", seq: 1, contentText: "refresh 后登录失败" });
+		insertMessage({ id: "m2", narratorId: "n1", seq: 2, contentText: "refresh 之后正常" });
+
+		const results = await searchService.searchNarratorMessages("n1", "refresh 登录");
+		expect(results.map((r) => r.messageId)).toEqual(["m1"]);
+	});
+
+	it("matches several short terms anywhere in a message, not as one phrase", async () => {
+		seedNarrator("n1");
+		insertMessage({ id: "m1", narratorId: "n1", seq: 1, contentText: "登录之后一直失败" });
+		insertMessage({ id: "m2", narratorId: "n1", seq: 2, contentText: "登录成功" });
+
+		const results = await searchService.searchNarratorMessages("n1", "登录 失败");
+		expect(results.map((r) => r.messageId)).toEqual(["m1"]);
+	});
+
+	it("finds nothing when a short term appears in no message", async () => {
+		seedNarrator("n1");
+		insertMessage({ id: "m1", narratorId: "n1", seq: 1, contentText: "refresh token 登录" });
+
+		expect(await searchService.searchNarratorMessages("n1", "refresh 注销")).toEqual([]);
+	});
+
 	it("returns empty for a blank query", async () => {
 		seedNarrator("n1");
 		insertMessage({ id: "m1", narratorId: "n1", seq: 1, contentText: "anything" });
@@ -201,6 +226,19 @@ describe("searchNarratorMessages across a lazy fork's ancestry", () => {
 		expect(ids).toContain("old");
 		expect(ids).toContain("own");
 		expect(ids).not.toContain("divergent");
+	});
+
+	it("applies short terms to ancestor history too", async () => {
+		seedNarrator("parent");
+		seedNarrator("child");
+		insertMessage({ id: "old", narratorId: "parent", seq: 1, contentText: "mango 登录 old" });
+		insertMessage({ id: "other", narratorId: "parent", seq: 2, contentText: "mango old" });
+		insertMessage({ id: "own", narratorId: "child", seq: 5, contentText: "mango 登录 own" });
+
+		const results = await searchService.searchNarratorMessages("child", "mango 登录", 60, [
+			{ narratorId: "parent", upperBoundSeq: 5 },
+		]);
+		expect(results.map((r) => r.messageId).sort()).toEqual(["old", "own"]);
 	});
 
 	it("ignores a scope whose seq bound is not a finite number", async () => {

@@ -650,14 +650,14 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 					createdAt: strOr(row, "created_at", ""),
 				}));
 			}
-			const needle = params.add(rawContains(query.text));
+			const contains = globalClause(["m.content_text"], query.text, params);
 			rows = await run(
 				`SELECT ${TIMELINE_COLUMNS},
 					substr(m.content_text, 1, ${PREVIEW_CHARS}) AS snippet
 				 FROM narrator_message_refs r
 				 JOIN narrator_messages m ON m.id = r.message_id
 				 WHERE ${scopeSql} AND r.segment_compact_id IS NULL
-				   AND m.content_text ILIKE ${needle}
+				   AND ${contains}
 				 ORDER BY r.seq DESC
 				 LIMIT ${params.add(query.limit)}`,
 				params,
