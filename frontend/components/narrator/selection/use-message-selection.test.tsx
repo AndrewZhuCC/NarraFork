@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { notifications } from "@mantine/notifications";
 import type { FileChangeRevertApplyResponse } from "@shared/file-change-protocol";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { NodeFilter, parseHTML } from "linkedom";
 import { act, memo, StrictMode, useContext, useEffect } from "react";
@@ -184,14 +185,16 @@ async function clickToggle() {
 function indexedResolver(ids: string[], prefix = "index"): MessageSelectionResolver {
 	const messages = ids.map(
 		(id, seq) =>
-			({
-				id,
-				seq: seq + 1,
-				role: "user",
-				contentText: `${prefix} ${id}`,
-				contentJson: [{ type: "text", text: `${prefix} ${id}` }],
-				children: [],
-			}) as unknown as NarratorMsg,
+			rowWithElements(
+				{
+					id,
+					seq: seq + 1,
+					role: "user",
+					contentText: `${prefix} ${id}`,
+					children: [],
+				},
+				[{ type: "text", text: `${prefix} ${id}` }],
+			) as unknown as NarratorMsg,
 	);
 	const index = buildSelectionIndex(messages);
 	return {

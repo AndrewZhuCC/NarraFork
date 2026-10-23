@@ -159,7 +159,7 @@ function projectChatRow(row: ChatRowInput, labels: ChatTreeProjectionLabels): Tr
 			: null,
 		omitHeader: row.grouped,
 		...(deleted ? { deletedLabel: labels.messageDeleted } : {}),
-	} as TreeMessage;
+	} as Omit<TreeMessage, "blocks">;
 	return rowWithElements(projected, elements);
 }
 

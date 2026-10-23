@@ -1,16 +1,15 @@
 /**
- * narrator-body-access.guard.test.ts — who touches a message row's body field
- * (docs/BLOCK_STORAGE-DESIGN.md, P3d).
+ * narrator-body-access.guard.test.ts — nothing on the frontend holds a message body in a
+ * `contentJson` field (docs/BLOCK_STORAGE-DESIGN.md, P3d).
  *
  * A row holds its body as blocks (`blocks`). Readers take it through the accessors in
  * `shared/narrator-blocks/message-blocks.ts` (`messageBody` for the elements,
  * `messageBlocks` for the blocks), and code that rewrites a row's body goes through the
- * helpers next to them (`mapRowElements`, `filterRowElements`, `rowWithElements`), so
- * nothing outside that module depends on how a row holds its body.
+ * helpers next to them (`mapRowElements`, `filterRowElements`, `rowWithElements`).
  *
- * `BODY_FIELD_USES` counts what each file still does with the old `contentJson` field
- * directly: the accessor, which still reads rows built with it (test fixtures, until P3d
- * 7b-2), and the row type. The counts only go down:
+ * `BODY_FIELD_USES` counts the field's remaining uses per file: only the accessor, which
+ * hands a client-built row's elements to the server's envelope splitter under that name.
+ * The counts only go down:
  *   - a use in an unlisted file, or more than its count, fails — read through
  *     `messageBody` / `messageBlocks`, or rewrite through the helpers;
  *   - fewer than its count fails too — lower it (drop the entry at zero).
@@ -27,10 +26,9 @@ const ROOT = join(import.meta.dir, "..", "..");
 /** Direct uses of the body field per file, and why they are there. */
 const BODY_FIELD_USES: Record<string, { count: number; why: string }> = {
 	"shared/narrator-blocks/message-blocks.ts": {
-		count: 6,
-		why: "the accessor, reading rows built before rows held blocks",
+		count: 1,
+		why: "splitRowBlocks feeds the server's envelope splitter",
 	},
-	"frontend/lib/api/types.ts": { count: 1, why: "the row type" },
 };
 
 const SCANNED = ["frontend", "shared/pretext-layout", "shared/narrator-blocks/message-blocks.ts"];

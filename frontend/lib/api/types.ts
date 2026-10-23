@@ -1030,9 +1030,7 @@ export interface TreeMessage {
 	 * The message's body as blocks, in order. Read it through `messageBody` (elements) or
 	 * `messageBlocks` (blocks); rewrite it through the helpers next to them.
 	 */
-	blocks?: MessageRowBlock[];
-	/** A row built before rows held blocks (test fixtures, until P3d 7b-2). */
-	contentJson?: ContentBlock[];
+	blocks: MessageRowBlock[];
 	contentText: string | null;
 	toolCalls: ToolCallRecord[];
 	tokensIn?: number | null;

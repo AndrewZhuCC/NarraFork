@@ -84,10 +84,12 @@ describe("messageBlocks", () => {
 		);
 	});
 
-	test("a row built with only its elements is split on read", () => {
-		const legacy = row({ contentJson: [think, hello] });
-		expect(messageBlocks(legacy).map((block) => block.id)).toEqual(["m1:0", "m1:1"]);
-		expect(messageBody(legacy)).toEqual([think, hello]);
+	test("a row without blocks has no body", () => {
+		const bare = row({});
+		expect(messageBlocks(bare)).toEqual([]);
+		expect(messageBody(bare)).toEqual([]);
+		expect(mapRowElements(bare, (element) => ({ ...element, seen: true }))).toBe(bare);
+		expect(filterRowElements(bare, () => false)).toBe(bare);
 	});
 
 	test("the same blocks give the same arrays", () => {
@@ -141,16 +143,10 @@ describe("rewriting a row's body", () => {
 		expect(filterRowElements(message, () => true)).toBe(message);
 	});
 
-	test("a rewritten row built with only its elements holds blocks afterwards", () => {
-		const legacy = row({ contentJson: [hello, tool] });
-		const mapped = mapRowElements(legacy, (element) =>
-			element.type === "tool_use" ? { ...element, status: "success" } : element,
-		);
-		expect(mapped).not.toHaveProperty("contentJson");
-		expect(mapped.blocks?.map((block) => [block.id, block.named])).toEqual([
-			["m1:0", false],
-			["m1:1", false],
-		]);
-		expect(messageBody(mapped)).toEqual([hello, { ...tool, status: "success" }]);
+	test("filterRowElements drops a block left empty and keeps the others' identity", () => {
+		const message = source();
+		const filtered = filterRowElements(message, (_element, index) => index !== 0);
+		expect(filtered.blocks?.map((block) => block.id)).toEqual(["b2", "b3"]);
+		expect(filtered.blocks?.[1]).toBe(message.blocks?.[2]);
 	});
 });

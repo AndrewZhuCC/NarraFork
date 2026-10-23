@@ -25,7 +25,7 @@ import type { RequestRecordingDetail, SavedRecording } from "@shared/request-rec
 import type { SubagentModelPools, SubagentModelUse } from "@shared/subagent-model-policy";
 import type { ToolEditPreview } from "@shared/tool-edit-preview";
 import type { WorkspaceContext } from "@shared/workspace-context";
-import { decodeBlockPage } from "../block-protocol";
+import { decodeBlockMessage, decodeBlockPage } from "../block-protocol";
 import { narratorLoadingMetrics } from "../narrator-loading-metrics";
 import { createSharedInflight, type SharedReadOptions } from "../shared-inflight";
 import type { GitIdentity } from "./auth";
@@ -2154,13 +2154,13 @@ export const narratorsApi = {
 		narratorId: string,
 		opts: { sourceMessageId: string; sourceMessageUuid?: string },
 	) =>
-		request<{ messageId: string; message?: TreeMessage }>(
+		request<{ messageId: string; message?: unknown }>(
 			`/narrators/${narratorId}/ask-in-passing/start`,
 			{
 				method: "POST",
 				body: JSON.stringify(opts),
 			},
-		),
+		).then(decodeBlockMessage),
 	askInPassing: (
 		narratorId: string,
 		opts: {
@@ -2168,10 +2168,10 @@ export const narratorsApi = {
 			pendingMessageId: string;
 		},
 	) =>
-		request<ApiEntity & { message?: TreeMessage }>(`/narrators/${narratorId}/ask-in-passing`, {
+		request<ApiEntity & { message?: unknown }>(`/narrators/${narratorId}/ask-in-passing`, {
 			method: "POST",
 			body: JSON.stringify(opts),
-		}),
+		}).then((response) => decodeBlockMessage(response) as ApiEntity & { message?: TreeMessage }),
 	cancelAskInPassing: (narratorId: string, messageId: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/ask-in-passing/${messageId}`, {
 			method: "DELETE",

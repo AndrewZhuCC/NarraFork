@@ -15,6 +15,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import type { StreamingBlock } from "../message/message-segments";
 import {
 	blockSupersedes,
@@ -25,7 +26,7 @@ import {
 const PARAGRAPH_FIXTURE = "确认了根因。";
 
 function assistantWith(blocks: unknown[]): SupersedeCandidateMessage {
-	return { role: "assistant", parentToolUseId: null, contentJson: blocks };
+	return rowWithElements({ role: "assistant", parentToolUseId: null }, blocks);
 }
 
 function liveText(text: string, id = "1:0", revision = 1): StreamingBlock {
@@ -95,16 +96,32 @@ describe("dropSupersededStreamingBlocks — provider tool blocks", () => {
 		const blocks = [live];
 		const committed: SupersedeCandidateMessage[] = [
 			assistantWith([{ type: "web_search", id: "ws_other" }]),
-			{
-				role: "assistant",
-				parentToolUseId: "tool-1",
-				contentJson: [{ type: "web_search", id: "ws_1" }],
-			},
+			rowWithElements(
+				{
+					role: "assistant",
+					parentToolUseId: "tool-1",
+				},
+				[{ type: "web_search", id: "ws_1" }],
+			),
 		];
 		expect(dropSupersededStreamingBlocks(blocks, committed)).toBe(false);
 		expect(blocks).toEqual([live]);
 	});
 });
+
+/** `row`, counting each read of its role. */
+function countRoleReads(
+	row: SupersedeCandidateMessage,
+	onRead: () => void,
+): SupersedeCandidateMessage {
+	return Object.defineProperty(row, "role", {
+		get() {
+			onRead();
+			return "assistant";
+		},
+		enumerable: true,
+	});
+}
 
 describe("dropSupersededStreamingBlocks — cost is bounded to the current turn", () => {
 	/**
@@ -118,18 +135,13 @@ describe("dropSupersededStreamingBlocks — cost is bounded to the current turn"
 	 */
 	it("examines only messages after the last user turn, not the whole window", () => {
 		let inspected = 0;
-		const older = Array.from({ length: 1200 }, () => ({
-			get role() {
-				inspected++;
-				return "assistant";
-			},
-			parentToolUseId: null,
-			contentJson: [{ type: "web_search", id: "ws_1" }],
-		})) as unknown as SupersedeCandidateMessage[];
+		const older = Array.from({ length: 1200 }, () =>
+			countRoleReads(assistantWith([{ type: "web_search", id: "ws_1" }]), () => inspected++),
+		);
 
 		const committed: SupersedeCandidateMessage[] = [
 			...older,
-			{ role: "user", parentToolUseId: null, contentJson: [{ type: "text", text: "新问题" }] },
+			rowWithElements({ role: "user", parentToolUseId: null }, [{ type: "text", text: "新问题" }]),
 			assistantWith([{ type: "web_search", id: "ws_1" }]),
 		];
 
@@ -146,14 +158,9 @@ describe("dropSupersededStreamingBlocks — cost is bounded to the current turn"
 	 */
 	it("does reach those same rows when no turn boundary bounds them", () => {
 		let inspected = 0;
-		const reachable = Array.from({ length: 3 }, () => ({
-			get role() {
-				inspected++;
-				return "assistant";
-			},
-			parentToolUseId: null,
-			contentJson: [{ type: "web_search", id: "ws_other" }],
-		})) as unknown as SupersedeCandidateMessage[];
+		const reachable = Array.from({ length: 3 }, () =>
+			countRoleReads(assistantWith([{ type: "web_search", id: "ws_other" }]), () => inspected++),
+		);
 
 		const blocks: StreamingBlock[] = [{ type: "web_search", id: "ws_1", status: "searching" }];
 		expect(dropSupersededStreamingBlocks(blocks, reachable)).toBe(false);

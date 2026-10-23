@@ -4868,7 +4868,7 @@ export const PretextExactMessageList = memo(
 			}, [semanticItems]);
 
 			// Full messages by id — the inline editor and the original-content modal need
-			// the raw payload (contentJson / creator / narratorId / editedAt), which the
+			// the raw payload (blocks / creator / narratorId / editedAt), which the
 			// measured layout spec deliberately drops.
 			const messagesById = useMemo(() => {
 				const map = new Map<string, TreeMessage>();

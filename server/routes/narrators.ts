@@ -297,7 +297,7 @@ import {
 	NARRATOR_ACL_COLUMNS,
 	narratorReadableWhere,
 } from "../services/narrator-acl";
-import { toBlockPage } from "../services/narrator-block-page";
+import { toBlockPage, toEnvelopes } from "../services/narrator-block-page";
 import { newEnvelopeColumns } from "../services/narrator-block-sync";
 import {
 	blockDetail,
@@ -5378,7 +5378,8 @@ narratorRoutes.post("/:id/ask-in-passing/start", async (c) => {
 		message: msg,
 	});
 
-	return c.json({ messageId: msgId, message: msg }, 201);
+	// The message in the block protocol, as every other message reaches the client.
+	return c.json({ messageId: msgId, message: toEnvelopes([msg]) }, 201);
 });
 
 // Resolve: fork + send question + update pending message to resolved
@@ -5474,7 +5475,10 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 		message: updatedMsg,
 	});
 
-	return c.json({ ...publicNarratorResponse(newNarrator), message: updatedMsg }, 201);
+	return c.json(
+		{ ...publicNarratorResponse(newNarrator), message: toEnvelopes([updatedMsg]) },
+		201,
+	);
 });
 
 // Cancel: delete a pending message

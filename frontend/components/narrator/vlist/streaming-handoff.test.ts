@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { BaseContentBlock, TreeMessage } from "@frontend/lib/api/types";
-import { messageBody } from "@shared/narrator-blocks/message-blocks";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { isLiveStreamingBlock } from "@shared/pretext-layout/streaming-live-blocks";
 import {
 	projectPendingEmptyReasoning,
@@ -9,15 +9,17 @@ import {
 } from "./streaming-handoff";
 
 function message(contentJson: BaseContentBlock[], id = "a1", extra = {}): TreeMessage {
-	return {
-		id,
-		role: "assistant",
-		parentToolUseId: null,
+	return rowWithElements(
+		{
+			id,
+			role: "assistant",
+			parentToolUseId: null,
+			toolCalls: [],
+			children: [],
+			...extra,
+		},
 		contentJson,
-		toolCalls: [],
-		children: [],
-		...extra,
-	} as unknown as TreeMessage;
+	) as unknown as TreeMessage;
 }
 const text = (id: string, revision: number, value = "正文") => ({
 	type: "text",

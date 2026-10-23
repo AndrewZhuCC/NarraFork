@@ -388,7 +388,7 @@ export function reasoningRunIndices(
 
 /**
  * Build the identity for a folded REASONING row, applying the run-start mapping.
- * `blocks` must be the owning message's full `contentJson` so run adjacency
+ * `blocks` must be the owning message's full body (`messageBody`) so run adjacency
  * matches what buildSelectionIndex saw.
  */
 export function reasoningTraceRowIdentity(

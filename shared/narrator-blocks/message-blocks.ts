@@ -10,7 +10,8 @@
  *
  * Readers take the body through `messageBody` (the elements) or `messageBlocks` (the
  * blocks); code that rewrites a row's body goes through `mapRowElements`,
- * `filterRowElements` or `rowWithElements`, which keep each block's identity.
+ * `filterRowElements` or `rowWithElements`, which keep each block's identity. A row
+ * without blocks has an empty body.
  */
 
 import { splitEnvelope } from "./storage";
@@ -40,11 +41,9 @@ export interface MessageBlock<E = unknown> extends RowBlock<E> {
 	from: number;
 }
 
-/** The least a row needs for `messageBody`: whatever holds its elements. */
+/** The least a row needs for `messageBody`: the blocks that hold its elements. */
 export interface MessageBodySource {
 	blocks?: readonly RowBlock<unknown>[] | null;
-	/** A row not yet built with blocks (test fixtures, until P3d 7b-2). */
-	contentJson?: unknown;
 }
 
 /** A row whose body holds elements of type `E` — what structural row types extend. */
@@ -52,11 +51,12 @@ export interface MessageWithBody<E> extends MessageBodySource {
 	blocks?: readonly RowBlock<E>[] | null;
 }
 
-/** What a message needs for its blocks: its body, and what a client-built row splits by. */
-export interface BlockSourceMessage<E> extends MessageWithBody<E> {
+/** What a client-built row is split by, besides its elements (`splitRowBlocks`). */
+export interface SplitSource {
 	id?: string;
 	narratorId?: string | null;
-	role: string;
+	/** Only an assistant row splits into a block per element group; any other is one block. */
+	role?: string;
 	contentText?: string | null;
 	parentToolUseId?: string | null;
 	messageUuid?: string | null;
@@ -65,18 +65,17 @@ export interface BlockSourceMessage<E> extends MessageWithBody<E> {
 	origin?: unknown;
 }
 
-type ElementsOfContent<M> = M extends { contentJson?: infer B }
-	? NonNullable<B> extends readonly (infer E)[]
-		? readonly E[]
-		: readonly unknown[]
-	: readonly unknown[];
+/** A row with its blocks and what identifies it. */
+export interface BlockSourceMessage<E> extends MessageWithBody<E>, SplitSource {
+	role: string;
+}
 
 /** A row's elements, typed after its blocks. */
 export type MessageBody<M> = M extends { blocks?: infer R }
 	? NonNullable<R> extends readonly RowBlock<infer E>[]
 		? readonly E[]
-		: ElementsOfContent<M>
-	: ElementsOfContent<M>;
+		: readonly unknown[]
+	: readonly unknown[];
 
 const EMPTY: readonly never[] = [];
 
@@ -85,16 +84,13 @@ const bodies = new WeakMap<readonly RowBlock<unknown>[], readonly unknown[]>();
 
 /**
  * The message's elements in order: its blocks' elements, one after another. The same
- * array while the row's blocks are the same. Readers take a message's body through here,
- * never from the row's storage field.
+ * array while the row's blocks are the same.
  */
 export function messageBody<M extends MessageBodySource>(
 	message: M | null | undefined,
 ): MessageBody<M> {
 	const blocks = message?.blocks;
-	if (Array.isArray(blocks)) return flatten(blocks) as unknown as MessageBody<M>;
-	const body = message?.contentJson;
-	return (Array.isArray(body) ? body : EMPTY) as unknown as MessageBody<M>;
+	return (Array.isArray(blocks) ? flatten(blocks) : EMPTY) as unknown as MessageBody<M>;
 }
 
 function flatten(blocks: readonly RowBlock<unknown>[]): readonly unknown[] {
@@ -111,54 +107,32 @@ function flatten(blocks: readonly RowBlock<unknown>[]): readonly unknown[] {
 /** Each block list with its starting positions. */
 const placed = new WeakMap<readonly RowBlock<unknown>[], readonly MessageBlock[]>();
 
-/** The last split of each body, with what it was split for (copies can share a body). */
-const splits = new WeakMap<
-	readonly unknown[],
-	{ id: string | undefined; role: string; origin: unknown; blocks: readonly MessageBlock[] }
->();
-
-/** The message's blocks in order; the same array while its blocks (or body) are the same. */
-export function messageBlocks<E>(message: BlockSourceMessage<E>): readonly MessageBlock<E>[] {
+/** The message's blocks in order; the same array while its blocks are the same. */
+export function messageBlocks<E>(message: MessageWithBody<E>): readonly MessageBlock<E>[] {
 	const held = message.blocks;
-	if (Array.isArray(held)) {
-		let blocks = placed.get(held);
-		if (!blocks) {
-			blocks = place(held);
-			placed.set(held, blocks);
-		}
-		return blocks as readonly MessageBlock<E>[];
+	if (!Array.isArray(held) || held.length === 0) return EMPTY;
+	let blocks = placed.get(held);
+	if (!blocks) {
+		let from = 0;
+		blocks = held.map((block) => {
+			const at = from;
+			from += block.elements.length;
+			return { ...block, from: at };
+		});
+		placed.set(held, blocks);
 	}
-	const elements = messageBody(message) as readonly E[];
-	const { id, role, origin } = message;
-	const cached = splits.get(elements);
-	if (cached && cached.id === id && cached.role === role && cached.origin === origin)
-		return cached.blocks as readonly MessageBlock<E>[];
-	const blocks = place(splitRowBlocks(message, elements));
-	if (elements !== EMPTY) splits.set(elements, { id, role, origin, blocks });
-	return blocks;
-}
-
-function place<E>(blocks: readonly RowBlock<E>[]): MessageBlock<E>[] {
-	let from = 0;
-	return blocks.map((block) => {
-		const at = from;
-		from += block.elements.length;
-		return { ...block, from: at };
-	});
+	return blocks as readonly MessageBlock<E>[];
 }
 
 /** The message's block holding element `index`. */
 export function blockAtIndex<E>(
-	message: BlockSourceMessage<E>,
+	message: MessageWithBody<E>,
 	index: number,
 ): MessageBlock<E> | undefined {
 	return messageBlocks(message).find(
 		(block) => index >= block.from && index < block.from + block.elements.length,
 	);
 }
-
-/** What `splitRowBlocks` needs of a client-built row besides its elements. */
-export type SplitSource = Omit<BlockSourceMessage<unknown>, "blocks" | "contentJson">;
 
 /**
  * A client-built row's elements as blocks, split as the server splits a legacy envelope:
@@ -200,25 +174,20 @@ export function splitRowBlocks<E>(message: SplitSource, elements: readonly E[]):
 
 /** The row's fields other than its body, to merge another row's body into. */
 export function withoutBody<M extends MessageBodySource>(row: M): Omit<M, keyof MessageBodySource> {
-	const { blocks: _blocks, contentJson: _contentJson, ...rest } = row;
+	const { blocks: _blocks, ...rest } = row;
 	return rest;
 }
 
-/** `row` holding `blocks` as its body (and no longer any body it was built with). */
-function withBlocks<M extends MessageBodySource>(row: M, blocks: readonly RowBlock<unknown>[]): M {
-	return { ...withoutBody(row), blocks } as unknown as M;
-}
-
 /**
- * A client-built row's body replaced by `elements`, split again into blocks. For a row
- * built on the client only: a server row's blocks keep their ids through
- * `mapRowElements` / `filterRowElements`.
+ * A client-built row with `elements` as its body, split into blocks. For a row built on
+ * the client only: a server row's blocks keep their ids through `mapRowElements` /
+ * `filterRowElements`.
  */
-export function rowWithElements<M extends BlockSourceMessage<unknown>>(
+export function rowWithElements<M extends object, E>(
 	row: M,
-	elements: MessageBody<M>,
-): M {
-	return withBlocks(row, splitRowBlocks(row, elements));
+	elements: readonly E[],
+): Omit<M, "blocks"> & { blocks: RowBlock<E>[] } {
+	return { ...row, blocks: splitRowBlocks(row as SplitSource, elements) };
 }
 
 type ElementOf<M> = MessageBody<M>[number];
@@ -227,24 +196,28 @@ type ElementOf<M> = MessageBody<M>[number];
  * Each element of the row through `map` (`index` is its position in the body). A block
  * keeps its identity; the row and every unchanged block stay the same objects.
  */
-export function mapRowElements<M extends BlockSourceMessage<unknown>>(
+export function mapRowElements<M extends MessageBodySource>(
 	row: M,
 	map: (element: ElementOf<M>, index: number) => ElementOf<M>,
 ): M {
+	const held = row.blocks;
+	if (!held?.length) return row;
 	let changed = false;
-	const blocks = messageBlocks(row).map((block, index) => {
+	let from = 0;
+	const blocks = held.map((block) => {
+		const at = from;
+		from += block.elements.length;
 		let blockChanged = false;
 		const elements = block.elements.map((element, offset) => {
-			const next = map(element as ElementOf<M>, block.from + offset);
+			const next = map(element as ElementOf<M>, at + offset);
 			if (next !== element) blockChanged = true;
 			return next;
 		});
-		if (!blockChanged) return unplaced(row, block, index);
+		if (!blockChanged) return block;
 		changed = true;
-		const { from: _from, ...rest } = block;
-		return { ...rest, elements };
+		return { ...block, elements };
 	});
-	return changed ? withBlocks(row, blocks) : row;
+	return changed ? { ...row, blocks } : row;
 }
 
 /**
@@ -252,36 +225,27 @@ export function mapRowElements<M extends BlockSourceMessage<unknown>>(
  * block left with no elements is dropped; the others keep their identity. The same row
  * when every element is kept.
  */
-export function filterRowElements<M extends BlockSourceMessage<unknown>>(
+export function filterRowElements<M extends MessageBodySource>(
 	row: M,
 	keep: (element: ElementOf<M>, index: number) => boolean,
 ): M {
+	const held = row.blocks;
+	if (!held?.length) return row;
 	let changed = false;
+	let from = 0;
 	const blocks: RowBlock<unknown>[] = [];
-	for (const [index, block] of messageBlocks(row).entries()) {
+	for (const block of held) {
+		const at = from;
+		from += block.elements.length;
 		const elements = block.elements.filter((element, offset) =>
-			keep(element as ElementOf<M>, block.from + offset),
+			keep(element as ElementOf<M>, at + offset),
 		);
 		if (elements.length === block.elements.length) {
-			blocks.push(unplaced(row, block, index));
+			blocks.push(block);
 			continue;
 		}
 		changed = true;
-		if (!elements.length) continue;
-		const { from: _from, ...rest } = block;
-		blocks.push({ ...rest, elements });
+		if (elements.length) blocks.push({ ...block, elements });
 	}
-	return changed ? withBlocks(row, blocks) : row;
-}
-
-/** The row's own block at `index` (`messageBlocks` keeps the order); a copy for a split row. */
-function unplaced<E>(
-	row: BlockSourceMessage<E>,
-	block: MessageBlock<E>,
-	index: number,
-): RowBlock<E> {
-	const own = row.blocks?.[index];
-	if (own) return own;
-	const { from: _from, ...rest } = block;
-	return rest;
+	return changed ? { ...row, blocks } : row;
 }

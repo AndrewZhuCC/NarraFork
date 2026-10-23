@@ -18,7 +18,7 @@
 
 import { describe, expect, it } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api/types";
-import { messageBody } from "@shared/narrator-blocks/message-blocks";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { buildStreamingMsg, type StreamingBlock } from "../message/message-segments";
 import { type HandoffMessage, projectStreamingMessage } from "./streaming-handoff";
 import { resolveStreamingClearedTrimEdge } from "./vlist-head-trim";
@@ -26,7 +26,7 @@ import { resolveStreamingClearedTrimEdge } from "./vlist-head-trim";
 const PARAGRAPH = "确认了根因，这是我的设计错误。";
 
 function persistedRow(blocks: unknown[]): HandoffMessage {
-	return { id: "m-partial", role: "assistant", parentToolUseId: null, contentJson: blocks };
+	return rowWithElements({ id: "m-partial", role: "assistant", parentToolUseId: null }, blocks);
 }
 
 function lane(

@@ -910,7 +910,7 @@ export function buildStreamingMsg(opts: {
 		// Text/reasoning blocks are emitted first and in the same order as
 		// `streamingBlocks`, so the accumulator's index carries over unchanged.
 		...(liveBlockIndex != null ? { liveBlockIndex } : {}),
-	} as NarratorMsg;
+	} as Omit<NarratorMsg, "blocks">;
 	return rowWithElements(row, blocks);
 }
 

@@ -7,21 +7,23 @@
 
 import { describe, expect, it } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api";
-import { messageBody } from "@shared/narrator-blocks/message-blocks";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { mergeToolCallFieldsInTree } from "./message-tree-utils";
 
 function msg(status: string, extra: Record<string, unknown> = {}): TreeMessage {
-	return {
-		id: "m1",
-		narratorId: "n1",
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: [{ type: "tool_use", id: "tu-1", name: "Edit", status, ...extra }],
-		contentText: null,
-		toolCalls: [{ toolUseId: "tu-1", toolName: "Edit", status, ...extra }],
-		createdAt: "2026-01-01T00:00:00.000Z",
-		children: [],
-	} as TreeMessage;
+	return rowWithElements(
+		{
+			id: "m1",
+			narratorId: "n1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: null,
+			toolCalls: [{ toolUseId: "tu-1", toolName: "Edit", status, ...extra }],
+			createdAt: "2026-01-01T00:00:00.000Z",
+			children: [],
+		},
+		[{ type: "tool_use", id: "tu-1", name: "Edit", status, ...extra }],
+	) as TreeMessage;
 }
 
 describe("mergeToolCallFieldsInTree", () => {

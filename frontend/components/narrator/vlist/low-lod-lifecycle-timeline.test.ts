@@ -19,6 +19,7 @@
  */
 
 import { beforeAll, describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 
 beforeAll(() => {
@@ -41,18 +42,23 @@ async function load() {
 type Mod = Awaited<ReturnType<typeof load>>;
 type Built = ReturnType<Mod["layout"]["buildPretextDocumentLayout"]>;
 
-const USER = {
-	id: "u1",
-	seq: 1,
-	role: "user",
-	contentJson: [{ type: "text", text: "请帮我构建" }],
-	toolCalls: [],
-	children: [],
-};
+const USER = rowWithElements(
+	{
+		id: "u1",
+		seq: 1,
+		role: "user",
+		toolCalls: [],
+		children: [],
+	},
+	[{ type: "text", text: "请帮我构建" }],
+);
 
 /** One persisted assistant message (the partial the server keeps appending to). */
 function persisted(blocks: unknown[]) {
-	return { id: "a1", seq: 2, role: "assistant", contentJson: blocks, toolCalls: [], children: [] };
+	return rowWithElements(
+		{ id: "a1", seq: 2, role: "assistant", toolCalls: [], children: [] },
+		blocks,
+	);
 }
 
 const REASONING = {

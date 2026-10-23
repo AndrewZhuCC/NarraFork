@@ -28,7 +28,7 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { messageBody } from "@shared/narrator-blocks/message-blocks";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import type { ContentBlock } from "../narrator-panel-types";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 
@@ -397,12 +397,14 @@ describe("live patches vs the structural reload", () => {
 		await coordinator.load("n1", BUILD_OPTIONS, { fetchPage: async () => runningToolPage() });
 
 		const before = coordinator.getSnapshot().input?.messages ?? [];
-		const live = {
-			id: "__streaming__",
-			role: "assistant",
-			contentJson: [{ type: "text", id: "new", revision: 1, text: "NEW" }],
-			toolCalls: [],
-		} as unknown as Msg;
+		const live = rowWithElements(
+			{
+				id: "__streaming__",
+				role: "assistant",
+				toolCalls: [],
+			},
+			[{ type: "text", id: "new", revision: 1, text: "NEW" }],
+		) as unknown as Msg;
 		expect(projectStreamingMessage(live, before)).toBe(live);
 		expect(
 			coordinator.applyLivePatch(toolCompletedPatch({ toolUseId: "tu-1", status: "success" })),
@@ -419,27 +421,31 @@ describe("live patches vs the structural reload", () => {
 		const { projectStreamingMessage } = await import("./streaming-handoff");
 		const coordinator = new PretextLayoutCoordinator();
 		await coordinator.load("n1", BUILD_OPTIONS, { fetchPage: async () => runningToolPage() });
-		const live = {
-			id: "__streaming__",
-			role: "assistant",
-			contentJson: [{ type: "text", id: "new", revision: 1, text: "NEW" }],
-			toolCalls: [],
-		} as unknown as Msg;
+		const live = rowWithElements(
+			{
+				id: "__streaming__",
+				role: "assistant",
+				toolCalls: [],
+			},
+			[{ type: "text", id: "new", revision: 1, text: "NEW" }],
+		) as unknown as Msg;
 
 		expect(
 			coordinator.appendMessage(
-				{
-					id: "m2",
-					narratorId: "n1",
-					parentToolUseId: null,
-					role: "assistant",
-					contentJson: [{ type: "text", text: "下一步" }],
-					contentText: "下一步",
-					toolCalls: [],
-					createdAt: "2026-01-01T00:01:00.000Z",
-					children: [],
-					seq: 1,
-				} as unknown as Msg,
+				rowWithElements(
+					{
+						id: "m2",
+						narratorId: "n1",
+						parentToolUseId: null,
+						role: "assistant",
+						contentText: "下一步",
+						toolCalls: [],
+						createdAt: "2026-01-01T00:01:00.000Z",
+						children: [],
+						seq: 1,
+					},
+					[{ type: "text", text: "下一步" }],
+				) as unknown as Msg,
 				false,
 			),
 		).toBe(true);
@@ -453,12 +459,29 @@ describe("live patches vs the structural reload", () => {
 	function runningToolPage(): import("@frontend/lib/api/types").PretextDocumentPageResult {
 		return {
 			messages: [
-				{
-					id: "m1",
-					narratorId: "n1",
-					parentToolUseId: null,
-					role: "assistant",
-					contentJson: [
+				rowWithElements(
+					{
+						id: "m1",
+						narratorId: "n1",
+						parentToolUseId: null,
+						role: "assistant",
+						contentText: null,
+						toolCalls: [
+							{
+								id: "tc-1",
+								narratorId: "n1",
+								messageId: "m1",
+								toolUseId: "tu-1",
+								toolName: "Bash",
+								inputJson: { command: "bun test" },
+								status: "running",
+								createdAt: "2026-01-01T00:00:00.000Z",
+							},
+						],
+						createdAt: "2026-01-01T00:00:00.000Z",
+						children: [],
+					},
+					[
 						{
 							type: "tool_use",
 							id: "tu-1",
@@ -468,22 +491,7 @@ describe("live patches vs the structural reload", () => {
 							status: "running",
 						},
 					],
-					contentText: null,
-					toolCalls: [
-						{
-							id: "tc-1",
-							narratorId: "n1",
-							messageId: "m1",
-							toolUseId: "tu-1",
-							toolName: "Bash",
-							inputJson: { command: "bun test" },
-							status: "running",
-							createdAt: "2026-01-01T00:00:00.000Z",
-						},
-					],
-					createdAt: "2026-01-01T00:00:00.000Z",
-					children: [],
-				} as unknown as Msg,
+				) as unknown as Msg,
 			],
 			messageVersion: 7,
 			minSeq: 0,
@@ -525,30 +533,30 @@ describe("live event → patch field mapping", () => {
 
 	function toolDoc(toolUseId: string, status: string): Msg[] {
 		return [
-			{
-				id: "m1",
-				narratorId: "n1",
-				parentToolUseId: null,
-				role: "assistant",
-				contentJson: [
-					{ type: "tool_use", id: toolUseId, name: "Bash", input: {}, status, inputJson: {} },
-				],
-				contentText: null,
-				toolCalls: [
-					{
-						id: `tc-${toolUseId}`,
-						narratorId: "n1",
-						messageId: "m1",
-						toolUseId,
-						toolName: "Bash",
-						status,
-						inputJson: {},
-						createdAt: "2026-01-01T00:00:00.000Z",
-					},
-				],
-				createdAt: "2026-01-01T00:00:00.000Z",
-				children: [],
-			} as unknown as Msg,
+			rowWithElements(
+				{
+					id: "m1",
+					narratorId: "n1",
+					parentToolUseId: null,
+					role: "assistant",
+					contentText: null,
+					toolCalls: [
+						{
+							id: `tc-${toolUseId}`,
+							narratorId: "n1",
+							messageId: "m1",
+							toolUseId,
+							toolName: "Bash",
+							status,
+							inputJson: {},
+							createdAt: "2026-01-01T00:00:00.000Z",
+						},
+					],
+					createdAt: "2026-01-01T00:00:00.000Z",
+					children: [],
+				},
+				[{ type: "tool_use", id: toolUseId, name: "Bash", input: {}, status, inputJson: {} }],
+			) as unknown as Msg,
 		];
 	}
 
