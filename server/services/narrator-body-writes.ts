@@ -7,8 +7,9 @@
  * instead of the column, and the rows are built from what it handed over, never read back
  * from the column. So what the column holds can change (P3b) without any writer noticing:
  *
- *   - `insertEnvelope`: a new envelope with its body; its rows are built in the same
- *     transaction;
+ *   - `insertEnvelope` (`insertEnvelopeIfAbsent`): a new envelope with its body; its rows
+ *     are built in the same transaction. `insertEnvelopeQueued` leaves a bulk copy's rows
+ *     to the sync queue, which builds them from the complete column;
  *   - `writeEnvelopeBody`: replace an envelope's body, with the other columns that change
  *     with it; `updateEnvelope` for a set of columns that may include it;
  *   - `readEnvelope` / `readEnvelopeBody`: what a read-modify-write starts from, read as
