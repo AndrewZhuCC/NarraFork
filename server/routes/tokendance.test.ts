@@ -65,10 +65,7 @@ mock.module("../lib/auth", () => ({
 	verifyToken: async () => {
 		throw new Error("invalid token");
 	},
-	renewToken: async () => {
-		throw new Error("not used");
-	},
-	isAuthenticSessionTokenIgnoringExpiry: async () => false,
+	extendSessionToken: async () => {},
 }));
 mock.module("../lib/oauth-provider", () => ({ validateAccessToken: () => null }));
 mock.module("../services/auth/store", () => ({ authSessionStore: {} }));

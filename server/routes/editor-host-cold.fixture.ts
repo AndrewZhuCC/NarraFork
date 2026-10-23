@@ -323,7 +323,7 @@ const server = Bun.serve<WSData>({
 					{
 						sessionExp: verified.exp,
 						sessionUserId: verified.sub,
-						sessionTokenVersion: verified.tokenVersion ?? 0,
+						sessionId: verified.sid,
 					},
 				);
 				if (data && server.upgrade(request, { data })) return;

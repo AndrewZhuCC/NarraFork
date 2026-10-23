@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "c0b82fe4-5f1e-438f-b8e6-efa463e32017",
+  "id": "79680360-7146-49e7-a87a-e45c3b904b2f",
   "prevId": "58a3cdfc-6942-482e-9bd2-adfbbd392ae7",
   "tables": {
     "acl_events": {
@@ -683,6 +683,13 @@
           "name": "idx_auth_sessions_expires",
           "columns": [
             "expires_at"
+          ],
+          "isUnique": false
+        },
+        "idx_auth_sessions_revoked": {
+          "name": "idx_auth_sessions_revoked",
+          "columns": [
+            "revoked_at"
           ],
           "isUnique": false
         }

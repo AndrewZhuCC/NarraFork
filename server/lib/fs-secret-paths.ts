@@ -48,7 +48,7 @@ import { narraforkDir } from "./settings";
  * password hashes and OAuth grants the main file does.
  */
 const SECRET_HOME_FILES: readonly string[] = [
-	"settings.json", // holds auth.jwtSecret — forging any user's session
+	"settings.json", // holds auth.jwtSecret — forging MFA challenges and internal signatures
 	"codex-credentials.json",
 	"update-server.json",
 	"update-server-test.json",

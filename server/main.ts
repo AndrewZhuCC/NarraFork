@@ -1096,11 +1096,11 @@ function startServer(listenPort: number, tlsCfg: typeof settings.server.tls) {
 							}
 						: undefined;
 
-					// Snapshot the credential's expiry so the heartbeat can drop the socket
-					// when it lapses; the upgrade is the only place the token is verified.
+					// Remember the session so the socket can be re-checked when it lapses or
+					// when the user's authorization changes (logout, revocation, role).
 					const wsData = resolveWSData(url, userInfo, undefined, {
 						sessionExp: payload.exp,
-						sessionTokenVersion: payload.tokenVersion ?? 0,
+						sessionId: payload.sid,
 						sessionUserId: payload.sub,
 					});
 					if (!wsData) {

@@ -18,4 +18,6 @@ CREATE INDEX `idx_auth_sessions_user` ON `auth_sessions` (`user_id`);
 --> statement-breakpoint
 CREATE INDEX `idx_auth_sessions_expires` ON `auth_sessions` (`expires_at`);
 --> statement-breakpoint
+CREATE INDEX `idx_auth_sessions_revoked` ON `auth_sessions` (`revoked_at`);
+--> statement-breakpoint
 PRAGMA foreign_keys=ON;

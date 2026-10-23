@@ -172,6 +172,10 @@ describe("AuthSessionStore — SQLite", () => {
 			revokedAt: null,
 		});
 		expect(await store.findSessionByTokenHash("hash-unknown")).toBeNull();
+		expect(await store.findSessionById(session.id)).toEqual(
+			await store.findSessionByTokenHash("hash-a"),
+		);
+		expect(await store.findSessionById(generateId())).toBeNull();
 	});
 
 	test("an extension only moves a live session's expiry forward", async () => {

@@ -236,10 +236,10 @@
 		{
 			"idx": 29,
 			"tag": "0029_auth_sessions",
-			"id": "8016a01d-520f-44ea-a3e9-ff25a82968c9",
+			"id": "c8b5bc82-4bf3-4eda-8cfc-f153106576c8",
 			"prevId": "99ad7e81-08d6-415e-85c1-b0a350926f04",
 			"version": "7",
-			"snapshotDigest": "edd18c50d4a7805eacf591aeedb1276128664046176bbc143e39de16ca4d05f4"
+			"snapshotDigest": "89f09f43a5fcca6455cf6584ba5ead7f3d043fd9d15923f2ce8f703909576851"
 		}
 	]
 }

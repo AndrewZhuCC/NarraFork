@@ -36,6 +36,7 @@ const injectedSession: AuthSessionStore = {
 	bumpTokenVersion: () => Promise.resolve(0),
 	createSession: () => Promise.resolve(),
 	findSessionByTokenHash: () => Promise.resolve(null),
+	findSessionById: () => Promise.resolve(null),
 	extendSession: () => Promise.resolve(),
 	revokeSession: () => Promise.resolve(),
 	deleteStaleSessions: () => Promise.resolve(0),

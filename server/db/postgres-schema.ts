@@ -1345,15 +1345,16 @@ export const authSessions = pgTable(
 			.references((): PgColumn => users.id, { onDelete: "cascade" }),
 		tokenHash: text("token_hash").notNull(),
 		tokenVersion: integer("token_version").notNull().default(0),
-		sessionStart: integer("session_start").notNull(),
-		createdAt: integer("created_at").notNull(),
-		expiresAt: integer("expires_at").notNull(),
-		revokedAt: integer("revoked_at"),
+		sessionStart: bigint("session_start", { mode: "number" }).notNull(),
+		createdAt: bigint("created_at", { mode: "number" }).notNull(),
+		expiresAt: bigint("expires_at", { mode: "number" }).notNull(),
+		revokedAt: bigint("revoked_at", { mode: "number" }),
 	},
 	(table) => [
 		uniqueIndex("idx_auth_sessions_token_hash").on(table.tokenHash),
 		index("idx_auth_sessions_user").on(table.userId),
 		index("idx_auth_sessions_expires").on(table.expiresAt),
+		index("idx_auth_sessions_revoked").on(table.revokedAt),
 	],
 );
 
@@ -11990,7 +11991,7 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "property": "sessionStart",
           "name": "session_start",
           "kind": "integer",
-          "pgType": "integer",
+          "pgType": "bigint",
           "notNull": true,
           "primary": false,
           "unique": false
@@ -11999,7 +12000,7 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "property": "createdAt",
           "name": "created_at",
           "kind": "integer",
-          "pgType": "integer",
+          "pgType": "bigint",
           "notNull": true,
           "primary": false,
           "unique": false
@@ -12008,7 +12009,7 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "property": "expiresAt",
           "name": "expires_at",
           "kind": "integer",
-          "pgType": "integer",
+          "pgType": "bigint",
           "notNull": true,
           "primary": false,
           "unique": false
@@ -12017,7 +12018,7 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "property": "revokedAt",
           "name": "revoked_at",
           "kind": "integer",
-          "pgType": "integer",
+          "pgType": "bigint",
           "notNull": false,
           "primary": false,
           "unique": false
@@ -12042,6 +12043,13 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_auth_sessions_expires",
           "columns": [
             "expiresAt"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_auth_sessions_revoked",
+          "columns": [
+            "revokedAt"
           ],
           "unique": false
         }

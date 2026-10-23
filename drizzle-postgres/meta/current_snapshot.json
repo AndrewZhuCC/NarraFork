@@ -1,5 +1,5 @@
 {
-  "id": "8016a01d-520f-44ea-a3e9-ff25a82968c9",
+  "id": "c8b5bc82-4bf3-4eda-8cfc-f153106576c8",
   "prevId": "99ad7e81-08d6-415e-85c1-b0a350926f04",
   "version": "7",
   "dialect": "postgresql",
@@ -895,25 +895,25 @@
         },
         "session_start": {
           "name": "session_start",
-          "type": "integer",
+          "type": "bigint",
           "primaryKey": false,
           "notNull": true
         },
         "created_at": {
           "name": "created_at",
-          "type": "integer",
+          "type": "bigint",
           "primaryKey": false,
           "notNull": true
         },
         "expires_at": {
           "name": "expires_at",
-          "type": "integer",
+          "type": "bigint",
           "primaryKey": false,
           "notNull": true
         },
         "revoked_at": {
           "name": "revoked_at",
-          "type": "integer",
+          "type": "bigint",
           "primaryKey": false,
           "notNull": false
         }
@@ -954,6 +954,21 @@
           "columns": [
             {
               "expression": "expires_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_auth_sessions_revoked": {
+          "name": "idx_auth_sessions_revoked",
+          "columns": [
+            {
+              "expression": "revoked_at",
               "isExpression": false,
               "asc": true,
               "nulls": "last"

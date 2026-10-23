@@ -4,6 +4,7 @@ import {
 	isOpaqueSessionToken,
 	SESSION_TOKEN_TTL_SECONDS,
 } from "@shared/session-auth";
+import type { AuthSessionRecord } from "../services/auth/session-store";
 import { authSessionStore } from "../services/auth/store";
 import { registrationAccountStore as accountStore } from "../services/registration/store";
 import { authAttemptLimiter, fingerprintAuthIdentifier } from "./auth-attempt-limiter";
@@ -111,22 +112,8 @@ export async function revokeUserSessions(userId: string): Promise<number> {
 	return version;
 }
 
-/**
- * Resolve a session token against the live database, so the role is the account's
- * current role and revocation is immediate.
- *
- * Throws `AppError` 401 for anything that is not a known session token,
- * `SessionTokenRevokedError` / `SessionTokenExpiredError` for a known one that is
- * finished, and lets storage failures through unchanged.
- */
-export async function verifyToken(token: string): Promise<SessionPayload> {
-	if (!isOpaqueSessionToken(token)) {
-		throw new AppError("Invalid token", 401, "UNAUTHORIZED");
-	}
-	const session = await authSessionStore.findSessionByTokenHash(hashSessionToken(token));
-	if (!session) {
-		throw new AppError("Invalid token", 401, "UNAUTHORIZED");
-	}
+/** Accept a live session row, or throw why it is finished. */
+function livePayload(session: AuthSessionRecord): SessionPayload {
 	if (session.revokedAt !== null || session.sessionTokenVersion < session.userTokenVersion) {
 		throw new SessionTokenRevokedError("Session revoked");
 	}
@@ -143,6 +130,42 @@ export async function verifyToken(token: string): Promise<SessionPayload> {
 		sessionStart: session.sessionStart,
 		tokenVersion: session.sessionTokenVersion,
 	};
+}
+
+/**
+ * Resolve a session token against the live database, so the role is the account's
+ * current role and revocation is immediate.
+ *
+ * Throws `AppError` 401 for anything that is not a known session token,
+ * `SessionTokenRevokedError` / `SessionTokenExpiredError` for a known one that is
+ * finished, and lets storage failures through unchanged.
+ */
+export async function verifyToken(token: string): Promise<SessionPayload> {
+	if (!isOpaqueSessionToken(token)) {
+		throw new AppError("Invalid token", 401, "UNAUTHORIZED");
+	}
+	const session = await authSessionStore.findSessionByTokenHash(hashSessionToken(token));
+	if (!session) {
+		throw new AppError("Invalid token", 401, "UNAUTHORIZED");
+	}
+	return livePayload(session);
+}
+
+/**
+ * Re-resolve a session a long-lived connection was opened with. Null when the session is
+ * gone, revoked or expired; storage failures are thrown.
+ */
+export async function resolveLiveSession(sessionId: string): Promise<SessionPayload | null> {
+	const session = await authSessionStore.findSessionById(sessionId);
+	if (!session) return null;
+	try {
+		return livePayload(session);
+	} catch (error) {
+		if (error instanceof SessionTokenRevokedError || error instanceof SessionTokenExpiredError) {
+			return null;
+		}
+		throw error;
+	}
 }
 
 /** Keep expired/revoked rows around this long, so a late request still reads "expired". */

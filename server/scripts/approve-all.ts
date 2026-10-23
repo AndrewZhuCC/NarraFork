@@ -110,28 +110,31 @@ async function approveAll(): Promise<{ approved: number; failed: number }> {
 	let approved = 0;
 	let failed = 0;
 
-	for (const p of pending) {
-		try {
-			const res = await fetch(`${baseUrl}/api/narrators/permissions/${p.id}/approve`, {
-				method: "POST",
-				headers: { Authorization: `Bearer ${token}` },
-			});
-			if (res.ok) {
-				const ts = new Date().toLocaleTimeString();
-				console.log(`  [${ts}] ✓ Approved ${p.id} (${p.tool_name})`);
-				approvedIds.add(p.id);
-				approved++;
-			} else {
-				const body = await res.text();
-				console.error(`  ✗ Failed ${p.id}: ${res.status} ${body}`);
+	try {
+		for (const p of pending) {
+			try {
+				const res = await fetch(`${baseUrl}/api/narrators/permissions/${p.id}/approve`, {
+					method: "POST",
+					headers: { Authorization: `Bearer ${token}` },
+				});
+				if (res.ok) {
+					const ts = new Date().toLocaleTimeString();
+					console.log(`  [${ts}] ✓ Approved ${p.id} (${p.tool_name})`);
+					approvedIds.add(p.id);
+					approved++;
+				} else {
+					const body = await res.text();
+					console.error(`  ✗ Failed ${p.id}: ${res.status} ${body}`);
+					failed++;
+				}
+			} catch (err) {
+				console.error(`  ✗ Failed ${p.id}: ${err}`);
 				failed++;
 			}
-		} catch (err) {
-			console.error(`  ✗ Failed ${p.id}: ${err}`);
-			failed++;
 		}
+	} finally {
+		session.revoke();
 	}
-	session.revoke();
 	return { approved, failed };
 }
 
@@ -142,9 +145,14 @@ if (watchMode) {
 	console.log("Press Ctrl+C to stop.\n");
 
 	const tick = async () => {
-		const { failed } = await approveAll();
-		if (failed > 0) {
-			console.log("Hint: make sure the server is running (bun run dev).");
+		try {
+			const { failed } = await approveAll();
+			if (failed > 0) {
+				console.log("Hint: make sure the server is running (bun run dev).");
+			}
+		} catch (err) {
+			// One failed pass (a busy database, say) must not end the watch.
+			console.error(`  ✗ Approval pass failed: ${err}`);
 		}
 	};
 

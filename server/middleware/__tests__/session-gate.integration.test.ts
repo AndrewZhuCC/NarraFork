@@ -29,6 +29,8 @@ const [
 	{ ABSOLUTE_SESSION_MAX_SECONDS, SESSION_RENEWAL_THRESHOLD_SECONDS, SESSION_TOKEN_TTL_SECONDS },
 	{ createToken, revokeUserSessions, verifyToken },
 	{ hashSessionToken },
+	{ authSessionStore },
+	{ isSessionInvalidResponse },
 ] = await Promise.all([
 	import("../../app"),
 	import("../../db"),
@@ -40,6 +42,8 @@ const [
 	import("@shared/session-auth"),
 	import("../../lib/auth"),
 	import("../../lib/session-token-hash"),
+	import("../../services/auth/store"),
+	import("@shared/session-auth"),
 ]);
 
 const USERNAME = "session-gate-user";
@@ -203,6 +207,28 @@ describe("live authorization state", () => {
 		expect((await authGet("/api/admin/users", token)).status).toBe(200);
 		await db.update(users).set({ role: "user" }).where(eq(users.id, userId));
 		expect((await authGet("/api/admin/users", token)).status).toBe(403);
+	});
+});
+
+describe("storage failures", () => {
+	test("a failing session lookup is a server error, never a session loss", async () => {
+		// Reading a DB hiccup as "your session is gone" would make every client drop a
+		// perfectly good token and log the whole user base out at once.
+		const token = await createToken(userId);
+		const original = authSessionStore.findSessionByTokenHash;
+		authSessionStore.findSessionByTokenHash = async () => {
+			throw new Error("database unavailable");
+		};
+		let response: Response;
+		try {
+			response = await authGet("/api/auth/me", token);
+		} finally {
+			authSessionStore.findSessionByTokenHash = original;
+		}
+		expect(response.status).toBeGreaterThanOrEqual(500);
+		const body = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+		expect(isSessionInvalidResponse(body)).toBe(false);
+		expect((await authGet("/api/auth/me", token)).status).toBe(200);
 	});
 });
 

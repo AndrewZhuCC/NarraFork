@@ -2484,6 +2484,7 @@ export const authSessions = sqliteTable(
 		uniqueIndex("idx_auth_sessions_token_hash").on(table.tokenHash),
 		index("idx_auth_sessions_user").on(table.userId),
 		index("idx_auth_sessions_expires").on(table.expiresAt),
+		index("idx_auth_sessions_revoked").on(table.revokedAt),
 	],
 );
 

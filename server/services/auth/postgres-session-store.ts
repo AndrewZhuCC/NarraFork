@@ -18,7 +18,7 @@
 import { withPgRetry } from "@server/db/pg-retry";
 import { authSessions, userPreferences, users } from "@server/db/postgres-schema";
 import { ValidationError } from "@server/lib/errors";
-import { and, eq, inArray, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, lt, or, type SQL, sql } from "drizzle-orm";
 import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
 import type { AccountRole } from "../registration/account-store";
 import type {
@@ -41,6 +41,29 @@ function asRole(role: string): AccountRole {
  * decision, and tests supply a handle pointed at a throwaway container.
  */
 export function createPostgresAuthSessionStore(db: BunSQLDatabase): AuthSessionStore {
+	/** One session row joined with its account, by a unique key. */
+	async function findSession(where: SQL): Promise<AuthSessionRecord | null> {
+		const rows = await db
+			.select({
+				id: authSessions.id,
+				userId: authSessions.userId,
+				role: users.role,
+				userTokenVersion: users.tokenVersion,
+				sessionTokenVersion: authSessions.tokenVersion,
+				sessionStart: authSessions.sessionStart,
+				createdAt: authSessions.createdAt,
+				expiresAt: authSessions.expiresAt,
+				revokedAt: authSessions.revokedAt,
+			})
+			.from(authSessions)
+			.innerJoin(users, eq(users.id, authSessions.userId))
+			.where(where)
+			.limit(1);
+		const row = rows[0];
+		if (!row) return null;
+		return { ...row, role: asRole(row.role) };
+	}
+
 	return {
 		async findLoginCredential(username: string): Promise<LoginCredential | null> {
 			return withPgRetry(
@@ -167,30 +190,15 @@ export function createPostgresAuthSessionStore(db: BunSQLDatabase): AuthSessionS
 		},
 
 		async findSessionByTokenHash(tokenHash: string): Promise<AuthSessionRecord | null> {
-			return withPgRetry(
-				async () => {
-					const rows = await db
-						.select({
-							id: authSessions.id,
-							userId: authSessions.userId,
-							role: users.role,
-							userTokenVersion: users.tokenVersion,
-							sessionTokenVersion: authSessions.tokenVersion,
-							sessionStart: authSessions.sessionStart,
-							createdAt: authSessions.createdAt,
-							expiresAt: authSessions.expiresAt,
-							revokedAt: authSessions.revokedAt,
-						})
-						.from(authSessions)
-						.innerJoin(users, eq(users.id, authSessions.userId))
-						.where(eq(authSessions.tokenHash, tokenHash))
-						.limit(1);
-					const row = rows[0];
-					if (!row) return null;
-					return { ...row, role: asRole(row.role) };
-				},
-				{ label: "authSession.findSessionByTokenHash" },
-			);
+			return withPgRetry(() => findSession(eq(authSessions.tokenHash, tokenHash)), {
+				label: "authSession.findSessionByTokenHash",
+			});
+		},
+
+		async findSessionById(sessionId: string): Promise<AuthSessionRecord | null> {
+			return withPgRetry(() => findSession(eq(authSessions.id, sessionId)), {
+				label: "authSession.findSessionById",
+			});
 		},
 
 		async extendSession(sessionId: string, expiresAt: number): Promise<void> {

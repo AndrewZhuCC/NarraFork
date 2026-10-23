@@ -15,7 +15,7 @@
  */
 import { db } from "@server/db";
 import { authSessions, userPreferences, users } from "@server/db/schema";
-import { and, eq, inArray, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, lt, or, type SQL, sql } from "drizzle-orm";
 import { updateLegacyGitIdentityProfile } from "../git-identities";
 import type { AccountRole } from "../registration/account-store";
 import type {
@@ -30,6 +30,29 @@ import type {
 /** The schema stores role as text; the two role names are all it ever holds. */
 function asRole(role: string): AccountRole {
 	return role === "admin" ? "admin" : "user";
+}
+
+/** One session row joined with its account, by a unique key. */
+async function findSession(where: SQL): Promise<AuthSessionRecord | null> {
+	const rows = await db
+		.select({
+			id: authSessions.id,
+			userId: authSessions.userId,
+			role: users.role,
+			userTokenVersion: users.tokenVersion,
+			sessionTokenVersion: authSessions.tokenVersion,
+			sessionStart: authSessions.sessionStart,
+			createdAt: authSessions.createdAt,
+			expiresAt: authSessions.expiresAt,
+			revokedAt: authSessions.revokedAt,
+		})
+		.from(authSessions)
+		.innerJoin(users, eq(users.id, authSessions.userId))
+		.where(where)
+		.limit(1);
+	const row = rows[0];
+	if (!row) return null;
+	return { ...row, role: asRole(row.role) };
 }
 
 export const sqliteAuthSessionStore: AuthSessionStore = {
@@ -110,25 +133,11 @@ export const sqliteAuthSessionStore: AuthSessionStore = {
 	},
 
 	async findSessionByTokenHash(tokenHash: string): Promise<AuthSessionRecord | null> {
-		const rows = await db
-			.select({
-				id: authSessions.id,
-				userId: authSessions.userId,
-				role: users.role,
-				userTokenVersion: users.tokenVersion,
-				sessionTokenVersion: authSessions.tokenVersion,
-				sessionStart: authSessions.sessionStart,
-				createdAt: authSessions.createdAt,
-				expiresAt: authSessions.expiresAt,
-				revokedAt: authSessions.revokedAt,
-			})
-			.from(authSessions)
-			.innerJoin(users, eq(users.id, authSessions.userId))
-			.where(eq(authSessions.tokenHash, tokenHash))
-			.limit(1);
-		const row = rows[0];
-		if (!row) return null;
-		return { ...row, role: asRole(row.role) };
+		return findSession(eq(authSessions.tokenHash, tokenHash));
+	},
+
+	async findSessionById(sessionId: string): Promise<AuthSessionRecord | null> {
+		return findSession(eq(authSessions.id, sessionId));
 	},
 
 	async extendSession(sessionId: string, expiresAt: number): Promise<void> {
