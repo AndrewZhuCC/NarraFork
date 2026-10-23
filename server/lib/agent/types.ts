@@ -444,9 +444,9 @@ export type AgentEvent =
 			 * names its element, so clients match it to its block (protocol v2).
 			 */
 			blockId: string;
-			blockRevision?: number;
+			blockRevision: number;
 			/** Raw text characters preceding this delta (metadata may also advance revision). */
-			blockTextOffset?: number;
+			blockTextOffset: number;
 	  }
 	| {
 			type: "tool_call";
@@ -720,9 +720,9 @@ export type AgentEvent =
 			outputIndex?: number;
 			/** As on `stream_text`: the element this delta extends. */
 			blockId: string;
-			blockRevision?: number;
+			blockRevision: number;
 			/** Raw text characters preceding this delta (metadata may also advance revision). */
-			blockTextOffset?: number;
+			blockTextOffset: number;
 	  }
 	| {
 			type: "context_usage";

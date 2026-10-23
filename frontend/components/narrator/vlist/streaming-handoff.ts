@@ -67,15 +67,13 @@ export function projectStreamingMessage(
 			block.type !== "image_generation"
 		)
 			return true;
+		// A text/reasoning lane is covered by its own persisted version; a provider tool
+		// block by the current turn's persisted block of the same id.
 		const identity = contentBlockIdentity(block);
-		// An actively written legacy lane has no exact evidence; keep its conservative guard.
 		const exact = identity ? versions.get(identity.id) : undefined;
-		const covered = exact
-			? blockSupersedes(exact, block as StreamingBlock)
-			: persisted.some((candidate) => {
-					if (index === liveIndex && !(identity && contentBlockIdentity(candidate))) return false;
-					return blockSupersedes(candidate, block as StreamingBlock);
-				});
+		const covered = identity
+			? !!exact && blockSupersedes(exact, block as StreamingBlock)
+			: persisted.some((candidate) => blockSupersedes(candidate, block as StreamingBlock));
 		if (!covered && index === liveIndex) nextLiveIndex = index;
 		return !covered;
 	});

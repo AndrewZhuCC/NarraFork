@@ -147,47 +147,55 @@ describe("segmentMessages", () => {
 });
 
 describe("mergeStreamingSnapshotBlocks", () => {
+	const text = (id: string, revision: number, body: string, outputIndex = 0): StreamingBlock => ({
+		type: "text",
+		id,
+		revision,
+		textOffset: 0,
+		text: body,
+		outputIndex,
+	});
+
 	test("fills gaps from a snapshot into empty live blocks", () => {
 		const blocks: StreamingBlock[] = [];
-		const changed = mergeStreamingSnapshotBlocks(blocks, [
-			{ type: "text", text: "hello", outputIndex: 0 },
-		]);
+		const changed = mergeStreamingSnapshotBlocks(blocks, [text("t1", 1, "hello")]);
 		expect(changed).toBe(true);
-		expect(blocks).toEqual([{ type: "text", text: "hello", outputIndex: 0 }]);
+		expect(blocks).toEqual([text("t1", 1, "hello")]);
 	});
 
-	test("never truncates live text with a shorter/older snapshot", () => {
-		const blocks: StreamingBlock[] = [{ type: "text", text: "hello world", outputIndex: 0 }];
-		const changed = mergeStreamingSnapshotBlocks(blocks, [
-			{ type: "text", text: "hello", outputIndex: 0 },
-		]);
+	test("never replaces live text with an older revision", () => {
+		const blocks: StreamingBlock[] = [text("t1", 2, "hello world")];
+		const changed = mergeStreamingSnapshotBlocks(blocks, [text("t1", 1, "hello")]);
 		expect(changed).toBe(false);
-		expect(blocks[0]).toEqual({ type: "text", text: "hello world", outputIndex: 0 });
+		expect(blocks[0]).toEqual(text("t1", 2, "hello world"));
 	});
 
-	test("adopts a longer snapshot for the same text block", () => {
-		const blocks: StreamingBlock[] = [{ type: "text", text: "hel", outputIndex: 0 }];
-		const changed = mergeStreamingSnapshotBlocks(blocks, [
-			{ type: "text", text: "hello", outputIndex: 0 },
-		]);
+	test("adopts a newer revision of the same text block", () => {
+		const blocks: StreamingBlock[] = [text("t1", 1, "hel")];
+		const changed = mergeStreamingSnapshotBlocks(blocks, [text("t1", 2, "hello")]);
 		expect(changed).toBe(true);
-		expect(blocks[0]).toEqual({ type: "text", text: "hello", outputIndex: 0 });
+		expect(blocks[0]).toEqual(text("t1", 2, "hello"));
 	});
 
-	test("merges text snapshots without outputIndex instead of duplicating them", () => {
-		const blocks: StreamingBlock[] = [{ type: "text", text: "hello world" }];
-		const changed = mergeStreamingSnapshotBlocks(blocks, [{ type: "text", text: "hello" }]);
+	test("matches reasoning by id and keeps the newer revision", () => {
+		const reasoning = (revision: number, body: string): StreamingBlock => ({
+			type: "reasoning",
+			id: "r1",
+			revision,
+			textOffset: 0,
+			text: body,
+		});
+		const blocks: StreamingBlock[] = [reasoning(2, "abcd")];
+		const changed = mergeStreamingSnapshotBlocks(blocks, [reasoning(1, "ab")]);
 		expect(changed).toBe(false);
-		expect(blocks).toEqual([{ type: "text", text: "hello world" }]);
+		expect(blocks[0]).toEqual(reasoning(2, "abcd"));
 	});
 
-	test("matches reasoning by id and keeps the longer text", () => {
-		const blocks: StreamingBlock[] = [{ type: "reasoning", id: "r1", text: "abcd" }];
-		const changed = mergeStreamingSnapshotBlocks(blocks, [
-			{ type: "reasoning", id: "r1", text: "ab" },
-		]);
-		expect(changed).toBe(false);
-		expect(blocks[0]).toEqual({ type: "reasoning", id: "r1", text: "abcd" });
+	test("ignores a text lane that does not name its element and revision", () => {
+		const blocks: StreamingBlock[] = [];
+		const unnamed = { type: "text", text: "hello", outputIndex: 0 } as unknown as StreamingBlock;
+		expect(mergeStreamingSnapshotBlocks(blocks, [unnamed])).toBe(false);
+		expect(blocks).toEqual([]);
 	});
 
 	test("refreshes web_search status from the snapshot", () => {
@@ -207,8 +215,8 @@ describe("mergeStreamingSnapshotBlocks", () => {
 	});
 
 	test("keeps blocks ordered by output index when inserting", () => {
-		const blocks: StreamingBlock[] = [{ type: "text", text: "second", outputIndex: 2 }];
-		mergeStreamingSnapshotBlocks(blocks, [{ type: "text", text: "first", outputIndex: 1 }]);
+		const blocks: StreamingBlock[] = [text("t2", 1, "second", 2)];
+		mergeStreamingSnapshotBlocks(blocks, [text("t1", 1, "first", 1)]);
 		expect(blocks.map((b) => (b.type === "text" ? b.text : ""))).toEqual(["first", "second"]);
 	});
 });

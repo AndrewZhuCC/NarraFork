@@ -131,6 +131,8 @@ async function withStream(
 		() => () => {},
 	);
 	const coordinator = new PretextLayoutCoordinator();
+	// Each lane's raw end, so a delta given without an offset appends as the server's does.
+	const rawEnds = new Map<string, number>();
 	await coordinator.load(
 		"handoff-n",
 		build,
@@ -261,15 +263,18 @@ async function withStream(
 					root.render(<Harness />);
 				});
 			},
-			delta: (block) =>
-				frame({
+			delta: (block) => {
+				const textOffset = block.textOffset ?? rawEnds.get(block.id) ?? 0;
+				rawEnds.set(block.id, Math.max(rawEnds.get(block.id) ?? 0, textOffset + block.text.length));
+				return frame({
 					type: "stream_event",
 					event: {
 						type: "content_block_delta",
 						outputIndex: block.outputIndex,
-						delta: { ...block, type: `${block.type}_delta` },
+						delta: { ...block, textOffset, type: `${block.type}_delta` },
 					},
-				}),
+				});
+			},
 			commit: (blocks, final = false) =>
 				frame({ type: final ? "message" : "message_updated", message: message(blocks) }),
 		});
@@ -557,7 +562,7 @@ describe("real streaming hook / local WS / coordinator / DOM handoff", () => {
 
 	it("restores request identity from snapshots and refreshes unchanged text on identity change", async () => {
 		await withStream(async (h) => {
-			const streamingBlocks = [content("reasoning", "r", "Reasoning")];
+			const streamingBlocks = [content("reasoning", "r", "Reasoning", 1, 0)];
 			await h.frame({
 				type: "streaming_snapshot",
 				model: "gpt-reconnected",

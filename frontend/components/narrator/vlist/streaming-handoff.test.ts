@@ -98,22 +98,19 @@ describe("block identity/revision handoff projection", () => {
 		const committed = [message([text("b", 5)])];
 		expect(projectStreamingDocument(committed, live([text("b", 4)]))).toBe(committed);
 	});
-	it("legacy completed blocks retain the conservative suffix and active-lane checks", () => {
+	it("text that only looks the same never covers a lane", () => {
 		const block = { type: "text", text: "suffix", outputIndex: 0 };
 		const committed = [message([{ ...block, text: "prefix suffix" }])];
-		expect(projectStreamingMessage(live([block]), committed)).toBeNull();
-		expect(projectStreamingMessage(live([block], 0), committed)?.contentJson).toEqual([block]);
-		expect(
-			projectStreamingMessage(live([{ ...block, text: "different" }]), committed),
-		).not.toBeNull();
-	});
-	it("does not match legacy blocks across user turns or parent/child boundaries", () => {
-		const block = { type: "text", text: "same" };
 		const streaming = live([block]);
+		expect(projectStreamingMessage(streaming, committed)).toBe(streaming);
+	});
+	it("does not match provider tool blocks across user turns or parent/child boundaries", () => {
+		const search = { type: "web_search", id: "ws_1", status: "completed" };
+		const streaming = live([search]);
 		expect(
-			projectStreamingMessage(streaming, [message([block]), message([], "u", { role: "user" })]),
+			projectStreamingMessage(streaming, [message([search]), message([], "u", { role: "user" })]),
 		).toBe(streaming);
-		const child = message([block], "child", { parentToolUseId: "agent-tool" });
+		const child = message([search], "child", { parentToolUseId: "agent-tool" });
 		expect(projectStreamingMessage(streaming, [child])).toBe(streaming);
 		expect(projectStreamingMessage(streaming, [child], true)).toBeNull();
 	});

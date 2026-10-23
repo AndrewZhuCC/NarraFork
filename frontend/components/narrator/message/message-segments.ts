@@ -561,9 +561,10 @@ export function clearToolBlockCache(): void {
 export type StreamingBlock =
 	| {
 			type: "reasoning";
-			id?: string;
-			revision?: number;
-			textOffset?: number;
+			/** The element this lane streams, its revision, and the raw characters before `text`. */
+			id: string;
+			revision: number;
+			textOffset: number;
 			outputIndex?: number;
 			text: string;
 	  }
@@ -591,9 +592,9 @@ export type StreamingBlock =
 	| {
 			type: "text";
 			text: string;
-			id?: string;
-			revision?: number;
-			textOffset?: number;
+			id: string;
+			revision: number;
+			textOffset: number;
 			outputIndex?: number;
 			fileReferenceContext?: FileReferenceContext | null;
 	  };
@@ -718,32 +719,18 @@ function findMatchingStreamingBlockIndex(
 	blocks: StreamingBlock[],
 	incoming: StreamingBlock,
 ): number {
-	if (incoming.type === "web_search" || incoming.type === "image_generation") {
-		return blocks.findIndex((b) => b.type === incoming.type && b.id === incoming.id);
-	}
-	if (incoming.type === "reasoning") {
-		const incomingOutputIndex = getStreamingBlockOutputIndex(incoming);
-		return blocks.findIndex((b) => {
-			if (b.type !== "reasoning") return false;
-			if (incoming.id) return b.id === incoming.id;
-			if (incomingOutputIndex != null)
-				return getStreamingBlockOutputIndex(b) === incomingOutputIndex;
-			return !b.id && getStreamingBlockOutputIndex(b) == null;
-		});
-	}
-	if (incoming.type === "text" && incoming.id) {
-		return blocks.findIndex((b) => b.type === "text" && b.id === incoming.id);
-	}
-	// text — prefer the provider output index, but legacy/providers without one
-	// still keep a single live text block that must merge with a reconnect snapshot
-	// instead of being inserted again and rendered twice.
-	const incomingOutputIndex = getStreamingBlockOutputIndex(incoming);
-	return blocks.findIndex((b) => {
-		if (b.type !== "text") return false;
-		const existingOutputIndex = getStreamingBlockOutputIndex(b);
-		if (incomingOutputIndex != null) return existingOutputIndex === incomingOutputIndex;
-		return existingOutputIndex == null;
-	});
+	return blocks.findIndex((b) => b.type === incoming.type && b.id === incoming.id);
+}
+
+/** A snapshot's text/reasoning lane names its element, revision and raw offset. */
+function isExactLane(block: StreamingBlock): boolean {
+	if (block.type !== "text" && block.type !== "reasoning") return true;
+	return (
+		typeof block.id === "string" &&
+		block.id.length > 0 &&
+		Number.isSafeInteger(block.revision) &&
+		Number.isSafeInteger(block.textOffset)
+	);
 }
 
 /**
@@ -761,14 +748,14 @@ export function mergeStreamingSnapshotBlocks(
 ): boolean {
 	let changed = false;
 	for (const incoming of snapshotBlocks) {
+		if (!isExactLane(incoming)) continue;
 		const idx = findMatchingStreamingBlockIndex(blocks, incoming);
 		if (idx === -1) {
 			const next = { ...incoming };
 			if (next.type === "text" || next.type === "reasoning") {
 				const rawLength = next.text.length;
 				next.text = appendStreamingTextPreview("", next.text);
-				if (next.textOffset != null || rawLength !== next.text.length)
-					next.textOffset = (next.textOffset ?? 0) + rawLength - next.text.length;
+				next.textOffset += rawLength - next.text.length;
 			}
 			blocks.splice(
 				findStreamingInsertIndex(blocks, getStreamingBlockOutputIndex(incoming)),
@@ -796,46 +783,28 @@ export function mergeStreamingSnapshotBlocks(
 				);
 				changed = true;
 			}
-			// Modern snapshots are exact versions, including shorter corrected bodies.
-			if (incoming.id && incoming.revision != null && existing.revision != null) {
-				if (incoming.revision <= existing.revision) {
-					// A delta may precede its reconnect snapshot. Revision guards the
-					// suffix; raw offsets let an older snapshot restore its missing prefix.
-					const start = incoming.textOffset;
-					const currentStart = existing.textOffset;
-					if (
-						start != null &&
-						currentStart != null &&
-						start < currentStart &&
-						start + incoming.text.length >= currentStart
-					) {
-						const end = currentStart + existing.text.length;
-						const prefix = incoming.text.slice(0, currentStart - start);
-						const text = appendStreamingTextPreview(prefix, existing.text);
-						if (text !== existing.text) {
-							existing.text = text;
-							existing.textOffset = end - text.length;
-							changed = true;
-						}
+			// Snapshots are exact versions, including shorter corrected bodies.
+			if (incoming.revision <= existing.revision) {
+				// A delta may precede its reconnect snapshot. Revision guards the
+				// suffix; raw offsets let an older snapshot restore its missing prefix.
+				const start = incoming.textOffset;
+				const currentStart = existing.textOffset;
+				if (start < currentStart && start + incoming.text.length >= currentStart) {
+					const end = currentStart + existing.text.length;
+					const prefix = incoming.text.slice(0, currentStart - start);
+					const text = appendStreamingTextPreview(prefix, existing.text);
+					if (text !== existing.text) {
+						existing.text = text;
+						existing.textOffset = end - text.length;
+						changed = true;
 					}
-					continue;
 				}
-				existing.text = appendStreamingTextPreview("", incoming.text);
-				existing.textOffset =
-					(incoming.textOffset ?? 0) + incoming.text.length - existing.text.length;
-				existing.revision = incoming.revision;
-				changed = true;
 				continue;
 			}
-			if (incoming.revision != null) existing.revision = incoming.revision;
-			// Legacy snapshots have no version; retain their conservative longer preview.
-			if (incoming.text.length > existing.text.length) {
-				existing.text = incoming.text;
-				if (incoming.type === "reasoning" && existing.type === "reasoning" && incoming.id) {
-					existing.id = incoming.id;
-				}
-				changed = true;
-			}
+			existing.text = appendStreamingTextPreview("", incoming.text);
+			existing.textOffset = incoming.textOffset + incoming.text.length - existing.text.length;
+			existing.revision = incoming.revision;
+			changed = true;
 		} else {
 			// web_search / image_generation: adopt the fresher snapshot status/fields.
 			blocks[idx] = { ...existing, ...incoming };
@@ -873,19 +842,15 @@ export function buildStreamingMsg(opts: {
 	const blocks: ContentBlock[] = [];
 
 	if (hasStreamingBlocks) {
-		for (const [index, sb] of streamingBlocks.entries()) {
+		for (const sb of streamingBlocks) {
 			if (sb.type === "reasoning") {
 				blocks.push({
 					type: "reasoning",
-					id:
-						sb.id ??
-						(sb.outputIndex != null
-							? `streaming:reasoning:${sb.outputIndex}`
-							: `streaming:reasoning:${index}`),
+					id: sb.id,
 					text: sb.text,
 					outputIndex: sb.outputIndex,
-					...(sb.revision != null ? { revision: sb.revision } : {}),
-					...(sb.textOffset != null ? { textOffset: sb.textOffset } : {}),
+					revision: sb.revision,
+					textOffset: sb.textOffset,
 				} as ContentBlock);
 			} else if (sb.type === "web_search") {
 				blocks.push({
@@ -911,10 +876,10 @@ export function buildStreamingMsg(opts: {
 			} else if (sb.type === "text") {
 				blocks.push({
 					type: "text",
-					id: sb.id ?? `streaming:text:${index}`,
+					id: sb.id,
 					text: sb.text,
-					...(sb.revision != null ? { revision: sb.revision } : {}),
-					...(sb.textOffset != null ? { textOffset: sb.textOffset } : {}),
+					revision: sb.revision,
+					textOffset: sb.textOffset,
 					outputIndex: sb.outputIndex,
 					...(sb.fileReferenceContext !== undefined
 						? { fileReferenceContext: normalizeFileReferenceContext(sb.fileReferenceContext) }

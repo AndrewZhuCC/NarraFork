@@ -1705,7 +1705,7 @@ reconcile(narrator, target, now):
 - **按块寻址的操作**：删除（单个、批量）、回滚、回滚与删除预览、文件恢复预览、编辑重生成，在已知块时走 `/blocks` 路由，作用于该元素所在的整块；只从 v1 服务端见过的消息仍走按下标的路由。编辑、恢复 assistant 消息仍按整条消息（编辑器编辑的是整条文本，按块编辑需要编辑器指明块）；allow-retry 按调用 id，本就精确。
 - **账本按块打补丁**：v2 连接上的 `tool_started` / `tool_completed` 带账本 attempt 所属的 tool 块（`blockId`：帧带 `toolCallId` 时取该 attempt 的 `block_id`，否则取该调用最新的 attempt）；前端只写持有该块的那一行，没有块 id 或未加载该块时仍写所有出现处。
 - **元素按块 id 作键**：以块协议到达的消息，其元素键为 `${messageId}-blk[<blockId>]`（多元素块的后续元素加 `+<offset>`），取代按位置的 `${messageId}-b<index>`；删除或插入前面的块不再改变后面行的键（测量高度、折叠、选择随之保留）。v1 消息仍用按位置的键。tool 行仍以调用 id 作键（反思、权限匹配、跳转都按它寻址）。
-- **流式交接**：流式元素与其落库副本已按元素的全局标识（`${attempt}:${order}`，即 v2 的块 id 所对应的元素）配对：supersede 用 id + revision，生命周期动画用 `lifecycleId`。按文本后缀、`outputIndex` 的旧匹配只服务于不带元素 id 的 provider 流与 `wsV2` 关闭时的 v1，因此保留，在 P3d 与 v1 协议和开关一起删除（前提是先确认各 provider 的流都带元素 id）。
+- **流式交接**：流式元素与其落库副本已按元素的全局标识（`${attempt}:${order}`，即 v2 的块 id 所对应的元素）配对：supersede 用 id + revision，生命周期动画用 `lifecycleId`。按文本后缀、`outputIndex` 的旧匹配只服务于不带元素 id 的 provider 流与 `wsV2` 关闭时的 v1，因此保留，在 P3d 与 v1 协议和开关一起删除（前提是先确认各 provider 的流都带元素 id）。P3d 第 2、6 步确认了这一前提并删除了旧匹配。
 
 ### P3 退役与新能力
 
@@ -1852,7 +1852,8 @@ reconcile(narrator, target, now):
 5. 正文经访问器：读消息正文的代码一律经 `messageBody`（元素）或 `messageBlocks`（块），不再读行的 `contentJson`。`frontend/lib/narrator-body-access.guard.test.ts` 按文件计数余下的直接使用，只降不升：访问器本身、行类型、构建或改写行的代码（store 的合并与补丁、流式、协议解码、聊天与夹具的行）。（已完成）
    - 分组不另改写：非 assistant 消息在服务端解码为一个块（input 或 context），注入与伴随块的配对用的是与服务端解码相同的 `contextBlockViews` / `injectionBlockViews`；assistant 消息的分段按元素的类别（正文、工具、相邻 reasoning 成段），块边界只落在元素之间、不跨类别（旧信封每个元素一块）。按元素遍历得到的分组因此与逐块遍历相同，改写不会改变输出。
    - 元素在消息内的位置只作遍历坐标（选择项、编辑目标、ask、各索引仍以 `(messageId, 位置)` 记），由 `messageBody` 从块推出，第 7 步后含义不变；身份（行键、操作）已按块。
-6. 流式改为按块 id 的 open 块，删除累加器、交接与启发式。
+6. 流式只认元素标识：每个流式增量都带元素 id、revision 与原始偏移，服务端快照块同样（loop 的累加器本来就给出，`stream_text` / `stream_reasoning` 的这两个字段改为必填，事件处理去掉缺偏移的分支）。前端的增量折叠、快照合并与交接只按 id + revision：删除按 `outputIndex` 认道、按文本后缀与 `providerMetadata.openai.itemId` 判断覆盖、合成的 `streaming:*` id，以及只为无版本块保留的丢弃路径；不带标识的增量与快照道不再应用。web_search / image_generation 仍按 id 在本轮落库后退场。开发用的模拟流按服务端的方式给出 id、revision 与偏移。（已完成）
+   - 累加器与交接保留：它们本就以元素 id 为键。交接把更新的 revision 合进同 id 的落库块，把已按该 revision 落库的道从流式行里去掉，这就是"同一块 id 的落库块取代 open 块"。把它们改成 store 里的 open 块只换数据结构，与第 7 步行直接持有块一起做。
 7. 行改为直接持有块：`messageBody` / `messageBlocks` 改从块读，守卫里列出的改写行的代码改为按块；删除 `contentJson`、`children`、`blockRefs`，删除 v1 协议、`wsV2`、`block-protocol.ts` 的回转、按下标的路由与死代码；更新文档。
 
 **验收**：

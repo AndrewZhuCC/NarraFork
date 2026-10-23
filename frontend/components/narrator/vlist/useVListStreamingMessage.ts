@@ -237,11 +237,12 @@ export function useVListStreamingMessage(
 	// raw bodies. A late final/checkpoint cannot clear a newer revision or NEW id.
 	useEffect(() => {
 		void version; // A final WS frame may seal ids after the loaded array last changed.
-		// Unversioned providers retain the old conservative per-block contraction;
-		// only modern ids can reopen the same raw accumulator after a checkpoint.
-		const legacy = blocksRef.current.filter((block) => !contentBlockIdentity(block));
-		dropSupersededStreamingBlocks(legacy, committedMessages, liveBlockRef.current);
-		const retainedLegacy = new Set(legacy);
+		// Provider tool blocks (web_search, image_generation) leave once persisted; a
+		// text/reasoning lane leaves once its id is acknowledged at its revision, and a
+		// newer revision can reopen the same raw accumulator after a checkpoint.
+		const providerTools = blocksRef.current.filter((block) => !contentBlockIdentity(block));
+		dropSupersededStreamingBlocks(providerTools, committedMessages);
+		const retainedTools = new Set(providerTools);
 		const acknowledged = new Map<string, number>();
 		for (const message of committedMessages) {
 			for (const block of messageBody(message) as readonly Record<string, unknown>[]) {
@@ -258,7 +259,7 @@ export function useVListStreamingMessage(
 			return identity
 				? (finalizedRef.current.get(identity.id) ?? -1) < identity.revision ||
 						(acknowledged.get(identity.id) ?? -1) < identity.revision
-				: retainedLegacy.has(block);
+				: retainedTools.has(block);
 		});
 	}, [committedMessages, version]);
 

@@ -24,45 +24,47 @@ function getToolUseBlocks(msg: StreamingMsg): ContentBlock[] {
 }
 
 // ---------------------------------------------------------------------------
-// buildStreamingMsg — stable synthetic IDs
+// buildStreamingMsg — every block keeps its element id
 // ---------------------------------------------------------------------------
 
-describe("buildStreamingMsg — stable block IDs", () => {
+describe("buildStreamingMsg — block ids", () => {
 	const base = { narratorId: "n1" };
 
-	test("reasoning block gets stable id", () => {
+	test("a reasoning block keeps its element id", () => {
 		const msg = buildStreamingMsg({
 			...base,
-			streamingBlocks: [{ type: "reasoning", text: "thinking..." }],
+			streamingBlocks: [
+				{ type: "reasoning", id: "1:0", revision: 1, textOffset: 0, text: "thinking..." },
+			],
 		});
 		expect(msg).not.toBeNull();
 		const reasoningBlock = findContentBlock(msg, "reasoning");
 		expect(reasoningBlock).toBeDefined();
-		expect(reasoningBlock?.id).toBe("streaming:reasoning:0");
+		expect(reasoningBlock?.id).toBe("1:0");
 	});
 
-	test("text block gets stable id", () => {
+	test("a text block keeps its element id", () => {
 		const msg = buildStreamingMsg({
 			...base,
-			streamingBlocks: [{ type: "text", text: "hello" }],
+			streamingBlocks: [{ type: "text", id: "1:2", revision: 1, textOffset: 0, text: "hello" }],
 		});
 		expect(msg).not.toBeNull();
 		const textBlock = findContentBlock(msg, "text");
 		expect(textBlock).toBeDefined();
-		expect(textBlock?.id).toBe("streaming:text:0");
+		expect(textBlock?.id).toBe("1:2");
 	});
 
-	test("reasoning + text both get stable ids", () => {
+	test("reasoning and text both keep their element ids", () => {
 		const msg = buildStreamingMsg({
 			...base,
 			streamingBlocks: [
-				{ type: "reasoning", text: "thinking..." },
-				{ type: "text", text: "hello" },
+				{ type: "reasoning", id: "1:0", revision: 1, textOffset: 0, text: "thinking..." },
+				{ type: "text", id: "1:2", revision: 1, textOffset: 0, text: "hello" },
 			],
 		});
 		expect(msg).not.toBeNull();
 		const ids = getContentBlocks(msg).map((block) => block.id);
-		expect(ids).toEqual(["streaming:reasoning:0", "streaming:text:1"]);
+		expect(ids).toEqual(["1:0", "1:2"]);
 	});
 
 	test("web_search block keeps its original id", () => {
@@ -112,30 +114,30 @@ describe("buildStreamingMsg — stable block IDs", () => {
 		const msg = buildStreamingMsg({
 			...base,
 			streamingBlocks: [
-				{ type: "reasoning", text: "thinking..." },
+				{ type: "reasoning", id: "1:0", revision: 1, textOffset: 0, text: "thinking..." },
 				{ type: "web_search", id: "ws-1", status: "completed", query: "q" },
-				{ type: "text", text: "result" },
+				{ type: "text", id: "1:2", revision: 1, textOffset: 0, text: "result" },
 			],
 			toolChunksMsg,
 		});
 		expect(msg).not.toBeNull();
 		const ids = getContentBlocks(msg).map((block) => block.id);
-		expect(ids).toEqual(["streaming:reasoning:0", "ws-1", "streaming:text:2", "tu-1"]);
+		expect(ids).toEqual(["1:0", "ws-1", "1:2", "tu-1"]);
 	});
 
 	test("ids are stable across incremental streaming updates", () => {
 		// Simulate the streaming sequence: reasoning → +text → +web_search → +tool
 		const step1 = buildStreamingMsg({
 			...base,
-			streamingBlocks: [{ type: "reasoning", text: "t" }],
+			streamingBlocks: [{ type: "reasoning", id: "1:0", revision: 1, textOffset: 0, text: "t" }],
 		});
 		const reasoningId1 = getContentBlocks(step1)[0]?.id;
 
 		const step2 = buildStreamingMsg({
 			...base,
 			streamingBlocks: [
-				{ type: "reasoning", text: "thinking..." },
-				{ type: "text", text: "hel" },
+				{ type: "reasoning", id: "1:0", revision: 1, textOffset: 0, text: "thinking..." },
+				{ type: "text", id: "1:2", revision: 1, textOffset: 0, text: "hel" },
 			],
 		});
 		const reasoningId2 = findContentBlock(step2, "reasoning")?.id;
@@ -144,20 +146,20 @@ describe("buildStreamingMsg — stable block IDs", () => {
 		const step3 = buildStreamingMsg({
 			...base,
 			streamingBlocks: [
-				{ type: "reasoning", text: "thinking..." },
+				{ type: "reasoning", id: "1:0", revision: 1, textOffset: 0, text: "thinking..." },
 				{ type: "web_search", id: "ws-1", status: "searching" },
-				{ type: "text", text: "hello world" },
+				{ type: "text", id: "1:2", revision: 1, textOffset: 0, text: "hello world" },
 			],
 		});
 		const reasoningId3 = findContentBlock(step3, "reasoning")?.id;
 		const textId3 = findContentBlock(step3, "text")?.id;
 
 		// All ids should be identical across steps
-		expect(reasoningId1).toBe("streaming:reasoning:0");
-		expect(reasoningId2).toBe("streaming:reasoning:0");
-		expect(reasoningId3).toBe("streaming:reasoning:0");
-		expect(textId2).toBe("streaming:text:1");
-		expect(textId3).toBe("streaming:text:2");
+		expect(reasoningId1).toBe("1:0");
+		expect(reasoningId2).toBe("1:0");
+		expect(reasoningId3).toBe("1:0");
+		expect(textId2).toBe("1:2");
+		expect(textId3).toBe("1:2");
 	});
 
 	test("temporal order is preserved: search between reasoning steps", () => {
@@ -165,9 +167,9 @@ describe("buildStreamingMsg — stable block IDs", () => {
 		const msg = buildStreamingMsg({
 			...base,
 			streamingBlocks: [
-				{ type: "reasoning", text: "initial thinking" },
+				{ type: "reasoning", id: "1:0", revision: 1, textOffset: 0, text: "initial thinking" },
 				{ type: "web_search", id: "ws-1", status: "completed", query: "first search" },
-				{ type: "text", text: "result" },
+				{ type: "text", id: "1:2", revision: 1, textOffset: 0, text: "result" },
 			],
 		});
 		expect(msg).not.toBeNull();
@@ -179,10 +181,10 @@ describe("buildStreamingMsg — stable block IDs", () => {
 		const msg = buildStreamingMsg({
 			...base,
 			streamingBlocks: [
-				{ type: "reasoning", text: "thinking about X" },
+				{ type: "reasoning", id: "1:0", revision: 1, textOffset: 0, text: "thinking about X" },
 				{ type: "web_search", id: "ws-1", status: "completed", query: "search X" },
 				{ type: "web_search", id: "ws-2", status: "searching", query: "search Y" },
-				{ type: "text", text: "partial..." },
+				{ type: "text", id: "1:2", revision: 1, textOffset: 0, text: "partial..." },
 			],
 		});
 		expect(msg).not.toBeNull();
@@ -202,8 +204,15 @@ describe("buildStreamingMsg — stable block IDs", () => {
 describe("native streaming tool upserts", () => {
 	test("web_search upsert inserts in output order and updates existing block", () => {
 		const blocks: StreamingBlock[] = [
-			{ type: "reasoning", text: "thinking", outputIndex: 0 },
-			{ type: "text", text: "answer", outputIndex: 3 },
+			{
+				type: "reasoning",
+				id: "1:0",
+				revision: 1,
+				textOffset: 0,
+				text: "thinking",
+				outputIndex: 0,
+			},
+			{ type: "text", id: "1:2", revision: 1, textOffset: 0, text: "answer", outputIndex: 3 },
 		];
 
 		upsertStreamingWebSearchBlock(blocks, {
@@ -228,7 +237,9 @@ describe("native streaming tool upserts", () => {
 	});
 
 	test("image_generation upsert promotes partial preview to final saved image", () => {
-		const blocks: StreamingBlock[] = [{ type: "text", text: "before", outputIndex: 0 }];
+		const blocks: StreamingBlock[] = [
+			{ type: "text", id: "1:2", revision: 1, textOffset: 0, text: "before", outputIndex: 0 },
+		];
 
 		upsertStreamingImageGenerationBlock(blocks, {
 			id: "ig-1",
@@ -432,12 +443,12 @@ describe("buildStreamingMsg — tool-use block reference stability", () => {
 
 		const msg1 = buildStreamingMsg({
 			narratorId: "n1",
-			streamingBlocks: [{ type: "text", text: "first" }],
+			streamingBlocks: [{ type: "text", id: "1:0", revision: 1, textOffset: 0, text: "first" }],
 			toolChunksMsg,
 		});
 		const msg2 = buildStreamingMsg({
 			narratorId: "n1",
-			streamingBlocks: [{ type: "text", text: "second" }],
+			streamingBlocks: [{ type: "text", id: "1:0", revision: 1, textOffset: 0, text: "second" }],
 			toolChunksMsg,
 		});
 
@@ -497,17 +508,19 @@ describe("buildStreamingMsg — tool-use block reference stability", () => {
 		// Simulate streaming: same tool chunks, changing text
 		const msg1 = buildStreamingMsg({
 			narratorId: "n1",
-			streamingBlocks: [{ type: "text", text: "h" }],
+			streamingBlocks: [{ type: "text", id: "1:0", revision: 1, textOffset: 0, text: "h" }],
 			toolChunksMsg,
 		});
 		const msg2 = buildStreamingMsg({
 			narratorId: "n1",
-			streamingBlocks: [{ type: "text", text: "hello" }],
+			streamingBlocks: [{ type: "text", id: "1:0", revision: 1, textOffset: 0, text: "hello" }],
 			toolChunksMsg,
 		});
 		const msg3 = buildStreamingMsg({
 			narratorId: "n1",
-			streamingBlocks: [{ type: "text", text: "hello world" }],
+			streamingBlocks: [
+				{ type: "text", id: "1:0", revision: 1, textOffset: 0, text: "hello world" },
+			],
 			toolChunksMsg,
 		});
 

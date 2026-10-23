@@ -30,7 +30,13 @@ describe("executeAgentLoop file-reference context", () => {
 				{ config, userText: "", history: { rows: [] }, eventContext },
 				{
 					eventSource: makeEventSource([
-						{ type: "stream_text", blockId: "text-4", text: "src/a.ts" },
+						{
+							type: "stream_text",
+							blockRevision: 1,
+							blockTextOffset: 0,
+							blockId: "text-4",
+							text: "src/a.ts",
+						},
 					]),
 					processEventFn: async (_event, ctx) => {
 						expect(ctx.getFileReferenceContext?.()).toEqual({ deviceId: "local", cwd });
