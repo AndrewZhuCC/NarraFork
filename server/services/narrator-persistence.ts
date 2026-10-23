@@ -71,6 +71,7 @@ import {
 	syncEnvelopeNow,
 } from "./narrator-block-sync";
 import { bodyColumns, contentJsonSql, fillBodies, fillBody } from "./narrator-body-reads";
+import { readEnvelope, writeEnvelopeBody } from "./narrator-body-writes";
 import { enrichToolUseBlocks, truncateToolIO } from "./narrator-messages";
 import type { RefMessage, RefMessageInput } from "./narrator-refs/port";
 import {
@@ -508,6 +509,7 @@ type MessageCopyResult = {
 export function cowEnvelopeTx(
 	tx: DbTx,
 	input: {
+		/** The envelope copied, its body as readers read it (`readEnvelope`). */
 		original: typeof narratorMessages.$inferSelect;
 		ref: { id: string; narratorId: string };
 		changes?: Partial<typeof narratorMessages.$inferInsert>;
@@ -518,16 +520,15 @@ export function cowEnvelopeTx(
 	const { original, ref } = input;
 	const id = generateId();
 	const now = new Date().toISOString();
-	tx.insert(narratorMessages)
-		.values({
-			...original,
-			...input.changes,
-			id,
-			narratorId: ref.narratorId,
-			authorNarratorId: original.authorNarratorId ?? original.narratorId,
-			createdAt: original.createdAt,
-		})
-		.run();
+	const copy = {
+		...original,
+		...input.changes,
+		id,
+		narratorId: ref.narratorId,
+		authorNarratorId: original.authorNarratorId ?? original.narratorId,
+		createdAt: original.createdAt,
+	};
+	tx.insert(narratorMessages).values(copy).run();
 	if (input.toolCalls.length)
 		tx.insert(narratorToolCalls)
 			.values(
@@ -541,7 +542,7 @@ export function cowEnvelopeTx(
 				})),
 			)
 			.run();
-	syncCopiedEnvelope(original.id, id);
+	syncCopiedEnvelope(original.id, id, copy.contentJson);
 	tx.update(narratorMessageRefs)
 		.set({ messageId: id })
 		.where(eq(narratorMessageRefs.id, ref.id))
@@ -570,9 +571,7 @@ function copyMessageForNarratorTx(
 	forceCopy = false,
 ): MessageCopyResult {
 	if (Object.hasOwn(overrides, "contentJson") || Object.hasOwn(overrides, "contentText")) {
-		const original = tx.query.narratorMessages
-			.findFirst({ where: eq(narratorMessages.id, messageId) })
-			.sync();
+		const original = readEnvelope(tx, messageId);
 		if (!original) throw new NotFoundError("Message", messageId);
 		overrides = {
 			...overrides,
@@ -600,16 +599,16 @@ function copyMessageForNarratorTx(
 		.all();
 	const shouldCopy = forceCopy || refs.length > 1;
 	if (!shouldCopy) {
-		if (Object.keys(overrides).length > 0) {
+		if (Object.hasOwn(overrides, "contentJson"))
+			writeEnvelopeBody(tx, messageId, overrides.contentJson, { set: overrides });
+		else if (Object.keys(overrides).length > 0) {
 			tx.update(narratorMessages).set(overrides).where(eq(narratorMessages.id, messageId)).run();
 			syncEnvelopeNow(messageId);
 		}
 		return { messageId, ref, copied: false };
 	}
 
-	const original = tx.query.narratorMessages
-		.findFirst({ where: eq(narratorMessages.id, messageId) })
-		.sync();
+	const original = readEnvelope(tx, messageId);
 	if (!original) throw new NotFoundError("Message", messageId);
 
 	const originalToolCalls = tx.query.narratorToolCalls
@@ -4214,9 +4213,7 @@ const sqliteNarratorPersistence = {
 			overrides != null &&
 			(Object.hasOwn(overrides, "contentJson") || Object.hasOwn(overrides, "contentText"));
 		if (semanticEdit && overrides) {
-			const original = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, messageId),
-			});
+			const original = readEnvelope(db, messageId);
 			if (!original) throw new NotFoundError("Message", messageId);
 			overrides = {
 				...overrides,
@@ -4236,9 +4233,7 @@ const sqliteNarratorPersistence = {
 			return id;
 		});
 		function rewrite(tx: DbTx): string {
-			const original = tx.query.narratorMessages
-				.findFirst({ where: eq(narratorMessages.id, messageId) })
-				.sync();
+			const original = readEnvelope(tx, messageId);
 			if (!original) throw new NotFoundError("Message", messageId);
 			options.beforeWrite?.(tx);
 			// Read ref membership atomically with the rewrite, including forks made while the
@@ -4268,10 +4263,13 @@ const sqliteNarratorPersistence = {
 			};
 			const updateOriginal = () => {
 				if (overrides && Object.keys(overrides).length > 0) {
-					tx.update(narratorMessages)
-						.set(overrides)
-						.where(eq(narratorMessages.id, messageId))
-						.run();
+					if (Object.hasOwn(overrides, "contentJson"))
+						writeEnvelopeBody(tx, messageId, overrides.contentJson, { set: overrides });
+					else
+						tx.update(narratorMessages)
+							.set(overrides)
+							.where(eq(narratorMessages.id, messageId))
+							.run();
 					if (semanticEdit)
 						updateRecipientMessageRef(tx, narratorId, currentRef.id, {
 							kind: "semantic_edit",

@@ -20,6 +20,7 @@ const blockSync = await import("../narrator-block-sync");
 const { mergeSummaryService } = await import("../merge-summary-service");
 const { markRecoveryCardResolved } = await import("../narrator-subagent-recovery");
 const { markCompactAsBlocking } = await import("../narrator-compact");
+const { settings } = await import("../../lib/settings");
 
 const NOW = "2026-10-01T00:00:00.000Z";
 
@@ -238,15 +239,22 @@ describe("patchState", () => {
 		expectRowsCurrent("s1");
 	});
 
-	test("rows that no longer line up with the content are rebuilt", async () => {
+	test("with block reads off, rows that no longer line up with the content are rebuilt", async () => {
+		// With block reads on the rows are the body the patch starts from; off, it is the
+		// column, and rows that differ from it are rebuilt from it.
 		seed("s1", "assistant", reasoningStep);
 		sqlite.run(
 			`UPDATE narrator_blocks SET payload = '{"raw":[{"type":"reasoning","id":"r1","text":"stale","completed":true}]}' WHERE message_id = 's1' AND kind = 'reasoning'`,
 		);
-		narratorStore.patchState("s1", (content) => {
-			(content[0] as Record<string, unknown>).translatedText = "t";
-			return content;
-		});
+		settings.narratorBlocks.read = false;
+		try {
+			narratorStore.patchState("s1", (content) => {
+				(content[0] as Record<string, unknown>).translatedText = "t";
+				return content;
+			});
+		} finally {
+			settings.narratorBlocks.read = true;
+		}
 		expectRowsCurrent("s1");
 	});
 });

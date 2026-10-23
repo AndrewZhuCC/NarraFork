@@ -44,8 +44,10 @@ import * as database from "../db";
 import { removeBlockIndexText, replaceBlockIndexText } from "../db/fts";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { bodySql, readBodies } from "../lib/narrator-bodies";
 import { settings } from "../lib/settings";
 import { blockIdForElement, reassignBlockIdForElement } from "./narrator-block-ids";
+import { blockReadsEnabled } from "./narrator-block-scans";
 import { activeTurnId } from "./narrator-turns";
 
 /** How incomplete output and reasoning are read: still streaming, sealed, or as they were. */
@@ -108,17 +110,40 @@ export function flushChangedEnvelopes(limit = FLUSH_LIMIT): number {
 	return ids.length;
 }
 
-/** Sync one envelope now and take it off the queue. */
+/**
+ * Sync one envelope now and take it off the queue. A writer that just wrote the body
+ * passes it as `content`, so the rows are built from what it wrote, not read back.
+ */
 export function syncEnvelopeNow(
 	messageId: string,
 	mode: SyncMode = "keep",
 	stamp: BlockStamp = {},
+	content?: unknown,
 ): void {
 	if (!hasBlockSchema()) return;
-	syncEnvelope(messageId, mode, stamp);
+	syncEnvelope(messageId, mode, stamp, content);
 	database.sqlite
 		.prepare("DELETE FROM narrator_block_sync_queue WHERE message_id = ?")
 		.run(messageId);
+}
+
+/**
+ * Rebuild an envelope's rows from what `content_json` stores, for a check that found them
+ * differing from it (the dual-write audit and the backfill's verify): the column is the
+ * reference they are checked against.
+ */
+export function resyncFromColumn(messageId: string, stored?: unknown): void {
+	if (!hasBlockSchema()) return;
+	const content =
+		stored ??
+		parse(
+			(
+				database.sqlite
+					.prepare("SELECT content_json AS contentJson FROM narrator_messages WHERE id = ?")
+					.get(messageId) as { contentJson: string | null } | null
+			)?.contentJson ?? null,
+		);
+	syncEnvelopeNow(messageId, "keep", {}, content);
 }
 
 const SWEEP_INTERVAL_MS = 5_000;
@@ -200,15 +225,19 @@ export function auditRecentEnvelopes(limit = AUDIT_ENVELOPES): string[] {
 		const assembled = assembleContent(
 			blocks.map((block) => ({ payload: parse(block.payload), state: parse(block.state) })),
 		);
-		return JSON.stringify(assembled) === JSON.stringify(inAssembledOrder(stored)) ? [] : [row.id];
+		return JSON.stringify(assembled) === JSON.stringify(inAssembledOrder(stored))
+			? []
+			: [{ id: row.id, stored }];
 	});
 	if (differing.length) {
-		logger.warn("Block rows differed from their envelope; re-synced", { messageIds: differing });
+		const messageIds = differing.map((envelope) => envelope.id);
+		logger.warn("Block rows differed from their envelope; re-synced", { messageIds });
 		database.sqlite.transaction(() => {
-			for (const id of differing) syncEnvelopeNow(id);
+			for (const { id, stored } of differing) resyncFromColumn(id, stored);
 		})();
+		return messageIds;
 	}
-	return differing;
+	return [];
 }
 
 // === Sync ===
@@ -217,7 +246,6 @@ interface EnvelopeRow {
 	id: string;
 	narratorId: string;
 	role: EnvelopeRole;
-	contentJson: string | null;
 	contentText: string | null;
 	parentToolUseId: string | null;
 	messageUuid: string | null;
@@ -313,25 +341,46 @@ function ledgerRows(messageId: string): PlanLedgerRow[] {
 		.all(messageId) as PlanLedgerRow[];
 }
 
+const ENVELOPE_COLUMNS = `id, narrator_id AS narratorId, role, content_text AS contentText,
+	parent_tool_use_id AS parentToolUseId, sdk_message_uuid AS messageUuid, origin, provider,
+	body_format AS bodyFormat`;
+
+function envelopeRow(messageId: string): EnvelopeRow | null {
+	return database.sqlite
+		.prepare(`SELECT ${ENVELOPE_COLUMNS} FROM narrator_messages WHERE id = ?`)
+		.get(messageId) as EnvelopeRow | null;
+}
+
 /**
- * Bring one envelope's block rows in line with its stored content, inside the caller's
- * transaction. A no-op for legacy-format envelopes and for content that is not an array.
+ * The envelope's body as readers read it (`narrator-bodies.ts`): assembled from its rows
+ * when they are current, `content_json` otherwise.
+ */
+function envelopeBody(messageId: string): unknown {
+	const row = database.sqlite
+		.prepare(
+			`SELECT id, ${bodySql("m", blockReadsEnabled())} AS body FROM narrator_messages m WHERE id = ?`,
+		)
+		.get(messageId) as { id: string; body: string | null } | null;
+	return row ? readBodies(database.sqlite, [row]).get(messageId) : undefined;
+}
+
+/**
+ * Bring one envelope's block rows in line with its content, inside the caller's
+ * transaction: `given` when the writer passes the body it wrote; otherwise the body as
+ * readers read it, which is `content_json` while a write outside the store is queued and
+ * the rows themselves once they are current (a ledger change re-derives a tool block's
+ * phase from them). A no-op for legacy-format envelopes and for content that is not an
+ * array.
  */
 export function syncEnvelope(
 	messageId: string,
 	mode: SyncMode = "keep",
 	stamp: BlockStamp = {},
+	given?: unknown,
 ): void {
-	const row = database.sqlite
-		.prepare(
-			`SELECT id, narrator_id AS narratorId, role, content_json AS contentJson,
-				content_text AS contentText, parent_tool_use_id AS parentToolUseId,
-				sdk_message_uuid AS messageUuid, origin, provider, body_format AS bodyFormat
-			 FROM narrator_messages WHERE id = ?`,
-		)
-		.get(messageId) as EnvelopeRow | null;
+	const row = envelopeRow(messageId);
 	if (!row || row.bodyFormat !== 2) return;
-	const content = parse(row.contentJson);
+	const content = given === undefined ? envelopeBody(messageId) : given;
 	if (!Array.isArray(content)) return;
 
 	const message = {
@@ -574,21 +623,14 @@ export function patchEnvelopeState(
 	mutate: (content: unknown[]) => unknown[] | null,
 ): boolean {
 	return database.sqlite.transaction(() => {
-		const row = database.sqlite
-			.prepare(
-				`SELECT id, narrator_id AS narratorId, role, content_json AS contentJson,
-					content_text AS contentText, parent_tool_use_id AS parentToolUseId,
-					sdk_message_uuid AS messageUuid, origin, provider, body_format AS bodyFormat
-				 FROM narrator_messages WHERE id = ?`,
-			)
-			.get(messageId) as EnvelopeRow | null;
+		const row = envelopeRow(messageId);
 		if (!row) return false;
-		const content = parse(row.contentJson);
+		const content = envelopeBody(messageId);
 		if (!Array.isArray(content)) return false;
 		const next = mutate(structuredClone(content));
 		if (!next) return false;
 		const json = JSON.stringify(next);
-		if (json === row.contentJson) return false;
+		if (json === JSON.stringify(content)) return false;
 		const message = {
 			id: row.id,
 			narratorId: row.narratorId,
@@ -607,7 +649,7 @@ export function patchEnvelopeState(
 			database.sqlite
 				.prepare("UPDATE narrator_messages SET content_json = ? WHERE id = ?")
 				.run(json, messageId);
-			if (row.bodyFormat === 2) syncEnvelopeNow(messageId);
+			if (row.bodyFormat === 2) syncEnvelopeNow(messageId, "keep", {}, next);
 			return true;
 		}
 		database.sqlite
@@ -652,10 +694,17 @@ export function contentByAttempt(
 	}));
 }
 
-/** Build a copied envelope's blocks now and point them at the blocks they copy (§6.3). */
-export function syncCopiedEnvelope(fromMessageId: string, toMessageId: string): void {
+/**
+ * Build a copied envelope's blocks now, from the body the copy was written with, and
+ * point them at the blocks they copy (§6.3).
+ */
+export function syncCopiedEnvelope(
+	fromMessageId: string,
+	toMessageId: string,
+	content?: unknown,
+): void {
 	if (!hasBlockSchema()) return;
-	syncEnvelopeNow(toMessageId);
+	syncEnvelopeNow(toMessageId, "keep", {}, content);
 	inheritBlockLineage(fromMessageId, toMessageId);
 }
 

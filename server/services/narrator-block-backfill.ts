@@ -33,7 +33,7 @@ import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
-import { syncEnvelopeNow } from "./narrator-block-sync";
+import { resyncFromColumn, syncEnvelopeNow } from "./narrator-block-sync";
 
 export type BlockJob = "convert" | "verify";
 
@@ -276,7 +276,7 @@ async function verifySlice(reader: SliceReader): Promise<void> {
 			// Queued envelopes are about to be synced; they are not a dual-write failure.
 			if (pending.get(id)) continue;
 			recordDiagnostic(id, "mismatch", "block rows did not assemble to content_json");
-			syncEnvelopeNow(id);
+			resyncFromColumn(id);
 		}
 		advance("verify", slice.lastRowid, slice.checked, slice.done);
 	})();
