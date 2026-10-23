@@ -272,6 +272,7 @@ function NarratorPanelBody({
 	narrator: narratorProp,
 	highlightMessageId,
 	highlightRequestId,
+	highlightNeedle,
 	onSendToTerminal,
 	appendInputRef,
 	terminalOpen,
@@ -3353,6 +3354,7 @@ function NarratorPanelBody({
 															permCb={permCbWithAsyncQuestions}
 															highlightMessageId={highlightMessageId}
 															highlightRequestId={highlightRequestId}
+															highlightNeedle={highlightNeedle}
 															tailFooter={messageListTailFooter}
 														/>
 													</Suspense>

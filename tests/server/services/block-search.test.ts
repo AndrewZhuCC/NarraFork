@@ -76,6 +76,7 @@ beforeEach(() => {
 afterEach(() => {
 	sqlite.run("PRAGMA foreign_keys = OFF");
 	for (const table of [
+		"narrator_tool_calls",
 		"narrator_block_sync_queue",
 		"narrator_blocks",
 		"narrator_message_refs",
@@ -115,6 +116,34 @@ describe("global message search with block hits", () => {
 
 	it("finds a message only its blocks match", async () => {
 		expect(await messageHits("giraffe")).toEqual([{ id: "tooling", blockId: "tooling-call" }]);
+	});
+
+	it("excerpts a tool-only hit from the tool's stored output and names the tool call", async () => {
+		sqlite.run(
+			`INSERT INTO narrator_tool_calls (id, narrator_id, message_id, tool_use_id, tool_name, output_json, block_id, created_at)
+			 VALUES ('tc1', 'n1', 'tooling', 'call-tooling-call', 'Read', ?, 'tooling-call', ?)`,
+			[JSON.stringify({ text: 'line one\nexport const giraffe = "tall"' }), NOW],
+		);
+		const [group] = await searchService.search({
+			query: "giraffe",
+			entities: ["messages"],
+			principal: ADMIN,
+			scope: FULL_MESSAGE_SCOPE,
+		});
+		expect(group?.id).toBe("tooling");
+		const sections = await searchService.searchSections({
+			query: "giraffe",
+			sections: ["sessions"],
+			principal: ADMIN,
+			limits: { sessions: 10 },
+			scope: FULL_MESSAGE_SCOPE,
+			fullHistory: true,
+		});
+		const hit = sections.sessions?.items[0]?.hits[0];
+		expect(hit).toMatchObject({ id: "tooling", toolUseId: "call-tooling-call", toolName: "Read" });
+		// Read back from the stored JSON with its escapes undone, not the empty message text.
+		expect(hit?.snippet).toContain('export const giraffe = "tall"');
+		expect(hit?.snippet).not.toContain("\\n");
 	});
 
 	it("skips block-only hits when a term is too short for the index to check", async () => {

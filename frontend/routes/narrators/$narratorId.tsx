@@ -144,6 +144,9 @@ function NarratorDetailPage() {
 	const hashMessageId = location.hash?.startsWith("msg-") ? location.hash.slice(4) : undefined;
 	// scrollTo search param takes precedence over hash-based highlight
 	const highlightMessageId = scrollToMessageId ?? hashMessageId;
+	// Global search passes the matched term, so the jump lands on the row that contains it.
+	const highlightNeedle =
+		typeof search?.find === "string" && search.find ? search.find.slice(0, 64) : undefined;
 	const isMobile = useMobileViewport();
 
 	// Fetch narrator data for recent tab tracking
@@ -563,6 +566,7 @@ function NarratorDetailPage() {
 								onHeaderPointerDown={isMobile ? undefined : onHeaderPointerDown}
 								onViewSubagentSession={onViewSubagentSession}
 								highlightMessageId={highlightMessageId}
+								highlightNeedle={highlightNeedle}
 								onSendToTerminal={isMobile && !isSubagent ? handleSendToTerminal : undefined}
 								appendInputRef={isMobile && !isSubagent ? appendInputRef : undefined}
 								terminalOpen={isMobile && !isSubagent ? drawerOpened : undefined}

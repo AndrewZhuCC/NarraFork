@@ -228,6 +228,9 @@ export interface SessionSearchHit {
 	messageRole?: string;
 	createdAt?: string;
 	blockId?: string;
+	/** Set when the hit is in a tool call: the jump then lands on that tool's row. */
+	toolUseId?: string;
+	toolName?: string;
 }
 
 /** A session (narrator) matching by its title, its messages, or both. */

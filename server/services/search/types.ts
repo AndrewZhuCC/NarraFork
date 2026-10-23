@@ -328,6 +328,10 @@ export interface MessageSearchRow {
 	 * block index; the hit still names its message.
 	 */
 	blockId?: string;
+	/** The tool call a tool-block hit belongs to, so a client can jump to that tool's row. */
+	toolUseId?: string;
+	/** That tool call's tool name. */
+	toolName?: string;
 }
 
 export interface NarratorSearchRow {

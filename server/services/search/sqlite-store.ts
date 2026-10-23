@@ -134,6 +134,22 @@ function mergeBlockHits<T extends { blockId?: string }>(
 /** Characters of context a substring-path session excerpt keeps before the match. */
 const SUBSTRING_LEAD = 60;
 
+/** How much of a block's stored text an excerpt searches; matches the block index's cap. */
+const BLOCK_EXCERPT_SOURCE_CHARS = 64 * 1024;
+
+/**
+ * Readable text from an excerpt cut out of stored JSON (a tool's input or output): the
+ * common escapes are undone and whitespace collapsed. A cut can split an escape; what is
+ * left of it is harmless in a one-line excerpt.
+ */
+export function jsonExcerptText(excerpt: string): string {
+	return excerpt
+		.replace(/\\[nrt]/g, " ")
+		.replace(/\\(["\\/])/g, "$1")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
 /** Binary string order, as SQLite compares TEXT. */
 function compareText(a: string, b: string): number {
 	return a < b ? -1 : a > b ? 1 : 0;
@@ -598,6 +614,36 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 		};
 	}
 
+	/**
+	 * An excerpt from a matching block, for hits whose message text does not contain the
+	 * term (a tool's input or output, an injected context). The block index is contentless,
+	 * so the text is read back from where it lives: the block's model text, the latest
+	 * attempt's tool output, then the block payload (a tool's input). Each source is cut to
+	 * {@link BLOCK_EXCERPT_SOURCE_CHARS} first, so a huge tool output costs a bounded scan.
+	 * The first term is looked up as a plain substring, which every index match contains.
+	 */
+	function blockExcerptSql(query: EntitySearchQuery): { sql: string; values: string[] } {
+		const { indexed, short } = globalQueryTerms(query.text);
+		const term = [...indexed, ...short][0] ?? query.text;
+		const cut = (expr: string) => `substr(${expr}, 1, ${BLOCK_EXCERPT_SOURCE_CHARS})`;
+		return {
+			sql: `(SELECT CASE WHEN pos > ${SUBSTRING_LEAD}
+					 THEN '...' || substr(src, pos - ${SUBSTRING_LEAD}, ${PREVIEW_CHARS})
+					 ELSE substr(src, 1, ${PREVIEW_CHARS}) END
+				 FROM (
+					SELECT src, instr(lower(src), lower(?)) AS pos, ord FROM (
+						SELECT 1 AS ord, ${cut("bb.model_text")} AS src
+						UNION ALL SELECT 2, ${cut(`(SELECT tc.output_json FROM narrator_tool_calls tc
+							WHERE tc.block_id = bb.id ORDER BY tc.created_at DESC LIMIT 1)`)}
+						UNION ALL SELECT 3, ${cut("bb.payload")}
+					)
+				 )
+				 WHERE bb.id IS NOT NULL AND pos > 0
+				 ORDER BY ord LIMIT 1)`,
+			values: [term],
+		};
+	}
+
 	function toSessionAggregate(row: RawRow, strategy: "index" | "substring"): SessionAggregateRow {
 		return {
 			narratorId: row.narrator_id,
@@ -742,6 +788,7 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 					? "created_at DESC, id ASC"
 					: "r IS NULL, r ASC, created_at DESC, id ASC";
 			const snippet = sessionSnippet(query);
+			const blockExcerpt = blockExcerptSql(query);
 			const offset = Math.max(0, Math.trunc(query.offset ?? 0));
 			const rows: RawRow[] = await execute(
 				`${cte.sql}, ranked AS (
@@ -749,14 +796,23 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 				 FROM per_msg
 			)
 			SELECT ${MESSAGE_COLUMNS}, ranked.block_id, ranked.r AS rank_score,
-				  ${snippet.sql} AS snippet
+				  ${snippet.sql} AS snippet,
+				  bb.kind AS block_kind, bb.wire_id AS tool_use_id, bb.subtype AS block_subtype,
+				  ${blockExcerpt.sql} AS block_snippet
 			 FROM ranked
 			 JOIN narrator_messages m ON m.id = ranked.id
 			 JOIN narrators n ON n.id = m.narrator_id
+			 LEFT JOIN narrator_blocks bb ON bb.id = ranked.block_id
 			 ${PROJECT_JOIN}
 			 WHERE ranked.rn > ? AND ranked.rn <= ?
 			 ORDER BY ranked.narrator_id ASC, ranked.rn ASC`,
-				[...cte.values, ...snippet.values, offset, offset + query.perSession],
+				[
+					...cte.values,
+					...snippet.values,
+					...blockExcerpt.values,
+					offset,
+					offset + query.perSession,
+				],
 				{ signal: query.signal, operation: "searchSessionHits" },
 			);
 			return rows.map((row) => ({
@@ -767,10 +823,15 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 				model: row.model ?? null,
 				messageRole: row.message_role ?? null,
 				createdAt: row.created_at ?? null,
-				snippet: row.snippet ?? "",
+				// The message text's own excerpt when its text matched; otherwise the matching
+				// block's, which is the only place a tool-only hit's term appears.
+				snippet: row.snippet || (row.block_snippet ? jsonExcerptText(row.block_snippet) : ""),
 				preview: row.content_preview ?? "",
 				rank: rankOf(row, query.strategy),
 				...(row.block_id ? { blockId: row.block_id } : {}),
+				...(row.block_kind === "tool" && row.tool_use_id
+					? { toolUseId: row.tool_use_id, toolName: row.block_subtype ?? undefined }
+					: {}),
 			}));
 		},
 

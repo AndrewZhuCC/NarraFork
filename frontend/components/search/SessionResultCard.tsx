@@ -6,11 +6,24 @@ import { useTranslation } from "react-i18next";
 import { useSessionHits } from "../../hooks/useSearch";
 import type { SearchRequest, SessionSearchHit, SessionSearchResult } from "../../lib/api";
 import { formatSmartTime } from "../../lib/format";
-import { highlightSearchText } from "../../lib/search-utils";
+import { highlightSearchText, searchHighlightTerms } from "../../lib/search-utils";
 
 const linkStyle = { textDecoration: "none", color: "inherit" } as const;
 /** Long excerpts are cut before highlighting so a huge message cannot stall rendering. */
 const MAX_SNIPPET_CHARS = 2_000;
+
+/**
+ * Where a hit's link lands: a tool call's own row for a hit inside one, else the message,
+ * with the first query term as the needle that picks the right row of a message rendered
+ * as several (text, thinking, tools).
+ */
+export function hitLinkTarget(hit: SessionSearchHit, query: string) {
+	const needle = searchHighlightTerms(query)[0];
+	return {
+		hash: `msg-${hit.toolUseId ?? hit.id}`,
+		search: needle ? { find: needle } : {},
+	};
+}
 
 function HitRow({
 	narratorId,
@@ -22,21 +35,29 @@ function HitRow({
 	query: string;
 }) {
 	const { t } = useTranslation("search");
+	const target = hitLinkTarget(hit, query);
 	return (
 		<Link
 			to="/narrators/$narratorId"
 			params={{ narratorId }}
-			hash={`msg-${hit.id}`}
+			hash={target.hash}
+			search={target.search as never}
 			style={linkStyle}
 		>
 			<Group gap="xs" wrap="nowrap" align="flex-start">
 				<Text size="xs" c="dimmed" w={112} style={{ flexShrink: 0, whiteSpace: "nowrap" }}>
 					{hit.createdAt ? formatSmartTime(hit.createdAt) : ""}
 				</Text>
-				{hit.messageRole && (
-					<Badge size="xs" variant="dot" style={{ flexShrink: 0 }}>
-						{t(`messageRole_${hit.messageRole}`, { defaultValue: hit.messageRole })}
+				{hit.toolUseId ? (
+					<Badge size="xs" variant="dot" color="orange" style={{ flexShrink: 0 }}>
+						{hit.toolName ? t("toolHitNamed", { tool: hit.toolName }) : t("toolHit")}
 					</Badge>
+				) : (
+					hit.messageRole && (
+						<Badge size="xs" variant="dot" style={{ flexShrink: 0 }}>
+							{t(`messageRole_${hit.messageRole}`, { defaultValue: hit.messageRole })}
+						</Badge>
+					)
 				)}
 				<Text size="sm" c="dimmed" lineClamp={2} style={{ minWidth: 0 }}>
 					{highlightSearchText(hit.snippet.slice(0, MAX_SNIPPET_CHARS), query)}
