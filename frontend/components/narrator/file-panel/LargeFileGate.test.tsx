@@ -1,11 +1,13 @@
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import { FILE_PANEL_PAGE_BYTES, MAX_FILE_PANEL_BYTES } from "@shared/file-reference";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
+import { api } from "../../../lib/api";
 import { editorDocumentApi } from "../../../lib/api/editor-documents";
 import { fileReferenceApi } from "../../../lib/api/file-references";
 import en from "../../../locales/en/narrator.json";
@@ -21,6 +23,7 @@ let readMode: ReturnType<typeof spyOn<typeof editorDocumentApi, "readMode">>;
 let page: ReturnType<typeof spyOn<typeof fileReferenceApi, "page">>;
 const confirm = mock(() => {});
 const storage = new Map<string, string>();
+let client: QueryClient;
 
 beforeEach(async () => {
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
@@ -60,6 +63,7 @@ beforeEach(async () => {
 		});
 	confirm.mockClear();
 	storage.clear();
+	client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
 	readMode = spyOn(editorDocumentApi, "readMode").mockResolvedValue("raw-v2");
 	info = spyOn(fileReferenceApi, "info").mockImplementation(async (_narrator, target) => ({
 		target,
@@ -104,22 +108,24 @@ async function render(
 ) {
 	await act(async () => {
 		root.render(
-			<MantineProvider>
-				<I18nextProvider i18n={i18n}>
-					<LargeFileGate
-						narratorId="n"
-						filePath={options.filePath ?? "/large.txt"}
-						deviceId={options.deviceId}
-						referenceOrigin={options.referenceOrigin}
-						legacyViewer={options.legacyViewer}
-						confirmed={options.confirmed}
-						persistenceKey={options.persistenceKey}
-						onConfirm={confirm}
-					>
-						<div data-normal-viewer>ordinary viewer mounted</div>
-					</LargeFileGate>
-				</I18nextProvider>
-			</MantineProvider>,
+			<QueryClientProvider client={client}>
+				<MantineProvider>
+					<I18nextProvider i18n={i18n}>
+						<LargeFileGate
+							narratorId="n"
+							filePath={options.filePath ?? "/large.txt"}
+							deviceId={options.deviceId}
+							referenceOrigin={options.referenceOrigin}
+							legacyViewer={options.legacyViewer}
+							confirmed={options.confirmed}
+							persistenceKey={options.persistenceKey}
+							onConfirm={confirm}
+						>
+							<div data-normal-viewer>ordinary viewer mounted</div>
+						</LargeFileGate>
+					</I18nextProvider>
+				</MantineProvider>
+			</QueryClientProvider>,
 		);
 	});
 }
@@ -141,15 +147,17 @@ test.each([
 	}));
 	await act(async () =>
 		root.render(
-			<MantineProvider>
-				<I18nextProvider i18n={i18n}>
-					<EditorRecoveryBoundary narratorId="n" filePath="/large.txt" rawProtocol>
-						<LargeFileGate narratorId="n" filePath="/large.txt" confirmed={confirmed}>
-							<div data-raw-editor />
-						</LargeFileGate>
-					</EditorRecoveryBoundary>
-				</I18nextProvider>
-			</MantineProvider>,
+			<QueryClientProvider client={client}>
+				<MantineProvider>
+					<I18nextProvider i18n={i18n}>
+						<EditorRecoveryBoundary narratorId="n" filePath="/large.txt" rawProtocol>
+							<LargeFileGate narratorId="n" filePath="/large.txt" confirmed={confirmed}>
+								<div data-raw-editor />
+							</LargeFileGate>
+						</EditorRecoveryBoundary>
+					</I18nextProvider>
+				</MantineProvider>
+			</QueryClientProvider>,
 		),
 	);
 	expect(!!host.querySelector("[data-raw-editor]")).toBe(confirmed);
@@ -163,15 +171,17 @@ test.each([
 	readMode.mockResolvedValue(mode);
 	await act(async () =>
 		root.render(
-			<MantineProvider>
-				<I18nextProvider i18n={i18n}>
-					<EditorRecoveryBoundary narratorId="n" filePath="/large.txt">
-						<LargeFileGate narratorId="n" filePath="/large.txt" confirmed>
-							<div data-complete-editor />
-						</LargeFileGate>
-					</EditorRecoveryBoundary>
-				</I18nextProvider>
-			</MantineProvider>,
+			<QueryClientProvider client={client}>
+				<MantineProvider>
+					<I18nextProvider i18n={i18n}>
+						<EditorRecoveryBoundary narratorId="n" filePath="/large.txt">
+							<LargeFileGate narratorId="n" filePath="/large.txt" confirmed>
+								<div data-complete-editor />
+							</LargeFileGate>
+						</EditorRecoveryBoundary>
+					</I18nextProvider>
+				</MantineProvider>
+			</QueryClientProvider>,
 		),
 	);
 	expect(host.querySelector("[data-complete-editor]")).toBeNull();
@@ -251,6 +261,45 @@ test("opens a large file as metadata only, then reads bounded pages after explic
 	await click("Previous");
 	expect(host.textContent).toContain("page at 0");
 	expect(host.querySelector("[data-normal-viewer]")).toBeNull();
+});
+
+test("the size prompt copies the path and reveals local files only when access is local", async () => {
+	const writeText = mock(async (_text: string) => {});
+	Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+	const reveal = spyOn(api, "fsReveal").mockResolvedValue({ ok: true });
+	try {
+		client.setQueryData(["health"], { platform: "linux" });
+		client.setQueryData(["user-preferences"], { treatAsLocalAccess: false });
+		await render({ filePath: "/data/build/app.apk" });
+		expect(host.textContent).not.toContain("Show in File Manager");
+		await click("Copy file path");
+		expect(writeText).toHaveBeenCalledWith("/data/build/app.apk");
+
+		await act(async () => root.unmount());
+		root = createRoot(host);
+		client.setQueryData(["user-preferences"], { treatAsLocalAccess: true });
+		await render({ filePath: "/data/build/app.apk" });
+		await click("Show in File Manager");
+		expect(reveal).toHaveBeenCalledWith("/data/build");
+
+		await act(async () => root.unmount());
+		root = createRoot(host);
+		await render({ filePath: "/data/build/app.apk", deviceId: "remote" });
+		expect(host.textContent).toContain("Copy file path");
+		expect(host.textContent).not.toContain("Show in File Manager");
+	} finally {
+		reveal.mockRestore();
+	}
+});
+
+test("over 1 GiB prompt still offers the file path", async () => {
+	info.mockResolvedValue({
+		target: { deviceId: "local", path: "/huge.bin" },
+		fileName: "huge.bin",
+		size: MAX_FILE_PANEL_BYTES + 1,
+	});
+	await render({ filePath: "/huge.bin" });
+	expect(host.textContent).toContain("Copy file path");
 });
 
 test("small files mount the existing viewer without a paged read", async () => {

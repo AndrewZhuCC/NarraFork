@@ -53,9 +53,12 @@ export interface BlockReindexSliceParams extends BlockSliceLimits {
 /** One envelope's blocks with the search text a sync gives them, as read. */
 export interface ReindexEnvelope {
 	id: string;
-	ledgerFingerprint: string;
-	/** In ordinal order; empty text leaves a block unsearchable (it is still streaming). */
-	blocks: Array<{ id: string; revision: number; text: string }>;
+	rowid: number;
+	/**
+	 * In ordinal order. `text` is what to write for a block the index lacks (empty: it is still
+	 * streaming and has an entry to drop); null leaves a block's entry as it is.
+	 */
+	blocks: Array<{ rowid: number; id: string; revision: number; text: string | null }>;
 	/** Not computed here (queued for its sync, or its rows do not line up with its body):
 	 *  the main thread syncs it itself. */
 	resync: boolean;
@@ -418,12 +421,20 @@ export function runBlockProjectionSlice(
 }
 
 /**
- * An envelope's blocks with the text the sync's index write gives them: its body assembled
- * from its rows, planned with its ledger exactly as `syncEnvelope` plans it, each planned block
- * matched to the row at its ordinal. A queued envelope, or one whose plan does not line up
- * with its rows, is left to the main thread's own sync.
+ * An envelope's blocks with the text the sync's index write gives them, for the blocks whose
+ * entry is missing (or, still streaming, should not be there). The store writes a block's
+ * entry whenever the block or its adopted ledger result changes, so an entry that exists is
+ * right; what can be missing is a lost index's. An envelope with nothing missing is not read
+ * further. Otherwise its body is assembled from its rows and planned with its ledger exactly
+ * as `syncEnvelope` plans it, each planned block matched to the row at its ordinal. A queued
+ * envelope, or one whose plan does not line up with its rows, is left to the main thread's own
+ * sync.
  */
-function reindexPlan(db: Database, rowid: number): ReindexEnvelope {
+function reindexPlan(
+	db: Database,
+	rowid: number,
+	indexed: (blockRowid: number) => boolean,
+): ReindexEnvelope {
 	const source = db
 		.query(
 			`SELECT m.id, m.narrator_id AS narratorId, m.role, m.content_text AS contentText,
@@ -438,28 +449,39 @@ function reindexPlan(db: Database, rowid: number): ReindexEnvelope {
 	> & {
 		queued: number;
 	};
-	const envelope = {
-		id: source.id,
-		ledgerFingerprint: ledgerFingerprint(db, source.id),
-		blocks: [] as ReindexEnvelope["blocks"],
-		resync: true,
-	};
+	const envelope = { id: source.id, rowid, blocks: [] as ReindexEnvelope["blocks"], resync: true };
 	if (source.queued) return envelope;
+	// The columns before the payload: no block body is read for an envelope fully indexed.
 	const rows = db
 		.query(
-			`SELECT id, revision, kind, phase, payload, state FROM narrator_blocks
+			`SELECT rowid, id, revision, kind, phase FROM narrator_blocks
 			 WHERE message_id = ? ORDER BY ordinal`,
 		)
 		.all(source.id) as Array<{
+		rowid: number;
 		id: string;
 		revision: number;
 		kind: string;
 		phase: string;
-		payload: string;
-		state: string | null;
 	}>;
+	const missing = rows.map((row) => indexed(row.rowid) === (row.phase === "open"));
+	const block = (row: (typeof rows)[number], text: string | null) => ({
+		rowid: row.rowid,
+		id: row.id,
+		revision: row.revision,
+		text,
+	});
+	if (!missing.includes(true))
+		return { ...envelope, resync: false, blocks: rows.map((row) => block(row, null)) };
+	const bodies = db
+		.query(
+			"SELECT rowid, payload, state FROM narrator_blocks WHERE message_id = ? ORDER BY ordinal",
+		)
+		.all(source.id) as Array<{ rowid: number; payload: string; state: string | null }>;
+	if (bodies.length !== rows.length || bodies.some((body, i) => body.rowid !== rows[i].rowid))
+		return envelope;
 	const content = assembleContent(
-		rows.map((row) => ({ payload: parseStored(row.payload), state: parseStored(row.state) })),
+		bodies.map((body) => ({ payload: parseStored(body.payload), state: parseStored(body.state) })),
 	);
 	const { queued: _queued, ...message } = source;
 	const planned = planEnvelopeBlocks(
@@ -468,27 +490,29 @@ function reindexPlan(db: Database, rowid: number): ReindexEnvelope {
 	).blocks;
 	if (
 		planned.length !== rows.length ||
-		planned.some((block, ordinal) => block.draft.kind !== rows[ordinal].kind)
+		planned.some((plan, ordinal) => plan.draft.kind !== rows[ordinal].kind)
 	)
 		return envelope;
 	return {
 		...envelope,
 		resync: false,
-		blocks: rows.map((row, ordinal) => ({
-			id: row.id,
-			revision: row.revision,
-			text:
-				row.phase === "open"
-					? ""
-					: blockIndexText(planned[ordinal].draft.canonical, planned[ordinal].output),
-		})),
+		blocks: rows.map((row, ordinal) =>
+			block(
+				row,
+				!missing[ordinal]
+					? null
+					: row.phase === "open"
+						? ""
+						: blockIndexText(planned[ordinal].draft.canonical, planned[ordinal].output),
+			),
+		),
 	};
 }
 
 /**
- * `reindex`: the next block-format envelopes' index text, within the slice's envelope, body
- * byte, index text and time budgets (at least one envelope). Sized by `body_bytes`, which a
- * rows-only envelope's column would not show.
+ * `reindex`: the next block-format envelopes' missing index text, within the slice's envelope,
+ * body byte, index text and time budgets (at least one envelope). Only envelopes whose body
+ * was read count their `body_bytes` (which a rows-only envelope's column would not show).
  */
 export function runBlockReindexSlice(
 	db: Database,
@@ -500,6 +524,12 @@ export function runBlockReindexSlice(
 			 WHERE rowid > ? AND body_format = 2 ORDER BY rowid LIMIT ?`,
 		)
 		.all(params.afterRowid, params.maxEnvelopes) as Candidate[];
+	const index = db
+		.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'narrator_blocks_fts'")
+		.get()
+		? db.query("SELECT 1 FROM narrator_blocks_fts WHERE rowid = ?")
+		: null;
+	const indexed = (blockRowid: number) => !!index?.get(blockRowid);
 	const started = performance.now();
 	const envelopes: ReindexEnvelope[] = [];
 	let lastRowid = params.afterRowid;
@@ -508,15 +538,15 @@ export function runBlockReindexSlice(
 	for (const row of rows) {
 		if (
 			envelopes.length > 0 &&
-			(bytes + row.bytes > params.maxSourceBytes ||
+			(bytes >= params.maxSourceBytes ||
 				chars >= params.maxIndexChars ||
 				performance.now() - started > params.budgetMs)
 		)
 			return { envelopes, lastRowid, done: false };
-		const envelope = reindexPlan(db, row.rowid);
+		const envelope = reindexPlan(db, row.rowid, indexed);
 		envelopes.push(envelope);
-		bytes += row.bytes;
-		for (const block of envelope.blocks) chars += block.text.length;
+		if (envelope.blocks.some((block) => block.text !== null)) bytes += row.bytes;
+		for (const block of envelope.blocks) chars += block.text?.length ?? 0;
 		lastRowid = row.rowid;
 	}
 	return { envelopes, lastRowid, done: rows.length < params.maxEnvelopes };

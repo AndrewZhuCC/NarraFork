@@ -80,7 +80,11 @@ function modelChars(block: CanonicalBlock | null): number {
 
 const INDEX_RESULT_CHARS = 64 * 1024;
 
-/** The text a block is found by (§4.6). */
+/**
+ * The text a block is found by (§4.6). The reindex job only fills entries the index lacks,
+ * trusting the ones the store wrote, so changing this text needs the block index cleared
+ * (`narrator_blocks_fts`) and the job started over for existing blocks to follow.
+ */
 export function blockIndexText(block: CanonicalBlock | null, adoptedOutput?: unknown): string {
 	if (!block) return "";
 	switch (block.kind) {

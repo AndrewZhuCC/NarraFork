@@ -146,7 +146,12 @@
 		"next": "下一页",
 		"byteRange": "字节 {{start}}–{{end}}",
 		"pageNumber": "页码",
-		"go": "跳转"
+		"go": "跳转",
+		"copyPath": "复制文件路径",
+		"pathCopied": "已复制文件路径",
+		"copyPathFailed": "无法复制文件路径",
+		"revealInExplorer": "在资源管理器中查看",
+		"revealFailed": "无法打开资源管理器"
 	},
 	"asyncQuestionResolved": "Agent 已回应",
 	"asyncQuestionPending": "已回答，待 Agent 回应",

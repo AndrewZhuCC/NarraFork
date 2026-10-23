@@ -4,7 +4,7 @@
  * reads or any revision that would invalidate its caches.
  */
 
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { assembleContent } from "@shared/narrator-blocks/storage";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 
@@ -96,6 +96,7 @@ beforeEach(() => {
 	]);
 	sqlite.run("DELETE FROM narrator_block_backfill");
 	sqlite.run("DELETE FROM narrator_block_diagnostics");
+	backfill.resetBlockJobPacingForTests();
 });
 afterEach(() => {
 	settings.narratorBlocks.write = true;
@@ -423,13 +424,52 @@ describe("block reindex", () => {
 		budgetMs: 1000,
 	};
 
-	test("the worker computes every sealed block's text; none falls back to the main thread", async () => {
+	test("the worker computes every missing block's text; none falls back to the main thread", async () => {
 		const stepId = await conversation();
+		sqlite.run("DELETE FROM narrator_blocks_fts");
 		const slice = runBlockReindexSlice(sqlite, reindexParams);
 		expect(slice.done).toBe(true);
 		expect(slice.envelopes.map((envelope) => envelope.resync)).toEqual([false, false]);
 		const step = slice.envelopes.find((envelope) => envelope.id === stepId);
-		expect(step?.blocks.map((block) => /cellar|quince/.test(block.text))).toEqual([true, true]);
+		expect(step?.blocks.map((block) => /cellar|quince/.test(block.text ?? ""))).toEqual([
+			true,
+			true,
+		]);
+	});
+
+	/** Rows of the block index's own storage: any write to the index adds or changes some. */
+	const indexStorage = () =>
+		sqlite.prepare("SELECT id, block FROM narrator_blocks_fts_data ORDER BY id").all();
+
+	test("entries already in the index are left as they are", async () => {
+		await conversation();
+		const before = indexStorage();
+		const slice = runBlockReindexSlice(sqlite, reindexParams);
+		expect(
+			slice.envelopes.flatMap((envelope) => envelope.blocks.map((block) => block.text)),
+		).toEqual([null, null, null]);
+		await drain();
+		expect(backfill.blockBackfillStatus().reindex).toMatchObject({ complete: true, processed: 2 });
+		expect(indexStorage()).toEqual(before);
+	});
+
+	test("a block missing from the index regains its entry; its neighbours are left", async () => {
+		const stepId = await conversation();
+		await drain();
+		const tool = sqlite
+			.prepare("SELECT rowid FROM narrator_blocks WHERE message_id = ? AND kind = 'tool'")
+			.get(stepId) as { rowid: number };
+		sqlite.run("DELETE FROM narrator_blocks_fts WHERE rowid = ?", [tool.rowid]);
+		expect(indexed("quince")).toEqual([]);
+		const slice = runBlockReindexSlice(sqlite, reindexParams);
+		const step = slice.envelopes.find((envelope) => envelope.id === stepId);
+		expect(step?.blocks.map((block) => block.text === null)).toEqual([true, false]);
+		sqlite.run(
+			"UPDATE narrator_block_backfill SET cursor = 0, complete = 0, processed = 0 WHERE job = 'reindex'",
+		);
+		await drain();
+		expect(indexed("quince")).toHaveLength(1);
+		expect(indexed("cellar")).toHaveLength(1);
 	});
 
 	test("an envelope rewritten after the read is reindexed from what it holds now", async () => {
@@ -460,8 +500,147 @@ describe("block reindex", () => {
 		expect(indexed("quince")).toHaveLength(1);
 	});
 
+	test("a ledger change synced after the read is reindexed from what it holds now", async () => {
+		await conversation();
+		await drain();
+		sqlite.run("DELETE FROM narrator_blocks_fts");
+		sqlite.run("UPDATE narrator_block_backfill SET cursor = 0, complete = 0 WHERE job = 'reindex'");
+		let raced = false;
+		const racing = {
+			...inline,
+			reindex: async (params: Parameters<typeof runBlockReindexSlice>[1]) => {
+				const slice = await inline.reindex(params);
+				if (!raced) {
+					raced = true;
+					// The tool's block row stays as read; only the ledger moves, and its sync runs.
+					sqlite.run("UPDATE narrator_tool_calls SET output_json = ? WHERE tool_use_id = 'c1'", [
+						JSON.stringify("jam/medlar.md"),
+					]);
+					blockSync.flushChangedEnvelopes();
+				}
+				return slice;
+			},
+		};
+		while (await backfill.runBlockJobSlice(racing));
+		expect(indexed("medlar")).toHaveLength(1);
+		expect(indexed("jam/quince")).toEqual([]);
+	});
+
+	/** Five envelopes (six blocks) whose index was lost, with reindex set to start over. */
+	async function lostIndex(): Promise<void> {
+		await conversation();
+		for (const text of ["damsons", "greengages", "loquats"])
+			await narratorStore.appendInput("n1", `where are the ${text}`);
+		await drain();
+		sqlite.run("DELETE FROM narrator_blocks_fts");
+		sqlite.run(
+			"UPDATE narrator_block_backfill SET cursor = 0, complete = 0, processed = 0 WHERE job = 'reindex'",
+		);
+	}
+
+	/** A reader after which every clock reading is 60ms on: each write takes the whole budget. */
+	function slowWrites() {
+		let clock: ReturnType<typeof spyOn> | undefined;
+		const reader = {
+			...inline,
+			reindex: async (params: Parameters<typeof runBlockReindexSlice>[1]) => {
+				const slice = await inline.reindex(params);
+				let now = performance.now();
+				clock ??= spyOn(performance, "now").mockImplementation(() => (now += 60));
+				return slice;
+			},
+		};
+		return { reader, restore: () => clock?.mockRestore() };
+	}
+
+	const indexedOnce = ["cellar", "quince", "damsons", "greengages", "loquats"];
+
+	test("a slice is written a block at a time, in short transactions", async () => {
+		await lostIndex();
+		const slow = slowWrites();
+		const transactions = spyOn(sqlite, "transaction");
+		let count = 0;
+		try {
+			expect(await backfill.runBlockJobSlice(slow.reader)).toBe(true);
+			count = transactions.mock.calls.length;
+		} finally {
+			slow.restore();
+			transactions.mockRestore();
+		}
+		// Five envelopes, six blocks: the step's two blocks went in two transactions.
+		expect(count).toBe(6);
+		expect(backfill.blockBackfillStatus().reindex).toMatchObject({ complete: true, processed: 5 });
+		for (const term of indexedOnce) expect(indexed(term)).toHaveLength(1);
+	}, 20_000);
+
+	test("a transaction stops at its index text budget, which grows while commits stay short", async () => {
+		const fruits = ["apricots", "bilberries", "cloudberries", "dewberries", "elderberries"];
+		for (const fruit of fruits)
+			await narratorStore.appendInput("n1", `${fruit} ${"x".repeat(20_000)}`);
+		await drain();
+		sqlite.run("DELETE FROM narrator_blocks_fts");
+		sqlite.run(
+			"UPDATE narrator_block_backfill SET cursor = 0, complete = 0, processed = 0 WHERE job = 'reindex'",
+		);
+		backfill.resetBlockJobPacingForTests();
+		let clock: ReturnType<typeof spyOn> | undefined;
+		const frozen = {
+			...inline,
+			reindex: async (params: Parameters<typeof runBlockReindexSlice>[1]) => {
+				const slice = await inline.reindex(params);
+				// Every transaction takes no time: only the text budget ends one.
+				clock ??= spyOn(performance, "now").mockReturnValue(performance.now());
+				return slice;
+			},
+		};
+		const transactions = spyOn(sqlite, "transaction");
+		let count = 0;
+		try {
+			expect(await backfill.runBlockJobSlice(frozen)).toBe(true);
+			count = transactions.mock.calls.length;
+		} finally {
+			clock?.mockRestore();
+			transactions.mockRestore();
+		}
+		// 32K characters: two 20K blocks. Grown to 40K, which two more do not reach: the other
+		// three. Without the growth the last one would take a third transaction.
+		expect(count).toBe(2);
+		expect(backfill.blockBackfillStatus().reindex).toMatchObject({ complete: true, processed: 5 });
+		for (const fruit of fruits) expect(indexed(fruit)).toHaveLength(1);
+	});
+
+	test("pausing between a slice's transactions stops it where it is", async () => {
+		await lostIndex();
+		const slow = slowWrites();
+		const transaction = sqlite.transaction.bind(sqlite);
+		let calls = 0;
+		const transactions = spyOn(sqlite, "transaction").mockImplementation((write) => {
+			if (++calls === 3)
+				sqlite.run("UPDATE narrator_block_backfill SET paused = 1 WHERE job = 'reindex'");
+			return transaction(write);
+		});
+		try {
+			expect(await backfill.runBlockJobSlice(slow.reader)).toBe(true);
+		} finally {
+			slow.restore();
+			transactions.mockRestore();
+		}
+		// The input and the step's first block were written; the cursor stays before the step.
+		expect(backfill.blockBackfillStatus().reindex).toMatchObject({
+			complete: false,
+			paused: true,
+			processed: 1,
+		});
+		expect(await backfill.runBlockJobSlice(inline)).toBe(false);
+		sqlite.run("UPDATE narrator_block_backfill SET paused = 0 WHERE job = 'reindex'");
+		await drain();
+		expect(backfill.blockBackfillStatus().reindex).toMatchObject({ complete: true, processed: 5 });
+		for (const term of indexedOnce) expect(indexed(term)).toHaveLength(1);
+	}, 20_000);
+
 	test("a slice stops at its index text budget, and a queued envelope is left to the sync", async () => {
 		const stepId = await conversation();
+		sqlite.run("DELETE FROM narrator_blocks_fts");
 		const first = runBlockReindexSlice(sqlite, { ...reindexParams, maxIndexChars: 1 });
 		expect(first.envelopes).toHaveLength(1);
 		expect(first.done).toBe(false);
