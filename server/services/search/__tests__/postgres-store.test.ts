@@ -728,6 +728,40 @@ describe("search parity: SQLite FTS5 vs PostgreSQL pg_trgm", () => {
 							},
 							["m3"],
 						],
+						// A short term filters the indexed one; short terms match apart.
+						[
+							"global index term with a short term",
+							{
+								text: "三阶段 充电",
+								strategy: "index",
+								limit: 20,
+								narratorId: null,
+								previewChars: 240,
+							},
+							["m3"],
+						],
+						[
+							"global index term with an absent short term",
+							{
+								text: "middleware 充电",
+								strategy: "index",
+								limit: 20,
+								narratorId: null,
+								previewChars: 240,
+							},
+							[],
+						],
+						[
+							"global short terms apart",
+							{
+								text: "充电 你好",
+								strategy: "substring",
+								limit: 20,
+								narratorId: null,
+								previewChars: 240,
+							},
+							["m3"],
+						],
 					];
 					for (const [label, query, expected] of recallCases) {
 						const [a, b] = await Promise.all([

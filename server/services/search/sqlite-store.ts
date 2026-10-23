@@ -427,14 +427,18 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 	 * Scoped mode joins `narrator_message_refs` and filters by the current narrator, so
 	 * fork-shared messages stay visible to the narrator that inherited them. Global mode joins
 	 * on the message's owning narrator, which deduplicates a fork-shared message to its origin.
+	 * Terms match on their own as in global search: `likes` short-term filters follow the
+	 * MATCH, or make up the whole match on the substring path.
 	 */
 	function recallStmt(
 		strategy: "index" | "substring",
 		global: boolean,
 		timeKey: string,
 		timeSuffix: string,
+		likes: number,
 	): QueryTemplate {
-		return cached(`recall:${strategy}:${global ? "global" : "scoped"}:${timeKey}`, () => {
+		const key = `recall:${strategy}:${global ? "global" : "scoped"}:${timeKey}:${likes}`;
+		return cached(key, () => {
 			const source = global
 				? `JOIN narrators n ON n.id = m.narrator_id`
 				: `JOIN narrator_message_refs r ON r.message_id = m.id
@@ -448,7 +452,7 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 		 FROM narrator_messages_fts
 		 JOIN narrator_messages m ON m.rowid = narrator_messages_fts.rowid
 		 ${source}
-		 WHERE narrator_messages_fts MATCH ?${scopeFilter}${timeSuffix}
+		 WHERE narrator_messages_fts MATCH ? ${likeSql("m.content_text", likes)}${scopeFilter}${timeSuffix}
 		 ORDER BY rank
 		 LIMIT ?`;
 			}
@@ -457,7 +461,7 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 		        substr(m.content_text, 1, ?) AS snippet
 		 FROM narrator_messages m
 		 ${source}
-		 WHERE m.content_text LIKE ?${scopeFilter}${timeSuffix}
+		 WHERE 1 = 1 ${likeSql("m.content_text", likes)}${scopeFilter}${timeSuffix}
 		 ORDER BY m.created_at DESC
 		 LIMIT ?`;
 		});
@@ -895,25 +899,27 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 		async searchRecallMessages(query: RecallSearchQuery): Promise<RecallMessageRow[]> {
 			const global = query.narratorId === null;
 			const options = { signal: query.signal, operation: "searchRecallMessages" };
+			const { match, likes } = globalNeedles(query);
 			const stmt = recallStmt(
-				query.strategy,
+				match === null ? "substring" : "index",
 				global,
 				recallTimeKey(query),
 				recallTimeSuffix(query),
+				likes.length,
 			);
 			const timeParams = recallTimeParams(query);
 			const scope = global ? [] : [query.narratorId as string];
 			const rows: RawRow[] =
-				query.strategy === "index"
-					? await stmt.all(options, prefixExpr(query.text), ...scope, ...timeParams, query.limit)
-					: await stmt.all(
+				match === null
+					? await stmt.all(
 							options,
 							query.previewChars,
-							rawContains(query.text),
+							...likes,
 							...scope,
 							...timeParams,
 							query.limit,
-						);
+						)
+					: await stmt.all(options, match, ...likes, ...scope, ...timeParams, query.limit);
 			return rows.map((row) => ({
 				messageId: row.id,
 				narratorId: row.narrator_id,
