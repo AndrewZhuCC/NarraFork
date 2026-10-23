@@ -297,7 +297,7 @@ import {
 	NARRATOR_ACL_COLUMNS,
 	narratorReadableWhere,
 } from "../services/narrator-acl";
-import { grantsBlockProtocol, toBlockPage } from "../services/narrator-block-page";
+import { toBlockPage } from "../services/narrator-block-page";
 import { newEnvelopeColumns } from "../services/narrator-block-sync";
 import {
 	blockDetail,
@@ -3499,9 +3499,8 @@ narratorRoutes.get("/:id/pretext-document", async (c) => {
 		columns: { id: true },
 	});
 	if (!narratorMeta) throw new NotFoundError("Narrator", id);
-	// `?protocol=2` asks for envelopes + blocks (§8.1); granted while `narratorBlocks.wsV2`
-	// is on, and the page says so (`protocol: 2`), else it is the v1 page.
-	return c.json(grantsBlockProtocol(c.req.query("protocol")) ? toBlockPage(result) : result);
+	// Envelopes + blocks (§8.1); the page says so (`protocol: 2`).
+	return c.json(toBlockPage(result));
 });
 
 // Resolve a message id to the document coordinate the exact-layout list jumps to.

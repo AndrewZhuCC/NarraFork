@@ -7,8 +7,7 @@
  * `TreeMessage` rows with `contentJson` and nested `children` — and keeps each row's
  * blocks alongside as `blockRefs`: every block's id and the elements `[from, to)` it holds
  * in `contentJson`, which block-addressed actions read from the row (`messageBlocks`).
- * Anything that is not v2 passes through unchanged, so a server with `narratorBlocks.wsV2`
- * off keeps working.
+ * v2 is the only message protocol (P3d); frames that are not message-shaped pass through.
  */
 
 import type { ContentBlock, MessageBlockRef, TreeMessage } from "./api/types";
@@ -93,10 +92,10 @@ function rowsOf(
 	return rows;
 }
 
-/** A page from `pretext-document?protocol=2` as the v1 page; a v1 page as it is. */
+/** A `pretext-document` page (envelopes + blocks) as rows. */
 export function decodeBlockPage<T>(page: T): T {
 	const value = page as unknown as Frame;
-	if (!value || value.protocol !== 2) return page;
+	if (!value) return page;
 	const { protocol: _protocol, messages, blocks, ...rest } = value;
 	const rows = rowsOf(array<EnvelopeDTO>(messages), array<BlockDTO>(blocks), true);
 	return { ...rest, messages: rows.map(({ row }) => row) } as unknown as T;
@@ -149,10 +148,8 @@ export function decodeBlockFrame(frame: Frame): Frame[] {
 			return [streamEvent(frame)];
 		// Its id reaches the store with the block's first checkpoint; nothing to render yet.
 		case "block_opened":
-		case "message_protocol":
 			return [];
 		case "catch_up": {
-			if (frame.protocol !== 2) return [frame];
 			const { protocol: _protocol, messages, blocks, orphanMessageIds, ...rest } = frame;
 			const orphans = new Set(array<string>(orphanMessageIds));
 			const rows = rowsOf(array<EnvelopeDTO>(messages), array<BlockDTO>(blocks), true);

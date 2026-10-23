@@ -40,7 +40,6 @@ beforeEach(() => {
 });
 afterEach(() => {
 	settings.narratorBlocks.write = true;
-	settings.narratorBlocks.wsV2 = true;
 });
 afterAll(() => {
 	blockSync.stopBlockSyncSweep();
@@ -168,15 +167,6 @@ describe("the message page in protocol v2", () => {
 		expect(ids).toEqual(rowIds(stepId));
 		// The other blocks kept their ids through the sync.
 		expect(ids).toEqual(before.filter((_, index) => index !== 1));
-	});
-
-	test("v2 is granted only to a request that asks while wsV2 is on", () => {
-		settings.narratorBlocks.wsV2 = false;
-		expect(page.grantsBlockProtocol("2")).toBe(false);
-		settings.narratorBlocks.wsV2 = true;
-		expect(page.grantsBlockProtocol("2")).toBe(true);
-		expect(page.grantsBlockProtocol(undefined)).toBe(false);
-		expect(page.grantsBlockProtocol("1")).toBe(false);
 	});
 });
 

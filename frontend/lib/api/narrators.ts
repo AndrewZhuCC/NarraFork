@@ -973,8 +973,7 @@ export const narratorsApi = {
 		if (opts?.beforeSeq != null) params.set("beforeSeq", String(opts.beforeSeq));
 		if (opts?.limit != null) params.set("limit", String(opts.limit));
 		if (opts?.messageVersion != null) params.set("messageVersion", String(opts.messageVersion));
-		// Block-keyed pages when the server offers them (§8.1), decoded back to v1 rows.
-		params.set("protocol", "2");
+		// The page is envelopes + blocks (§8.1), decoded into rows.
 		return request<PretextDocumentPageResult>(`/narrators/${id}/pretext-document?${params}`, {
 			signal: opts?.signal,
 			maxResponseBytes: opts?.maxResponseBytes,

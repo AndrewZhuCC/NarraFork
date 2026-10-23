@@ -27,13 +27,9 @@ const block = (id: string, messageId: string, elements: unknown[], kind = "outpu
 });
 
 describe("block protocol decoding", () => {
-	test("a v1 page and v1 frames pass through untouched", () => {
-		const page = { messages: [{ id: "m1", contentJson: [] }], hasPrev: false };
-		expect(decodeBlockPage(page)).toBe(page);
-		const frame = { type: "message_updated", narratorId: "n1", message: { id: "m1" } };
+	test("frames that are not message-shaped pass through untouched", () => {
+		const frame = { type: "status_changed", narratorId: "n1", status: "idle" };
 		expect(decodeBlockFrame(frame)).toEqual([frame]);
-		const catchUp = { type: "catch_up", narratorId: "n1", topLevel: [], orphanChildren: [] };
-		expect(decodeBlockFrame(catchUp)).toEqual([catchUp]);
 	});
 
 	test("a block holding several elements maps to their range of contentJson", () => {
@@ -62,10 +58,7 @@ describe("block protocol decoding", () => {
 		]);
 	});
 
-	test("protocol bookkeeping frames reach no listener", () => {
-		expect(
-			decodeBlockFrame({ type: "message_protocol", narratorIds: ["n1"], protocol: 2 }),
-		).toEqual([]);
+	test("a block opening reaches no listener", () => {
 		expect(
 			decodeBlockFrame({
 				type: "block_opened",
@@ -96,7 +89,7 @@ describe("block protocol decoding", () => {
 });
 
 describe("the WS manager", () => {
-	test("asks for the block protocol on message subscriptions only", () => {
+	test("subscriptions name no protocol: v2 is the only one", () => {
 		const manager = new NarratorWSManager();
 		const sent: Array<Record<string, unknown>> = [];
 		const internals = manager as unknown as {
@@ -112,7 +105,7 @@ describe("the WS manager", () => {
 		internals._sendSubscribe(messages, ["n1"]);
 		internals._sendSubscribe(panel, ["n1"]);
 		const frames = sent.filter((frame) => frame.type === "subscribe");
-		expect(frames.find((frame) => frame.kind === "messages")?.protocol).toBe(2);
-		expect(frames.find((frame) => frame.kind === "panel")).not.toHaveProperty("protocol");
+		expect(frames.map((frame) => frame.kind)).toEqual(["messages", "panel"]);
+		for (const frame of frames) expect(frame).not.toHaveProperty("protocol");
 	});
 });

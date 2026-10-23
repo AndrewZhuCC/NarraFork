@@ -9,6 +9,7 @@
  * by the verified narratorId).
  */
 import { beforeAll, describe, expect, test } from "bun:test";
+import { decodeBlockPage } from "@frontend/lib/block-protocol";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../../db";
@@ -140,7 +141,8 @@ describe("public share read-through endpoints", () => {
 		const share = await shared(narratorId);
 		const res = await get(share, "/pretext-document");
 		expect(res.status).toBe(200);
-		const page = (await res.json()) as {
+		// The page is envelopes + blocks; the share page renders the rows they decode to.
+		const page = decodeBlockPage(await res.json()) as {
 			messages: Array<{
 				id: string;
 				contentJson: Array<{
@@ -202,7 +204,9 @@ describe("public share read-through endpoints", () => {
 		message(narratorB, 0, "beta-secret");
 		const shareA = await shared(narratorA);
 		const res = await get(shareA, "/pretext-document");
-		const page = (await res.json()) as { messages: Array<{ contentJson: unknown }> };
+		const page = decodeBlockPage(await res.json()) as {
+			messages: Array<{ contentJson: unknown }>;
+		};
 		expect(JSON.stringify(page.messages)).toContain("alpha");
 		expect(JSON.stringify(page.messages)).not.toContain("beta-secret");
 	});

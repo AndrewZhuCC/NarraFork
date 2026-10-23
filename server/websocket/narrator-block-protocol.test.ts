@@ -14,7 +14,6 @@ mock.module("../db", () => ({ ...realDbModule, db, sqlite }));
 // narrator-service must be imported before narrator-persistence (pre-existing cycle).
 await import("../services/narrator-service");
 const { narratorStore } = await import("../services/narrator-store");
-const { settings } = await import("../lib/settings");
 const blockSync = await import("../services/narrator-block-sync");
 const { broadcastToNarrator, getNarratorConnections, handleNarratorWS } = await import(
 	"./narrator-ws"
@@ -76,7 +75,6 @@ beforeEach(() => {
 afterEach(() => {
 	for (const ws of opened.splice(0)) handleNarratorWS.close(ws);
 	getNarratorConnections().clear();
-	settings.narratorBlocks.wsV2 = true;
 });
 afterAll(() => {
 	blockSync.stopBlockSyncSweep();
@@ -244,7 +242,7 @@ describe("tool lifecycle frames", () => {
 	});
 });
 
-describe("negotiating the message protocol", () => {
+describe("every subscriber gets the block-keyed protocol", () => {
 	async function subscribe(ws: FakeWs, version?: 1 | 2) {
 		await handleNarratorWS.message(ws, {
 			type: "subscribe",
@@ -254,40 +252,31 @@ describe("negotiating the message protocol", () => {
 		});
 	}
 
-	test("a v2 subscriber gets message rows as envelopes; others keep v1", async () => {
-		settings.narratorBlocks.wsV2 = true;
-		const v2 = openWs();
-		const v1 = openWs();
-		await subscribe(v2.ws, 2);
-		await subscribe(v1.ws);
-		expect(v2.sent).toContainEqual(
-			expect.objectContaining({ type: "message_protocol", narratorIds: ["n1"], protocol: 2 }),
-		);
-		expect(v1.sent.some((frame) => frame.type === "message_protocol")).toBe(false);
-
+	test("message rows reach every subscriber as envelopes, whatever protocol it named", async () => {
+		const subscribers = [openWs(), openWs(), openWs()];
+		await subscribe(subscribers[0].ws, 2);
+		await subscribe(subscribers[1].ws, 1);
+		await subscribe(subscribers[2].ws);
 		const input = await narratorStore.appendInput("n1", "hi");
-		v1.sent.length = 0;
-		v2.sent.length = 0;
+		for (const { sent } of subscribers) sent.length = 0;
 		broadcastToNarrator("n1", {
 			type: "message_updated",
 			narratorId: "n1",
 			message: messageRow(input.id),
 		});
-		expect(v1.sent.map((frame) => frame.type)).toEqual(["message_updated"]);
-		expect(v2.sent).toEqual([
-			expect.objectContaining({ type: "message_upserted", cause: "message_updated" }),
-		]);
+		for (const { sent } of subscribers) {
+			expect(sent.some((frame) => frame.type === "message_protocol")).toBe(false);
+			expect(sent).toEqual([
+				expect.objectContaining({ type: "message_upserted", cause: "message_updated" }),
+			]);
+		}
 	});
 
-	test("a v2 frame that cannot be built asks the client to reload; v1 is unaffected", async () => {
-		settings.narratorBlocks.wsV2 = true;
-		const v2 = openWs();
-		const v1 = openWs();
-		await subscribe(v2.ws, 2);
-		await subscribe(v1.ws);
+	test("a frame that cannot be built asks the client to reload", async () => {
+		const { ws, sent } = openWs();
+		await subscribe(ws);
 		const input = await narratorStore.appendInput("n1", "hi");
-		v1.sent.length = 0;
-		v2.sent.length = 0;
+		sent.length = 0;
 		sqlite.run("ALTER TABLE narrator_blocks RENAME TO narrator_blocks_moved");
 		try {
 			broadcastToNarrator("n1", {
@@ -298,18 +287,7 @@ describe("negotiating the message protocol", () => {
 		} finally {
 			sqlite.run("ALTER TABLE narrator_blocks_moved RENAME TO narrator_blocks");
 		}
-		expect(v1.sent.map((frame) => frame.type)).toEqual(["message_updated"]);
-		expect(v2.sent).toEqual([{ type: "full_reload", narratorId: "n1" }]);
-	});
-
-	test("with wsV2 off a client asking for v2 is told it has v1", async () => {
-		settings.narratorBlocks.wsV2 = false;
-		const { ws, sent } = openWs();
-		await subscribe(ws, 2);
-		expect(sent).toContainEqual(expect.objectContaining({ type: "message_protocol", protocol: 1 }));
-		sent.length = 0;
-		broadcastToNarrator("n1", delta("att4:0", "x"));
-		expect(sent.map((frame) => frame.type)).toEqual(["stream_event"]);
+		expect(sent).toEqual([{ type: "full_reload", narratorId: "n1" }]);
 	});
 });
 
