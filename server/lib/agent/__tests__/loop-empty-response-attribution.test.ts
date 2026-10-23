@@ -34,7 +34,14 @@ let providerScenario:
 	| "reasoning_then_truncated_tool_input"
 	| "broken_anthropic_single"
 	| "broken_anthropic_mixed"
-	| "ws_error_response" = "error_then_usage_only";
+	| "ws_error_response"
+	| "tool_then_quiet" = "error_then_usage_only";
+/** What `tool_then_quiet` answers once its tool has run. */
+let quietTail:
+	| { usage: { promptTokens: number; completionTokens: number } }
+	| { stopReason: string } = { usage: { promptTokens: 900, completionTokens: 0 } };
+/** The call `tool_then_quiet` makes first; a stand-in replaces any real tool by that name. */
+let quietCall: { name: string; input: string } = { name: "__QuietFinishTest", input: "{}" };
 let providerAttempts = 0;
 let wsBaseUrl = "";
 /**
@@ -146,6 +153,22 @@ const testProvider: ProviderAdapter = {
 			}
 			// `queueStatus` counts as "meaningful" for liveness but lands nothing.
 			yield { queueStatus: { position: 2, queueDepth: 5 } };
+			return;
+		}
+
+		if (providerScenario === "tool_then_quiet") {
+			if (providerAttempts === 1) {
+				yield {
+					toolUseChunk: {
+						toolUseId: "tu-quiet",
+						name: quietCall.name,
+						input: quietCall.input,
+						stop: true,
+					},
+				};
+				return;
+			}
+			yield quietTail;
 			return;
 		}
 
@@ -524,5 +547,73 @@ describe("空响应细分归因", () => {
 		expect(followUp).toContain("Write");
 		expect(followUp).toContain("SPLICE_1");
 		expect(followUp).toContain("10,000");
+	});
+});
+
+describe("an empty reply after handing work off is a finish", () => {
+	async function quietRun(
+		overrides: Partial<AgentConfig>,
+		tail: typeof quietTail,
+		call: typeof quietCall = { name: "__QuietFinishTest", input: "{}" },
+	) {
+		providerScenario = "tool_then_quiet";
+		providerAttempts = 0;
+		quietTail = tail;
+		quietCall = call;
+		const real = toolRegistry.get(call.name);
+		if (real) toolRegistry.unregister(call.name);
+		toolRegistry.register({
+			name: call.name,
+			description: "Stand-in tool",
+			parameters: z.object({}).passthrough(),
+			execute: async () => ({ output: "Started." }),
+		});
+		try {
+			return await runLoop({ maxTurns: 4, ...overrides });
+		} finally {
+			toolRegistry.unregister(call.name);
+			if (real) toolRegistry.register(real);
+		}
+	}
+	const usageOnly = { usage: { promptTokens: 900, completionTokens: 0 } };
+	const lastType = (events: AgentEvent[]) => events.at(-1)?.type;
+
+	test("a bot with nothing left to say after any tool round is done", async () => {
+		const events = await quietRun({ bot: true }, usageOnly);
+		expect(lastType(events)).toBe("done");
+		expect(events.some((event) => event.type === "retrying")).toBe(false);
+		expect(providerAttempts).toBe(2);
+	});
+
+	test("so is one that stops normally without text", async () => {
+		expect(lastType(await quietRun({ bot: true }, { stopReason: "stop" }))).toBe("done");
+	});
+
+	test.each([
+		["Send", '{"id":"parent","message":"done"}'],
+		["Agent", '{"prompt":"look into it"}'],
+		["Bash", '{"command":"bun test","run_in_background":true}'],
+	])("an ordinary narrator that handed work off with %s is done", async (name, input) => {
+		expect(lastType(await quietRun({}, usageOnly, { name, input }))).toBe("done");
+	});
+
+	test("a foreground command is not a hand-off", async () => {
+		const call = { name: "Bash", input: '{"command":"ls"}' };
+		expect(lastType(await quietRun({}, usageOnly, call))).toBe("invalid_state");
+	});
+
+	test("an ordinary narrator after other tools still reports the empty reply", async () => {
+		expect(lastType(await quietRun({}, usageOnly))).toBe("invalid_state");
+	});
+
+	test("a refusal is still reported after a hand-off", async () => {
+		const events = await quietRun({ bot: true }, { stopReason: "content_filter" });
+		expect(lastType(events)).toBe("invalid_state");
+	});
+
+	test("an empty first reply has handed nothing off", async () => {
+		providerScenario = "usage_only_forever";
+		providerAttempts = 0;
+		expect(lastType(await runLoop({ bot: true }))).toBe("invalid_state");
 	});
 });

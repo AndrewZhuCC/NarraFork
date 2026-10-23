@@ -20,7 +20,7 @@ import {
 	users,
 } from "../../db/schema";
 import { generateId } from "../../lib/id";
-import { postMessage, resolveDmRoom, softDeleteMessage } from "../chat-service";
+import { postBotMessage, postMessage, resolveDmRoom, softDeleteMessage } from "../chat-service";
 import {
 	fanoutChatMessageNotifications,
 	fanoutPermissionRequestNotifications,
@@ -151,6 +151,31 @@ describe("DM chat_message fan-out", () => {
 		expect(recorder.rows[0].sourceKey).toBe(posted.id);
 		expect(recorder.rows[0].link).toEqual({ type: "chat_room", roomId: room.id });
 		expect(recorder.rows[0].preview).toContain("hello notification");
+	});
+
+	test("a bot writing to someone is notified under the bot's name", async () => {
+		const recorder = installRecordingWriter();
+		const reader = await makeUser("bot-reader");
+		const botId = generateId();
+		await seedNarrator({ id: botId, ownerUserId: null, visibility: "public", title: "Fanout Bot" });
+		const sent = await postBotMessage({ narratorId: botId, userId: reader, text: "Your report" });
+
+		await fanoutChatMessageNotifications({
+			roomId: sent.roomId,
+			messageId: sent.id,
+			seq: sent.seq,
+			senderUserId: null,
+			roomKind: "bot",
+			narratorId: botId,
+		});
+
+		expect(recorder.rows).toHaveLength(1);
+		expect(recorder.rows[0]).toMatchObject({
+			userId: reader,
+			title: "Fanout Bot",
+			link: { type: "chat_room", roomId: sent.roomId },
+		});
+		expect(recorder.rows[0].preview).toContain("Your report");
 	});
 
 	test("muted member is not notified", async () => {

@@ -3,6 +3,7 @@ import {
 	IconArchive,
 	IconArchiveOff,
 	IconBox,
+	IconRobot,
 	IconServer,
 	IconSubtask,
 	IconTerminal2,
@@ -72,6 +73,8 @@ export interface NarratorListItem {
 	messageCount?: number | null;
 	/** Custom avatar image id; absent → the identicon derived from the narrator id. */
 	avatarImageId?: string | null;
+	/** Public trait tags; only `bot` is read here (it changes what opening the card shows). */
+	traits?: string[] | null;
 	createdAt: string;
 	lastMessageAt?: string | null;
 	activeTerminalCount?: number | null;
@@ -169,6 +172,17 @@ function NarratorBadges({
 	const runningContainers = narrator.runningContainerCount ?? 0;
 	return (
 		<>
+			{narrator.traits?.includes("bot") && (
+				<Badge
+					size="xs"
+					variant="light"
+					color="grape"
+					leftSection={<IconRobot size={10} />}
+					style={mobile ? { flexShrink: 0 } : undefined}
+				>
+					{t("botBadge")}
+				</Badge>
+			)}
 			{activeTerminals > 0 && (
 				<Badge
 					size="xs"

@@ -132,7 +132,7 @@ export const DEFAULTS: NarraForkSettings = {
 	narratorBlocks: {
 		write: true,
 		read: true,
-		wsV2: false,
+		wsV2: true,
 	},
 	containers: {
 		portRangeStart: 10000,
@@ -823,9 +823,9 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		valid: "true / false，默认 true",
 	},
 	"narratorBlocks.wsV2": {
-		desc: "是否接受以块为单位的消息协议 v2（页面接口返回信封 + 块，WS 推送块级事件）。只有声明支持 v2 的客户端会收到 v2；关闭时所有连接都使用 v1。默认 false。",
+		desc: "是否接受以块为单位的消息协议 v2（页面接口返回信封 + 块，WS 推送块级事件）。只有声明支持 v2 的客户端会收到 v2；关闭时所有连接都使用 v1，前端照常工作（回退开关）。默认 true。",
 		type: "boolean",
-		valid: "true / false，默认 false",
+		valid: "true / false，默认 true",
 	},
 
 	// ── containers ──────────────────────────────────────────────────────

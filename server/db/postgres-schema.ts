@@ -1671,7 +1671,10 @@ export const chatRooms = pgTable(
 	},
 	(table) => [
 		uniqueIndex("idx_chat_rooms_dm_key").on(table.dmKey),
-		uniqueIndex("idx_chat_rooms_narrator").on(table.narratorId),
+		uniqueIndex("idx_chat_rooms_narrator")
+			.on(table.narratorId)
+			.where(sql.raw("\"kind\" = 'narrator'")),
+		index("idx_chat_rooms_narrator_id").on(table.narratorId),
 		index("idx_chat_rooms_kind_last").on(table.kind, table.lastMessageAt),
 	],
 );
@@ -1710,12 +1713,14 @@ export const chatMessages = pgTable(
 		}),
 		senderShareId: text("sender_share_id"),
 		senderGuestName: text("sender_guest_name"),
+		senderNarratorId: text("sender_narrator_id"),
 		kind: text("kind").notNull().default("text"),
 		contentText: text("content_text").notNull(),
 		replyToMessageId: text("reply_to_message_id"),
 		replyToSeq: integer("reply_to_seq"),
 		replyToSenderUserId: text("reply_to_sender_user_id"),
 		replyToGuestName: text("reply_to_guest_name"),
+		replyToSenderNarratorId: text("reply_to_sender_narrator_id"),
 		replyToPreview: text("reply_to_preview"),
 		editedAt: text("edited_at"),
 		deletedAt: text("deleted_at"),
@@ -1725,10 +1730,16 @@ export const chatMessages = pgTable(
 		uniqueIndex("idx_chat_messages_room_seq").on(table.roomId, table.seq),
 		index("idx_chat_messages_sender").on(table.senderUserId),
 		index("idx_chat_messages_sender_share").on(table.senderShareId),
+		index("idx_chat_messages_sender_narrator").on(table.senderNarratorId),
 		foreignKey({
 			name: "fk_chat_messages_sender_share",
 			columns: [table.senderShareId],
 			foreignColumns: [narratorPublicShares.id],
+		}).onDelete("set null"),
+		foreignKey({
+			name: "fk_chat_messages_sender_narrator",
+			columns: [table.senderNarratorId],
+			foreignColumns: [narrators.id],
 		}).onDelete("set null"),
 	],
 );
@@ -4058,7 +4069,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 129,
-  "columnCount": 1773,
+  "columnCount": 1775,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -13798,7 +13809,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "columns": [
             "narratorId"
           ],
-          "unique": true
+          "unique": true,
+          "predicate": "\"kind\" = 'narrator'"
+        },
+        {
+          "name": "idx_chat_rooms_narrator_id",
+          "columns": [
+            "narratorId"
+          ],
+          "unique": false
         },
         {
           "name": "idx_chat_rooms_kind_last",
@@ -13999,6 +14018,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "senderNarratorId",
+          "name": "sender_narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "kind",
           "name": "kind",
           "kind": "text",
@@ -14048,6 +14076,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         {
           "property": "replyToGuestName",
           "name": "reply_to_guest_name",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "replyToSenderNarratorId",
+          "name": "reply_to_sender_narrator_id",
           "kind": "text",
           "pgType": "text",
           "notNull": false,
@@ -14113,6 +14150,13 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "senderShareId"
           ],
           "unique": false
+        },
+        {
+          "name": "idx_chat_messages_sender_narrator",
+          "columns": [
+            "senderNarratorId"
+          ],
+          "unique": false
         }
       ],
       "checks": [],
@@ -14129,6 +14173,20 @@ export const POSTGRES_SCHEMA_COVERAGE = {
               "column": "id",
               "onDelete": "set null",
               "constraintName": "fk_chat_messages_sender_share"
+            }
+          ]
+        },
+        {
+          "name": "fk_chat_messages_sender_narrator",
+          "columns": [
+            "senderNarratorId"
+          ],
+          "references": [
+            {
+              "table": "narrators",
+              "column": "id",
+              "onDelete": "set null",
+              "constraintName": "fk_chat_messages_sender_narrator"
             }
           ]
         }

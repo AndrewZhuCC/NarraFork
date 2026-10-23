@@ -93,9 +93,16 @@ export interface AnthropicProviderState {
 	disabled?: boolean;
 }
 
-/** Ensure a model value has a "provider:" prefix. */
+/**
+ * Ensure a model value has a "provider:" prefix.
+ *
+ * Values starting with `__` are settings sentinels (`__default__`, `__summary__`,
+ * `__agg__:…`), not model IDs. Prefixing one turns "follow the default model"
+ * into a provider-qualified string that no model list contains, so every Select
+ * that only offers the bare sentinel renders it as an empty field.
+ */
 export function ensurePrefix(val: string): string {
-	if (!val || val.includes(":")) return val;
+	if (!val || val.includes(":") || val.startsWith("__")) return val;
 	// Bare claude model names resolve to the Anthropic provider.
 	if (["claude-haiku-4.5", "claude-sonnet-4.5", "claude-opus-4.5", "claude-opus-4.6"].includes(val))
 		return `anthropic:${val}`;

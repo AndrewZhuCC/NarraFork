@@ -217,6 +217,12 @@ describe("applyChatUnreadToSummary", () => {
 		expect(next?.dmTotal).toBe(2);
 	});
 
+	test("a bot room is a conversation: it counts in dmTotal like a DM", () => {
+		const next = applyChatUnreadToSummary(summary({ dmTotal: 2 }), "b1", 3, "bot");
+		expect(next?.byRoom).toEqual({ b1: 3 });
+		expect(next?.dmTotal).toBe(5);
+	});
+
 	test("a muted room is excluded from both byRoom and the total", () => {
 		const next = applyChatUnreadToSummary(summary({ dmTotal: 1 }), "r1", 5, "dm", true);
 		expect(next?.byRoom).not.toHaveProperty("r1");

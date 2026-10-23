@@ -84,7 +84,7 @@ import { AppError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { isSecretPlatformPath } from "../lib/fs-secret-paths";
 import { logger } from "../lib/logger";
-import { isPlanModeTrait } from "../lib/narrator-utils";
+import { isBotNarrator, isPlanModeTrait } from "../lib/narrator-utils";
 import {
 	type DeviceAccessPolicy,
 	intersectOAuthClientPolicies,
@@ -3107,6 +3107,10 @@ export async function shouldAutoAllowSendWithinScope(
 ): Promise<boolean> {
 	try {
 		if (!caller) return false;
+		// A bot's message to a person is its only voice; asking approval for every reply
+		// would make it mute. Delivery re-reads the bot trait, so a non-bot never gets here
+		// to a successful send.
+		if (input.user !== undefined) return isBotNarrator(caller.traits);
 		const root = teamRootOf({ ...caller, id: narratorId });
 		const callerIsSubagent = root !== narratorId;
 		const teamParentId = callerIsSubagent ? root : null;

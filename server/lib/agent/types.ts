@@ -987,6 +987,12 @@ export interface AgentConfig {
 	chapterId?: string;
 	/** Resolved by server runtime assembly; DB authorization remains the final authority. */
 	runtimePolicy?: RuntimePolicy;
+	/**
+	 * This narrator is a bot: people see only what it delivers with `Send({ user })`, so
+	 * Send offers that target. Shapes the offered schema only; the bot trait is re-read
+	 * when the message is delivered.
+	 */
+	bot?: boolean;
 	/** Parent narrator ID — set for subagents, passed through to ToolContext for Team tracking */
 	parentNarratorId?: string;
 	/** Parent Agent/Task/Send tool_use that spawned this subagent. */

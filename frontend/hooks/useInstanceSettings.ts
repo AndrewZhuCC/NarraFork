@@ -23,6 +23,7 @@ import type {
 	DirectoryWhitelistRuleInput,
 } from "../lib/api/types";
 import { normalizeRuleTargetSelector } from "../lib/api/types";
+import { FOLLOW_DEFAULT_MODEL, FOLLOW_SUMMARY_MODEL } from "../lib/constants";
 import { DEFAULT_GITHUB_REPOSITORY, type UpdateSource } from "../lib/update-source";
 import { normalizeUrlProtocol } from "../lib/url";
 import { PROJECT_DIR_STATUS_QUERY_KEY } from "./useProjectDirStatus";
@@ -169,6 +170,63 @@ export function readRequestRecordingSettings(
 	};
 }
 
+/** Meta references a model field may hold instead of a model ID. */
+const META_MODEL_REFERENCES = new Set([FOLLOW_DEFAULT_MODEL, FOLLOW_SUMMARY_MODEL]);
+
+/**
+ * Normalize one stored model reference into settings-form state.
+ *
+ * `fallback` follows `??` semantics: only an absent value uses it, an explicit
+ * empty string stays empty (the server reads both differently).
+ *
+ * The legacy prefix strip heals settings written by builds that pushed every
+ * stored value through `ensurePrefix`, turning a `__default__` summary model
+ * into `openai:__default__`. The Select only offers the bare sentinel, so a
+ * prefixed one renders the role as empty — and the next save would persist the
+ * broken value all over again.
+ */
+export function normalizeSettingsModelRef(value: string | null | undefined, fallback = ""): string {
+	const stored = (value ?? fallback).trim();
+	const separator = stored.indexOf(":");
+	// "provider:__default__" is the same instruction as "__default__"; the model
+	// list has no such entry, only the sentinel.
+	const model = separator > 0 ? stored.slice(separator + 1) : "";
+	if (META_MODEL_REFERENCES.has(model)) return model;
+	return ensurePrefix(stored);
+}
+
+/** The subset of `agent` settings the form holds as model references. */
+interface AgentModelRefSettings {
+	defaultModel?: string;
+	summaryModel?: string;
+	translationModel?: string;
+	promptOptimizeModel?: string;
+	subagentModels?: Partial<Record<"explore" | "plan" | "search" | "review", string>>;
+}
+
+/**
+ * Build every model-reference field of the settings form.
+ *
+ * Kept as one exported function so the mapping stays directly testable: a role
+ * that silently loses its sentinel only shows up as an empty Select after a
+ * reload, which is exactly the failure this mapping exists to prevent.
+ */
+export function readInstanceModelRefs(agent?: AgentModelRefSettings) {
+	return {
+		defaultModel: normalizeSettingsModelRef(agent?.defaultModel),
+		summaryModel: normalizeSettingsModelRef(agent?.summaryModel),
+		translationModel: normalizeSettingsModelRef(agent?.translationModel, FOLLOW_SUMMARY_MODEL),
+		promptOptimizeModel: normalizeSettingsModelRef(
+			agent?.promptOptimizeModel,
+			FOLLOW_SUMMARY_MODEL,
+		),
+		subagentExploreModel: normalizeSettingsModelRef(agent?.subagentModels?.explore),
+		subagentPlanModel: normalizeSettingsModelRef(agent?.subagentModels?.plan),
+		subagentSearchModel: normalizeSettingsModelRef(agent?.subagentModels?.search),
+		subagentReviewModel: normalizeSettingsModelRef(agent?.subagentModels?.review),
+	};
+}
+
 function makeDefaults(): InstanceSettingsState {
 	return {
 		port: 7778,
@@ -298,24 +356,13 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				updateAutoDownload: settings.update?.autoDownload ?? false,
 				brandName: settings.branding?.name ?? "",
 				brandIconColor: settings.branding?.iconColor ?? DEFAULT_BRAND_ICON_COLOR,
-				defaultModel: ensurePrefix(settings.agent?.defaultModel ?? ""),
+				...readInstanceModelRefs(settings.agent),
 				permissionMode: settings.agent?.defaultPermissionMode ?? "default",
 				defaultNarratorVisibility: settings.agent?.defaultNarratorVisibility ?? "auto",
 				defaultNarratorWriteAudience: settings.agent?.defaultNarratorWriteAudience ?? "auto",
 				defaultStartInPlanMode: settings.agent?.defaultStartInPlanMode ?? false,
-				summaryModel: ensurePrefix(settings.agent?.summaryModel ?? ""),
-				translationModel: settings.agent?.translationModel?.startsWith("__")
-					? settings.agent.translationModel
-					: ensurePrefix(settings.agent?.translationModel ?? "__summary__"),
-				promptOptimizeModel: settings.agent?.promptOptimizeModel?.startsWith("__")
-					? settings.agent.promptOptimizeModel
-					: ensurePrefix(settings.agent?.promptOptimizeModel ?? "__summary__"),
 				promptOptimizeContextMaxMessages: settings.agent?.promptOptimizeContextMaxMessages ?? 3,
 				maxTurns: settings.agent?.maxTurns ?? 1000,
-				subagentExploreModel: ensurePrefix(settings.agent?.subagentModels?.explore ?? ""),
-				subagentPlanModel: ensurePrefix(settings.agent?.subagentModels?.plan ?? ""),
-				subagentSearchModel: ensurePrefix(settings.agent?.subagentModels?.search ?? ""),
-				subagentReviewModel: ensurePrefix(settings.agent?.subagentModels?.review ?? ""),
 				subagentAllowedModels: {
 					explore: settings.agent?.subagentAllowedModels?.explore ?? [],
 					plan: settings.agent?.subagentAllowedModels?.plan ?? [],

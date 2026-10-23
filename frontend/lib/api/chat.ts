@@ -1,3 +1,4 @@
+import type { ChatRoomKind } from "@shared/chat-room-kinds";
 import { ApiError, apiBase, authorizedFetch, readFetchError, request } from "./client";
 
 export interface ChatUserSnapshot {
@@ -7,6 +8,8 @@ export interface ChatUserSnapshot {
 	avatarImageId: string | null;
 	/** Guests have a display-only id; never use it for user/profile requests. */
 	isGuest?: boolean;
+	/** A bot: `id` is its NARRATOR id, and `avatarImageId` keys a narrator avatar. */
+	isBot?: boolean;
 }
 
 /**
@@ -52,18 +55,20 @@ export interface ChatMessage {
 
 export interface ChatRoomSummary {
 	id: string;
-	kind: "dm" | "narrator";
+	kind: ChatRoomKind;
 	narratorId: string | null;
 	lastMessageAt: string | null;
 	lastMessagePreview: string | null;
 	lastMessageSenderId: string | null;
-	/** DM only: the other participant. */
+	/** DM: the other participant. Bot room: the bot. */
 	peer: ChatUserSnapshot | null;
 	unread: number;
 	/** `unread` hit the server probe ceiling — display as "99+". */
 	unreadCapped: boolean;
 	lastReadSeq: number;
 	muted: boolean;
+	/** Bot room resolved on its own: whether this person may drive the bot. */
+	canPost?: boolean;
 }
 
 export interface ChatMessagePage {
@@ -97,6 +102,9 @@ export const chatApi = {
 
 	getNarratorChatRoom: (narratorId: string) =>
 		request<ChatRoomSummary>(`/chat/rooms/narrator/${narratorId}`),
+
+	/** The caller's own conversation with a bot narrator (created on first open). */
+	getBotChatRoom: (narratorId: string) => request<ChatRoomSummary>(`/chat/rooms/bot/${narratorId}`),
 
 	listChatMessages: (roomId: string, params?: { beforeSeq?: number; limit?: number }) => {
 		const search = new URLSearchParams();

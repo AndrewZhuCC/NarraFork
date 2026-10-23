@@ -25,6 +25,8 @@ import type { RequestRecordingDetail, SavedRecording } from "@shared/request-rec
 import type { SubagentModelPools, SubagentModelUse } from "@shared/subagent-model-policy";
 import type { ToolEditPreview } from "@shared/tool-edit-preview";
 import type { WorkspaceContext } from "@shared/workspace-context";
+import { decodeBlockPage } from "../block-protocol";
+import { blockAt, onlyBlockOfKind } from "../block-refs";
 import { narratorLoadingMetrics } from "../narrator-loading-metrics";
 import { createSharedInflight, type SharedReadOptions } from "../shared-inflight";
 import type { GitIdentity } from "./auth";
@@ -658,6 +660,19 @@ export type NarratorSlashMenuResponse = {
 	allSkillsBlocked?: boolean;
 };
 
+/** Delete whole blocks by id, history only (§5.5). */
+function deleteBlocksById(narratorId: string, blockIds: string[]) {
+	return request<{
+		ok: boolean;
+		deleted: number;
+		failed?: number;
+		results: Array<{ blockId: string; messageId: string; messageDeleted: boolean }>;
+	}>(`/narrators/${narratorId}/blocks`, {
+		method: "DELETE",
+		body: JSON.stringify({ blockIds, skipRevert: true }),
+	});
+}
+
 export const narratorsApi = {
 	getRequestRecordingDetail: (narratorId: string, requestId: string, signal?: AbortSignal) =>
 		request<RequestRecordingDetail>(
@@ -914,7 +929,7 @@ export const narratorsApi = {
 		title?: string;
 		makeNamed?: boolean;
 		handle?: string;
-		kind?: "knowledge" | "setup";
+		kind?: "knowledge" | "setup" | "bot";
 	}) => request<ApiEntity>("/narrators", { method: "POST", body: JSON.stringify(data) }),
 	/**
 	 * Spawn a Setup Assistant narrator that installs the missing system
@@ -982,15 +997,13 @@ export const narratorsApi = {
 		if (opts?.beforeSeq != null) params.set("beforeSeq", String(opts.beforeSeq));
 		if (opts?.limit != null) params.set("limit", String(opts.limit));
 		if (opts?.messageVersion != null) params.set("messageVersion", String(opts.messageVersion));
-		const qs = params.toString();
-		return request<PretextDocumentPageResult>(
-			`/narrators/${id}/pretext-document${qs ? `?${qs}` : ""}`,
-			{
-				signal: opts?.signal,
-				maxResponseBytes: opts?.maxResponseBytes,
-				onResponseBytes: opts?.onResponseBytes,
-			},
-		);
+		// Block-keyed pages when the server offers them (§8.1), decoded back to v1 rows.
+		params.set("protocol", "2");
+		return request<PretextDocumentPageResult>(`/narrators/${id}/pretext-document?${params}`, {
+			signal: opts?.signal,
+			maxResponseBytes: opts?.maxResponseBytes,
+			onResponseBytes: opts?.onResponseBytes,
+		}).then(decodeBlockPage);
 	},
 	// Resolve a message id to its top-level seq coordinate (jump-to-message).
 	getMessageLocation: (id: string, messageId: string, signal?: AbortSignal) =>
@@ -1794,12 +1807,30 @@ export const narratorsApi = {
 			recoveryMode?: "snapshot";
 		},
 		signal?: AbortSignal,
-	) =>
-		request<RevertActionPreview>(`/narrators/${narratorId}/revert-action-preview`, {
+	) => {
+		// A rollback or a tool block deletion is planned for the whole block (§5.5).
+		const block =
+			(body.action === "rollback_to_block" || body.action === "delete_tool_block") &&
+			body.blockIndex !== undefined
+				? blockAt(body.messageId, body.blockIndex)
+				: undefined;
+		if (block)
+			return request<RevertActionPreview>(`/narrators/${narratorId}/blocks/revert-action-preview`, {
+				method: "POST",
+				body: JSON.stringify({
+					action: body.action,
+					blockIds: [block.id],
+					idempotencyKey: body.idempotencyKey,
+					...(body.recoveryMode ? { recoveryMode: body.recoveryMode } : {}),
+				}),
+				signal,
+			});
+		return request<RevertActionPreview>(`/narrators/${narratorId}/revert-action-preview`, {
 			method: "POST",
 			body: JSON.stringify(body),
 			signal,
-		}),
+		});
+	},
 	getRevertPlanFiles: (
 		narratorId: string,
 		planId: string,
@@ -1830,18 +1861,23 @@ export const narratorsApi = {
 		messageId: string,
 		blockIndex: number,
 		opts?: { skipRevert?: boolean; scope?: RevertScope },
-	) =>
-		request<{ ok: boolean; warnings?: RevertWarning[] }>(
+	) => {
+		const options = {
+			skipRevert: opts?.skipRevert === true,
+			...(opts?.scope ? { scope: opts.scope } : {}),
+		};
+		// Keep the whole block the element belongs to (§5.5); index route for a v1 server.
+		const block = blockAt(messageId, blockIndex);
+		if (block)
+			return request<{ ok: boolean; warnings?: RevertWarning[] }>(
+				`/narrators/${narratorId}/blocks/rollback`,
+				{ method: "POST", body: JSON.stringify({ blockIds: [block.id], ...options }) },
+			);
+		return request<{ ok: boolean; warnings?: RevertWarning[] }>(
 			`/narrators/${narratorId}/rollback/${messageId}`,
-			{
-				method: "POST",
-				body: JSON.stringify({
-					blockIndex,
-					skipRevert: opts?.skipRevert === true,
-					...(opts?.scope ? { scope: opts.scope } : {}),
-				}),
-			},
-		),
+			{ method: "POST", body: JSON.stringify({ blockIndex, ...options }) },
+		);
+	},
 	/**
 	 * Edit a user message and regenerate from it.
 	 *
@@ -1868,6 +1904,8 @@ export const narratorsApi = {
 		const headers: Record<string, string> = {};
 		const token = getToken();
 		if (token) headers.Authorization = `Bearer ${token}`;
+		// The input block of the message (§5.5); the message route for a v1 server.
+		const inputBlock = onlyBlockOfKind(messageId, "input");
 
 		let body: BodyInit;
 		// Use multipart whenever new files (images or text files) are uploaded;
@@ -1910,7 +1948,9 @@ export const narratorsApi = {
 		}
 
 		const res = await fetch(
-			`${apiBase()}/narrators/${narratorId}/edit-and-regenerate/${messageId}`,
+			inputBlock
+				? `${apiBase()}/narrators/${narratorId}/blocks/${encodeURIComponent(inputBlock.id)}/edit-and-regenerate`
+				: `${apiBase()}/narrators/${narratorId}/edit-and-regenerate/${messageId}`,
 			{
 				method: "POST",
 				headers,
@@ -2036,24 +2076,44 @@ export const narratorsApi = {
 			},
 		),
 	/** What deleting one tool_use block would roll back, for the confirm dialog. */
-	blockDeletePreview: (narratorId: string, messageId: string, blockIndex: number) =>
-		request<BlockDeletePreview>(
+	blockDeletePreview: (narratorId: string, messageId: string, blockIndex: number) => {
+		const block = blockAt(messageId, blockIndex);
+		if (block)
+			return request<BlockDeletePreview>(
+				`/narrators/${narratorId}/blocks/${encodeURIComponent(block.id)}/delete-preview`,
+			);
+		return request<BlockDeletePreview>(
 			`/narrators/${narratorId}/block-delete-preview?messageId=${encodeURIComponent(
 				messageId,
 			)}&blockIndex=${blockIndex}`,
-		),
+		);
+	},
 	/** History-only: deleting a tool block with its files uses `applyRevertPlan`. */
-	deleteMessageBlock: (narratorId: string, messageId: string, blockIndex: number) =>
-		request<{ ok: boolean; messageDeleted: boolean }>(
-			`/narrators/${narratorId}/messages/${messageId}/blocks/${blockIndex}?skipRevert=1`,
-			{ method: "DELETE" },
-		),
+	deleteMessageBlock: async (narratorId: string, messageId: string, blockIndex: number) => {
+		// The whole block the element belongs to (§5.5); index route for a v1 server.
+		const block = blockAt(messageId, blockIndex);
+		if (!block)
+			return request<{ ok: boolean; messageDeleted: boolean }>(
+				`/narrators/${narratorId}/messages/${messageId}/blocks/${blockIndex}?skipRevert=1`,
+				{ method: "DELETE" },
+			);
+		const result = await deleteBlocksById(narratorId, [block.id]);
+		return {
+			ok: result.ok,
+			messageDeleted: result.results.some((item) => item.messageDeleted),
+		};
+	},
 	/** History-only: a multi-block selection has no previewable file restore plan. */
-	deleteMessageBlocks: (
+	deleteMessageBlocks: async (
 		narratorId: string,
 		blocks: Array<{ messageId: string; blockIndex: number }>,
-	) =>
-		request<{
+	) => {
+		const ids = blocks.map(({ messageId, blockIndex }) => blockAt(messageId, blockIndex)?.id);
+		if (ids.length && ids.every((id): id is string => !!id)) {
+			const result = await deleteBlocksById(narratorId, [...new Set(ids)]);
+			return { ok: result.ok, deleted: result.deleted, failed: result.failed ?? 0 };
+		}
+		return request<{
 			ok: boolean;
 			deleted: number;
 			failed: number;
@@ -2061,7 +2121,8 @@ export const narratorsApi = {
 		}>(`/narrators/${narratorId}/messages/batch-blocks`, {
 			method: "DELETE",
 			body: JSON.stringify({ blocks, skipRevert: true }),
-		}),
+		});
+	},
 	updateCompactSummary: (narratorId: string, messageId: string, summary: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/compact/${messageId}`, {
 			method: "PATCH",
@@ -2113,16 +2174,20 @@ export const narratorsApi = {
 		}>(`/narrators/${narratorId}/file-tree-status`),
 
 	// File rollback previews
-	getRollbackPreview: (narratorId: string, messageId: string, blockIndex: number) =>
-		request<
+	getRollbackPreview: (narratorId: string, messageId: string, blockIndex: number) => {
+		const block = blockAt(messageId, blockIndex);
+		return request<
 			RevertScopePreviews<RevertPreviewFile> & {
 				toolCallCount: number;
 				deletedBlockCount: number;
 				deletedMessageCount: number;
 			}
 		>(
-			`/narrators/${narratorId}/rollback-preview?messageId=${encodeURIComponent(messageId)}&blockIndex=${blockIndex}`,
-		),
+			block
+				? `/narrators/${narratorId}/blocks/rollback-preview?blockIds=${encodeURIComponent(block.id)}`
+				: `/narrators/${narratorId}/rollback-preview?messageId=${encodeURIComponent(messageId)}&blockIndex=${blockIndex}`,
+		);
+	},
 	getPermissionFilePreview: (narratorId: string, toolUseId: string) =>
 		request<{
 			deviceId: string;

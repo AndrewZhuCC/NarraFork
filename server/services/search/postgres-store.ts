@@ -39,6 +39,7 @@ import { AppError, ValidationError } from "../../lib/errors";
 import { narratorReadableSqlFragment } from "../narrator-acl";
 import { projectReadableSqlFragment } from "../project-acl";
 import type { SearchStore } from "./port";
+import { messageScopeSql, narratorScopeSql } from "./scope";
 import {
 	type ChapterSearchRow,
 	type EntitySearchQuery,
@@ -428,6 +429,7 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 			const gate = query.viewer.isAdmin
 				? ""
 				: `AND ${gateClause(NARRATOR_GATE_SQL, query.viewer.userId, params)}`;
+			const scope = messageScopeSql(query.scope);
 			let rows: Row[];
 			if (query.strategy === "index") {
 				const where = phraseClause(["f.content_text"], query.text, params);
@@ -440,7 +442,7 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 					 JOIN narrators n ON n.id = m.narrator_id
 					 LEFT JOIN chapters c ON c.id = n.chapter_id
 					 LEFT JOIN projects p ON p.id = c.project_id
-					 WHERE ${where} ${gate}
+					 WHERE ${where} ${gate} ${scope}
 					 ORDER BY ${query.sort === "time" ? "m.created_at DESC, m.id ASC" : "rank_score"} LIMIT ${params.add(query.limit)}`,
 					params,
 				);
@@ -453,7 +455,7 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 					 JOIN narrators n ON n.id = m.narrator_id
 					 LEFT JOIN chapters c ON c.id = n.chapter_id
 					 LEFT JOIN projects p ON p.id = c.project_id
-					 WHERE m.content_text ILIKE ${needle} ${gate}
+					 WHERE m.content_text ILIKE ${needle} ${gate} ${scope}
 					 ${query.sort === "time" ? "ORDER BY m.created_at DESC, m.id ASC" : ""} LIMIT ${params.add(query.limit)}`,
 					params,
 				);
@@ -479,6 +481,7 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 			const gate = query.viewer.isAdmin
 				? ""
 				: `AND ${gateClause(NARRATOR_GATE_SQL, query.viewer.userId, params)}`;
+			const scope = narratorScopeSql(query.scope);
 			let rows: Row[];
 			if (query.strategy === "index") {
 				const where = phraseClause(["f.title"], query.text, params);
@@ -490,7 +493,7 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 					 JOIN narrators n ON n.id = f.id
 					 LEFT JOIN chapters c ON c.id = n.chapter_id
 					 LEFT JOIN projects p ON p.id = c.project_id
-					 WHERE ${where} ${gate}
+					 WHERE ${where} ${gate} ${scope}
 					 ORDER BY ${query.sort === "time" ? "COALESCE(n.updated_at, n.created_at, n.last_message_at) DESC, n.id ASC" : "rank_score"} LIMIT ${params.add(query.limit)}`,
 					params,
 				);
@@ -503,7 +506,7 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 					 FROM narrators n
 					 LEFT JOIN chapters c ON c.id = n.chapter_id
 					 LEFT JOIN projects p ON p.id = c.project_id
-					 WHERE n.title ILIKE ${needle} ${gate}
+					 WHERE n.title ILIKE ${needle} ${gate} ${scope}
 					 ${query.sort === "time" ? "ORDER BY COALESCE(n.updated_at, n.created_at, n.last_message_at) DESC, n.id ASC" : ""} LIMIT ${params.add(query.limit)}`,
 					params,
 				);

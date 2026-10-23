@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
 	DEFAULT_SEARCH_SORT,
+	normalizeSearchInclude,
 	normalizeSearchSort,
 	normalizeSearchType,
 	sortVisibleSearchResults,
@@ -128,5 +129,17 @@ describe("all results share the selected ordering", () => {
 		expect(sortVisibleSearchResults(hits, "narrator", "time", (id) => id).map((r) => r.id)).toEqual(
 			["n-new", "n-old"],
 		);
+	});
+});
+
+describe("normalizeSearchInclude", () => {
+	test("keeps known names in canonical order and drops the rest", () => {
+		expect(normalizeSearchInclude("tools,nonsense, subagents")).toEqual(["subagents", "tools"]);
+		expect(normalizeSearchInclude(["system", "system"])).toEqual(["system"]);
+	});
+
+	test("treats a missing value as the default scope", () => {
+		expect(normalizeSearchInclude(undefined)).toEqual([]);
+		expect(normalizeSearchInclude("")).toEqual([]);
 	});
 });

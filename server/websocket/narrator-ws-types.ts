@@ -453,6 +453,8 @@ export type NarratorServerMessage =
 			narratorId: string;
 			toolCallId: string | null;
 			toolUseId: string;
+			/** Protocol v2 only: the tool block of the ledger attempt (§8.2). */
+			blockId?: string;
 			subagentNarratorId?: string;
 			toolName?: string;
 			status: string;
@@ -693,6 +695,8 @@ export type NarratorServerMessage =
 			narratorId: string;
 			toolCallId: string | null;
 			toolUseId: string;
+			/** Protocol v2 only: the tool block of the ledger attempt (§8.2). */
+			blockId?: string;
 			subagentNarratorId?: string;
 			toolName: string;
 			input?: unknown;
@@ -867,6 +871,8 @@ export type NarratorServerMessage =
 			protocol: 2;
 			messages: unknown[];
 			blocks: unknown[];
+			/** Rows sent as v1 `orphanChildren`: children whose parent row is not included. */
+			orphanMessageIds: string[];
 			subagentActivities: unknown[];
 			cursor?: CatchUpCursor;
 			messageVersion?: number;
