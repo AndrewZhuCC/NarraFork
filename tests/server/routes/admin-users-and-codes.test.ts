@@ -129,9 +129,8 @@ describe("POST /users", () => {
 /**
  * Role changes and the token generation.
  *
- * The role is read live on every request, so a demotion takes away admin access at
- * once. It still ends the target's sessions, so every open client starts over under
- * the reduced role.
+ * The role is read live on every request, so a role change takes effect on the next
+ * request by itself and never needs to end the target's sessions.
  */
 describe("PATCH /users/:id role changes", () => {
 	async function seedUser(id: string, role: "admin" | "user") {
@@ -160,14 +159,14 @@ describe("PATCH /users/:id role changes", () => {
 		return row?.tokenVersion ?? -1;
 	}
 
-	test("a demotion revokes the target's existing sessions", async () => {
+	test("a demotion does not revoke sessions", async () => {
 		await seedUser("second-admin", "admin");
 		const before = await tokenVersionOf("second-admin");
 
 		const res = await patch("/users/second-admin", { role: "user" });
 
 		expect(res.status).toBe(200);
-		expect(await tokenVersionOf("second-admin")).toBeGreaterThan(before);
+		expect(await tokenVersionOf("second-admin")).toBe(before);
 	});
 
 	test("a promotion does not revoke sessions", async () => {
@@ -183,8 +182,7 @@ describe("PATCH /users/:id role changes", () => {
 	});
 
 	test("re-applying the same role revokes nothing", async () => {
-		// Not a demotion: there is no stale elevated claim to invalidate, so a no-op
-		// write must not sign the user out.
+		// A no-op write must not sign the user out.
 		await seedUser("plain", "user");
 		const before = await tokenVersionOf("plain");
 

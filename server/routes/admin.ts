@@ -129,12 +129,10 @@ adminRoutes.patch("/users/:id", async (c) => {
 		throw new AppError("Cannot demote yourself", 400, "SELF_DEMOTE");
 	}
 
-	// Read the live role once: it decides both the last-administrator guard below and
-	// whether this request is a DEMOTION, which has to end the target's sessions.
+	// Read the live role once for the last-administrator guard below.
 	const targetBefore = role
 		? await db.query.users.findFirst({ where: eq(users.id, id), columns: { role: true } })
 		: undefined;
-	const isDemotion = role === "user" && targetBefore?.role === "admin";
 
 	// Prevent demoting the last administrator
 	if (role === "user" && id !== caller.sub && targetBefore?.role === "admin") {
@@ -179,11 +177,8 @@ adminRoutes.patch("/users/:id", async (c) => {
 	// An administrator resets a password when they believe the old one is compromised, so the
 	// sessions opened with it must die too: bumping the token generation ends every one of
 	// them on its next request. A new password alone would leave a stolen token valid.
-	//
-	// The role is read live on every request, so a demotion takes away admin access at once
-	// regardless. It still ends the user's sessions, so every open client starts over under
-	// the reduced role instead of failing piecemeal on its next privileged request.
-	if (password || isDemotion) {
+	// A role change needs no such step: the role is read live on every request.
+	if (password) {
 		await revokeUserSessions(id);
 	}
 	if (role || password) {
