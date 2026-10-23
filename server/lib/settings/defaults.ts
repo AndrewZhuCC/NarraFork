@@ -792,7 +792,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		valid: "true / false，默认 true",
 	},
 	"narratorBlocks.compactJson": {
-		desc: "新写入的块格式消息是否只把正文存在块表里（content_json 写 []，body_rows_only 置 1），省去重复的兼容投影。只在 SQLite 且 write、read 都开启时生效。关闭后新消息恢复写完整的 content_json；已是只存块的消息保持不变，需要回退时先在存储页运行「恢复投影」。默认 false。",
+		desc: "新写入的块格式消息是否只把正文存在块表里（content_json 写 []，body_rows_only 置 1），省去重复的兼容投影。只在 SQLite 且 write、read 都开启时生效。关闭后新消息恢复写完整的 content_json；已是只存块的消息保持不变，需要回退时先在存储页运行「恢复副本」。默认 false。",
 		type: "boolean",
 		valid: "true / false，默认 false",
 	},

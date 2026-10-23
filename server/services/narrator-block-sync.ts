@@ -44,7 +44,7 @@ import * as database from "../db";
 import { removeBlockIndexText, replaceBlockIndexText } from "../db/fts";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
-import { bodySql, readBodies } from "../lib/narrator-bodies";
+import { bodySql, keepsProjection, readBodies } from "../lib/narrator-bodies";
 import { settings } from "../lib/settings";
 import { blockIdForElement, reassignBlockIdForElement } from "./narrator-block-ids";
 import { blockReadsEnabled, noteRowsOnlyEnvelopes } from "./narrator-block-scans";
@@ -84,13 +84,6 @@ export function rowsOnlyWrites(): boolean {
 }
 
 /**
- * Compact markers (compact, plan, clear, segment compact) keep their projection: their
- * lifecycle is read from `content_json` (the `compact_pending` column behind startup
- * recovery and fork exclusion).
- */
-const PROJECTED_MARKERS = new Set(["compact", "segment_compact"]);
-
-/**
  * The `content_json` and `body_rows_only` an envelope of `bodyFormat` is stored with for
  * `content`: `[]` and 1 when its body is kept only in its rows (`rowsOnlyWrites`, a
  * block-format envelope that is not a compact marker), the body itself and 0 otherwise.
@@ -99,12 +92,8 @@ export function storedProjection(
 	bodyFormat: number | null | undefined,
 	content: unknown,
 ): { contentJson: unknown; bodyRowsOnly: 0 | 1 } {
-	const first = Array.isArray(content) ? (content[0] as { type?: unknown } | undefined) : undefined;
 	const rowsOnly =
-		bodyFormat === 2 &&
-		Array.isArray(content) &&
-		!PROJECTED_MARKERS.has(String(first?.type)) &&
-		rowsOnlyWrites();
+		bodyFormat === 2 && Array.isArray(content) && !keepsProjection(content) && rowsOnlyWrites();
 	if (!rowsOnly) return { contentJson: content, bodyRowsOnly: 0 };
 	noteRowsOnlyEnvelopes(true);
 	return { contentJson: [], bodyRowsOnly: 1 };

@@ -43,6 +43,16 @@ export function hasBlockStorage(db: Database): boolean {
 }
 
 /**
+ * Whether a block-format body keeps its `content_json` projection with rows-only writes on:
+ * a compact marker (compact, plan, clear, segment compact), whose lifecycle is read from
+ * the column (the `compact_pending` column behind startup recovery and fork exclusion).
+ */
+export function keepsProjection(content: unknown[]): boolean {
+	const type = (content[0] as { type?: unknown } | undefined)?.type;
+	return type === "compact" || type === "segment_compact";
+}
+
+/**
  * Whether the database holds rows-only envelopes (P3b): their `content_json` holds no body,
  * so they are read from their rows whatever the read switch says. Answered by the partial
  * index `idx_messages_rows_only`, which holds exactly these.

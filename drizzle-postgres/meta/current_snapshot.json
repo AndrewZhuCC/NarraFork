@@ -1,6 +1,6 @@
 {
-  "id": "4b2b3cbc-bad3-4cef-a238-234de6ae6642",
-  "prevId": "08a277a3-303b-4df5-bef0-ee9535cae552",
+  "id": "3c8f5a32-e1a8-4bc5-99ef-7489da1a1cdc",
+  "prevId": "4b2b3cbc-bad3-4cef-a238-234de6ae6642",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -9683,7 +9683,7 @@
       "checkConstraints": {
         "ck_block_backfill_job": {
           "name": "ck_block_backfill_job",
-          "value": "\"job\" in ('convert', 'verify')"
+          "value": "\"job\" in ('convert', 'verify', 'clear', 'restore')"
         }
       },
       "isRLSEnabled": false

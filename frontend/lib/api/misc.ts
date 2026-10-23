@@ -1444,6 +1444,11 @@ export const miscApi = {
 			method: "POST",
 			body: JSON.stringify({ paused }),
 		}),
+	runBlockProjectionAction: (action: "clear" | "restore" | "stop") =>
+		request<{ status: BlockBackfillStatus }>("/storage/blocks/projection", {
+			method: "POST",
+			body: JSON.stringify({ action }),
+		}),
 
 	// Runtime Resources
 	scanRuntime: () => request<RuntimeScanResult>("/runtime/scan"),

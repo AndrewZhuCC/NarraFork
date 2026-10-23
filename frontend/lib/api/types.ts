@@ -502,10 +502,25 @@ export interface BlockJobState {
 	updatedAt: string;
 }
 
+/** What a projection job needs that is missing. */
+export type BlockProjectionBlock =
+	| "unavailable"
+	| "compact_json_off"
+	| "compact_json_on"
+	| "backfill_incomplete";
+
 export interface BlockBackfillStatus {
 	available: boolean;
 	convert: BlockJobState | null;
 	verify: BlockJobState | null;
+	/** Drops verified messages' duplicate `content_json` (admin-started). */
+	clear: BlockJobState | null;
+	/** Writes it back from the block rows (admin-started). */
+	restore: BlockJobState | null;
+	blocked: { clear: BlockProjectionBlock | null; restore: BlockProjectionBlock | null };
+	/** Some message keeps its body only in block rows. */
+	rowsOnly: boolean;
+	projectionRunning: boolean;
 	/** Newest message row: a job's cursor against it is its progress. */
 	maxRowid: number;
 	diagnostics: number;

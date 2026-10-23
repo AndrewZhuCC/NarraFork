@@ -6,6 +6,9 @@
  *     envelopes; the main thread only inserts them.
  *   - `blockVerifySlice` checks block-format envelopes' rows against their stored content
  *     and names the ones that differ.
+ *   - `blockProjectionSlice` serves the admin-started projection jobs (P3b): `clear` names
+ *     the envelopes whose rows assemble to their `content_json`, so the main thread can drop
+ *     it; `restore` assembles rows-only envelopes' projections for it to write back.
  *
  * Each slice stops at whichever limit comes first: envelope count, source bytes, or time.
  * Like every worker module, this must not import `server/db/index.ts`.
@@ -22,6 +25,7 @@ import {
 } from "@shared/narrator-blocks/plan";
 import { assembleContent, inAssembledOrder } from "@shared/narrator-blocks/storage";
 import type { EnvelopeRole } from "@shared/narrator-blocks/types";
+import { keepsProjection } from "../narrator-bodies";
 
 export interface BlockSliceLimits {
 	afterRowid: number;
@@ -36,6 +40,11 @@ export interface BlockBackfillSliceParams extends BlockSliceLimits {
 
 export interface BlockVerifySliceParams extends BlockSliceLimits {
 	kind: "blockVerifySlice";
+}
+
+export interface BlockProjectionSliceParams extends BlockSliceLimits {
+	kind: "blockProjectionSlice";
+	job: "clear" | "restore";
 }
 
 /** One planned row, ready to insert. */
@@ -84,6 +93,27 @@ export interface BlockVerifySliceResult {
 	done: boolean;
 }
 
+/** An envelope a projection slice read, at the revisions it was read at. */
+export interface ProjectionEnvelope {
+	id: string;
+	bodyRevision: number;
+	stateRevision: number;
+	/** `restore`: the array its rows assemble to, serialized. */
+	json?: string;
+	/** `restore`: `rowsSignature` of the rows it was assembled from. */
+	rows?: string;
+}
+
+export interface BlockProjectionSliceResult {
+	/** `clear`: envelopes whose rows assemble to their column. `restore`: their projections. */
+	envelopes: ProjectionEnvelope[];
+	/** `clear`: envelopes whose rows do not assemble to their column. */
+	mismatched: string[];
+	checked: number;
+	lastRowid: number;
+	done: boolean;
+}
+
 interface EnvelopeSource {
 	rowid: number;
 	id: string;
@@ -100,12 +130,10 @@ interface EnvelopeSource {
 	stateRevision: number;
 }
 
+type Candidate = { rowid: number; bytes: number };
+
 /** Rowids and sizes of the next candidates; bodies are read one at a time within the budget. */
-function candidates(
-	db: Database,
-	params: BlockSliceLimits,
-	bodyFormat: 1 | 2,
-): Array<{ rowid: number; bytes: number }> {
+function candidates(db: Database, params: BlockSliceLimits, bodyFormat: 1 | 2): Candidate[] {
 	return db
 		.query(
 			// A literal format, so convert's candidates come from idx_messages_legacy_body.
@@ -115,21 +143,26 @@ function candidates(
 				${bodyFormat === 1 ? "" : "AND body_rows_only = 0"}
 			 ORDER BY rowid LIMIT ?`,
 		)
-		.all(params.afterRowid, params.maxEnvelopes) as Array<{
-		rowid: number;
-		bytes: number;
-	}>;
+		.all(params.afterRowid, params.maxEnvelopes) as Candidate[];
+}
+
+/** The next rows-only envelopes (through `idx_messages_rows_only`), sized by their body. */
+function rowsOnlyCandidates(db: Database, params: BlockSliceLimits): Candidate[] {
+	return db
+		.query(
+			`SELECT rowid, body_bytes AS bytes FROM narrator_messages
+			 WHERE body_rows_only = 1 AND rowid > ? ORDER BY rowid LIMIT ?`,
+		)
+		.all(params.afterRowid, params.maxEnvelopes) as Candidate[];
 }
 
 /** Walk candidates within the slice's byte and time budget; at least one is always taken. */
 function withinBudget<T>(
-	db: Database,
 	params: BlockSliceLimits,
-	bodyFormat: 1 | 2,
+	rows: Candidate[],
 	visit: (rowid: number) => T,
 ): { results: T[]; lastRowid: number; done: boolean } {
 	const started = performance.now();
-	const rows = candidates(db, params, bodyFormat);
 	const results: T[] = [];
 	let lastRowid = params.afterRowid;
 	let bytes = 0;
@@ -230,10 +263,25 @@ export function runBlockBackfillSlice(
 	db: Database,
 	params: BlockBackfillSliceParams,
 ): BlockBackfillSliceResult {
-	const { results, lastRowid, done } = withinBudget(db, params, 1, (rowid) =>
+	const { results, lastRowid, done } = withinBudget(params, candidates(db, params, 1), (rowid) =>
 		planBackfill(db, rowid),
 	);
 	return { envelopes: results, lastRowid, done };
+}
+
+/** What an envelope's block rows assemble to. */
+function assembledRows(db: Database, messageId: string): unknown[] {
+	const rows = db
+		.query("SELECT payload, state FROM narrator_blocks WHERE message_id = ? ORDER BY ordinal")
+		.all(messageId) as Array<{ payload: string; state: string | null }>;
+	return assembleContent(
+		rows.map((row) => ({ payload: parseStored(row.payload), state: parseStored(row.state) })),
+	);
+}
+
+/** Whether rows assemble to exactly the stored array. */
+function assemblesTo(db: Database, messageId: string, stored: unknown[]): boolean {
+	return JSON.stringify(assembledRows(db, messageId)) === JSON.stringify(inAssembledOrder(stored));
 }
 
 /** Whether a block-format envelope's rows assemble to exactly what it stores. */
@@ -244,25 +292,100 @@ function rowsMatch(db: Database, rowid: number): { id: string; matches: boolean 
 	const stored = parseStored(envelope.contentJson);
 	// Non-array content keeps no rows by design.
 	if (!Array.isArray(stored)) return { id: envelope.id, matches: true };
-	const rows = db
-		.query("SELECT payload, state FROM narrator_blocks WHERE message_id = ? ORDER BY ordinal")
-		.all(envelope.id) as Array<{ payload: string; state: string | null }>;
-	const assembled = assembleContent(
-		rows.map((row) => ({ payload: parseStored(row.payload), state: parseStored(row.state) })),
-	);
-	return {
-		id: envelope.id,
-		matches: JSON.stringify(assembled) === JSON.stringify(inAssembledOrder(stored)),
-	};
+	return { id: envelope.id, matches: assemblesTo(db, envelope.id, stored) };
 }
 
 export function runBlockVerifySlice(
 	db: Database,
 	params: BlockVerifySliceParams,
 ): BlockVerifySliceResult {
-	const { results, lastRowid, done } = withinBudget(db, params, 2, (rowid) => rowsMatch(db, rowid));
+	const { results, lastRowid, done } = withinBudget(params, candidates(db, params, 2), (rowid) =>
+		rowsMatch(db, rowid),
+	);
 	return {
 		mismatched: results.filter((result) => !result.matches).map((result) => result.id),
+		checked: results.length,
+		lastRowid,
+		done,
+	};
+}
+
+type ProjectionVisit = { envelope?: ProjectionEnvelope; mismatched?: string };
+
+/**
+ * `clear`: an envelope whose projection can go — an array that is not a compact marker,
+ * not waiting on its sync, whose rows assemble to it exactly. A mismatch is named instead.
+ */
+function clearable(db: Database, rowid: number): ProjectionVisit {
+	const row = db
+		.query(
+			`SELECT m.id, m.content_json AS contentJson, m.body_revision AS bodyRevision,
+				m.state_revision AS stateRevision,
+				EXISTS (SELECT 1 FROM narrator_block_sync_queue q WHERE q.message_id = m.id) AS queued
+			 FROM narrator_messages m WHERE m.rowid = ?`,
+		)
+		.get(rowid) as {
+		id: string;
+		contentJson: string | null;
+		bodyRevision: number;
+		stateRevision: number;
+		queued: number;
+	};
+	// A queued envelope's rows are about to be rebuilt; a later run sees it settled.
+	if (row.queued) return {};
+	const stored = parseStored(row.contentJson);
+	if (!Array.isArray(stored) || keepsProjection(stored)) return {};
+	if (!assemblesTo(db, row.id, stored)) return { mismatched: row.id };
+	const { id, bodyRevision, stateRevision } = row;
+	return { envelope: { id, bodyRevision, stateRevision } };
+}
+
+/**
+ * What an envelope's rows are, without reading their bodies: each row's id, revision (it
+ * moves with the payload) and state size, in order. A state rewrite by the sync moves no
+ * revision of the envelope's, so `restore` checks this too before writing what it read.
+ */
+export function rowsSignature(db: Database, messageId: string): string {
+	return (
+		(
+			db
+				.query(
+					`SELECT group_concat(sig, ',') AS sig FROM (
+					SELECT id || '.' || revision || '.' || coalesce(octet_length(state), -1) AS sig
+					FROM narrator_blocks WHERE message_id = ? ORDER BY ordinal)`,
+				)
+				.get(messageId) as { sig: string | null }
+		).sig ?? ""
+	);
+}
+
+/** `restore`: a rows-only envelope's projection, assembled from its rows. */
+function restorable(db: Database, rowid: number): ProjectionVisit {
+	const row = db
+		.query(
+			`SELECT id, body_revision AS bodyRevision, state_revision AS stateRevision
+			 FROM narrator_messages WHERE rowid = ?`,
+		)
+		.get(rowid) as { id: string; bodyRevision: number; stateRevision: number };
+	// Reads here are separate snapshots: rows that moved while being assembled are skipped
+	// (a later run reads them settled), and revisions read before them make a stale apply fail.
+	const rows = rowsSignature(db, row.id);
+	const json = JSON.stringify(assembledRows(db, row.id));
+	if (rowsSignature(db, row.id) !== rows) return {};
+	return { envelope: { ...row, rows, json } };
+}
+
+export function runBlockProjectionSlice(
+	db: Database,
+	params: BlockProjectionSliceParams,
+): BlockProjectionSliceResult {
+	const { results, lastRowid, done } =
+		params.job === "clear"
+			? withinBudget(params, candidates(db, params, 2), (rowid) => clearable(db, rowid))
+			: withinBudget(params, rowsOnlyCandidates(db, params), (rowid) => restorable(db, rowid));
+	return {
+		envelopes: results.flatMap((result) => (result.envelope ? [result.envelope] : [])),
+		mismatched: results.flatMap((result) => (result.mismatched ? [result.mismatched] : [])),
 		checked: results.length,
 		lastRowid,
 		done,

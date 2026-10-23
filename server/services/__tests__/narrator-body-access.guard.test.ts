@@ -45,8 +45,14 @@ const RAW_BODY_ACCESS: Record<string, { count: number; why: string }> = {
 	"server/services/narrator-body-reads.ts": { count: 1, why: "envelope row size" },
 	"server/services/narrator-block-scans.ts": { count: 5, why: "scans: column fallback" },
 	"server/services/narrator-block-targets.ts": { count: 2, why: "legacy envelopes' ids" },
-	"server/services/narrator-block-backfill.ts": { count: 2, why: "legacy envelope conversion" },
-	"server/lib/db-worker/block-backfill-query.ts": { count: 3, why: "legacy envelope conversion" },
+	"server/services/narrator-block-backfill.ts": {
+		count: 5,
+		why: "legacy envelope conversion, projection clear/restore",
+	},
+	"server/lib/db-worker/block-backfill-query.ts": {
+		count: 4,
+		why: "legacy envelope conversion, verify, projection clear",
+	},
 	// The column itself: schema, triggers, settings text.
 	"server/db/schema.ts": { count: 4, why: "column, compact_pending" },
 	"server/db/postgres-schema.ts": { count: 8, why: "PG: the column is the body" },

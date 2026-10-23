@@ -1,0 +1,2 @@
+ALTER TABLE "narrator_block_backfill" DROP CONSTRAINT "ck_block_backfill_job";--> statement-breakpoint
+ALTER TABLE "narrator_block_backfill" ADD CONSTRAINT "ck_block_backfill_job" CHECK ("job" in ('convert', 'verify', 'clear', 'restore'));

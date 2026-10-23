@@ -312,6 +312,14 @@
 			"prevId": "08a277a3-303b-4df5-bef0-ee9535cae552",
 			"version": "7",
 			"snapshotDigest": "50a4fd5898bb9a4b0dc51c430248cc5bba65381aa1db9e98362546457699a020"
+		},
+		{
+			"idx": 39,
+			"tag": "0039_block_projection_jobs",
+			"id": "3c8f5a32-e1a8-4bc5-99ef-7489da1a1cdc",
+			"prevId": "4b2b3cbc-bad3-4cef-a238-234de6ae6642",
+			"version": "7",
+			"snapshotDigest": "68b9403a288280826e61609c728574dcbbcf638e05b8f447a94067fcb4909306"
 		}
 	]
 }
