@@ -183,6 +183,57 @@ const actions = (page: Page) =>
 	page.evaluate(() => (window as unknown as { actions: [string, string][] }).actions);
 
 browserTest(
+	"buffers markup received before React mounts and renders the latest tree",
+	async () => {
+		const source = await builtinRuntime();
+		// Keep the real React runtime, but hold its first render so message delivery
+		// can win the race deterministically, as it can with WebKit's task ordering.
+		source.runtimeJs += `
+(() => {
+  const runtime = globalThis.__nfPluginRuntime;
+  const createRoot = runtime.ReactDOMClient.createRoot;
+  globalThis.__nfReceivedTrees = 0;
+  addEventListener("message", event => {
+    if (event.source === parent && event.data?.type === "narrafork:ui-tree")
+      globalThis.__nfReceivedTrees++;
+  });
+  globalThis.__nfPluginRuntime = {
+    ...runtime,
+    ReactDOMClient: {
+      ...runtime.ReactDOMClient,
+      createRoot(...args) {
+        const root = createRoot(...args);
+        return { render(node) { globalThis.__nfReleaseMount = () => root.render(node); } };
+      }
+    }
+  };
+})();`;
+		const { page, frame } = await open(source, false);
+		try {
+			await post(page, '<Text id="earlier">Earlier</Text>', true);
+			await post(
+				page,
+				'<Stack><Text id="latest">Latest</Text><TextInput id="seeded" bind="name" defaultValue="kept" /></Stack>',
+				true,
+			);
+			await frame.waitForFunction(
+				() => (globalThis as unknown as { __nfReceivedTrees: number }).__nfReceivedTrees === 2,
+			);
+			expect(await frame.$eval("#root", (node) => node.childElementCount)).toBe(0);
+			await frame.evaluate(() =>
+				(globalThis as unknown as { __nfReleaseMount(): void }).__nfReleaseMount(),
+			);
+			await frame.waitForSelector("#latest");
+			expect(await frame.$eval("#latest", (node) => node.textContent)).toBe("Latest");
+			expect(await frame.$("#earlier")).toBeNull();
+			expect(await frame.$eval("#seeded", (node) => (node as HTMLInputElement).value)).toBe("kept");
+		} finally {
+			await page.close();
+		}
+	},
+	30_000,
+);
+browserTest(
 	"built-in kit: UI appears while it streams, typed state survives, actions reach the host",
 	async () => {
 		const { page, frame } = await open(await builtinRuntime(), false);

@@ -474,9 +474,12 @@ export function createPreviewShell(
     // Building the element happens inside the boundary, so a tree this frame cannot
     // turn into elements costs that tree and not the root every later tree needs.
     function NodeView(props) { return renderNode(props.node); }
+    // root.render is asynchronous: a tree can arrive before Markup creates its setter.
+    // Keep the latest one so the first render cannot lose the host's only message.
+    let latestTree = [];
     let setTree;
     function Markup() {
-      const [nodes, set] = React.useState([]);
+      const [nodes, set] = React.useState(latestTree);
       const [, setVersion] = React.useState(0);
       setTree = set;
       rerender = () => setVersion((version) => version + 1);
@@ -502,7 +505,12 @@ export function createPreviewShell(
     window.addEventListener("message", event => {
       if (event.source !== parent) return;
       const data = event.data;
-      if (data?.type === "narrafork:ui-tree" && Array.isArray(data.nodes)) { seedTree(data.nodes); setTree?.(data.nodes); return; }
+      if (data?.type === "narrafork:ui-tree" && Array.isArray(data.nodes)) {
+        latestTree = data.nodes;
+        seedTree(latestTree);
+        setTree?.(latestTree);
+        return;
+      }
       if (data?.type === "narrafork:ui-state") { adopt(data.values); return; }
       if (data?.type !== "narrafork:preview-theme" || config.kit) return;
       const theme = data.theme;
