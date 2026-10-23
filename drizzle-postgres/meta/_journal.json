@@ -260,6 +260,27 @@
 			"when": 1792700457769,
 			"tag": "0036_project_index",
 			"breakpoints": true
+		},
+		{
+			"idx": 37,
+			"version": "7",
+			"when": 1792724756605,
+			"tag": "0037_body_rows_only",
+			"breakpoints": true
+		},
+		{
+			"idx": 38,
+			"version": "7",
+			"when": 1792724989809,
+			"tag": "0038_rows_only_index",
+			"breakpoints": true
+		},
+		{
+			"idx": 39,
+			"version": "7",
+			"when": 1792728129984,
+			"tag": "0039_block_projection_jobs",
+			"breakpoints": true
 		}
   ]
 }

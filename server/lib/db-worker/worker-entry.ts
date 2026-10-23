@@ -25,7 +25,11 @@ import {
 	scanDatabaseObjectStorage,
 	summarizeToolCallPayloads,
 } from "../../services/storage-scan-queries";
-import { runBlockBackfillSlice, runBlockVerifySlice } from "./block-backfill-query";
+import {
+	runBlockBackfillSlice,
+	runBlockProjectionSlice,
+	runBlockVerifySlice,
+} from "./block-backfill-query";
 import { DisplayPageReadError } from "./display-page-protocol";
 import { runDisplayPageQuery } from "./display-page-query";
 import { runPostgresDisplayPageQuery } from "./postgres-display-page-query";
@@ -189,27 +193,29 @@ self.onmessage = async (event: MessageEvent<DbWorkerInbound>) => {
 					? runBlockBackfillSlice(getConnection(message.dbPath), params)
 					: params.kind === "blockVerifySlice"
 						? runBlockVerifySlice(getConnection(message.dbPath), params)
-						: params.kind === "displayPageMessages"
-							? runDisplayPageQuery(getConnection(message.dbPath), params)
-							: params.kind === "selectRows"
-								? runSelectRows(getConnection(message.dbPath), params)
-								: params.kind === "storageScanContext"
-									? runStorageScanContext(message.dbPath)
-									: params.kind === "storageScanSerial"
-										? runStorageScanSerial(
-												message.dbPath,
-												message.requestId,
-												params.mainBytes,
-												controller.signal,
-											)
-										: params.kind === "storageScanCleanupSummaries"
-											? runStorageScanCleanupSummaries(message.dbPath, params)
-											: runStorageScanTables(
+						: params.kind === "blockProjectionSlice"
+							? runBlockProjectionSlice(getConnection(message.dbPath), params)
+							: params.kind === "displayPageMessages"
+								? runDisplayPageQuery(getConnection(message.dbPath), params)
+								: params.kind === "selectRows"
+									? runSelectRows(getConnection(message.dbPath), params)
+									: params.kind === "storageScanContext"
+										? runStorageScanContext(message.dbPath)
+										: params.kind === "storageScanSerial"
+											? runStorageScanSerial(
 													message.dbPath,
 													message.requestId,
-													params,
+													params.mainBytes,
 													controller.signal,
-												);
+												)
+											: params.kind === "storageScanCleanupSummaries"
+												? runStorageScanCleanupSummaries(message.dbPath, params)
+												: runStorageScanTables(
+														message.dbPath,
+														message.requestId,
+														params,
+														controller.signal,
+													);
 		post({
 			type: "result",
 			requestId: message.requestId,

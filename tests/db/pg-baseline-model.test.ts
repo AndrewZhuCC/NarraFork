@@ -33,6 +33,7 @@ import {
 	parseCatalog,
 	parseDeparseOutput,
 	psqlProxyCallback,
+	replacesConstraintsOnly,
 	type Snapshot,
 	type SnapshotColumn,
 	type SnapshotIndex,
@@ -1816,5 +1817,31 @@ describe("server-canonical expression defaults", () => {
 		expect(parseDeparseOutput(requests, `${row}\n${row}`).problems).toEqual([
 			`deparse: duplicate result name ${name}`,
 		]);
+	});
+});
+
+describe("constraint-only migrations", () => {
+	const breakpoint = "--> statement-breakpoint\n";
+	it("recognises a replaced constraint, which re-runs by construction", () => {
+		expect(
+			replacesConstraintsOnly(
+				`ALTER TABLE "t" DROP CONSTRAINT "ck_t";${breakpoint}ALTER TABLE "t" ADD CONSTRAINT "ck_t" CHECK ("v" in ('a', 'b'));`,
+			),
+		).toBe(true);
+	});
+
+	it("does not count a migration that creates or only drops something", () => {
+		expect(replacesConstraintsOnly('ALTER TABLE "t" ADD COLUMN "c" integer;')).toBe(false);
+		expect(replacesConstraintsOnly('CREATE INDEX "i" ON "t" USING btree ("c");')).toBe(false);
+		expect(
+			replacesConstraintsOnly(
+				`ALTER TABLE "t" DROP CONSTRAINT "ck_t";${breakpoint}ALTER TABLE "t" ADD COLUMN "c" integer;`,
+			),
+		).toBe(false);
+		// Adding a constraint it did not drop fails on replay.
+		expect(
+			replacesConstraintsOnly('ALTER TABLE "t" ADD CONSTRAINT "ck_new" CHECK ("v" > 0);'),
+		).toBe(false);
+		expect(replacesConstraintsOnly('ALTER TABLE "t" DROP CONSTRAINT "ck_t";')).toBe(false);
 	});
 });

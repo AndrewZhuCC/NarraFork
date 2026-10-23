@@ -617,7 +617,12 @@ export const updateSettingsSchema = z
 			.optional(),
 		workspace: z.object({ treeSnapshotsEnabled: z.boolean() }).partial().optional(),
 		narratorBlocks: z
-			.object({ write: z.boolean(), read: z.boolean(), wsV2: z.boolean() })
+			.object({
+				write: z.boolean(),
+				read: z.boolean(),
+				wsV2: z.boolean(),
+				compactJson: z.boolean(),
+			})
 			.partial()
 			.optional(),
 		editor: z

@@ -1,6 +1,6 @@
 {
-  "id": "ad79826f-3e84-4be5-8553-5879cace6553",
-  "prevId": "da73efaf-92c0-4786-9720-a50f994a0756",
+  "id": "3c8f5a32-e1a8-4bc5-99ef-7489da1a1cdc",
+  "prevId": "4b2b3cbc-bad3-4cef-a238-234de6ae6642",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -9683,7 +9683,7 @@
       "checkConstraints": {
         "ck_block_backfill_job": {
           "name": "ck_block_backfill_job",
-          "value": "\"job\" in ('convert', 'verify')"
+          "value": "\"job\" in ('convert', 'verify', 'clear', 'restore')"
         }
       },
       "isRLSEnabled": false
@@ -11755,6 +11755,13 @@
           "notNull": true,
           "default": 0
         },
+        "body_rows_only": {
+          "name": "body_rows_only",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
+        },
         "created_at": {
           "name": "created_at",
           "type": "text",
@@ -11927,6 +11934,22 @@
           ],
           "isUnique": false,
           "where": "\"body_format\" = 1",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_messages_rows_only": {
+          "name": "idx_messages_rows_only",
+          "columns": [
+            {
+              "expression": "body_rows_only",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"body_rows_only\" = 1",
           "concurrently": false,
           "method": "btree",
           "with": {}

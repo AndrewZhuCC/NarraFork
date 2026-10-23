@@ -1376,6 +1376,12 @@ export const narratorMessages = sqliteTable(
 		 * triggers (contract v3) neither bump nor queue a block sync for it.
 		 */
 		stateRevision: integer("state_revision").notNull().default(0),
+		/**
+		 * 1: `content_json` holds `[]`, not this block-format envelope's body; the block rows
+		 * are its only copy (`narratorBlocks.compactJson`, the clearing job; §10.4). 0: the
+		 * column holds the complete projection (or is the body, for `body_format = 1`).
+		 */
+		bodyRowsOnly: integer("body_rows_only").notNull().default(0),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
@@ -1402,6 +1408,7 @@ export const narratorMessages = sqliteTable(
 		// converts and body scans still match on content_json. Empty once the backfill is
 		// done, so finding them never walks message bodies (docs/BLOCK_STORAGE-DESIGN.md §10.3).
 		index("idx_messages_legacy_body").on(table.bodyFormat).where(sql`"body_format" = 1`),
+		index("idx_messages_rows_only").on(table.bodyRowsOnly).where(sql`"body_rows_only" = 1`),
 	],
 );
 
@@ -1811,13 +1818,15 @@ export const narratorTurns = sqliteTable(
 /**
  * Progress of the background block jobs, one row per job:
  *   - `convert` turns legacy (`body_format = 1`) envelopes into block rows;
- *   - `verify` checks block-format envelopes' rows against their stored content.
+ *   - `verify` checks block-format envelopes' rows against their stored content;
+ *   - `clear` / `restore` (admin-started, P3b) drop verified envelopes' `content_json`
+ *     projections (`body_rows_only`) and write them back from the rows.
  * `cursor` is the last `narrator_messages.rowid` the job handled; it resumes after it.
  */
 export const narratorBlockBackfill = sqliteTable(
 	"narrator_block_backfill",
 	{
-		job: text("job", { enum: ["convert", "verify"] }).primaryKey(),
+		job: text("job", { enum: ["convert", "verify", "clear", "restore"] }).primaryKey(),
 		cursor: integer("cursor").notNull().default(0),
 		complete: integer("complete", { mode: "boolean" }).notNull().default(false),
 		paused: integer("paused", { mode: "boolean" }).notNull().default(false),
@@ -1825,7 +1834,9 @@ export const narratorBlockBackfill = sqliteTable(
 		processed: integer("processed").notNull().default(0),
 		updatedAt: text("updated_at").notNull(),
 	},
-	(table) => [check("ck_block_backfill_job", sql`${table.job} in ('convert', 'verify')`)],
+	(table) => [
+		check("ck_block_backfill_job", sql`${table.job} in ('convert', 'verify', 'clear', 'restore')`),
+	],
 );
 
 // === narrator_block_diagnostics (§10.3) ===

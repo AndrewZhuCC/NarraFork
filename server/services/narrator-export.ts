@@ -41,7 +41,7 @@ import {
 	publicGenUiSummary,
 } from "@shared/gen-ui-public";
 import { and, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
-import { activeDatabaseBackend, db, sqlite } from "../db";
+import { db, sqlite } from "../db";
 import { narratorMessageRefs, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
 import { logger } from "../lib/logger";
 import { blockBodies, bodySql, readBodies } from "../lib/narrator-bodies";
@@ -53,7 +53,7 @@ import {
 	ownTurnSql,
 	RUNTIME_SOURCE_COLUMNS,
 } from "../lib/runtime-source";
-import { settings } from "../lib/settings";
+import { blockReadsEnabled } from "./narrator-block-scans";
 import { resolveLazyLineage } from "./narrator-refs-backfill";
 import { projectPublicNarratorPayload } from "./public-narrator-share-gen-ui";
 
@@ -598,7 +598,7 @@ const MESSAGE_COLUMNS = {
  * that writes them. Exported for the session interchange, which reads the same bodies.
  */
 export function exportBodiesFromBlocks(): boolean {
-	return settings.narratorBlocks.read && activeDatabaseBackend === "sqlite";
+	return blockReadsEnabled();
 }
 
 async function loadMessages(messageIds: string[]): Promise<Map<string, ExportMessageRow>> {

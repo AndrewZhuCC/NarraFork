@@ -3,7 +3,12 @@ import { Hono } from "hono";
 import { z } from "zod/v4";
 import { requireAdmin } from "../middleware/auth";
 import { databaseCleanupService } from "../services/database-cleanup-service";
-import { blockBackfillStatus, setBlockBackfillPaused } from "../services/narrator-block-backfill";
+import {
+	blockBackfillStatus,
+	setBlockBackfillPaused,
+	startProjectionJob,
+	stopProjectionJobs,
+} from "../services/narrator-block-backfill";
 import {
 	cancelStorageScan,
 	getStorageScanJob,
@@ -70,6 +75,21 @@ storageRoutes.post("/blocks/backfill/pause", requireAdmin, async (c) => {
 	const parsed = backfillPauseSchema.safeParse(await c.req.json().catch(() => ({})));
 	if (!parsed.success) return c.json({ error: "Invalid pause request" }, 400);
 	return c.json({ status: setBlockBackfillPaused(parsed.data.paused) });
+});
+
+const projectionSchema = z.object({ action: z.enum(["clear", "restore", "stop"]) });
+
+/**
+ * POST /api/storage/blocks/projection — Start the job that drops verified messages'
+ * duplicate `content_json` (`clear`, needs `narratorBlocks.compactJson`), the one that
+ * writes it back (`restore`, needs the switch off), or stop either (admin only). 409 when
+ * what the job needs is missing; the status names it.
+ */
+storageRoutes.post("/blocks/projection", requireAdmin, async (c) => {
+	const parsed = projectionSchema.safeParse(await c.req.json().catch(() => ({})));
+	if (!parsed.success) return c.json({ error: "Invalid projection request" }, 400);
+	const { action } = parsed.data;
+	return c.json({ status: action === "stop" ? stopProjectionJobs() : startProjectionJob(action) });
 });
 
 /**

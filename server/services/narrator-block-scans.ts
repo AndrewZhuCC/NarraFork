@@ -8,7 +8,8 @@
  * kinds of envelope still answer from `content_json`:
  *
  *   - queued ones (`narrator_block_sync_queue`), whose body a write outside the store
- *     changed and whose rows have not caught up; the queue is small and keyed by id;
+ *     changed and whose rows have not caught up; the queue is small and keyed by id. A
+ *     rows-only envelope (P3b) is found through its rows even while queued;
  *   - legacy ones (`body_format = 1`): not converted yet, written while block writes were
  *     off, or imported. `idx_messages_legacy_body` holds exactly these, so they are found
  *     without walking other bodies, and the index is empty once all are converted.
@@ -19,12 +20,32 @@
 
 import { parseStored } from "@shared/narrator-blocks/plan";
 import * as database from "../db";
-import { blocksCurrentSql } from "../lib/narrator-bodies";
+import { blocksCurrentSql, hasRowsOnlyBodies } from "../lib/narrator-bodies";
 import { settings } from "../lib/settings";
 
-/** Whether scans go through the block tables: SQLite with `narratorBlocks.read`. */
+/**
+ * Whether readers go through the block tables: SQLite with `narratorBlocks.read`, or while
+ * any envelope is rows-only (P3b) — its `content_json` holds nothing to fall back to, so
+ * the read switch only takes effect once the restore job has written every projection back.
+ */
 export function blockReadsEnabled(): boolean {
-	return database.activeDatabaseBackend === "sqlite" && settings.narratorBlocks.read;
+	return (
+		database.activeDatabaseBackend === "sqlite" &&
+		(settings.narratorBlocks.read || rowsOnlyEnvelopesExist())
+	);
+}
+
+let rowsOnlyKnown: boolean | undefined;
+
+/** Whether any envelope is rows-only (`hasRowsOnlyBodies`), cached. */
+export function rowsOnlyEnvelopesExist(): boolean {
+	rowsOnlyKnown ??= hasRowsOnlyBodies(database.sqlite);
+	return rowsOnlyKnown;
+}
+
+/** Record that an envelope became rows-only, or (`undefined`) that the answer must be re-read. */
+export function noteRowsOnlyEnvelopes(present: true | undefined): void {
+	rowsOnlyKnown = present;
 }
 
 /** The envelope at `alias` is not waiting on the block sync. */
@@ -65,7 +86,8 @@ export function imageEnvelopeOwners(): {
 			 FROM narrator_block_assets a
 			 JOIN narrator_blocks b ON b.id = a.block_id
 			 JOIN narrator_messages m ON m.id = b.message_id
-			 WHERE a.role = 'input_image' AND m.body_format = 2 AND ${NOT_QUEUED("m")}`,
+			 WHERE a.role = 'input_image' AND m.body_format = 2
+				AND (m.body_rows_only = 1 OR ${NOT_QUEUED("m")})`,
 		)
 		.all() as Array<{ narratorId: string }>;
 	type Row = { narratorId: string; body: string | null };
@@ -75,7 +97,7 @@ export function imageEnvelopeOwners(): {
 			.query(
 				`SELECT m.narrator_id AS narratorId, m.content_json AS body
 				 FROM narrator_block_sync_queue q JOIN narrator_messages m ON m.id = q.message_id
-				 WHERE m.content_json LIKE ?`,
+				 WHERE m.body_rows_only = 0 AND m.content_json LIKE ?`,
 			)
 			.all(marker) as Row[]),
 		...(sqlite

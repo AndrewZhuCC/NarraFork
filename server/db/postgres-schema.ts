@@ -742,6 +742,7 @@ export const narratorMessages = pgTable(
 		providerResponseId: text("provider_response_id"),
 		bodyBytes: integer("body_bytes").notNull().default(0),
 		stateRevision: integer("state_revision").notNull().default(0),
+		bodyRowsOnly: integer("body_rows_only").notNull().default(0),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
@@ -758,6 +759,7 @@ export const narratorMessages = pgTable(
 			.on(table.compactPending)
 			.where(sql.raw('"compact_pending" = 1')),
 		index("idx_messages_legacy_body").on(table.bodyFormat).where(sql.raw('"body_format" = 1')),
+		index("idx_messages_rows_only").on(table.bodyRowsOnly).where(sql.raw('"body_rows_only" = 1')),
 	],
 );
 
@@ -1042,7 +1044,9 @@ export const narratorBlockBackfill = pgTable(
 		processed: integer("processed").notNull().default(0),
 		updatedAt: text("updated_at").notNull(),
 	},
-	(table) => [check("ck_block_backfill_job", sql.raw("\"job\" in ('convert', 'verify')"))],
+	(table) => [
+		check("ck_block_backfill_job", sql.raw("\"job\" in ('convert', 'verify', 'clear', 'restore')")),
+	],
 );
 
 export const narratorBlockDiagnostics = pgTable(
@@ -3851,7 +3855,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 124,
-  "columnCount": 1662,
+  "columnCount": 1663,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -8110,6 +8114,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "defaultExpression": "0"
         },
         {
+          "property": "bodyRowsOnly",
+          "name": "body_rows_only",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
           "property": "createdAt",
           "name": "created_at",
           "kind": "text",
@@ -8190,6 +8205,14 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           ],
           "unique": false,
           "predicate": "\"body_format\" = 1"
+        },
+        {
+          "name": "idx_messages_rows_only",
+          "columns": [
+            "bodyRowsOnly"
+          ],
+          "unique": false,
+          "predicate": "\"body_rows_only\" = 1"
         }
       ],
       "checks": [],
@@ -9738,7 +9761,7 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       "checkDefinitions": [
         {
           "name": "ck_block_backfill_job",
-          "expression": "\"job\" in ('convert', 'verify')"
+          "expression": "\"job\" in ('convert', 'verify', 'clear', 'restore')"
         }
       ],
       "foreignKeys": [],

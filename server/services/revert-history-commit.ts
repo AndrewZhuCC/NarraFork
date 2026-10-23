@@ -18,7 +18,12 @@ import { type BunSQLiteDatabase, SQLiteBunTransaction } from "drizzle-orm/bun-sq
 import { narratorBufferedMessages, narratorMessages, narratorToolCalls } from "../db/schema";
 import { AppError } from "../lib/errors";
 import { generateId } from "../lib/id";
-import { bodyLengthSql, boundedBodyText, hasBlockStorage } from "../lib/narrator-bodies";
+import {
+	bodyLengthSql,
+	boundedBodyText,
+	hasBlockStorage,
+	hasRowsOnlyBodies,
+} from "../lib/narrator-bodies";
 import { settings } from "../lib/settings";
 import {
 	nextCurrentRevision,
@@ -235,7 +240,8 @@ const TOOL_COLUMNS = Object.values(getTableColumns(narratorToolCalls))
 	.map((column) => column.name);
 const PAGE = REVERT_SELECTION_PAGE_ITEMS;
 /** Whether bodies are read from block rows (`narrator-bodies.ts`); the database is SQLite. */
-const bodiesFromBlocks = (db: Database) => settings.narratorBlocks.read && hasBlockStorage(db);
+const bodiesFromBlocks = (db: Database) =>
+	hasBlockStorage(db) && (settings.narratorBlocks.read || hasRowsOnlyBodies(db));
 const MAILBOX_FIELDS: Record<string, { name: string }> = getTableColumns(narratorBufferedMessages);
 /** The shared runtime patch uses schema field names; map them to stored SQL columns. */
 function mailboxPatch(patch: Record<string, Value>): Row {
@@ -862,6 +868,8 @@ export class RevertHistoryCommitService {
 				content_json: rewritten.body,
 				content_text: rewritten.text,
 				context_chars_json: rewritten.contextCharsJson,
+				// The column holds the rewritten body again; the sync queue rebuilds the rows.
+				...(stored.message.includes("body_rows_only") ? { body_rows_only: 0 } : {}),
 				...(invalidBoundary ? { tree_hash_after: null, snapshot_commit_sha: null } : {}),
 			};
 			if (message.action === "rewrite") {

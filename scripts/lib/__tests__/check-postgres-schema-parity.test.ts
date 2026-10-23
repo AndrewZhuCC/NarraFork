@@ -523,7 +523,7 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 124 tables and 1662 columns including file IO outcomes, editor recovery and bot authors", () => {
+	test("covers 124 tables and 1663 columns including file IO outcomes, editor recovery and bot authors", () => {
 		expect(target.tables.length).toBe(124);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
@@ -535,7 +535,7 @@ describe("real schema parity", () => {
 		// Bot narrators add chat_messages.sender_narrator_id and reply_to_sender_narrator_id (2).
 		// Retiring the narrative line drops six tables (102 columns) and 19 columns elsewhere; the
 		// project index adds narrator_project_links (7) and projects.root_key.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1662);
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1663);
 		expect(
 			target.tables
 				.find((table) => table.name === "narrator_context_pins")

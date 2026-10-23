@@ -223,6 +223,7 @@ export type {
 	BlacklistDir,
 	BlockBackfillStatus,
 	BlockJobState,
+	BlockProjectionBlock,
 	BufferCreator,
 	BufferMessageSummary,
 	ChangelogEntry,

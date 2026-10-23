@@ -12,6 +12,19 @@
  *   - `verify` then walks block-format envelopes and records any whose rows do not
  *     assemble to its stored content in `narrator_block_diagnostics`, re-syncing it.
  *
+ * Two more are started from the storage page (P3b, §10.4), one at a time:
+ *
+ *   - `clear` drops the `content_json` projection of every verified block-format envelope
+ *     whose rows assemble to it exactly, leaving it rows-only (`body_rows_only`); compact
+ *     markers keep theirs. Only with `narratorBlocks.compactJson` in effect and convert and
+ *     verify complete.
+ *   - `restore` writes rows-only envelopes' projections back from their rows, so the
+ *     switch can be turned off and block reads with it. Only with the switch off.
+ *
+ * Both are state-only writes (`state_revision`): the model's view and the rows stay as
+ * they are, so nothing is bumped or queued. A worker reads; the main thread applies each
+ * envelope only if it has not changed since.
+ *
  * SQLite only, like the rest of block storage in this phase.
  */
 
@@ -22,20 +35,30 @@ import {
 	type BackfillEnvelope,
 	type BlockBackfillSliceParams,
 	type BlockBackfillSliceResult,
+	type BlockProjectionSliceParams,
+	type BlockProjectionSliceResult,
 	type BlockVerifySliceParams,
 	type BlockVerifySliceResult,
 	ledgerFingerprint,
+	rowsSignature,
 	runBlockBackfillSlice,
+	runBlockProjectionSlice,
 	runBlockVerifySlice,
 } from "../lib/db-worker/block-backfill-query";
 import { runReadTask, WorkersUnavailableError } from "../lib/db-worker/pool";
+import { AppError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { hasRowsOnlyBodies } from "../lib/narrator-bodies";
 import { settings } from "../lib/settings";
-import { resyncFromColumn, syncEnvelopeNow } from "./narrator-block-sync";
+import { noteRowsOnlyEnvelopes, rowsOnlyEnvelopesExist } from "./narrator-block-scans";
+import { resyncFromColumn, rowsOnlyWrites, syncEnvelopeNow } from "./narrator-block-sync";
 
-export type BlockJob = "convert" | "verify";
+/** The admin-started jobs that drop or write back envelopes' projections (P3b). */
+export type ProjectionJob = "clear" | "restore";
+export type BlockJob = "convert" | "verify" | ProjectionJob;
+const PROJECTION_JOBS: readonly ProjectionJob[] = ["clear", "restore"];
 
 const MAX_SLICE_ENVELOPES = 100;
 const MIN_SLICE_ENVELOPES = 5;
@@ -55,7 +78,7 @@ export interface SliceReader {
 }
 
 async function readInWorker<T>(
-	params: BlockBackfillSliceParams | BlockVerifySliceParams,
+	params: BlockBackfillSliceParams | BlockVerifySliceParams | BlockProjectionSliceParams,
 	inline: () => T,
 ): Promise<T> {
 	try {
@@ -80,9 +103,26 @@ const workerReader: SliceReader = {
 		readInWorker(params, () => runBlockVerifySlice(database.sqlite, inlineLimits(params))),
 };
 
+/** How a projection job's slice is read: by a db-worker, or inline on a given connection. */
+export type ProjectionReader = (
+	params: BlockProjectionSliceParams,
+) => Promise<BlockProjectionSliceResult>;
+
+const workerProjectionReader: ProjectionReader = (params) =>
+	readInWorker(params, () => runBlockProjectionSlice(database.sqlite, inlineLimits(params)));
+
 const state = hotSafe("narrator-block-backfill:state", () => ({
 	running: false,
 	sliceEnvelopes: MAX_SLICE_ENVELOPES,
+}));
+
+const projection = hotSafe("narrator-block-backfill:projection", () => ({
+	running: false,
+	/**
+	 * The current `restore` pass: whether it began at the first envelope, and how many it
+	 * wrote back. A whole pass that wrote none stops the job.
+	 */
+	pass: { fromStart: false, restored: 0 },
 }));
 
 let schema: boolean | undefined;
@@ -106,9 +146,12 @@ export interface BlockJobState {
 }
 
 function jobState(job: BlockJob): BlockJobState {
+	// A projection job only runs once started: its row starts out paused.
 	database.sqlite
-		.prepare("INSERT OR IGNORE INTO narrator_block_backfill (job, updated_at) VALUES (?, ?)")
-		.run(job, new Date().toISOString());
+		.prepare(
+			"INSERT OR IGNORE INTO narrator_block_backfill (job, paused, updated_at) VALUES (?, ?, ?)",
+		)
+		.run(job, PROJECTION_JOBS.includes(job as ProjectionJob) ? 1 : 0, new Date().toISOString());
 	const row = database.sqlite
 		.prepare(
 			`SELECT cursor, complete, paused, processed, updated_at AS updatedAt
@@ -330,7 +373,10 @@ export function rearmBlockConvert(): void {
 
 /** Start the jobs in the background, if they have work; a no-op while they already run. */
 export function startBlockBackfill(): void {
-	if (state.running || !hasSchema()) return;
+	if (!hasSchema()) return;
+	// A projection job started before a restart resumes where it was.
+	startProjectionRunner();
+	if (state.running) return;
 	rearmBlockConvert();
 	state.running = true;
 	const next = () => {
@@ -353,6 +399,13 @@ export interface BlockBackfillStatus {
 	available: boolean;
 	convert: BlockJobState | null;
 	verify: BlockJobState | null;
+	clear: BlockJobState | null;
+	restore: BlockJobState | null;
+	/** What a projection job needs that is missing (`projectionBlocked`), or null. */
+	blocked: { clear: ProjectionBlock | null; restore: ProjectionBlock | null };
+	/** Some envelope is rows-only: block reads stay on whatever the read switch says. */
+	rowsOnly: boolean;
+	projectionRunning: boolean;
 	/** The newest `narrator_messages.rowid`: cursors are read as progress against it. */
 	maxRowid: number;
 	diagnostics: number;
@@ -365,6 +418,11 @@ export function blockBackfillStatus(): BlockBackfillStatus {
 			available: false,
 			convert: null,
 			verify: null,
+			clear: null,
+			restore: null,
+			blocked: { clear: "unavailable", restore: "unavailable" },
+			rowsOnly: false,
+			projectionRunning: false,
 			maxRowid: 0,
 			diagnostics: 0,
 			running: false,
@@ -384,6 +442,11 @@ export function blockBackfillStatus(): BlockBackfillStatus {
 		available: true,
 		convert: jobState("convert"),
 		verify: jobState("verify"),
+		clear: jobState("clear"),
+		restore: jobState("restore"),
+		blocked: { clear: projectionBlocked("clear"), restore: projectionBlocked("restore") },
+		rowsOnly: rowsOnlyEnvelopesExist(),
+		projectionRunning: projection.running,
 		maxRowid,
 		diagnostics,
 		running: state.running,
@@ -396,9 +459,217 @@ export function setBlockBackfillPaused(paused: boolean): BlockBackfillStatus {
 		jobState("convert");
 		jobState("verify");
 		database.sqlite
-			.prepare("UPDATE narrator_block_backfill SET paused = ?, updated_at = ?")
+			.prepare(
+				"UPDATE narrator_block_backfill SET paused = ?, updated_at = ? WHERE job IN ('convert', 'verify')",
+			)
 			.run(paused ? 1 : 0, new Date().toISOString());
 		if (!paused) startBlockBackfill();
 	}
 	return blockBackfillStatus();
+}
+
+/** Why a projection job cannot run now. */
+export type ProjectionBlock =
+	| "unavailable"
+	| "compact_json_off"
+	| "compact_json_on"
+	| "backfill_incomplete";
+
+/**
+ * What `job` needs that is missing: `clear` runs only where new envelopes are written
+ * rows-only too (`rowsOnlyWrites`) and every envelope's rows were built and verified;
+ * `restore` only where they are not, or it would never finish.
+ */
+function projectionBlocked(job: ProjectionJob): ProjectionBlock | null {
+	if (!hasSchema()) return "unavailable";
+	if (job === "restore") return rowsOnlyWrites() ? "compact_json_on" : null;
+	if (!rowsOnlyWrites()) return "compact_json_off";
+	return jobState("convert").complete && jobState("verify").complete ? null : "backfill_incomplete";
+}
+
+function pauseProjection(job: ProjectionJob): void {
+	database.sqlite
+		.prepare("UPDATE narrator_block_backfill SET paused = 1, updated_at = ? WHERE job = ?")
+		.run(new Date().toISOString(), job);
+}
+
+/**
+ * Start (or resume) a projection job in the background; the other one stops where it is.
+ * A finished job starts over from the first envelope. `read` replaces the db-worker (tests).
+ */
+export function startProjectionJob(
+	job: ProjectionJob,
+	read: ProjectionReader = workerProjectionReader,
+): BlockBackfillStatus {
+	const blocked = projectionBlocked(job);
+	if (blocked)
+		throw new AppError(`Cannot ${job} projections: ${blocked}`, 409, "BLOCK_PROJECTION_BLOCKED");
+	for (const name of PROJECTION_JOBS) jobState(name);
+	pauseProjection(job === "clear" ? "restore" : "clear");
+	database.sqlite
+		.prepare(
+			`UPDATE narrator_block_backfill SET paused = 0, updated_at = ?,
+				cursor = CASE WHEN complete THEN 0 ELSE cursor END,
+				processed = CASE WHEN complete THEN 0 ELSE processed END, complete = 0
+			 WHERE job = ?`,
+		)
+		.run(new Date().toISOString(), job);
+	startProjectionRunner(read);
+	return blockBackfillStatus();
+}
+
+/** Stop whichever projection job runs, where it is; starting it again resumes it. */
+export function stopProjectionJobs(): BlockBackfillStatus {
+	if (hasSchema()) for (const job of PROJECTION_JOBS) pauseProjection(job);
+	return blockBackfillStatus();
+}
+
+/** The projection job that was started and has not finished, if any. */
+function activeProjection(): ProjectionJob | undefined {
+	return PROJECTION_JOBS.find((job) => {
+		const current = jobState(job);
+		return !current.complete && !current.paused;
+	});
+}
+
+/** After a read: the job was not stopped meanwhile, and still has what it needs. */
+function stillRunning(job: ProjectionJob): boolean {
+	return activeProjection() === job && !projectionBlocked(job);
+}
+
+async function clearSlice(read: ProjectionReader): Promise<void> {
+	const job = jobState("clear");
+	const slice = await read({
+		kind: "blockProjectionSlice",
+		job: "clear",
+		afterRowid: job.cursor,
+		maxEnvelopes: state.sliceEnvelopes,
+		maxSourceBytes: MAX_SLICE_SOURCE_BYTES,
+		budgetMs: SLICE_BUDGET_MS,
+	});
+	if (!stillRunning("clear")) return;
+	const started = performance.now();
+	const cleared = database.sqlite.transaction(() => {
+		// Only as read: not rewritten, not waiting on its sync, still with its projection.
+		const clear = database.sqlite.prepare(
+			`UPDATE narrator_messages SET content_json = '[]', body_rows_only = 1,
+				state_revision = state_revision + 1
+			 WHERE id = ? AND body_format = 2 AND body_rows_only = 0 AND body_revision = ?
+				AND state_revision = ?
+				AND NOT EXISTS (SELECT 1 FROM narrator_block_sync_queue WHERE message_id = ?)`,
+		);
+		let count = 0;
+		for (const envelope of slice.envelopes)
+			count += clear.run(
+				envelope.id,
+				envelope.bodyRevision,
+				envelope.stateRevision,
+				envelope.id,
+			).changes;
+		const pending = database.sqlite.prepare(
+			"SELECT 1 FROM narrator_block_sync_queue WHERE message_id = ?",
+		);
+		for (const id of slice.mismatched) {
+			if (pending.get(id)) continue;
+			recordDiagnostic(id, "mismatch", "block rows did not assemble to content_json");
+			resyncFromColumn(id);
+		}
+		advance("clear", slice.lastRowid, count, slice.done);
+		return count;
+	})();
+	if (cleared) noteRowsOnlyEnvelopes(true);
+	adapt(performance.now() - started, slice.envelopes.length);
+}
+
+async function restoreSlice(read: ProjectionReader): Promise<void> {
+	const job = jobState("restore");
+	if (job.cursor === 0) projection.pass = { fromStart: true, restored: 0 };
+	const slice = await read({
+		kind: "blockProjectionSlice",
+		job: "restore",
+		afterRowid: job.cursor,
+		maxEnvelopes: state.sliceEnvelopes,
+		maxSourceBytes: MAX_SLICE_SOURCE_BYTES,
+		budgetMs: SLICE_BUDGET_MS,
+	});
+	if (!stillRunning("restore")) return;
+	const started = performance.now();
+	const outcome = database.sqlite.transaction(() => {
+		// Only as read: the same revisions and the same rows (a state rewrite by the sync
+		// moves neither revision), and still rows-only (a write since stored its own).
+		const write = database.sqlite.prepare(
+			`UPDATE narrator_messages SET content_json = ?, body_rows_only = 0,
+				state_revision = state_revision + 1
+			 WHERE id = ? AND body_rows_only = 1 AND body_revision = ? AND state_revision = ?`,
+		);
+		let count = 0;
+		for (const envelope of slice.envelopes)
+			if (rowsSignature(database.sqlite, envelope.id) === envelope.rows)
+				count += write.run(
+					envelope.json ?? "[]",
+					envelope.id,
+					envelope.bodyRevision,
+					envelope.stateRevision,
+				).changes;
+		projection.pass.restored += count;
+		if (!slice.done) {
+			advance("restore", slice.lastRowid, count, false);
+			return "more";
+		}
+		// The end of a pass: done once none is left. Ones that changed under it are taken by
+		// another pass, as long as passes make progress.
+		if (!hasRowsOnlyBodies(database.sqlite)) {
+			advance("restore", slice.lastRowid, count, true);
+			return "complete";
+		}
+		const { fromStart, restored } = projection.pass;
+		advance("restore", 0, count, false);
+		return fromStart && restored === 0 ? "stuck" : "more";
+	})();
+	adapt(performance.now() - started, slice.envelopes.length);
+	if (outcome === "complete") noteRowsOnlyEnvelopes(undefined);
+	if (outcome === "stuck") {
+		pauseProjection("restore");
+		logger.warn("Projection restore made no progress in a full pass; stopped", {});
+	}
+}
+
+/**
+ * Run one slice of the started projection job. Returns whether one ran (false when none is
+ * started, or what it needs went away — then it stops where it is).
+ */
+export async function runProjectionSlice(
+	read: ProjectionReader = workerProjectionReader,
+): Promise<boolean> {
+	if (!hasSchema()) return false;
+	const job = activeProjection();
+	if (!job) return false;
+	const blocked = projectionBlocked(job);
+	if (blocked) {
+		pauseProjection(job);
+		logger.warn("Projection job stopped: what it needs is missing", { job, blocked });
+		return false;
+	}
+	if (job === "clear") await clearSlice(read);
+	else await restoreSlice(read);
+	return true;
+}
+
+function startProjectionRunner(read: ProjectionReader = workerProjectionReader): void {
+	if (projection.running || !hasSchema() || !activeProjection()) return;
+	projection.running = true;
+	const next = () => {
+		runProjectionSlice(read)
+			.then((ran) => {
+				if (ran) setTimeout(next, 0);
+				else projection.running = false;
+			})
+			.catch((error) => {
+				projection.running = false;
+				logger.warn("Projection job stopped; start it again from the storage page", {
+					error: String(error),
+				});
+			});
+	};
+	setTimeout(next, 0);
 }

@@ -904,6 +904,14 @@ export interface NarraForkSettings {
 		 * is the rollback switch).
 		 */
 		wsV2: boolean;
+		/**
+		 * Whether a block-format envelope written from now on keeps its body only in its
+		 * block rows: `content_json` holds `[]` and `body_rows_only` is set (P3b). Takes
+		 * effect only on SQLite with `write` and `read` on. Off: new envelopes keep the
+		 * complete `content_json` projection; envelopes already rows-only stay so until the
+		 * restore job writes their projection back.
+		 */
+		compactJson: boolean;
 	};
 	editor: {
 		type: "vscode" | "cursor" | "windsurf" | "zed";

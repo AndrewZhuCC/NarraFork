@@ -31,7 +31,12 @@ import {
 	NON_OPERATION_ROLES,
 } from "@shared/file-change-protocol";
 import { AppError } from "../lib/errors";
-import { bodyLengthSql, boundedBodyText, hasBlockStorage } from "../lib/narrator-bodies";
+import {
+	bodyLengthSql,
+	boundedBodyText,
+	hasBlockStorage,
+	hasRowsOnlyBodies,
+} from "../lib/narrator-bodies";
 import { settings } from "../lib/settings";
 import {
 	createFileChangeIdentity,
@@ -1222,7 +1227,8 @@ const NARRATOR_SELECT = `SELECT id, owner_user_id AS ownerUserId, visibility, wr
  parent_narrator_id AS parentNarratorId, origin_tool_call_id AS originToolCallId FROM narrators`;
 const READ_ONLY_TOOLS = new Set(["Read", "Glob", "Grep", "StructView", "WebSearch", "WebFetch"]);
 /** Whether bodies are read from block rows (`narrator-bodies.ts`); the database is SQLite. */
-const bodiesFromBlocks = (db: Database) => settings.narratorBlocks.read && hasBlockStorage(db);
+const bodiesFromBlocks = (db: Database) =>
+	hasBlockStorage(db) && (settings.narratorBlocks.read || hasRowsOnlyBodies(db));
 /** Refs with their message's sizes; a body is measured as readers read it. */
 const refSelect = (db: Database) => {
 	const body = bodyLengthSql("m", bodiesFromBlocks(db));
