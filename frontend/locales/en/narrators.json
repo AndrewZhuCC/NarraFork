@@ -64,11 +64,6 @@
 	"sortDescending": "Descending",
 	"sortAscending": "Ascending",
 	"loadingMore": "Loading more...",
-	"filterAll": "All",
-	"filterStandalone": "Standalone",
-	"filterChapter": "Chapter",
-	"chapterLabel": "Chapter: {{title}}",
-	"projectLabel": "Project: {{name}}",
 	"activeTerminals": "{{count}} terminal(s)",
 	"viewingNow": "Viewing now",
 	"filterHasTerminals": "Has Terminals",
@@ -169,5 +164,9 @@
 			"target_cwd_missing": "The working directory does not exist on the target machine",
 			"session_index_skipped": "Codex session_index.jsonl was not updated, so the session shows without a title"
 		}
-	}
+	},
+	"botNarrator": "Bot",
+	"botNarratorHint": "People chat with it and see only what it sends them. Its replies and tool calls stay in the transcript, which you can open as a monitor.",
+	"botName": "Bot name",
+	"botNameHint": "Required. Shown on every message the bot sends."
 }

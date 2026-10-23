@@ -1,5 +1,5 @@
 import { existsSync, rmSync } from "node:fs";
-import { resolve, sep } from "node:path";
+import { resolve } from "node:path";
 import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
@@ -11,8 +11,6 @@ import {
 	apiRequests,
 	backgroundTasks,
 	benchmarkTaskResults,
-	chapterCommits,
-	chapters,
 	gatewaySessionMappings,
 	integrationResourceBindings,
 	narratorBlacklistCmds,
@@ -51,7 +49,7 @@ import {
 	measureSummaryCharacters,
 	queueContextCharacterRefresh,
 } from "../lib/context-characters";
-import { NotFoundError, ValidationError } from "../lib/errors";
+import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { fastModeOverrideFromLegacyInput, legacyFastModeMirror } from "../lib/fast-mode";
 import { hotSafe } from "../lib/hot-safe";
@@ -71,6 +69,7 @@ import {
 	upsertEncodedTrait,
 } from "../lib/narrator-custom-traits";
 import {
+	BOT_TRAIT,
 	isSubagentVariant,
 	KNOWLEDGE_KIND_TRAIT,
 	type NarratorTrait,
@@ -114,6 +113,7 @@ import { generateWordSlug } from "../lib/words";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { agentMessageDeliveryBody } from "./agent-message-delivery";
 import { type AgentMessageSender, buildAgentMessageOrigin } from "./agent-message-origin";
+import { BOT_RUNTIME_CEILING } from "./agent-runtime/policy";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
 import type {
 	BlockAllSkillsResult,
@@ -132,14 +132,13 @@ import { integrationResourceBindingService } from "./integration-resource-bindin
 import { assertNarratorAccess, type NarratorAccessNeed } from "./narrator-acl";
 import { newEnvelopeColumns, syncEnvelopeNow } from "./narrator-block-sync";
 import { contentJsonSql, fillBodies } from "./narrator-body-reads";
-import { resolveNarratorSessionCwd } from "./narrator-cwd";
+import { isFormerChapterSessionWithoutDirectory, resolveNarratorSessionCwd } from "./narrator-cwd";
 import { buildSystemInjectionBlock, type SystemInjectionBlock } from "./narrator-injection";
 import { DEFAULT_TOOL_IO_BUDGET, narratorMessageQueries, truncateJson } from "./narrator-messages";
 // `bumpParentNarratorMessageVersion` is deliberately NOT imported any more: the bump
 // now happens inside `persistUserMessage`/`persistSystemMessage`, so every writer of a
 // child row gets it rather than only the subagent entry point that remembered to call it.
 import { deleteRecipientMessageRefs, narratorPersistence } from "./narrator-persistence";
-import { resolveNarratorProjectId } from "./narrator-project";
 import {
 	claimNextRefSeq,
 	initializeRefSeqFloor,
@@ -149,6 +148,7 @@ import { materializeChildrenOf } from "./narrator-refs-backfill";
 import { isSignedReviewBoundaryRow, signReviewBoundaryRuleId } from "./narrator-review-boundary";
 import { withNarratorWorkAdmission } from "./narrator-session-state";
 import { narratorStore } from "./narrator-store";
+import { syncNarratorProjectLinksSafely } from "./project-index";
 import { resolveSkillContextForNarrator } from "./skill-service";
 import { specVfsService } from "./spec-vfs-service";
 import { removeTabFromAllUsers } from "./user-preferences-service";
@@ -336,7 +336,6 @@ async function deleteNarratorPackExtractions(narratorId: string): Promise<void> 
 }
 
 export interface CreateNarratorInput {
-	chapterId?: string | null;
 	/** Internal creation provenance; not accepted by the public narrator API. */
 	scheduledTaskId?: string | null;
 	type?: "primary";
@@ -365,15 +364,16 @@ export interface CreateNarratorInput {
 	 * Specialized standalone narrator kind.
 	 * "knowledge" → a Knowledge Steward (knowledge-base management).
 	 * "setup" → a Setup Assistant (installs missing system dependencies).
+	 * "bot" → a bot, faced through chat rooms (see `BOT_TRAIT`). Requires `title`.
 	 */
-	kind?: "knowledge" | "setup";
+	kind?: "knowledge" | "setup" | "bot";
 	/** Whether the creating user is an admin (gates KnowledgeAdmin preinstall for kind="knowledge"). */
 	creatorIsAdmin?: boolean;
 	/** Locale for generating the default kind-specific system prompt. */
 	locale?: Locale;
 	/** Extra permanent trait tags to attach (merged with derived traits, deduped). */
 	extraTraits?: NarratorTrait[];
-	/** Explicit project context for a chapterless narrator; independent of its cwd. */
+	/** Explicit project context for the narrator; independent of its cwd. */
 	contextProjectId?: string | null;
 	/** Frozen OAuth client policy applied at provisioning time. */
 	oauthPolicySnapshotJson?: Record<string, unknown> | null;
@@ -387,7 +387,7 @@ export interface CreateNarratorInput {
 	ownerUserId?: string | null;
 	/**
 	 * Read audience. Omitted follows agent.defaultNarratorVisibility; auto keeps
-	 * standalone narrators private and chapter-bound narrators project-visible.
+	 * narrators private (project-page sessions pass explicit audiences).
 	 */
 	visibility?: "private" | "project" | "public";
 	/**
@@ -444,8 +444,8 @@ const ADMIN_ONLY_LOAD_TOOLS = new Set([
  */
 async function resolveLayeredTraitsFor(
 	narrator: {
+		id: string;
 		traits: unknown;
-		chapterId?: string | null;
 		contextProjectId?: string | null;
 	} & RuntimeSourceRow,
 	userId: string | undefined,
@@ -1216,13 +1216,13 @@ async function insertSpecClearedCarryoverCard(narratorId: string): Promise<void>
 type NarratorInsertExecutor = Pick<typeof db, "insert">;
 
 /** A fork keeps execution constraints and explicit audiences, but not named/task identity. */
-async function forkTraits(
-	parent: typeof narrators.$inferSelect,
-	chapterId: string | null,
-): Promise<string[]> {
-	const excluded = new Set(["standalone", "named", "scheduled", "background"]);
+async function forkTraits(parent: typeof narrators.$inferSelect): Promise<string[]> {
+	// A fork of a bot is an ordinary narrator: a bot is made at creation (named and
+	// standalone), and its people's conversations stay with the original. Ceilings,
+	// the bot's included, carry over like any other — a fork never widens.
+	const excluded = new Set(["standalone", "named", "scheduled", "background", BOT_TRAIT]);
 	const traits = [
-		...(chapterId ? [] : ["standalone"]),
+		"standalone",
 		...parseTraits(parent.traits).filter((trait) => !excluded.has(trait)),
 	];
 	return traits;
@@ -1336,48 +1336,6 @@ function copyForkAccessAndRules(
 			: row.id,
 		narratorId: childId,
 	}));
-	// Review primaries are created with the ordinary default permission mode.
-	// Their real constraint is the chapter's worktree, so freeze that boundary
-	// before dropping chapter identity; descendants keep the server-owned deny row.
-	const sourceChapter = tx
-		.select({ role: chapters.role, worktreePath: chapters.worktreePath })
-		.from(narrators)
-		.innerJoin(chapters, eq(narrators.chapterId, chapters.id))
-		.where(eq(narrators.id, parentId))
-		.limit(1)
-		.get();
-	if (sourceChapter?.role === "review") {
-		if (!sourceChapter.worktreePath)
-			throw new ValidationError("Review workspace boundary is unavailable");
-		const root = sourceChapter.worktreePath;
-		const existingBoundary = blackDirs.some(
-			(row) => isSignedReviewBoundaryRow(row) && resolve(row.path) === resolve(root),
-		);
-		if (!existingBoundary) {
-			// Keep editable rules intact (including denyAll and non-host selectors).
-			// The legacy unique index uses lexical paths, while policy compilation uses
-			// canonical identities: a bounded '/.' suffix lets both layers coexist.
-			if (blackDirs.length >= 1_000) throw new ValidationError("Fork access profile exceeds limit");
-			let boundaryPath = root;
-			while (blackDirs.some((row) => row.path === boundaryPath && row.deviceScope === "local")) {
-				boundaryPath = `${boundaryPath}${sep}.`;
-			}
-			blackDirs.push({
-				id: signReviewBoundaryRuleId(childId, boundaryPath),
-				narratorId: childId,
-				path: boundaryPath,
-				pathFlavor: null,
-				pathKey: null,
-				denyLevel: "denyWrite",
-				enabled: true,
-				targetKind: "host",
-				targetValue: null,
-				deviceScope: "local",
-				createdAt: new Date().toISOString(),
-				updatedAt: null,
-			});
-		}
-	}
 	if (blackDirs.length > 1_000) throw new ValidationError("Fork access profile exceeds limit");
 	if (blackDirs.length)
 		tx.insert(narratorBlacklistDirs)
@@ -1419,13 +1377,30 @@ async function resolveForkExecutionContext(parent: typeof narrators.$inferSelect
 	// A committed workspace is authoritative. Never reinterpret a remote session's
 	// absent cwd as the host project's path; an unresolved remote workspace stays blocked.
 	const remote = parent.defaultDeviceId && parent.defaultDeviceId !== "local";
+	// A former chapter session without a directory has none to hand down; the fork must
+	// not quietly start in the home directory (see narrator-cwd.ts).
+	if (
+		!remote &&
+		isFormerChapterSessionWithoutDirectory({
+			cwd: committedContext?.cwd || parent.cwd,
+			traits: parent.traits,
+		})
+	) {
+		throw new AppError(
+			"This legacy workspace has no directory. Choose a working directory before forking.",
+			409,
+			"WORKSPACE_DIRECTORY_REQUIRED",
+		);
+	}
 	const cwd = committedContext?.cwd || parent.cwd || (remote ? null : context.cwd);
 	if (remote && !cwd) {
 		throw new ValidationError(
 			"Remote workspace is unresolved; select a device directory before forking",
 		);
 	}
-	const contextProjectId = await resolveNarratorProjectId(parent);
+	// Only an explicit project is inherited; a project derived from the directory is
+	// derived again for the fork from the same directory, and follows it if it moves.
+	const contextProjectId = parent.contextProjectId ?? null;
 	return {
 		cwd,
 		defaultDeviceId: parent.defaultDeviceId,
@@ -1450,32 +1425,15 @@ export interface PreparedNarratorCreation {
 export async function prepareNarratorCreation(
 	input: CreateNarratorInput,
 ): Promise<PreparedNarratorCreation> {
-	if (input.chapterId) {
-		const chapter = await db.query.chapters.findFirst({
-			where: eq(chapters.id, input.chapterId),
-		});
-		if (!chapter) throw new NotFoundError("Chapter", input.chapterId);
-		if (chapter.status !== "active") {
-			throw new ValidationError("Cannot create narrator for non-active chapter");
-		}
-	}
-
 	const type = input.type ?? "primary";
-	if (type === "primary" && input.chapterId) {
-		const existing = await db.query.narrators.findFirst({
-			where: and(eq(narrators.chapterId, input.chapterId), eq(narrators.variant, "primary")),
-		});
-		if (existing) {
-			throw new ValidationError("Chapter already has a primary narrator");
-		}
-	}
-
 	const now = new Date().toISOString();
 	const resolvedPermMode = normalizeLegacyPermissionMode(
 		input.permissionMode ?? settings.agent.defaultPermissionMode,
 		"default",
 	);
-	const startInPlanMode = input.startInPlanMode ?? settings.agent.defaultStartInPlanMode;
+	// A bot can't leave plan mode: approving a plan is denied by its ceiling (below).
+	const startInPlanMode =
+		input.kind !== "bot" && (input.startInPlanMode ?? settings.agent.defaultStartInPlanMode);
 	const previousPermissionMode = startInPlanMode ? resolvedPermMode : null;
 	const planFileId = startInPlanMode ? generateWordSlug() : null;
 	if (input.model === FOLLOW_PARENT_MODEL) {
@@ -1494,8 +1452,7 @@ export async function prepareNarratorCreation(
 		input.fastMode,
 	);
 
-	const chapterId = input.chapterId ?? null;
-	const traits: string[] = chapterId === null ? ["standalone"] : [];
+	const traits: string[] = ["standalone"];
 	if (startInPlanMode) traits.push("plan");
 
 	// Knowledge Steward: a specialized standalone narrator for knowledge-base management.
@@ -1504,9 +1461,6 @@ export async function prepareNarratorCreation(
 	const enabledToolsSet = new Set<string>();
 	let resolvedSystemPrompt = input.systemPrompt;
 	if (input.kind === "knowledge") {
-		if (chapterId !== null) {
-			throw new ValidationError("Knowledge Steward narrators must be standalone (no chapterId)");
-		}
 		traits.push(KNOWLEDGE_KIND_TRAIT);
 		for (const tool of KNOWLEDGE_KIND_PRELOAD_TOOLS) enabledToolsSet.add(tool);
 		if (input.creatorIsAdmin) enabledToolsSet.add(KNOWLEDGE_KIND_PRELOAD_TOOLS_ADMIN);
@@ -1521,9 +1475,6 @@ export async function prepareNarratorCreation(
 	// rendered by the caller and passed in as `systemPrompt`; the fallback below
 	// only covers callers that supply none.
 	if (input.kind === "setup") {
-		if (chapterId !== null) {
-			throw new ValidationError("Setup Assistant narrators must be standalone (no chapterId)");
-		}
 		traits.push(SETUP_KIND_TRAIT);
 		for (const tool of SETUP_KIND_PRELOAD_TOOLS) enabledToolsSet.add(tool);
 		if (!resolvedSystemPrompt) {
@@ -1531,16 +1482,20 @@ export async function prepareNarratorCreation(
 		}
 	}
 
-	// Named narrators must be standalone so they are independent of a chapter lifecycle.
+	// Bot: a narrator people meet in a chat room instead of its transcript. Named up
+	// front because its title is how it signs every message — the first-message
+	// auto-title would rename it after whatever the first person happened to ask.
+	if (input.kind === "bot") {
+		if (!input.title?.trim()) throw new ValidationError("A bot needs a name (title)");
+		traits.push(BOT_TRAIT, ...appendRuntimePolicyTrait([], BOT_RUNTIME_CEILING));
+	}
+
 	const makeNamed = input.makeNamed ?? false;
 	let displayHandle: string | null = null;
 	let foldedHandle: string | null = null;
 	if (makeNamed) {
 		if (!input.handle) {
 			throw new ValidationError("handle is required when creating a named narrator");
-		}
-		if (chapterId !== null) {
-			throw new ValidationError("Named narrators must be standalone (no chapterId)");
 		}
 		displayHandle = input.handle.trim();
 		foldedHandle = foldHandle(displayHandle);
@@ -1558,7 +1513,6 @@ export async function prepareNarratorCreation(
 		handleFold: foldedHandle,
 		row: {
 			id: generateId(),
-			chapterId,
 			scheduledTaskId: input.scheduledTaskId ?? null,
 			type,
 			variant: "primary",
@@ -1593,7 +1547,7 @@ export async function prepareNarratorCreation(
 			...resolveNarratorAudiences(
 				input.visibility,
 				input.writeAudience,
-				chapterId,
+				null,
 				settings.agent.defaultNarratorVisibility,
 				settings.agent.defaultNarratorWriteAudience,
 			),
@@ -1614,7 +1568,7 @@ export async function prepareNarratorCreation(
 
 type CreationWorkspace = Pick<
 	typeof narrators.$inferInsert,
-	"chapterId" | "contextProjectId" | "cwd" | "workspaceContext" | "defaultDeviceId"
+	"contextProjectId" | "cwd" | "workspaceContext" | "defaultDeviceId"
 >;
 const preparedWorkspaceAdmissions = new WeakMap<
 	PreparedNarratorCreation,
@@ -1622,7 +1576,6 @@ const preparedWorkspaceAdmissions = new WeakMap<
 >();
 function creationWorkspaceFields(row: CreationWorkspace): string {
 	return JSON.stringify([
-		row.chapterId ?? null,
 		row.contextProjectId ?? null,
 		row.cwd ?? null,
 		row.defaultDeviceId ?? null,
@@ -1632,16 +1585,7 @@ function creationWorkspaceFields(row: CreationWorkspace): string {
 export async function narratorCreationWorkspaceTarget(
 	row: CreationWorkspace,
 ): Promise<LifecycleTarget[]> {
-	const chapter = row.chapterId
-		? db
-				.select({ path: chapters.worktreePath, projectId: chapters.projectId })
-				.from(chapters)
-				.where(eq(chapters.id, row.chapterId))
-				.limit(1)
-				.get()
-		: undefined;
-	const scopeProjectId =
-		chapter?.projectId ?? row.contextProjectId ?? row.workspaceContext?.contextProjectId ?? null;
+	const scopeProjectId = row.contextProjectId ?? row.workspaceContext?.contextProjectId ?? null;
 	const project = scopeProjectId
 		? db
 				.select({ path: projects.gitPath })
@@ -1650,7 +1594,7 @@ export async function narratorCreationWorkspaceTarget(
 				.limit(1)
 				.get()
 		: undefined;
-	const cwd = resolveNarratorSessionCwd(row.cwd, chapter?.path, project?.path, getHome());
+	const cwd = resolveNarratorSessionCwd(row.cwd, project?.path, getHome());
 	const deviceId = !localPathSemantics.isAbsolute(cwd)
 		? (row.defaultDeviceId ?? row.workspaceContext?.deviceId ?? "local")
 		: "local";
@@ -1700,7 +1644,6 @@ export function publishNarratorCreated(narrator: typeof narrators.$inferSelect):
 	backgroundOccupancyStore.refreshNarrator(narrator.id);
 	logger.info("Narrator created", {
 		id: narrator.id,
-		chapterId: narrator.chapterId,
 		type: narrator.type,
 		handle: narrator.handle,
 	});
@@ -1732,6 +1675,7 @@ export const narratorService = {
 			: await insertNarrator();
 
 		publishNarratorCreated(narrator);
+		await syncNarratorProjectLinksSafely(narrator.id);
 		return narrator;
 	},
 
@@ -1817,16 +1761,12 @@ export const narratorService = {
 				input.reasoningEffort ??
 				(storedModel === FOLLOW_PARENT_MODEL ? null : (parent.reasoningEffort ?? null));
 
-			const subChapterId = parent.chapterId ?? null;
 			// The template is compiled into an ordinary ceiling trait; the parent's own
 			// restrictions are not copied but followed live through the registered
 			// policy source, so a later tightening of the parent reaches the child.
 			const runtimePolicy =
 				input.runtimePolicy ?? (await compileDelegationCeiling(input.subagentType));
-			const subTraits = withRuntimePolicyTrait(
-				subChapterId === null ? ["standalone"] : [],
-				runtimePolicy,
-			);
+			const subTraits = withRuntimePolicyTrait(["standalone"], runtimePolicy);
 			// The delegator is the policy/model source and the controller; the model pool
 			// the child follows the source within is fixed now, from the template.
 			const runtimeRegistration = delegationRegistration(
@@ -1835,7 +1775,6 @@ export const narratorService = {
 			);
 
 			const creationWorkspace: CreationWorkspace = {
-				chapterId: subChapterId,
 				contextProjectId: parent.contextProjectId,
 				cwd: input.cwd,
 				defaultDeviceId: input.defaultDeviceId ?? parent.defaultDeviceId ?? null,
@@ -1846,7 +1785,6 @@ export const narratorService = {
 					.insert(narrators)
 					.values({
 						id,
-						chapterId: subChapterId,
 						type: "subagent",
 						subagentType: input.subagentType,
 						variant: subagentVariant(input.subagentType),
@@ -2274,9 +2212,6 @@ export const narratorService = {
 			const displayHandle = handle === null ? null : handle.trim();
 			const foldedHandle = displayHandle ? foldHandle(displayHandle) : null;
 			if (displayHandle) {
-				if (narrator.chapterId !== null) {
-					throw new ValidationError("Only standalone narrators can be named");
-				}
 				await this.assertHandleAvailable(displayHandle, narratorId);
 			}
 			const currentTraits = parseTraits(narrator.traits);
@@ -2296,14 +2231,6 @@ export const narratorService = {
 				.returning();
 			logger.info("Narrator handle updated", { narratorId, handle: displayHandle });
 			return updated;
-		});
-	},
-
-	async listByChapter(chapterId: string) {
-		return db.query.narrators.findMany({
-			columns: { runtimeRegistrationJson: false },
-			where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
-			orderBy: (n, { asc }) => [asc(n.createdAt)],
 		});
 	},
 
@@ -2367,10 +2294,6 @@ export const narratorService = {
 				.where(eq(narratorBlacklistCmds.narratorId, narratorId))
 				.run();
 			tx.delete(apiRequests).where(eq(apiRequests.narratorId, narratorId)).run();
-			tx.update(chapterCommits)
-				.set({ narratorId: null })
-				.where(eq(chapterCommits.narratorId, narratorId))
-				.run();
 			tx.update(benchmarkTaskResults)
 				.set({ narratorId: null })
 				.where(eq(benchmarkTaskResults.narratorId, narratorId))
@@ -2447,10 +2370,6 @@ export const narratorService = {
 				tx.update(narrators)
 					.set({ forkMessageId: null })
 					.where(inArray(narrators.forkMessageId, orphanIds))
-					.run();
-				tx.update(chapterCommits)
-					.set({ narratorMessageId: null })
-					.where(inArray(chapterCommits.narratorMessageId, orphanIds))
 					.run();
 				tx.update(apiRequests)
 					.set({ messageId: null })
@@ -2541,13 +2460,13 @@ export const narratorService = {
 				| "dontAsk";
 
 			const executionContext = await resolveForkExecutionContext(parent);
-			const inheritedTraits = await forkTraits(parent, null);
+			const inheritedTraits = await forkTraits(parent);
 			const policySource = forkPolicySource(parent);
 
 			// Fork inserts the narrator row first, then initializeRefSeqFloor — do not pre-raise
 			// a not-yet-inserted id. withSeqFloorRaiseScope marks after the tx commits because
 			// initializeRefSeqFloor records into the active raise scope.
-			const creationWorkspace: CreationWorkspace = { ...executionContext, chapterId: null };
+			const creationWorkspace: CreationWorkspace = { ...executionContext };
 			const creationTarget = await narratorCreationWorkspaceTarget(creationWorkspace);
 			const newNarrator = await withWorkspaceAdmission(creationTarget, async () =>
 				withSeqFloorRaiseScope(() =>
@@ -2558,7 +2477,6 @@ export const narratorService = {
 							.insert(narrators)
 							.values({
 								id,
-								chapterId: null,
 								type: "primary",
 								variant: "primary",
 								traits: inheritedTraits,
@@ -2651,13 +2569,10 @@ export const narratorService = {
 		opts?: {
 			title?: string;
 			model?: string;
-			newChapterId?: string;
 			inheritMode?: "full" | "compressed" | "fresh";
 			userId?: string | null;
 			locale?: string;
 			forkMessageId?: string;
-			/** Allow forking a chapter-bound narrator into a standalone narrator (no chapter). */
-			standalone?: boolean;
 			/**
 			 * What to do with the inherited Dynamic Spec tasks in the child.
 			 * Defaults to `"card"` (surface a reset card when tasks exist).
@@ -2672,12 +2587,6 @@ export const narratorService = {
 				throw new ValidationError("Cannot fork from a subagent narrator");
 			}
 
-			if (parent.chapterId && !opts?.newChapterId && !opts?.standalone) {
-				throw new ValidationError(
-					"Chapter-bound narrators can only be forked together with a chapter",
-				);
-			}
-
 			const inheritMode = opts?.inheritMode ?? "fresh";
 			const now = new Date().toISOString();
 			const id = generateId();
@@ -2688,8 +2597,6 @@ export const narratorService = {
 				| "bypassPermissions"
 				| "readOnly"
 				| "dontAsk";
-
-			const targetChapterId = opts?.newChapterId ?? null;
 
 			let contextSummary: string | null = null;
 			let apiConversationId: string | null = null;
@@ -2757,16 +2664,12 @@ export const narratorService = {
 			// (follow the global default). Never固化 the resolved default here.
 			const resolvedReasoningEffort = parent.reasoningEffort ?? null;
 
-			const forkTraits2 = await forkTraits(parent, targetChapterId);
+			const forkTraits2 = await forkTraits(parent);
 			const policySource = forkPolicySource(parent);
 			const executionContext = await resolveForkExecutionContext(parent);
 
 			// Same as forkFromMessages: insert first, initializeRefSeqFloor after refs land.
-			const creationWorkspace: CreationWorkspace = {
-				...executionContext,
-				chapterId: targetChapterId,
-				...(targetChapterId ? { cwd: null, workspaceContext: null, contextProjectId: null } : {}),
-			};
+			const creationWorkspace: CreationWorkspace = { ...executionContext };
 			const creationTarget = await narratorCreationWorkspaceTarget(creationWorkspace);
 			const newNarrator = await withWorkspaceAdmission(creationTarget, async () =>
 				withSeqFloorRaiseScope(() =>
@@ -2777,21 +2680,11 @@ export const narratorService = {
 						tx.insert(narrators)
 							.values({
 								id,
-								chapterId: targetChapterId,
 								type: "primary",
 								variant: "primary",
 								traits: forkTraits2,
 								...policySource,
 								...executionContext,
-								// A new chapter supplies its own project and effective workspace.
-								...(targetChapterId
-									? {
-											contextProjectId: null,
-											cwd: null,
-											workspaceContext: null,
-											workspaceRevision: 0,
-										}
-									: {}),
 								...creationWorkspace,
 								model: storedModel,
 								systemPrompt,
@@ -2813,8 +2706,7 @@ export const narratorService = {
 								parentNarratorId,
 								forkMessageId: null,
 								// Same rule as forkFromMessages: inherited history keeps the parent's
-								// audiences, both of them. When the fork lands in a chapter it is at least
-								// project-visible anyway, so inheriting can only narrow, never widen.
+								// audiences, both of them.
 								ownerUserId: parent.ownerUserId,
 								visibility: parent.visibility,
 								writeAudience: parent.writeAudience,
@@ -3197,7 +3089,6 @@ export const narratorService = {
 					title: opts?.title,
 					model: opts?.model,
 					inheritMode: "fresh",
-					standalone: true,
 					userId: opts?.userId,
 					locale: opts?.locale,
 				});
@@ -3208,7 +3099,6 @@ export const narratorService = {
 			return this.forkNarrator(parentNarratorId, latestMsgUuid, {
 				title: opts?.title,
 				model: opts?.model,
-				standalone: true,
 				inheritMode: opts?.inheritMode ?? "full",
 				userId: opts?.userId ?? null,
 				locale: opts?.locale,
@@ -3258,10 +3148,6 @@ export const narratorService = {
 		narratorMessageQueries.deleteDanglingReasoningMessage.bind(narratorMessageQueries),
 	dismissSpecCarryoverMessage:
 		narratorMessageQueries.dismissSpecCarryoverMessage.bind(narratorMessageQueries),
-	markReviewFeedbackApplied:
-		narratorMessageQueries.markReviewFeedbackApplied.bind(narratorMessageQueries),
-	releaseReviewFeedbackClaim:
-		narratorMessageQueries.releaseReviewFeedbackClaim.bind(narratorMessageQueries),
 	dismissCwdRecoveryMessage:
 		narratorMessageQueries.dismissCwdRecoveryMessage.bind(narratorMessageQueries),
 	dismissSubagentRecoveryMessage:

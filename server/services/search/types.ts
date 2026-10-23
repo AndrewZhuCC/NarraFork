@@ -12,7 +12,7 @@
  * ------------------------------------
  * Four call sites search text today and they do NOT agree on recall:
  *
- *   - global search (chapters / messages / narrators) matches the whole query as ONE PHRASE;
+ *   - global search (messages / narrators) matches the whole query as ONE PHRASE;
  *   - the narrator timeline and Recall match each whitespace-separated term as a PREFIX;
  *   - knowledge matches prefixes too, but supports any-term matching and a field restriction;
  *   - the substring fallbacks disagree on wildcard escaping: knowledge escapes `%`/`_` typed
@@ -89,7 +89,7 @@ export interface SnippetFormat {
 	readonly tokens: number;
 }
 
-/** Global search (chapter descriptions, message bodies, narrator titles): unmarked excerpt. */
+/** Global search (message bodies, narrator titles): unmarked excerpt. */
 export const GLOBAL_SNIPPET: SnippetFormat = {
 	open: "",
 	close: "",
@@ -143,7 +143,41 @@ export interface EntitySearchQuery {
 	strategy: SearchStrategy;
 	limit: number;
 	viewer: SearchViewer;
+	/** Which conversation content message and narrator hits may come from. Omitted means
+	 *  {@link FULL_MESSAGE_SCOPE}. */
+	scope?: MessageSearchScope;
 }
+
+/**
+ * Which kinds of conversation content global search looks at.
+ *
+ * Each flag widens the search beyond what people wrote and read in a primary session. Off,
+ * the search skips text that repeats elsewhere or that nobody typed: a subagent's working
+ * notes (its result already lands in the parent), injected context such as knowledge hints
+ * (the entry itself is a knowledge hit), and tool calls with their output.
+ */
+export interface MessageSearchScope {
+	/** Subagent narrators: their messages, and their titles in narrator search. */
+	subagents: boolean;
+	/** System-written rows: injections, reminders, compact markers, automation prompts. */
+	system: boolean;
+	/** Tool calls and their results. */
+	tools: boolean;
+}
+
+/** Everything, which is what global search matched before scopes existed. */
+export const FULL_MESSAGE_SCOPE: MessageSearchScope = Object.freeze({
+	subagents: true,
+	system: true,
+	tools: true,
+});
+
+/** The global search default: what people wrote and read in primary sessions. */
+export const CONVERSATION_MESSAGE_SCOPE: MessageSearchScope = Object.freeze({
+	subagents: false,
+	system: false,
+	tools: false,
+});
 
 /**
  * Search inside one narrator's own timeline.
@@ -236,25 +270,11 @@ export interface ShadowedEntryQuery {
 // Rows
 // ─────────────────────────────────────────────────────────────────────────────
 
-export interface ChapterSearchRow {
-	id: string;
-	title: string | null;
-	description: string | null;
-	status: string | null;
-	role: string | null;
-	projectName: string | null;
-	createdAt: string | null;
-	updatedAt: string | null;
-	snippet: string;
-	rank: RelevanceRank;
-}
-
 export interface MessageSearchRow {
 	id: string;
 	narratorId: string | null;
 	narratorTitle: string | null;
-	chapterId: string | null;
-	chapterTitle: string | null;
+	/** Name of the narrator's project (the `resolveNarratorProjectId` rule), if it has one. */
 	projectName: string | null;
 	model: string | null;
 	messageRole: string | null;
@@ -274,8 +294,7 @@ export interface MessageSearchRow {
 export interface NarratorSearchRow {
 	id: string;
 	title: string | null;
-	chapterId: string | null;
-	chapterTitle: string | null;
+	/** See {@link MessageSearchRow.projectName}. */
 	projectName: string | null;
 	status: string | null;
 	model: string | null;
@@ -302,7 +321,6 @@ export interface RecallMessageRow {
 	messageId: string;
 	narratorId: string;
 	narratorTitle: string | null;
-	chapterId: string | null;
 	role: string;
 	createdAt: string;
 	snippet: string;

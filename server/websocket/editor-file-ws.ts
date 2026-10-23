@@ -115,8 +115,6 @@ eventBus.onAny((event) => {
 	if (
 		event.type.startsWith("device:") ||
 		event.type.startsWith("oauth:") ||
-		event.type === "chapter:files_changed" ||
-		event.type === "chapter:dormant" ||
 		event.type === "auth:changed"
 	)
 		editorFileSubscriptions.hint();

@@ -1,12 +1,13 @@
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { api } from "../lib/api";
-import type { SearchSortMode } from "../lib/search-utils";
+import type { SearchInclude, SearchSortMode } from "../lib/search-utils";
 
 export function useSearch(
 	query: string,
-	entities = "chapters,messages,narrators",
+	entities = "messages,narrators",
 	sort: SearchSortMode = "relevance",
+	include: readonly SearchInclude[] = [],
 ) {
 	const normalizedQuery = query.trim();
 	const [debouncedQuery, setDebouncedQuery] = useState(normalizedQuery);
@@ -20,10 +21,16 @@ export function useSearch(
 
 	return {
 		...useQuery({
-			queryKey: ["search", debouncedQuery, entities, sort],
+			queryKey: ["search", debouncedQuery, entities, sort, include.join(",")],
 			// Title/type only reorder the relevance-selected candidates on the page.
 			queryFn: ({ signal }) =>
-				api.search(debouncedQuery, entities, sort === "time" ? "time" : "relevance", signal),
+				api.search(
+					debouncedQuery,
+					entities,
+					sort === "time" ? "time" : "relevance",
+					signal,
+					include,
+				),
 			enabled: debouncedQuery.length > 0,
 			staleTime: 30_000,
 			gcTime: 60_000,

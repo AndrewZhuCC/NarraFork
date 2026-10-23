@@ -358,7 +358,6 @@ export interface DatabaseStorageBreakdown {
 export type DatabaseCleanupTarget = "archivedSessions" | "staleSessions" | "toolCallPayloads";
 
 export type DatabaseCleanupBlockedReasonCode =
-	| "chapterBound"
 	| "runningTerminal"
 	| "backgroundRunning"
 	| "nonArchived"
@@ -403,7 +402,6 @@ export interface DatabaseCleanupApiRequestSample extends FallbackDiagnostics {
 	id: string;
 	narratorId: string | null;
 	narratorTitle: string | null;
-	chapterTitle: string | null;
 	createdAt: string;
 	approxBytes: number;
 }
@@ -939,6 +937,24 @@ export interface BufferMessageSummary {
 	queueMode?: "turn" | "tool" | "interrupt";
 }
 
+/**
+ * One block of a message as the block-keyed protocol names it (docs/BLOCK_STORAGE-DESIGN.md
+ * §8): its id, what it is, and the elements `[from, to)` of `contentJson` it holds.
+ */
+export interface MessageBlockRef {
+	id: string;
+	kind: string;
+	subtype: string | null;
+	phase: string;
+	revision: number;
+	wireId: string | null;
+	attemptId: string | null;
+	/** An edited output block keeps its body from before the first edit. */
+	hasOriginal: boolean;
+	from: number;
+	to: number;
+}
+
 export interface TreeMessage {
 	/** Actual model/provider for this message, not the narrator's current selection. */
 	model?: string | null;
@@ -992,6 +1008,11 @@ export interface TreeMessage {
 	deliveryState?: "queued" | "claimed" | "materialized" | "failed" | "cancelled" | null;
 	createdAt: string;
 	children: TreeMessage[];
+	/**
+	 * The message's blocks over `contentJson`, when it arrived in the block-keyed protocol
+	 * (`lib/block-protocol.ts`); absent from a v1 server.
+	 */
+	blockRefs?: MessageBlockRef[];
 	/** Maps each index in the (possibly filtered/reordered) contentJson back to its index in the original contentJson. */
 	_blockOriginalIndices?: number[];
 	/**

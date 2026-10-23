@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { FILE_CHANGE_LIMITS, type FileChangeState } from "@shared/file-change-protocol";
 import { and, eq, inArray } from "drizzle-orm";
@@ -24,6 +24,7 @@ import { FileChangeBlobStore } from "../file-change-blob-store";
 import { createFileChangeIdentity, fileChangeIdentityKey } from "../file-change-identity";
 import { narratorService } from "../narrator-service";
 import { getToolEditPreview, readToolEditPreviewState } from "../tool-edit-preview";
+import { treeSnapshotPhysicalDir } from "../tree-snapshot-paths";
 import { worktreeTreeSnapshot } from "../worktree-tree-snapshot";
 
 const now = "2026-09-08T00:00:00.000Z";
@@ -646,7 +647,7 @@ describe("local historical tree fallback", () => {
 			expect(result.before).toEqual({ status: "unavailable", reason: "missing_evidence" });
 			expect(result.after).toEqual({ status: "unavailable", reason: "missing_evidence" });
 		} finally {
-			await worktreeTreeSnapshot.destroy(root, "local");
+			await rm(treeSnapshotPhysicalDir("local", root), { recursive: true, force: true });
 		}
 	});
 
@@ -725,6 +726,6 @@ describe("local historical tree fallback", () => {
 				options,
 			),
 		).toEqual({ status: "unavailable", reason: "binary" });
-		await worktreeTreeSnapshot.destroy(root, "local");
+		await rm(treeSnapshotPhysicalDir("local", root), { recursive: true, force: true });
 	});
 });

@@ -133,6 +133,7 @@ function projectChatRow(row: ChatRowInput, labels: ChatTreeProjectionLabels): Tr
 					avatarColor: message.sender.avatarColor,
 					avatarImageId: message.sender.avatarImageId,
 					...(message.sender.isGuest ? { isGuest: true } : {}),
+					...(message.sender.isBot ? { isBot: true } : {}),
 				}
 			: null,
 		children: [],

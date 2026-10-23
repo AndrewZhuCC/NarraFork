@@ -5,7 +5,7 @@
  *
  * The first version of this feature carried `sessionNarratorId` + `sessionMessageId`
  * on the bubble's data: two fields for one target kind. Three more kinds then wanted
- * in (a knowledge entry, a Dynamic Spec file, a review chapter), and the flat shape
+ * in (a knowledge entry, a Dynamic Spec file), and the flat shape
  * scales badly in a specific way — not just "more fields", but fields that are
  * mutually exclusive with no way to say so. Nothing would stop a row from carrying a
  * narrator id AND a spec uri, and the integration layer would silently pick whichever
@@ -42,17 +42,14 @@
  * - `spec` — a Dynamic Spec file, addressed by its `spec://` uri. The panel is a
  *   singleton with a file selector, so the uri selects within it rather than opening
  *   an instance per file.
- * - `chapter` — a chapter (a review's own chapter, a merge's source chapter). Always a
- *   route, never a dock panel: a chapter is not a panel kind.
  */
 export type InjectionTarget =
 	| { kind: "narrator"; narratorId: string; messageId?: string | null }
 	| { kind: "knowledge"; entryId: string; scope: "global" | "personal" }
-	| { kind: "spec"; uri: string }
-	| { kind: "chapter"; chapterId: string };
+	| { kind: "spec"; uri: string };
 
 /** Every target kind, for exhaustiveness checks and runtime validation. */
-const INJECTION_TARGET_KINDS = new Set(["narrator", "knowledge", "spec", "chapter"]);
+const INJECTION_TARGET_KINDS = new Set(["narrator", "knowledge", "spec"]);
 
 /**
  * Narrow a value read off measured data back to an `InjectionTarget`.
@@ -91,10 +88,6 @@ export function coerceInjectionTarget(value: unknown): InjectionTarget | undefin
 		case "spec": {
 			const uri = str(raw.uri);
 			return uri ? { kind: "spec", uri } : undefined;
-		}
-		case "chapter": {
-			const chapterId = str(raw.chapterId);
-			return chapterId ? { kind: "chapter", chapterId } : undefined;
 		}
 		default:
 			return undefined;

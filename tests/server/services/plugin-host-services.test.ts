@@ -204,7 +204,7 @@ describe("PluginHostServices", () => {
 		});
 		publicApi.commands.register({
 			commandId: "narrafork.test.command",
-			capability: "command.chapter.write",
+			capability: "command.routine.write",
 			inputSchema: z.object({ value: z.string() }).strict(),
 			sideEffect: "none",
 			handler: async (input) => ({ data: { echoed: input.value } }),
@@ -221,7 +221,7 @@ describe("PluginHostServices", () => {
 		});
 		const capabilities: StoredPermissionGrant["capability"][] = [
 			"query.read.projects",
-			"command.chapter.write",
+			"command.routine.write",
 			"event.subscribe.public",
 			"storage.read_self",
 			"storage.write_self",

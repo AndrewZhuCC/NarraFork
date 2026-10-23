@@ -10,6 +10,7 @@
  *   - a text or reasoning delta (`stream_event` content_block_delta) → `block_delta`
  *     addressed by block id, after `block_opened` when it is the element's first;
  *   - a tool call's first input chunk → `block_opened`, then the chunk as it is;
+ *   - `tool_started` / `tool_completed` → the same frame naming its tool block (`blockId`);
  *   - every other frame as it is.
  * Block ids of streaming elements come from `narrator-block-ids.ts`, the same ids the
  * store's sync gives their rows at the next checkpoint. The reconnect snapshot and
@@ -18,12 +19,14 @@
  */
 
 import { blockIdForElement } from "../services/narrator-block-ids";
-import { toEnvelopes } from "../services/narrator-block-page";
+import { ledgerBlockId, toEnvelopes } from "../services/narrator-block-page";
 import type { NarratorServerMessage } from "./narrator-ws-types";
 
 type Frame = Record<string, unknown> & { type: string };
 
 const MESSAGE_FRAMES = new Set(["message", "user_message", "message_updated"]);
+/** Tool lifecycle frames a client patches into the tool block's card. */
+const TOOL_FRAMES = new Set(["tool_started", "tool_completed"]);
 
 function record(value: unknown): Record<string, unknown> | undefined {
 	return value && typeof value === "object" && !Array.isArray(value)
@@ -125,10 +128,22 @@ export function toolOpened(frame: Frame): NarratorServerMessage | undefined {
 	};
 }
 
+/** A tool lifecycle frame naming the block its ledger attempt belongs to (`blockId`). */
+function withToolBlock(frame: Frame): NarratorServerMessage | undefined {
+	const toolUseId = text(frame.toolUseId);
+	if (!toolUseId) return undefined;
+	const narratorIds = [text(frame.narratorId), text(frame.subagentNarratorId)].filter(
+		(id): id is string => !!id,
+	);
+	const blockId = ledgerBlockId(text(frame.toolCallId), toolUseId, narratorIds);
+	return blockId ? ({ ...frame, blockId } as unknown as NarratorServerMessage) : undefined;
+}
+
 /** The frames a v2 connection receives for one v1 broadcast frame. */
 export function toBlockFrames(message: NarratorServerMessage): NarratorServerMessage[] {
 	const frame = message as unknown as Frame;
 	if (MESSAGE_FRAMES.has(frame.type)) return [upserted(frame) ?? message];
+	if (TOOL_FRAMES.has(frame.type)) return [withToolBlock(frame) ?? message];
 	if (frame.type === "stream_event") return delta(frame) ?? [message];
 	if (frame.type === "tool_use_chunk") {
 		const opened = toolOpened(frame);
@@ -161,19 +176,23 @@ export function toBlockSnapshot<T extends Frame>(snapshot: T): T & { protocol: 2
 	};
 }
 
-/** A v1 catch-up frame in protocol v2: its rows, children included, as envelopes + blocks. */
+/**
+ * A v1 catch-up frame in protocol v2: its rows, children included, as envelopes + blocks.
+ * `orphanMessageIds` names the rows v1 sent as `orphanChildren` (children whose parent row
+ * is not in this catch-up); every other row without a parent was in `topLevel`.
+ */
 export function toBlockCatchUp(frame: Frame): Frame {
-	const rows = [
-		...(Array.isArray(frame.topLevel) ? frame.topLevel : []),
-		...(Array.isArray(frame.orphanChildren) ? frame.orphanChildren : []),
-	] as Array<Record<string, unknown> & { id: string }>;
+	type Row = Record<string, unknown> & { id: string };
+	const topLevel = (Array.isArray(frame.topLevel) ? frame.topLevel : []) as Row[];
+	const orphans = (Array.isArray(frame.orphanChildren) ? frame.orphanChildren : []) as Row[];
 	const { topLevel: _top, orphanChildren: _orphans, ...rest } = frame;
 	return {
 		...(rest as Omit<Frame, "type">),
 		type: "catch_up",
 		narratorId: frame.narratorId as string,
 		protocol: 2,
-		...toEnvelopes(rows),
+		...toEnvelopes([...topLevel, ...orphans]),
+		orphanMessageIds: orphans.map((row) => row.id),
 		subagentActivities: Array.isArray(frame.subagentActivities) ? frame.subagentActivities : [],
 	};
 }

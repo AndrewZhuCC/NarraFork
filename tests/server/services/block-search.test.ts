@@ -5,10 +5,11 @@
  * blocks are unchanged.
  */
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { FULL_MESSAGE_SCOPE } from "../../../server/services/search/types";
 import { getTestDb } from "../../setup";
 
 const { db, sqlite } = getTestDb();
-mock.module("../../../server/db", () => ({ db, sqlite }));
+mock.module("../../../server/db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 
 const { createSqliteSearchStore } = await import("../../../server/services/search/sqlite-store");
 const searchStore = createSqliteSearchStore(async (sql, params) =>
@@ -61,10 +62,8 @@ beforeEach(() => {
 	sqlite.exec(`
 		INSERT INTO projects (id, name, git_path, created_at, updated_at)
 		VALUES ('p1', 'Proj', '/tmp/repo', '${NOW}', '${NOW}');
-		INSERT INTO chapters (id, project_id, title, branch, base_branch, created_at, updated_at)
-		VALUES ('ch1', 'p1', 'Chapter', 'chapter/ch1', 'main', '${NOW}', '${NOW}');
-		INSERT INTO narrators (id, chapter_id, type, inherit_mode, created_at, updated_at)
-		VALUES ('n1', 'ch1', 'primary', 'fresh', '${NOW}', '${NOW}');
+		INSERT INTO narrators (id, context_project_id, type, inherit_mode, created_at, updated_at)
+		VALUES ('n1', 'p1', 'primary', 'fresh', '${NOW}', '${NOW}');
 	`);
 	envelope("legacy", 1, 1, "zebra crossing in a legacy body");
 	envelope("native", 2, 2, "zebra crossing in the answer");
@@ -82,17 +81,27 @@ afterEach(() => {
 		"narrator_message_refs",
 		"narrator_messages",
 		"narrators",
-		"chapters",
 		"projects",
 	])
 		sqlite.run(`DELETE FROM "${table}"`);
 	sqlite.run("PRAGMA foreign_keys = ON");
 });
 
+/**
+ * Every matching message, across all content kinds. Global search groups hits per narrator,
+ * so the messages are read from each group's `hits`, best first.
+ */
 async function messageHits(query: string, sort?: "time" | "relevance") {
-	return (
-		await searchService.search({ query, entities: ["messages"], principal: ADMIN, sort })
-	).map((hit) => ({ id: hit.id, blockId: hit.blockId }));
+	const groups = await searchService.search({
+		query,
+		entities: ["messages"],
+		principal: ADMIN,
+		sort,
+		scope: FULL_MESSAGE_SCOPE,
+	});
+	return groups.flatMap((group) =>
+		(group.hits ?? []).map((hit) => ({ id: hit.id, blockId: hit.blockId })),
+	);
 }
 
 describe("global message search with block hits", () => {

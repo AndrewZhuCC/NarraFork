@@ -94,7 +94,7 @@ describe("integration authorization cache", () => {
 				input.requirement.operation = "project.list";
 			}),
 			changedKey((input) => {
-				input.requirement.capability = "chapter.read";
+				input.requirement.capability = "narrator.read";
 			}),
 			changedKey((input) => {
 				input.requirement.resource.id = "project-2";

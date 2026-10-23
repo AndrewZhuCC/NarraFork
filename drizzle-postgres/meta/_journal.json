@@ -232,6 +232,34 @@
 			"when": 1792663582482,
 			"tag": "0032_block_state_writes",
 			"breakpoints": true
+		},
+		{
+			"idx": 33,
+			"version": "7",
+			"when": 1792684370944,
+			"tag": "0033_bot_rooms",
+			"breakpoints": true
+		},
+		{
+			"idx": 34,
+			"version": "7",
+			"when": 1792700453990,
+			"tag": "0034_retire_chapter_references",
+			"breakpoints": true
+		},
+		{
+			"idx": 35,
+			"version": "7",
+			"when": 1792700455801,
+			"tag": "0035_retire_narrative_line",
+			"breakpoints": true
+		},
+		{
+			"idx": 36,
+			"version": "7",
+			"when": 1792700457769,
+			"tag": "0036_project_index",
+			"breakpoints": true
 		}
   ]
 }

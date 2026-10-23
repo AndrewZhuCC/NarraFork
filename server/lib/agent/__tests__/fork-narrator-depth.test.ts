@@ -1,7 +1,7 @@
 import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../../tests/setup";
-import { chapters, narrators, projects } from "../../../db/schema";
+import { narrators } from "../../../db/schema";
 
 const { db, sqlite } = getTestDb();
 // Bun's mock.module is process-wide and mock.restore() does not undo it, so the
@@ -25,34 +25,6 @@ function ts() {
 	return new Date(BASE_TIME + tsOffset++ * 1000).toISOString();
 }
 
-function seedProject() {
-	db.insert(projects)
-		.values({ id: "p1", name: "Proj", gitPath: "/tmp/repo", createdAt: ts(), updatedAt: ts() })
-		.run();
-}
-
-/** Insert a chain of chapters, each forked from the previous one. */
-function seedChapterChain(length: number): string[] {
-	const ids: string[] = [];
-	for (let i = 0; i < length; i++) {
-		const id = `ch-${i}`;
-		db.insert(chapters)
-			.values({
-				id,
-				projectId: "p1",
-				title: `Chapter ${i}`,
-				branch: i === 0 ? "main" : `chapter/c${i}`,
-				baseBranch: "main",
-				parentChapterId: i === 0 ? null : `ch-${i - 1}`,
-				createdAt: ts(),
-				updatedAt: ts(),
-			})
-			.run();
-		ids.push(id);
-	}
-	return ids;
-}
-
 /** Insert a chain of standalone narrators, each forked from the previous one. */
 function seedNarratorChain(length: number): string[] {
 	const ids: string[] = [];
@@ -61,7 +33,6 @@ function seedNarratorChain(length: number): string[] {
 		db.insert(narrators)
 			.values({
 				id,
-				chapterId: null,
 				parentNarratorId: i === 0 ? null : `n-${i - 1}`,
 				title: `Narrator ${i}`,
 				createdAt: ts(),
@@ -79,65 +50,47 @@ afterEach(() => {
 });
 
 describe("resolveForkDepth", () => {
-	test("a root chapter has no ancestors", async () => {
-		seedProject();
-		seedChapterChain(1);
-		expect(await resolveForkDepth({ id: "any", chapterId: "ch-0" })).toBe(0);
+	test("follows narrator lineage to its root", async () => {
+		seedNarratorChain(4);
+		expect(await resolveForkDepth({ id: "n-3" })).toBe(3);
 	});
 
-	test("counts chapter ancestors, not chapters in the project", async () => {
+	test("a narrator with no parent is depth 0", async () => {
+		seedNarratorChain(1);
+		expect(await resolveForkDepth({ id: "n-0" })).toBe(0);
+	});
+
+	test("counts ancestors, not siblings", async () => {
 		// Breadth must not read as depth: three siblings off the root are depth 1, not 3.
-		seedProject();
-		seedChapterChain(1);
+		seedNarratorChain(1);
 		for (const suffix of ["a", "b", "c"]) {
-			db.insert(chapters)
+			db.insert(narrators)
 				.values({
-					id: `ch-${suffix}`,
-					projectId: "p1",
+					id: `n-${suffix}`,
+					parentNarratorId: "n-0",
 					title: `Sibling ${suffix}`,
-					branch: `chapter/${suffix}`,
-					baseBranch: "main",
-					parentChapterId: "ch-0",
 					createdAt: ts(),
 					updatedAt: ts(),
 				})
 				.run();
 		}
-		expect(await resolveForkDepth({ id: "any", chapterId: "ch-b" })).toBe(1);
-	});
-
-	test("follows a chapter chain to its root", async () => {
-		seedProject();
-		seedChapterChain(5);
-		expect(await resolveForkDepth({ id: "any", chapterId: "ch-4" })).toBe(4);
-	});
-
-	test("uses narrator lineage when the narrator is standalone", async () => {
-		seedNarratorChain(4);
-		expect(await resolveForkDepth({ id: "n-3", chapterId: null })).toBe(3);
-	});
-
-	test("a standalone narrator with no parent is depth 0", async () => {
-		seedNarratorChain(1);
-		expect(await resolveForkDepth({ id: "n-0", chapterId: null })).toBe(0);
+		expect(await resolveForkDepth({ id: "n-b" })).toBe(1);
 	});
 
 	test("terminates on a cycle instead of walking forever", async () => {
-		// `parent_chapter_id` is a self-reference with no constraint forbidding a cycle,
+		// `parent_narrator_id` is a self-reference with no constraint forbidding a cycle,
 		// and this runs on the main thread, so the walk cannot trust the data's shape.
-		seedProject();
-		seedChapterChain(3);
-		db.update(chapters).set({ parentChapterId: "ch-2" }).where(eq(chapters.id, "ch-0")).run();
+		seedNarratorChain(3);
+		db.update(narrators).set({ parentNarratorId: "n-2" }).where(eq(narrators.id, "n-0")).run();
 
-		const depth = await resolveForkDepth({ id: "any", chapterId: "ch-2" });
+		const depth = await resolveForkDepth({ id: "n-2" });
 		expect(Number.isFinite(depth)).toBe(true);
 	});
 
-	test("a missing chapter row resolves to 0 rather than throwing", async () => {
+	test("a missing narrator row resolves to 0 rather than throwing", async () => {
 		// Fork must not be blocked by a dangling reference; refusing is worse than
 		// treating unknown lineage as shallow.
-		seedProject();
-		expect(await resolveForkDepth({ id: "any", chapterId: "ch-does-not-exist" })).toBe(0);
+		expect(await resolveForkDepth({ id: "n-does-not-exist" })).toBe(0);
 	});
 });
 

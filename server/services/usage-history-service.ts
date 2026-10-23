@@ -1,5 +1,5 @@
 import { db } from "@server/db";
-import { apiRequests, chapters, narrators, users } from "@server/db/schema";
+import { apiRequests, narrators, users } from "@server/db/schema";
 import { readQuery } from "@server/db/worker-read";
 import { aggregateCostStatus, type CostStatus } from "@server/lib/cost-estimate";
 import { resolveCredentialDisplayName } from "@server/lib/credential-display-name";
@@ -9,6 +9,7 @@ import {
 	encodeUsageHistoryCursor,
 	type UsageHistoryCursor,
 } from "@server/lib/usage-history-cursor";
+import { narratorProjectIdColumn } from "@server/services/narrator-project";
 import { normalizeModelFamily } from "@shared/model-id";
 
 const costCoverageSelection = {
@@ -48,7 +49,6 @@ export interface UsageHistoryFilters {
 	/** Historical owner; __unattributed__ selects requests with no recorded owner. */
 	userId?: string;
 	narratorId?: string;
-	chapterId?: string;
 	projectId?: string;
 	provider?: string;
 	/** Exact credential id — narrows history to one account in a provider pool. */
@@ -331,8 +331,6 @@ export interface UsageHistoryRecord {
 	createdAt: string;
 	errorMessage?: string | null;
 	narratorTitle?: string | null;
-	chapterTitle?: string | null;
-	chapterId?: string | null;
 	projectId?: string | null;
 	/** Bounded diagnostics summary exists (list rows never carry its content). */
 	hasDiagnostics?: boolean;
@@ -371,8 +369,6 @@ interface UsageHistoryListRow {
 	errorMessage: string | null;
 	createdAt: string;
 	narratorTitle: string | null;
-	chapterTitle: string | null;
-	chapterId: string | null;
 	projectId: string | null;
 }
 
@@ -472,7 +468,6 @@ export class UsageHistoryService {
 			.select({ count: sql<number>`count(*)` })
 			.from(apiRequests)
 			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
-			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
 			.leftJoin(users, eq(apiRequests.userId, users.id))
 			.where(and(...conditions));
 
@@ -510,13 +505,10 @@ export class UsageHistoryService {
 				errorMessage: apiRequests.errorMessage,
 				createdAt: apiRequests.createdAt,
 				narratorTitle: narrators.title,
-				chapterTitle: chapters.title,
-				chapterId: narrators.chapterId,
-				projectId: chapters.projectId,
+				projectId: narratorProjectIdColumn,
 			})
 			.from(apiRequests)
 			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
-			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
 			.leftJoin(users, eq(apiRequests.userId, users.id))
 			.where(and(...conditions))
 			.orderBy(desc(apiRequests.createdAt), desc(apiRequests.id))
@@ -579,13 +571,10 @@ export class UsageHistoryService {
 				errorMessage: apiRequests.errorMessage,
 				createdAt: apiRequests.createdAt,
 				narratorTitle: narrators.title,
-				chapterTitle: chapters.title,
-				chapterId: narrators.chapterId,
-				projectId: chapters.projectId,
+				projectId: narratorProjectIdColumn,
 			})
 			.from(apiRequests)
 			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
-			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
 			.leftJoin(users, eq(apiRequests.userId, users.id))
 			.where(and(...conditions))
 			.orderBy(desc(apiRequests.createdAt), desc(apiRequests.id))
@@ -631,7 +620,6 @@ export class UsageHistoryService {
 			})
 			.from(apiRequests)
 			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
-			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
 			.leftJoin(users, eq(apiRequests.userId, users.id))
 			.where(and(...conditions));
 
@@ -698,7 +686,6 @@ export class UsageHistoryService {
 			})
 			.from(apiRequests)
 			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
-			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
 			.leftJoin(users, eq(apiRequests.userId, users.id))
 			.where(and(...conditions))
 			.groupBy(bucket)
@@ -783,13 +770,10 @@ export class UsageHistoryService {
 				errorMessage: apiRequests.errorMessage,
 				createdAt: apiRequests.createdAt,
 				narratorTitle: narrators.title,
-				chapterTitle: chapters.title,
-				chapterId: narrators.chapterId,
-				projectId: chapters.projectId,
+				projectId: narratorProjectIdColumn,
 			})
 			.from(apiRequests)
 			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
-			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
 			.leftJoin(users, eq(apiRequests.userId, users.id))
 			.where(eq(apiRequests.id, id));
 
@@ -840,7 +824,6 @@ export class UsageHistoryService {
 			})
 			.from(apiRequests)
 			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
-			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
 			.leftJoin(users, eq(apiRequests.userId, users.id))
 			.where(and(...conditions))
 			.groupBy(dimensionColumn)
@@ -932,7 +915,6 @@ export class UsageHistoryService {
 			})
 			.from(apiRequests)
 			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
-			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
 			.leftJoin(users, eq(apiRequests.userId, users.id))
 			.where(and(...conditions))
 			.groupBy(dimensionColumn)
@@ -977,7 +959,6 @@ export class UsageHistoryService {
 			})
 			.from(apiRequests)
 			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
-			.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
 			.leftJoin(users, eq(apiRequests.userId, users.id))
 			.where(and(...conditions))
 			.groupBy(bucket, groupedLabel)
@@ -1153,8 +1134,7 @@ export class UsageHistoryService {
 					: eq(apiRequests.narratorId, filters.narratorId),
 			);
 		}
-		if (filters.chapterId) conditions.push(eq(narrators.chapterId, filters.chapterId));
-		if (filters.projectId) conditions.push(eq(chapters.projectId, filters.projectId));
+		if (filters.projectId) conditions.push(eq(narratorProjectIdColumn, filters.projectId));
 		if (provider) conditions.push(eq(apiRequests.provider, provider));
 		// Exact match, backed by idx_api_requests_credential: credential ids are
 		// opaque nanoids, so a LIKE here would only buy a table scan.

@@ -11,7 +11,6 @@ import {
 } from "../db/resource-protection-index";
 import type { WorktreeJournalRecord } from "./narrator-worktree-journal";
 import { createResourceProtectionIndex } from "./resource-protection-index";
-import { treeSnapshotKey, treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
 import type { LifecycleTarget, ResourceClaim } from "./worktree-lifecycle-guard";
 
 let database: Database;
@@ -64,9 +63,8 @@ beforeEach(async () => {
 	receipts = join(root, "worktree-requests");
 	database = new Database(":memory:");
 	database.exec(`
-		CREATE TABLE narrators(id TEXT PRIMARY KEY, cwd TEXT, chapter_id TEXT, default_device_id TEXT,
+		CREATE TABLE narrators(id TEXT PRIMARY KEY, cwd TEXT, default_device_id TEXT,
 			workspace_context TEXT, workspace_revision INTEGER NOT NULL DEFAULT 0, title TEXT);
-		CREATE TABLE chapters(id TEXT PRIMARY KEY, worktree_path TEXT, snapshot_shadow_key TEXT, title TEXT);
 		CREATE TABLE narrator_worktree_resources(id TEXT PRIMARY KEY, device_id TEXT NOT NULL,
 			worktree_path TEXT NOT NULL, repository_key TEXT NOT NULL, scope_project_id TEXT, state TEXT, owner_narrator_id TEXT);
 		CREATE TABLE resource_protection_sources(source TEXT NOT NULL, source_id TEXT NOT NULL,
@@ -252,180 +250,44 @@ describe("resource protection reverse index", () => {
 		).toContain("r");
 		expect(await claims([{ path: root }])).toEqual([]);
 	});
-	test("legacy device/chapter/revision and shadow-only claims remain intact", async () => {
+	test("legacy device/revision and repository claims remain intact", async () => {
 		narrator("n", root, { cwd: root, deviceId: "local", git: { repositoryKey: "rk" } });
-		database.query("UPDATE narrators SET chapter_id='chapter' WHERE id='n'").run();
-		database
-			.query("INSERT INTO chapters(id, snapshot_shadow_key) VALUES ('chapter', ?)")
-			.run(`local\0${root}`);
 		await bootstrap();
 		const found = await claims([{ path: root }]);
-		expect(
-			found.some(
-				(claim) => claim.kind === "narrator" && claim.legacyChapterCwd && claim.revision === 0,
-			),
-		).toBe(true);
-		expect(found.some((claim) => claim.kind === "chapter")).toBe(false);
-		for (const target of [
-			{ shadowKey: treeSnapshotKey("local", root) },
-			{ path: treeSnapshotPhysicalDir("local", root) },
-		]) {
-			expect(
-				(await claims([target])).some(
-					(claim) => claim.kind === "chapter" && claim.shadowKey === treeSnapshotKey("local", root),
-				),
-			).toBe(true);
-		}
+		expect(found.some((claim) => claim.kind === "narrator" && claim.revision === 0)).toBe(true);
 		expect((await claims([{ repositoryKey: "rk" }])).some((claim) => claim.id === "n")).toBe(true);
 	});
-	for (const phase of ["bootstrap", "dirty", "warm"]) {
-		test(`${phase} splits checkout ownership from shadow reference and real physical storage`, async () => {
-			initializeAbsentReceiptProtectionSource(database, receipts);
-			if (phase === "dirty") await bootstrap();
-			const checkout = join(root, "active"),
-				logical = join(root, "old-checkout");
-			database
-				.query(
-					"INSERT INTO chapters(id, worktree_path, snapshot_shadow_key) VALUES ('chapter', ?, ?)",
-				)
-				.run(checkout, treeSnapshotKey("local", logical));
-			if (phase === "warm") await bootstrap();
-			const before = changes();
-			expect(await claims([{ path: logical }])).toEqual([]);
-			const direct = await claims([{ path: checkout }]);
-			expect(direct).toHaveLength(1);
-			expect(direct[0]).toMatchObject({ id: "chapter", path: checkout });
-			expect(direct[0]?.shadowKey).toBeUndefined();
-			for (const target of [
-				{ shadowKey: treeSnapshotKey("local", logical) },
-				{ path: treeSnapshotPhysicalDir("local", logical) },
-			]) {
-				const shadow = await claims([target]);
-				expect(shadow).toHaveLength(1);
-				expect(shadow[0]).toMatchObject({
-					id: "chapter",
-					shadowKey: treeSnapshotKey("local", logical),
-				});
-				expect(shadow[0]?.path).toBeUndefined();
-			}
-			expect(changes()).toBe(before);
-		});
-	}
-	for (const phase of ["bootstrap", "dirty", "warm"]) {
-		test(`${phase} shadow aliases use canonical references but preserve persisted physical hash`, async () => {
-			initializeAbsentReceiptProtectionSource(database, receipts);
-			const one = join(root, "one"),
-				two = join(root, "two"),
-				alias = join(root, "alias");
-			await mkdir(one);
-			await mkdir(two);
-			await symlink(one, alias);
-			if (phase === "dirty") await bootstrap();
-			database
-				.query("INSERT INTO chapters(id, snapshot_shadow_key) VALUES ('chapter', ?)")
-				.run(treeSnapshotKey("local", alias));
-			if (phase === "warm") {
-				await bootstrap();
-				await rm(alias);
-				await symlink(two, alias);
-			}
-			const canonical = phase === "warm" ? two : one;
-			const before = changes();
-			for (const target of [
-				{ shadowKey: treeSnapshotKey("local", canonical) },
-				{ path: treeSnapshotPhysicalDir("local", alias) },
-			])
-				expect((await claims([target])).some((claim) => claim.id === "chapter")).toBe(true);
-			expect(await claims([{ path: canonical }])).toEqual([]);
-			expect(await claims([{ path: treeSnapshotPhysicalDir("local", canonical) }])).toEqual([]);
-			expect(changes()).toBe(before);
-		});
-	}
-	test("a restarted upgraded index with more than one chapter page reads immediately without maintenance", async () => {
-		for (let i = 0; i < 130; i++)
-			database
-				.query("INSERT INTO chapters(id, snapshot_shadow_key) VALUES (?, ?)")
-				.run(`chapter-${i}`, treeSnapshotKey("local", join(root, `old-${i}`)));
+	test("rows of the removed chapter source are purged in bounded maintenance pages", async () => {
+		initializeAbsentReceiptProtectionSource(database, receipts);
 		await bootstrap();
+		const old = join(root, "old-chapter-checkout");
+		const source =
+			database.query(`INSERT INTO resource_protection_sources(source, source_id, dirty, complete)
+			VALUES ('chapter', ?, 0, 1)`);
+		const path = database.query(`INSERT INTO resource_protection_paths
+			(source, source_id, slot, device_id, canonical_path, claim_json) VALUES ('chapter', ?, 0, 'local', ?, ?)`);
+		source.run("");
+		for (let i = 0; i < 130; i++) {
+			const id = `chapter-${i.toString().padStart(3, "0")}`;
+			source.run(id);
+			path.run(id, old, JSON.stringify({ kind: "chapter", id, path: old }));
+		}
+		// Model the upgraded database at process start: the rows predate this index instance.
 		service = createResourceProtectionIndex(database, receipts);
-		const before = changes();
-		expect(await claims([{ path: join(root, "checkout") }])).toEqual([]);
-		expect(
-			await claims([{ path: treeSnapshotPhysicalDir("local", join(root, "cold")) }], false),
-		).toEqual([]);
-		expect(
-			(await claims([{ shadowKey: treeSnapshotKey("local", join(root, "old-129")) }])).some(
-				(claim) => claim.id === "chapter-129",
-			),
-		).toBe(true);
-		expect(changes()).toBe(before);
-	});
-	test("unrelated old shadow slots never gate checkout reads or cold physical creation", async () => {
-		database
-			.query("INSERT INTO chapters(id, snapshot_shadow_key) VALUES ('old', ?)")
-			.run(treeSnapshotKey("local", join(root, "unrelated")));
-		await bootstrap();
-		database
-			.query("UPDATE resource_protection_paths SET slot=0, canonical_path=? WHERE source='chapter'")
-			.run(join(root, "unrelated"));
-		service = createResourceProtectionIndex(database, receipts);
-		const before = changes();
-		expect(await claims([{ path: join(root, "checkout") }])).toEqual([]);
-		expect(
-			await claims([{ path: treeSnapshotPhysicalDir("local", join(root, "cold")) }], false),
-		).toEqual([]);
-		expect(await claims([{ path: join(root, "unrelated") }])).toEqual([]);
-		expect(
-			(await claims([{ path: treeSnapshotPhysicalDir("local", join(root, "unrelated")) }])).some(
-				(claim) => claim.id === "old",
-			),
-		).toBe(true);
-		expect(changes()).toBe(before);
-	});
-	test("legacy clean shadow slots rebuild in bounded pages without revoking old receipt pins", async () => {
-		await mkdir(receipts);
-		const file = join(receipts, `${"a".repeat(64)}.json`);
-		await writeFile(file, JSON.stringify(receipt(join(root, "pinned"))));
-		for (let i = 0; i < 130; i++)
-			database
-				.query("INSERT INTO chapters(id, snapshot_shadow_key) VALUES (?, ?)")
-				.run(`chapter-${i.toString().padStart(3, "0")}`, treeSnapshotKey("local", root));
-		await bootstrap();
-		const pins = database
-			.query("SELECT * FROM resource_protection_paths WHERE source = 'receipt'")
-			.all();
-		// Emulate the already-clean logical-cwd projection shipped before this fix.
-		database
-			.query(
-				"UPDATE resource_protection_paths SET slot = 0, canonical_path = ? WHERE source = 'chapter'",
-			)
-			.run(root);
-		service = createResourceProtectionIndex(database, receipts);
-		const target = [{ path: treeSnapshotPhysicalDir("local", root) }];
-		const before = changes();
-		expect(await claims(target)).toHaveLength(130);
-		expect(changes()).toBe(before);
+		const remaining = (table: string) =>
+			(
+				database.query(`SELECT count(*) AS n FROM ${table} WHERE source = 'chapter'`).get() as {
+					n: number;
+				}
+			).n;
 		await service.maintain(deadline());
-		expect(
-			database
-				.query(
-					"SELECT count(*) AS n FROM resource_protection_paths WHERE source='chapter' AND slot >= 0",
-				)
-				.get(),
-		).toEqual({ n: 66 });
-		expect(await claims(target)).toHaveLength(130);
-		await service.maintain(deadline());
-		await service.maintain(deadline());
-		expect(await claims(target)).toHaveLength(130);
-		expect((await claims([{ path: root }])).filter((claim) => claim.kind === "chapter")).toEqual(
-			[],
-		);
-		expect(
-			database.query("SELECT * FROM resource_protection_paths WHERE source = 'receipt'").all(),
-		).toEqual(pins);
-		expect((await claims([{ path: join(root, "pinned") }])).map((claim) => claim.id)).toEqual([
-			file,
-		]);
+		// One bounded page per pass, never one unbounded delete on the main thread.
+		expect(remaining("resource_protection_paths")).toBe(130 - 64);
+		expect(remaining("resource_protection_sources")).toBe(131 - 64);
+		for (let pass = 0; pass < 3; pass++) await service.maintain(deadline());
+		expect(remaining("resource_protection_paths")).toBe(0);
+		expect(remaining("resource_protection_sources")).toBe(0);
+		expect(await claims([{ path: old }])).toEqual([]);
 	});
 	test("warm known aliases are revalidated without maintenance writes", async () => {
 		const one = join(root, "one"),
@@ -800,12 +662,9 @@ describe("one-time legacy receipt pins", () => {
 				await expect(work).rejects.toThrow();
 				narrator("business-narrator", root);
 				registry("business-registry", root);
-				database
-					.query("INSERT INTO chapters(id, worktree_path) VALUES ('business-chapter', ?)")
-					.run(root);
 				await service.maintain(deadline());
 				expect(opens).toBe(1); // No second open/read while the first IO or its close is unresolved.
-				expect(await claims([{ path: root }], false)).toHaveLength(3);
+				expect(await claims([{ path: root }], false)).toHaveLength(2);
 				expect((await service.read([{ path: root }], deadline())).complete).toBe(false);
 				release.resolve();
 				await closed.promise;

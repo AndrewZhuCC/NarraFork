@@ -11,7 +11,6 @@ import { formatOriginLabel } from "@shared/message-origin";
 import { and, desc, eq, inArray, like, ne } from "drizzle-orm";
 import { db } from "../db";
 import {
-	chapters,
 	gatewaySessionMappings,
 	narratorMessageRefs,
 	narratorMessages,
@@ -621,9 +620,8 @@ class Gateway {
 		const narratorId = generateId();
 		const mappingId = generateId();
 
-		// Resolve project/chapter binding
-		const projectId = this.config?.defaultProjectId ?? null;
-		const chapterId = this.config?.defaultChapterId ?? null;
+		// Resolve the project binding
+		let projectId = this.config?.defaultProjectId ?? null;
 
 		// Validate project exists if specified
 		if (projectId) {
@@ -633,6 +631,7 @@ class Gateway {
 			});
 			if (!project) {
 				logger.warn(`[gateway] Default project ${projectId} not found, creating unbound narrator`);
+				projectId = null;
 			}
 		}
 
@@ -644,7 +643,7 @@ class Gateway {
 		const gwPermMode = this.config?.defaultPermissionMode ?? "default";
 		await db.insert(narrators).values({
 			id: narratorId,
-			chapterId: chapterId,
+			contextProjectId: projectId,
 			type: "primary",
 			title: `IM: ${msg.username} (${msg.platform})`,
 			status: "idle",
@@ -664,7 +663,7 @@ class Gateway {
 			isBackground: false,
 			isAskInPassing: false,
 			variant: "primary",
-			traits: chapterId ? [] : ["standalone"],
+			traits: ["standalone"],
 			messageVersion: 0,
 			// Access control: the auto-resolved deployment user owns the session, the
 			// same id already used for attribution and knowledge-base reads below. It
@@ -688,7 +687,6 @@ class Gateway {
 			narratorId,
 			appUserId,
 			projectId,
-			chapterId,
 			lastMessageAt: now,
 			createdAt: now,
 			updatedAt: now,
@@ -1540,8 +1538,6 @@ class Gateway {
 		const narratorIds: string[] = [];
 		for (const t of tabs) {
 			if (t.type === "narrator" && typeof t.id === "string") narratorIds.push(t.id);
-			else if (t.type === "chapter" && typeof t.narratorId === "string")
-				narratorIds.push(t.narratorId);
 		}
 
 		// Batch-fetch narrator statuses
@@ -1554,7 +1550,7 @@ class Gateway {
 			for (const r of rows) statusMap.set(r.id, r.status);
 		}
 
-		// Format output: group by workspace, show narrator/chapter tabs
+		// Format output: group by workspace, show narrator tabs
 		const lines: string[] = [t("gateway.recentTabs", locale)];
 		const orderedNarratorIds: string[] = [];
 		let idx = 0;
@@ -1703,14 +1699,14 @@ class Gateway {
 					title: string | null;
 					status: string;
 					model: string | null;
-					chapterId: string | null;
+					contextProjectId: string | null;
 			  }
 			| undefined;
 
 		// Try exact match first
 		narrator = await db.query.narrators.findFirst({
 			where: eq(narrators.id, trimmed),
-			columns: { id: true, title: true, status: true, model: true, chapterId: true },
+			columns: { id: true, title: true, status: true, model: true, contextProjectId: true },
 		});
 
 		// If not found, try prefix match (LIKE)
@@ -1719,7 +1715,7 @@ class Gateway {
 			const escaped = trimmed.replace(/[%_]/g, "\\$&");
 			narrator = await db.query.narrators.findFirst({
 				where: like(narrators.id, `${escaped}%`),
-				columns: { id: true, title: true, status: true, model: true, chapterId: true },
+				columns: { id: true, title: true, status: true, model: true, contextProjectId: true },
 			});
 		}
 
@@ -1729,17 +1725,15 @@ class Gateway {
 		}
 
 		// Ownership check: if the gateway has a default project, only allow
-		// switching to narrators that belong to that project (via chapter).
+		// switching to narrators that belong to that project.
 		const defaultProjectId = this.config?.defaultProjectId;
-		if (defaultProjectId && narrator.chapterId) {
-			const chapter = await db.query.chapters.findFirst({
-				where: eq(chapters.id, narrator.chapterId),
-				columns: { projectId: true },
-			});
-			if (chapter && chapter.projectId !== defaultProjectId) {
-				await adapter.send(msg.chatId, t("gateway.narratorWrongProject", locale));
-				return;
-			}
+		if (
+			defaultProjectId &&
+			narrator.contextProjectId &&
+			narrator.contextProjectId !== defaultProjectId
+		) {
+			await adapter.send(msg.chatId, t("gateway.narratorWrongProject", locale));
+			return;
 		}
 
 		// Find or create the session mapping

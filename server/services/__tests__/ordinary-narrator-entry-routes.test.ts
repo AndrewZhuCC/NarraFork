@@ -3,7 +3,6 @@ import { Hono } from "hono";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
 	aclGrants,
-	chapters,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -18,9 +17,6 @@ mock.module("../../db", () => ({ ...realDb, db, sqlite, activeDatabaseBackend: "
 const { narratorContext } = await import("../narrator-context");
 const { narratorService } = await import("../narrator-service");
 const { gitService } = await import("../git-service");
-const { chapterService } = await import("../chapter-service");
-const { projectDbManager } = await import("../../lib/project-db");
-const projectSync = await import("../project-db-sync");
 const { narratorRoutes } = await import("../../routes/narrators");
 const { projectRoutes } = await import("../../routes/projects");
 const spies: Array<{ mockRestore(): void }> = [];
@@ -51,13 +47,11 @@ function post(app: Hono, path: string, body: unknown = {}) {
 	});
 }
 function counts() {
-	return {
-		chapters: sqlite.query("SELECT count(*) AS n FROM chapters").get(),
-		projects: sqlite.query("SELECT count(*) AS n FROM projects").get(),
-	};
+	return { projects: sqlite.query("SELECT count(*) AS n FROM projects").get() };
 }
-async function source(chapter = true, extra: Partial<typeof narrators.$inferInsert> = {}) {
-	if (chapter) {
+/** The source session; `inProject` puts it in a project working in a subdirectory of it. */
+async function source(inProject = true, extra: Partial<typeof narrators.$inferInsert> = {}) {
+	if (inProject) {
 		await db.insert(projects).values({
 			id: "project",
 			name: "fixture",
@@ -67,20 +61,12 @@ async function source(chapter = true, extra: Partial<typeof narrators.$inferInse
 			createdAt: now,
 			updatedAt: now,
 		});
-		await db.insert(chapters).values({
-			id: "chapter",
-			projectId: "project",
-			title: "fixture",
-			branch: "fixture",
-			baseBranch: "main",
-			worktreePath: "/fixture-host/worktree",
-			createdAt: now,
-			updatedAt: now,
-		});
 	}
 	await db.insert(narrators).values({
 		id: "source",
-		chapterId: chapter ? "chapter" : null,
+		contextProjectId: inProject ? "project" : null,
+		cwd: inProject ? "/fixture-host/worktree" : null,
+		traits: ["standalone"],
 		ownerUserId: "owner",
 		visibility: "private",
 		writeAudience: "owner",
@@ -124,7 +110,7 @@ describe("ordinary HTTP conversation forks", () => {
 		"fresh",
 		"full",
 		"compressed",
-	] as const)("chapter %s HTTP fork keeps model/restrictions with no new chapter/project", async (inheritMode) => {
+	] as const)("project %s HTTP fork keeps model/restrictions/project with no new project", async (inheritMode) => {
 		await source();
 		const before = counts();
 		const response = await post(appFor(), "/narrators/source/fork", {
@@ -136,7 +122,6 @@ describe("ordinary HTTP conversation forks", () => {
 		const result = await response.json();
 		const child = await narratorService.getById(result.id);
 		expect(child).toMatchObject({
-			chapterId: null,
 			contextProjectId: "project",
 			model: "parent-model",
 			permissionMode: "readOnly",
@@ -190,8 +175,8 @@ describe("ordinary HTTP conversation forks", () => {
 	test.each([
 		false,
 		true,
-	])("ask-in-passing chapter=%s promote returns narrator route identity, not a chapter, without widening", async (chapter) => {
-		await source(chapter, { traits: ["ask-in-passing"], isAskInPassing: true });
+	])("ask-in-passing inProject=%s promote returns narrator route identity without widening", async (inProject) => {
+		await source(inProject, { traits: ["standalone", "ask-in-passing"], isAskInPassing: true });
 		const before = counts();
 		const response = await post(appFor(), "/narrators/source/promote");
 		expect(response.status).toBe(200);
@@ -199,29 +184,21 @@ describe("ordinary HTTP conversation forks", () => {
 		expect(typeof result.narratorId).toBe("string");
 		expect(result).not.toHaveProperty("chapter");
 		const child = await narratorService.getById(result.narratorId);
-		expect(child.chapterId).toBeNull();
+		expect(child.contextProjectId).toBe(inProject ? "project" : null);
 		expect(child.permissionMode).toBe("readOnly");
 		expect(child.isAskInPassing).toBe(false);
 		expect(counts()).toEqual(before);
 	});
 });
 
-describe("project creation does not synthesize ordinary root chapters", () => {
+describe("project creation creates context only, no sessions", () => {
 	function isolateProjectFilesystem() {
 		spies.push(spyOn(gitService, "isGitRepo").mockResolvedValue(true));
 		spies.push(spyOn(gitService, "getCurrentBranch").mockResolvedValue("main"));
 		spies.push(spyOn(gitService, "cloneRepoStreaming").mockResolvedValue(undefined));
-		spies.push(spyOn(gitService, "commitGitignoreIfDirty").mockResolvedValue(undefined));
-		spies.push(spyOn(projectDbManager, "openForGitPath").mockReturnValue({} as never));
-		spies.push(spyOn(projectSync, "ensureGitignoreEntry").mockImplementation(() => {}));
-		const create = spyOn(chapterService, "create").mockImplementation(async () => {
-			throw new Error("must not create root chapter");
-		});
-		spies.push(create);
-		return create;
 	}
 	test("ordinary project POST creates context only", async () => {
-		const create = isolateProjectFilesystem();
+		isolateProjectFilesystem();
 		const response = await post(appFor(), "/projects", {
 			name: "fixture",
 			repoMode: "existing",
@@ -229,12 +206,10 @@ describe("project creation does not synthesize ordinary root chapters", () => {
 		});
 		expect(response.status).toBe(201);
 		expect(await db.select().from(projects)).toHaveLength(1);
-		expect(await db.select().from(chapters)).toHaveLength(0);
 		expect(await db.select().from(narrators)).toHaveLength(0);
-		expect(create).not.toHaveBeenCalled();
 	});
 	test("clone SSE completion creates context only without real network/filesystem", async () => {
-		const create = isolateProjectFilesystem();
+		isolateProjectFilesystem();
 		const response = await post(appFor(), "/projects", {
 			name: "fixture",
 			repoMode: "clone",
@@ -244,8 +219,6 @@ describe("project creation does not synthesize ordinary root chapters", () => {
 		expect(response.status).toBe(200);
 		expect(await response.text()).toContain("event: complete");
 		expect(await db.select().from(projects)).toHaveLength(1);
-		expect(await db.select().from(chapters)).toHaveLength(0);
 		expect(await db.select().from(narrators)).toHaveLength(0);
-		expect(create).not.toHaveBeenCalled();
 	});
 });

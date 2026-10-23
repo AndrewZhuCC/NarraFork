@@ -19,11 +19,7 @@ import {
 import { detectShell } from "../../lib/agent/shell";
 import { getMissingWorkingDirectoryRecovery, SHELL_TOOL_NAME } from "../../lib/agent/tools/bash";
 import { clearBehaviorFenceEditGrant } from "../../lib/agent/tools/behavior-fence-grant";
-import {
-	KNOWLEDGE_KIND_DENY_CORE,
-	OPTIONAL_TOOLS,
-	REVIEW_TOOLS,
-} from "../../lib/agent/tools/index";
+import { KNOWLEDGE_KIND_DENY_CORE, OPTIONAL_TOOLS } from "../../lib/agent/tools/index";
 import { buildAttachedFilesHint } from "../../lib/attached-files";
 import { normalizeBooleanOverride, resolveBooleanOverride } from "../../lib/boolean-override";
 import { queueContextCharacterRefresh } from "../../lib/context-characters";
@@ -36,12 +32,18 @@ import {
 	getBlockedSkills,
 	getDisabledToolSet,
 } from "../../lib/narrator-custom-traits";
-import { isPlanModeTrait, parseSubstatus, redactDraftTraits } from "../../lib/narrator-utils";
+import {
+	isBotNarrator,
+	isPlanModeTrait,
+	parseSubstatus,
+	redactDraftTraits,
+} from "../../lib/narrator-utils";
 import { nugAvailabilityPoller } from "../../lib/nug-availability-poller";
 import { resolveKnownUnavailableNugModel } from "../../lib/nug-model-availability";
 import { markNugCachedModelUnavailable } from "../../lib/nug-model-cache";
 import { resolveEffectiveRelaxedPlan } from "../../lib/permission-modes";
 import {
+	getBotModePrompt,
 	getRunDeliveryHint,
 	getToolMessage,
 	getToolMessageWithParams,
@@ -92,7 +94,6 @@ import { awaitRunHold } from "../agent-runtime/run";
 import { getRuntimeQueuePort } from "../agent-runtime/runtime-queue-port";
 import { backgroundTaskService } from "../background-task-service";
 import { getAgentFileReferenceContext } from "../file-reference-context";
-import { gitService } from "../git-service";
 import { getStatusSummaryCached, invalidateStatus } from "../git-status-cache";
 import { injectionKey, knowledgeInjection } from "../knowledge-injection";
 import { knowledgeInjectionReads, knowledgeService } from "../knowledge-service";
@@ -196,7 +197,6 @@ import { abandonSessionTreeSnapshots } from "../narrator-tree-snapshot-hooks";
 import { endTurn, startTurn } from "../narrator-turns";
 import { assertOAuthNarratorRuntimeActive } from "../oauth-narrator-runtime-policy";
 import { resolvePlanApprovalAttribution } from "../plan-approval-attribution";
-import { reviewService } from "../review-service";
 import { subagentRetryRecoveredBroadcast } from "../subagent-executor";
 import { isMcpToolAllowedForNarrator, runtimeToolFilter } from "../subagent-tools";
 import { buildFinalToolStartAuthorization } from "../tool-final-start-authorization";
@@ -211,7 +211,6 @@ import {
 	specContinuationStopNote,
 } from "../turn-continuation-decisions";
 import { registerNarratorLoop } from "../update-coordinator";
-import { worktreeWatcher } from "../worktree-watcher";
 import { createRuntimeEventContext, createRuntimeMessageWriters } from "./context";
 import { buildRuntimeHistory, questionModelReceipts } from "./history";
 import { createRuntimeRunState, type RuntimeRunOutcome } from "./input";
@@ -224,9 +223,8 @@ import { selectRuntimeInterruption, selectRuntimeRecovery } from "./transition";
 /**
  * Where a narrator's file-mutating tool calls should be git-tracked, or null.
  *
- * Chapter narrators track their worktree. Chapter-less narrators track their
- * cwd, but only a local Git repo — gitService spawns local git, so a remote
- * device would report the host's state. Evaluated per tool call rather than
+ * Narrators track their cwd, but only a local Git repo — gitService spawns local
+ * git, so a remote device would report the host's state. Evaluated per tool call rather than
  * per session so a mid-session cwd switch re-evaluates `_isInGitRepo`.
  *
  * Known gap: `_isInGitRepo` is probed at session creation and cwd switches
@@ -235,14 +233,9 @@ import { selectRuntimeInterruption, selectRuntimeRecovery } from "./transition";
  * workspace re-probe interval covers the bar in the meantime.
  */
 export function gitTrackPathForSession(
-	session: Pick<
-		ActiveNarrator,
-		"_worktreePath" | "_chapterId" | "_isInGitRepo" | "_defaultDeviceId" | "cwd"
-	>,
+	session: Pick<ActiveNarrator, "_isInGitRepo" | "_defaultDeviceId" | "cwd">,
 ): string | null {
-	if (session._worktreePath && session._chapterId) return session._worktreePath;
 	if (
-		!session._chapterId &&
 		session._isInGitRepo === true &&
 		(session._defaultDeviceId ?? LOCAL_DEVICE_ID) === LOCAL_DEVICE_ID
 	)
@@ -259,7 +252,7 @@ export async function isGitCommandToolResult(
 	if (toolName !== SHELL_TOOL_NAME || !input) return false;
 	const command = typeof input.command === "string" ? input.command : "";
 	if (!command || !/\bgit\b/.test(command)) return false;
-	const analysis = await analyzeShellCommand(command, cwd, detectShell().type, true);
+	const analysis = await analyzeShellCommand(command, cwd, detectShell().type);
 	return analysis.commands.some((item) => item.tokens[0] === "git");
 }
 
@@ -313,14 +306,17 @@ export async function executeRuntimeRetry(
  * The session's stored base prompt plus projections of its registered relations and
  * capability ceiling. Delivery names its actual recipient; only capability denials
  * state interaction limits. A control grant adds no prompt or behavioral restrictions.
+ * A bot's channel is a relation too: its audience reads only what it sends them, so
+ * the protocol follows the persona rather than replacing it.
  */
 export function runtimeBasePrompt(
-	row: RuntimeSourceRow & { systemPrompt: string | null },
+	row: RuntimeSourceRow & { systemPrompt: string | null; traits?: unknown },
 	locale: Locale,
 	policy: RuntimePolicy,
 ): string | null {
 	const base = row.systemPrompt;
 	const sections: string[] = [];
+	if (isBotNarrator(row.traits)) sections.push(getBotModePrompt(locale));
 	const deliverTo = runDeliverToOf(row);
 	if (deliverTo) {
 		const run = readRuntimeRegistrationColumn(row.runtimeRegistrationJson)?.run;
@@ -599,12 +595,27 @@ export async function runAgentLoopUnlocked(
 			// Keep accepted snapshots and uploaded files recoverable until the
 			// ordinary user message commits, just like the interrupt drain path.
 			const terminalCommand =
-				parseQueuedNewCommand(buffered.text, buffered.commandText, buffered.composerDocument) ||
-				parseQueuedGoalCommand(buffered.text, buffered.commandText, buffered.composerDocument);
+				parseQueuedNewCommand(
+					buffered.text,
+					buffered.commandText,
+					buffered.composerDocument,
+					buffered.executionIntent,
+				) ||
+				parseQueuedGoalCommand(
+					buffered.text,
+					buffered.commandText,
+					buffered.composerDocument,
+					buffered.executionIntent,
+				);
 			pendingBufferedDelivery = buffered;
 			if (
 				terminalCommand &&
-				parseQueuedNewCommand(buffered.text, buffered.commandText, buffered.composerDocument)
+				parseQueuedNewCommand(
+					buffered.text,
+					buffered.commandText,
+					buffered.composerDocument,
+					buffered.executionIntent,
+				)
 			) {
 				await persistClaimedUserInput({
 					claim: bufferedClaim,
@@ -643,6 +654,7 @@ export async function runAgentLoopUnlocked(
 				buffered.text,
 				buffered.commandText,
 				buffered.composerDocument,
+				buffered.executionIntent,
 			);
 			if (newCommand) {
 				const newNarratorId = await executeQueuedNewCommand(
@@ -677,6 +689,7 @@ export async function runAgentLoopUnlocked(
 				buffered.text,
 				buffered.commandText,
 				buffered.composerDocument,
+				buffered.executionIntent,
 			);
 			if (goalCommand) {
 				await executeQueuedGoalCommand(narratorId, buffered, goalCommand.objective);
@@ -1468,14 +1481,12 @@ export async function runAgentLoopUnlocked(
 				// standalone narrator's git bar never moved until a foreground refetch.
 				onGitTrack: (toolName, toolUseId, input) => {
 					if (!FILE_MUTATING_TOOLS.has(toolName)) return;
-					const chapterId = active._chapterId ?? null;
 					const worktreePath = gitTrackPathForSession(active);
 					if (!worktreePath) return;
 					// Mark the directory dirty at the tool boundary, not in the narrator's
 					// trailing timer. The directory pool owns throttled live refreshes;
-					// this timer only retains the legacy chapter-specific broadcast.
+					// this timer only pushes the session's status line.
 					invalidateStatus(worktreePath);
-					const baseBranch = active._baseBranch as string | undefined;
 					const scheduleRefresh = (delayMs: number) => {
 						// Collapse rapid successive calls into one trailing query. Git commands
 						// use delay 0 so branch/commit-only changes are visible immediately.
@@ -1484,13 +1495,8 @@ export async function runAgentLoopUnlocked(
 							active._gitTrackTimer = undefined;
 							// Reuse the directory pool's result (or another narrator's query).
 							// A late timer must not invalidate the same completed write again.
-							Promise.all([
-								getStatusSummaryCached(worktreePath),
-								baseBranch
-									? gitService.getCommitsAhead(worktreePath, baseBranch)
-									: Promise.resolve({ count: 0, baseBranch: "" }),
-							]).then(
-								([gitStatus, ahead]) => {
+							getStatusSummaryCached(worktreePath).then(
+								(gitStatus) => {
 									// Strip files array from WS broadcast to avoid
 									// sending huge payloads when many files are changed.
 									// The Git panel fetches the full list via API.
@@ -1498,11 +1504,8 @@ export async function runAgentLoopUnlocked(
 									broadcastToNarrator(narratorId, {
 										type: "git_status",
 										narratorId,
-										chapterId,
 										toolUseId,
 										status: statusWithoutFiles as typeof gitStatus,
-										commitsAhead: ahead.count,
-										baseBranch: ahead.baseBranch,
 										linesAdded: gitStatus.linesAdded,
 										linesRemoved: gitStatus.linesRemoved,
 									});
@@ -1631,6 +1634,7 @@ export async function runAgentLoopUnlocked(
 				// Freeze this logical run's segment across every retry/compact pass.
 				executionSegmentId: run?.executionSegmentId,
 				runtimePolicy,
+				bot: isBotNarrator(freshNarrator.traits),
 				narratorId,
 				conversationId: active.conversationId,
 				model: resolved.model,
@@ -1674,7 +1678,6 @@ export async function runAgentLoopUnlocked(
 				signal: active.abortController.signal,
 				guidanceSignal: active._guidanceAbortController.signal,
 				urgentGuidanceSignal: active._urgentGuidanceAbortController.signal,
-				chapterId: active._chapterId,
 				parentNarratorId: placement?.parentNarratorId,
 				parentToolUseId: placement?.parentToolUseId,
 				reviewReadOnlyBash: runtimePolicy.readOnlyGitShell,
@@ -1717,7 +1720,6 @@ export async function runAgentLoopUnlocked(
 					)?.planFilePath,
 				skillRoot: active._skillRoot ?? undefined,
 				projectGitPath: active._projectGitPath ?? undefined,
-				worktreePath: active._worktreePath ?? undefined,
 				skillScopeKey: active._skillScopeKey ?? undefined,
 				userId: active._currentUserId ?? null,
 				projectId: oauthRuntime?.projectId ?? active._projectId ?? null,
@@ -1806,10 +1808,6 @@ export async function runAgentLoopUnlocked(
 					// loop from the history's loading state (`toolLoading` above).
 					if (OPTIONAL_TOOLS.has(tool.name)) {
 						return managedOptionalTools.has(tool.name);
-					}
-					// Review tools: only available for review chapter narrators
-					if (REVIEW_TOOLS.has(tool.name)) {
-						return active._chapterRole === "review";
 					}
 					// MCP tools: exclude tools with "deny" behavior
 					if (tool.name.startsWith("mcp__")) {
@@ -2003,7 +2001,6 @@ export async function runAgentLoopUnlocked(
 						{
 							hook_event_name: event as import("../hook-service").HookEvent,
 							narrator_id: narratorId,
-							chapter_id: active._chapterId,
 							project_id: active._projectId,
 							cwd: active.cwd,
 							...payload,
@@ -2972,43 +2969,6 @@ export async function runAgentLoopUnlocked(
 				continue;
 			}
 
-			// Review git state check — if the review narrator modified files,
-			// reset and re-inject a message to continue the loop.
-			// [continuation-source: review-git-guard]
-			if (active._chapterRole === "review" && active._chapterId && active.alive) {
-				const gitCheck = await reviewService.checkAndResetGitState(active._chapterId);
-				if (!gitCheck.clean && gitCheck.message) {
-					// Review guardrail notice generated by the review service.
-					const userMsg = await messageWriters.persistUserMessage(
-						narratorId,
-						gitCheck.message,
-						[{ type: "text", text: gitCheck.message }],
-						undefined,
-						undefined,
-						{ origin: "system", originLabel: formatOriginLabel("review") },
-					);
-					broadcastToNarrator(narratorId, {
-						type: "user_message",
-						narratorId,
-						message: fileReferenceMessageForDisplay(userMsg),
-					});
-					active.events.emit("event", {
-						type: "user_message",
-						data: fileReferenceMessageForDisplay(userMsg),
-					});
-					await narratorService.updateStatus(narratorId, "working");
-					runState.input.text = gitCheck.message;
-					// The guardrail notice starts a new pass, so keep a cut-in message's
-					// boundary alive instead of stranding it for the rest of the loop.
-					rearmCutInSoftStopBeforeContinuing(active);
-					continue;
-				}
-				// Git is clean and loop ended normally — conclude the review
-				if (!result.hasError) {
-					await reviewService.concludeReview(active._chapterId);
-				}
-			}
-
 			// Agent loop done — update stats (always, even if we continue with buffered messages)
 			await narratorService.updateStats(narratorId, 0);
 
@@ -3266,7 +3226,6 @@ export async function runAgentLoopUnlocked(
 							{
 								hook_event_name: "Stop",
 								narrator_id: narratorId,
-								chapter_id: active._chapterId,
 								project_id: active._projectId,
 								cwd: active.cwd,
 								stop_reason: stopReason,
@@ -3327,10 +3286,6 @@ export async function runAgentLoopUnlocked(
 			}
 
 			if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
-			// Stop file watcher for this narrator
-			if (active._worktreePath) {
-				worktreeWatcher.unwatch(active._worktreePath, narratorId);
-			}
 			// Persist conversationId so the next activation can resume the API session
 			// (avoids cache miss from generating a new random UUID every time).
 			//

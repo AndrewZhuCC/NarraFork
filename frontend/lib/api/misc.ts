@@ -112,12 +112,16 @@ export const miscApi = {
 	// Search
 	search: (
 		q: string,
-		entities = "chapters,messages",
+		entities = "messages",
 		sort?: "time" | "relevance",
 		signal?: AbortSignal,
+		/** Conversation content beyond the default: `subagents`, `system`, `tools`. */
+		include: readonly string[] = [],
 	) =>
 		request<SearchResponse>(
-			`/search?q=${encodeURIComponent(q)}&entities=${entities}${sort ? `&sort=${sort}` : ""}`,
+			`/search?q=${encodeURIComponent(q)}&entities=${entities}${sort ? `&sort=${sort}` : ""}${
+				include.length ? `&include=${include.join(",")}` : ""
+			}`,
 			{ signal },
 		),
 

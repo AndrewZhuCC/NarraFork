@@ -645,7 +645,7 @@ export interface NarraForkSettings {
 	agent: {
 		defaultModel: string;
 		defaultPermissionMode: PermissionMode;
-		/** Creation default only; auto keeps chapter/project and standalone/private behavior. */
+		/** Creation default only; auto makes project-page sessions project-visible, others private. */
 		defaultNarratorVisibility: "auto" | "private" | "public";
 		/** Creation default only; narrowed to visibility, auto uses its widest legal audience. */
 		defaultNarratorWriteAudience: "auto" | "owner" | "project" | "public";
@@ -871,19 +871,15 @@ export interface NarraForkSettings {
 		 */
 		queueDuringCompaction?: boolean;
 	};
-	chapters: {
-		maxActiveWorktrees: number;
-		maxActiveContainers: number;
-		worktreeSizeWarningMb: number;
-		autoSaveOnDormant: boolean;
-		dormantAfterMinutes: number;
+	workspace: {
 		/**
 		 * Whether tool calls / external edits capture content-addressed whole-tree
 		 * snapshots of the workspace (the precise rollback boundary). When off, the
 		 * snapshot scan never runs on the tool path and rollback degrades to per-file
-		 * replay of recorded Write/Edit inputs. Structural captures (fork/merge/restore)
-		 * are unaffected. Default true; hot-path captures also degrade automatically
-		 * when a worktree proves too large to scan within the capture budget.
+		 * replay of recorded Write/Edit inputs. Default true; hot-path captures also
+		 * degrade automatically when a worktree proves too large to scan within the
+		 * capture budget. Stored as `chapters.treeSnapshotsEnabled` before chapters
+		 * were removed; migrated on load.
 		 */
 		treeSnapshotsEnabled: boolean;
 	};
@@ -904,17 +900,10 @@ export interface NarraForkSettings {
 		/**
 		 * Whether clients may negotiate the block-keyed message protocol v2: page API
 		 * envelopes + blocks, block-level WS events (§8). A client opts in per
-		 * subscription; off, every connection gets v1.
+		 * subscription; off, every connection gets v1 (the client handles both, so this
+		 * is the rollback switch).
 		 */
 		wsV2: boolean;
-	};
-	containers: {
-		portRangeStart: number;
-		portRangeEnd: number;
-		proxy: {
-			enabled: boolean;
-			port: number;
-		};
 	};
 	editor: {
 		type: "vscode" | "cursor" | "windsurf" | "zed";

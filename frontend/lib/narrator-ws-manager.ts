@@ -17,6 +17,7 @@ import {
 	RECENT_TABS_WS_BATCH_SIZE,
 } from "@shared/recent-tabs";
 import { getToken } from "./api";
+import { decodeBlockFrame } from "./block-protocol";
 import { observePageLifecycle } from "./page-lifecycle";
 import { dispatchTokenDanceRecovery } from "./tokendance-recovery";
 import { buildWsUrl, safeCloseWs } from "./ws";
@@ -1559,7 +1560,8 @@ export class NarratorWSManager {
 					return;
 				}
 				dispatchTokenDanceRecovery(data);
-				this._dispatch(data);
+				// Block-keyed (v2) frames reach listeners as the v1 frames they stand for.
+				for (const frame of decodeBlockFrame(data)) this._dispatch(frame);
 			} catch {
 				if (import.meta.env.DEV) {
 					console.warn("[NarratorWSManager] Failed to parse WS message");
@@ -1974,6 +1976,9 @@ export class NarratorWSManager {
 				type: "subscribe",
 				narratorIds: activeNarratorIds,
 				kind,
+				// Every message subscribe asks for the block-keyed protocol: the server keeps
+				// one protocol per connection and narrator, so all of them must agree.
+				protocol: 2,
 				...(requestId ? { requestId } : {}),
 			};
 			if (cursor) msg.catchUpCursor = cursor;
@@ -1997,6 +2002,7 @@ export class NarratorWSManager {
 					type: "subscribe",
 					narratorIds,
 					kind,
+					...(kind === "messages" ? { protocol: 2 } : {}),
 					...(requestId ? { requestId } : {}),
 					...(downgrade ? { downgrade: true } : {}),
 				}),

@@ -239,7 +239,7 @@ export async function seedFixture(owner: FixtureLifetime) {
 				.get();
 			if (!row) throw new Error("No narrator");
 			checkNarrator(user, row);
-			if (row.chapterId || !row.contextProjectId) throw new Error("Not in fixture context");
+			if (!row.contextProjectId) throw new Error("Not in fixture context");
 			const project = db
 				.select()
 				.from(schema.projects)

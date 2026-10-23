@@ -19,7 +19,6 @@
  */
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import {
-	chapters,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -28,7 +27,7 @@ import {
 import { getTestDb } from "../../setup";
 
 const { db, sqlite } = getTestDb();
-mock.module("../../../server/db", () => ({ db, sqlite }));
+mock.module("../../../server/db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 
 const { createSqliteSearchStore } = await import("../../../server/services/search/sqlite-store");
 const searchStore = createSqliteSearchStore(async (sql, params) =>
@@ -48,7 +47,7 @@ function seedNarrator(id: string, title: string) {
 	db.insert(narrators)
 		.values({
 			id,
-			chapterId: "chap-recall",
+			contextProjectId: "proj-recall",
 			type: "primary",
 			inheritMode: "fresh",
 			title,
@@ -117,30 +116,13 @@ beforeEach(() => {
 			updatedAt: EARLY,
 		})
 		.run();
-	db.insert(chapters)
-		.values({
-			id: "chap-recall",
-			projectId: "proj-recall",
-			title: "Chapter",
-			branch: "chapter/chap-recall",
-			baseBranch: "main",
-			createdAt: EARLY,
-			updatedAt: EARLY,
-		})
-		.run();
 	seedNarrator("narr-self", "Self");
 	seedNarrator("narr-other", "Other");
 });
 
 afterEach(() => {
 	sqlite.run("PRAGMA foreign_keys = OFF");
-	for (const table of [
-		"narrator_message_refs",
-		"narrator_messages",
-		"narrators",
-		"chapters",
-		"projects",
-	]) {
+	for (const table of ["narrator_message_refs", "narrator_messages", "narrators", "projects"]) {
 		sqlite.run(`DELETE FROM "${table}"`);
 	}
 	sqlite.run("PRAGMA foreign_keys = ON");

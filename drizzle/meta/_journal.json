@@ -1520,6 +1520,27 @@
       "when": 1792663570008,
       "tag": "0216_block_state_writes",
       "breakpoints": true
+    },
+    {
+      "idx": 217,
+      "version": "6",
+      "when": 1792684355126,
+      "tag": "0217_bot_rooms",
+      "breakpoints": true
+    },
+    {
+      "idx": 218,
+      "version": "6",
+      "when": 1792700418112,
+      "tag": "0218_retire_narrative_line",
+      "breakpoints": true
+    },
+    {
+      "idx": 219,
+      "version": "6",
+      "when": 1792700426767,
+      "tag": "0219_project_index",
+      "breakpoints": true
     }
   ]
 }

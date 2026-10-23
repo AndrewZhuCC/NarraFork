@@ -4,7 +4,6 @@ import { askUserQuestionTool } from "./ask-user-question";
 import { awaitTool } from "./await";
 import { bashTool } from "./bash";
 import { browserTool } from "./browser";
-import { concludeReviewTool } from "./conclude-review";
 import { contextAskTool } from "./context-ask";
 import { dangerCancelTool, dangerConfirmTool } from "./danger-reflection";
 import { editTool } from "./edit";
@@ -111,13 +110,6 @@ export const KNOWLEDGE_KIND_DENY_CORE: ReadonlySet<string> = new Set<string>([
 	"WebFetch",
 ]);
 
-/**
- * Review-only tools — only injected for narrators in review chapters.
- */
-export const REVIEW_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
-	["ConcludeReview", concludeReviewTool],
-]);
-
 /** Core tools provider — always-available tools. */
 const coreProvider: ToolProvider = {
 	name: "core",
@@ -173,19 +165,10 @@ const optionalProvider: ToolProvider = {
 	},
 };
 
-/** Review tools provider — injected for review narrators. */
-const reviewProvider: ToolProvider = {
-	name: "review",
-	tools() {
-		return [...REVIEW_TOOLS.values()];
-	},
-};
-
 /** Register all core tools into the singleton registry */
 export function registerCoreTools(): void {
 	toolRegistry.registerProvider(coreProvider);
 	toolRegistry.registerProvider(optionalProvider);
-	toolRegistry.registerProvider(reviewProvider);
 }
 
 // Register after this module has finished initializing provider constants. Keeping the

@@ -125,11 +125,14 @@ describe("recent-tabs indexed side paths", () => {
 		]);
 		seedLegacyTabs(
 			[
+				// A legacy chapter tab pointing at the same narrator: chapters were removed, so it
+				// is dropped on migration and must not count as narrator membership.
 				makeTab("chapter-1", {
 					type: "chapter",
 					narratorId: "n-title",
 					title: "Old chapter title",
 				}),
+				makeTab("n-title", { title: "Old title" }),
 				makeTab("project-1", { type: "project" }),
 			],
 			"user-2",
@@ -138,6 +141,7 @@ describe("recent-tabs indexed side paths", () => {
 			"user-1",
 			"user-2",
 		]);
+		expect(storedKeys("user-2")).toEqual(["narrator:n-title", "project:project-1"]);
 		expect(await recentTabs.getRecentTabUserIdsForNarrator("n-title", 1)).toEqual(["user-1"]);
 		expect(await recentTabs.getRecentTabUserIdsForNarrator("n-title", 0)).toEqual([]);
 		await recentTabs.syncNarratorTitleToRecentTabs("n-title", "New title");

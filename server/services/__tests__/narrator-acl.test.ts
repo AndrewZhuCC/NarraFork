@@ -32,7 +32,6 @@ import {
 	canManageNarratorAcl,
 	canReadNarrator,
 	canWriteNarrator,
-	defaultVisibilityForNarrator,
 	filterReadableNarrators,
 	listNarratorAudience,
 	type NarratorPrincipal,
@@ -63,7 +62,6 @@ async function makeUser(label: string): Promise<string> {
 async function makeNarrator(options: {
 	ownerUserId?: string | null;
 	visibility?: string;
-	chapterId?: string | null;
 }): Promise<string> {
 	const id = generateId();
 	const now = new Date().toISOString();
@@ -146,12 +144,6 @@ describe("private narrators", () => {
 		expect(await canReadNarrator(row, admin())).toBe(true);
 		expect(await canWriteNarrator(row, admin())).toBe(true);
 	});
-
-	test("standalone narrators default to private, chapter-bound to project", () => {
-		expect(defaultVisibilityForNarrator(null)).toBe("private");
-		expect(defaultVisibilityForNarrator(undefined)).toBe("private");
-		expect(defaultVisibilityForNarrator("chapter-1")).toBe("project");
-	});
 });
 
 // ─── 2. Read never implies write ─────────────────────────────────────────
@@ -166,7 +158,7 @@ describe("visibility grants read only", () => {
 	test("project visibility no longer means 'anyone', it means project members", async () => {
 		// Behaviour change: `project` used to resolve the same as `public` because every
 		// signed-in user could reach every project. Now it is gated on membership, and a
-		// standalone narrator (no chapter, hence no project) grants nothing at all — it
+		// narrator in no project grants nothing at all — it
 		// must not become a backdoor to "visible to everybody with nothing constraining
 		// it".
 		const row = await rowOf(await makeNarrator({ ownerUserId: ownerId, visibility: "project" }));
@@ -286,7 +278,7 @@ describe("list predicate matches single-row decisions", () => {
 		// Regression: Drizzle rewrites embedded column references in a relational-query
 		// `where` callback to the OUTER table's alias, which turned the grant subquery's
 		// `narrator_grants.narrator_id` into `narrators.narrator_id` and made every
-		// query using this path (the story graph, chapter listings) fail to prepare.
+		// query using this path (e.g. narrator listings) fail to prepare.
 		const mine = await makeNarrator({ ownerUserId: ownerId });
 		const shared = await makeNarrator({ ownerUserId: strangerId });
 		await grant(shared, ownerId, "read");

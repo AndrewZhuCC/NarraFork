@@ -55,16 +55,3 @@ export function sanitizeUntrustedReviewBoundaryIds(value: unknown): unknown {
 		),
 	);
 }
-
-/** A chapter review protects its host worktree, not every directory or another device's same path. */
-export function reviewBoundaryRule(id: string, path: string): LegacyDirectoryBlacklistEntry {
-	return {
-		id: `${REVIEW_BOUNDARY_RULE_PREFIX}${id}`,
-		path,
-		denyLevel: "denyWrite",
-		enabled: true,
-		targetKind: "host",
-		targetValue: null,
-		deviceScope: "local",
-	};
-}

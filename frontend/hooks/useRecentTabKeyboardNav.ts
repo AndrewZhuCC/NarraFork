@@ -41,7 +41,6 @@ export function usePendingTabKey() {
 
 function tabToUrl(tab: RecentTab): { to: string } {
 	if (tab.type === "project") return { to: `/projects/${tab.id}` };
-	if (tab.type === "chapter" && tab.narratorId) return { to: `/narrators/${tab.narratorId}` };
 	if (tab.type === "workspace") return { to: `/narrators/workspace/${tab.id}` };
 	return { to: `/narrators/${tab.id}` };
 }

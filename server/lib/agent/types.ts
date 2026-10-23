@@ -122,8 +122,6 @@ export interface ToolContext {
 	pipelineUnusedToolCallThreshold?: number;
 	/** Locale for i18n of tool outputs */
 	locale: string;
-	/** Chapter ID the narrator belongs to (cached to avoid repeated DB lookups) */
-	chapterId?: string;
 	/** Plan file ID — set during plan mode, used by ExitPlanMode to locate the plan file */
 	planFileId?: string;
 	/** Plan file path — set during plan mode, passed to EnterPlanMode tool for the result prompt */
@@ -132,8 +130,6 @@ export interface ToolContext {
 	skillRoot?: string;
 	/** Project git path used to resolve project-level skills for this context. */
 	projectGitPath?: string | null;
-	/** Active chapter worktree root, used for cwd recovery suggestions. */
-	worktreePath?: string | null;
 	/** Resolved skill summary cache scope key for this context. */
 	skillScopeKey?: string;
 	/** Skills blocked by narrator custom traits. `all` blocks every skill. */
@@ -983,10 +979,14 @@ export interface AgentConfig {
 	onToolsCharacters?: (toolsChars: number) => void | Promise<void>;
 	locale?: string;
 	signal: AbortSignal;
-	/** Chapter ID the narrator belongs to (passed through to ToolContext) */
-	chapterId?: string;
 	/** Resolved by server runtime assembly; DB authorization remains the final authority. */
 	runtimePolicy?: RuntimePolicy;
+	/**
+	 * This narrator is a bot: people see only what it delivers with `Send({ user })`, so
+	 * Send offers that target. Shapes the offered schema only; the bot trait is re-read
+	 * when the message is delivered.
+	 */
+	bot?: boolean;
 	/** Parent narrator ID — set for subagents, passed through to ToolContext for Team tracking */
 	parentNarratorId?: string;
 	/** Parent Agent/Task/Send tool_use that spawned this subagent. */
@@ -1029,8 +1029,6 @@ export interface AgentConfig {
 	skillRoot?: string;
 	/** Project git path used to resolve project-level skills for this context. */
 	projectGitPath?: string | null;
-	/** Active chapter worktree root, used for cwd recovery suggestions. */
-	worktreePath?: string | null;
 	/** Resolved skill summary cache scope key for this context. */
 	skillScopeKey?: string;
 	/** User who triggered this loop turn — flows into ToolContext.userId for knowledge ACL. */

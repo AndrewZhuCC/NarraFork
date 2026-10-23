@@ -264,6 +264,38 @@
 			"prevId": "20534647-c4ef-455c-8c6f-4250ed5f2786",
 			"version": "7",
 			"snapshotDigest": "0cd62b8a55a55325c3e2350bf052b92bc1dc89ae08618397eca2b168f8589bdf"
+		},
+		{
+			"idx": 33,
+			"tag": "0033_bot_rooms",
+			"id": "ae0bd9a2-3a8a-430f-83b1-497b4a3c46ba",
+			"prevId": "a2ff5b16-5c87-43fc-a770-b84045892e96",
+			"version": "7",
+			"snapshotDigest": "c82ec97b630961854083a4bb003d164a8b4b4fbf3d9f615d3c5adbd92eb14b01"
+		},
+		{
+			"idx": 34,
+			"tag": "0034_retire_chapter_references",
+			"id": "4edc054c-f934-4821-b4bc-d8cd2ed0bb1b",
+			"prevId": "ae0bd9a2-3a8a-430f-83b1-497b4a3c46ba",
+			"version": "7",
+			"snapshotDigest": "1683cc9494e5075796d42eb13384892e186ca28026266b47306d0ac3fe0c6132"
+		},
+		{
+			"idx": 35,
+			"tag": "0035_retire_narrative_line",
+			"id": "da73efaf-92c0-4786-9720-a50f994a0756",
+			"prevId": "4edc054c-f934-4821-b4bc-d8cd2ed0bb1b",
+			"version": "7",
+			"snapshotDigest": "4a7173eca8df5927e81db0478641eea947b3fb5fd81c166f59f9cea0c0d41cb2"
+		},
+		{
+			"idx": 36,
+			"tag": "0036_project_index",
+			"id": "ad79826f-3e84-4be5-8553-5879cace6553",
+			"prevId": "da73efaf-92c0-4786-9720-a50f994a0756",
+			"version": "7",
+			"snapshotDigest": "1e97f92d225b90b809a8659d946d4c9c7f0ef6a0d2786c6ec1cbfd6107a884f7"
 		}
 	]
 }

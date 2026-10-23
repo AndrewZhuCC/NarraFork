@@ -4,10 +4,9 @@
  * The catalog rollout gives an error two texts: the server's English template and the
  * client's translation of the same `messageCode`. For most entries those differ, and the
  * disclosure is how a user reaches the original for a bug report. For several entries they
- * are byte-identical in English — `FORBIDDEN_ACTION`, `RESOURCE_NOT_FOUND`,
- * `VALIDATION_FAILED` and the `MERGE_DIRTY_*` family all translate to the same sentence the
- * server sends — and there the block repeated the message under a link promising something
- * else.
+ * are byte-identical in English — `FORBIDDEN_ACTION`, `RESOURCE_NOT_FOUND` and
+ * `VALIDATION_FAILED` all translate to the same sentence the server sends — and there the
+ * block repeated the message under a link promising something else.
  *
  * Tested through `errorDetailDisclosure` rather than by rendering: the decision is pure, and
  * a DOM assertion here would mostly exercise Mantine's Collapse.

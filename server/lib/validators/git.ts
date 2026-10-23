@@ -94,7 +94,7 @@ export const gitCommitDiffQuerySchema = z.object({
 // === modification view ===
 
 /**
- * Query for `GET /:chapterId/git/modifications`.
+ * Query for `GET /api/narrators/:narratorId/git/modifications`.
  *
  * Validated rather than forwarded raw because the failure mode is silent. `since`/`until`
  * are compared as STRINGS against `file_attributions.changed_at` (SQLite has no date type),

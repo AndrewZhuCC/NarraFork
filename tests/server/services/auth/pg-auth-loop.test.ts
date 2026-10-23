@@ -83,10 +83,6 @@ const { setAuthStores } = authStores;
 const { setKnowledgeReadStore, setKnowledgeWriteStore } = await import(
 	"../../../../server/services/knowledge/store"
 );
-const { setChapterWriteStore } = await import("../../../../server/services/chapter-write/store");
-const { setProjectArchiveMainStore } = await import(
-	"../../../../server/services/project-archive/store"
-);
 const { setProjectReadAdapter } = await import("../../../../server/services/read");
 const { setPostgresRuntimeQueue } = await import(
 	"../../../../server/services/agent-runtime/postgres-runtime-queue"
@@ -441,8 +437,6 @@ async function runLoop(
 		setAuthStores(undefined);
 		setKnowledgeWriteStore(undefined);
 		setKnowledgeReadStore(undefined);
-		setChapterWriteStore(undefined);
-		setProjectArchiveMainStore(undefined);
 		setProjectReadAdapter(undefined);
 		setPostgresRuntimeQueue(undefined);
 		unbindPostgresSearchClientForTests();

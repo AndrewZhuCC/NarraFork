@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import type { BackgroundTaskType } from "@shared/background-task-list";
+import type { ChatRoomKind } from "@shared/chat-room-kinds";
 import type { NOTIFICATION_CENTER_CHANGED_WS_TYPE } from "@shared/notification-center";
 import type { PublicationRun } from "../services/agent-runtime/publication-outbox";
 import type { NarratorServerMessage } from "../websocket/narrator-ws-types";
@@ -31,125 +32,6 @@ export type NarraForkEvent =
 			change: "revoked" | "restricted";
 			reasonCode: string;
 	  }
-	// Chapter lifecycle
-	| { type: "chapter:created"; chapterId: string; projectId: string }
-	/**
-	 * `projectId` is required rather than optional because this event is broadcast to
-	 * every WS connection: the frontend's graph invalidation treats a *missing*
-	 * project id as "may concern me", so omitting it makes one project's fork refetch
-	 * every other project's graph.
-	 */
-	| { type: "chapter:forked"; chapterId: string; parentId: string; projectId: string }
-	| { type: "chapter:merged"; sourceId: string; targetId: string; userId?: string }
-	| { type: "chapter:conflict"; sourceId: string; targetId: string; files: string[] }
-	| { type: "chapter:dormant"; chapterId: string }
-	| { type: "chapter:woken"; chapterId: string }
-	| { type: "chapter:abandoned"; chapterId: string; projectId: string }
-	| { type: "review:created"; reviewChapterId: string; sourceChapterId: string }
-	| {
-			type: "review:concluded";
-			reviewChapterId: string;
-			sourceChapterId: string;
-			/**
-			 * The reviewer replaced an earlier conclusion rather than submitting its first.
-			 * Reachable because `ConcludeReview` accepts resubmission (a restored workspace
-			 * invalidates findings the reviewer already sent), so consumers must treat the
-			 * event as "there is a new conclusion" rather than "the review just finished".
-			 */
-			revised?: boolean;
-	  }
-	| { type: "review:converted"; reviewChapterId: string; action: "subagent" | "promote" }
-	| { type: "review:dismissed"; reviewChapterId: string }
-	| {
-			type: "chapter:split";
-			prefixChapterId: string;
-			continuationChapterId: string;
-			newForkChapterId: string;
-			commitSha: string;
-			/** Required for the same reason as on `chapter:forked`. */
-			projectId: string;
-	  }
-	| { type: "chapter:cherry_picked"; sourceId: string; targetId: string; commits: string[] } // TODO: not yet emitted
-	// No `chapter:frozen`: the `frozen` chapter status it announced has been removed, so the
-	// transition it described can no longer happen.
-	| { type: "chapter:role_changed"; chapterId: string; role: string }
-	| { type: "chapter:files_changed"; chapterId: string; worktreePath: string }
-	| {
-			/** An edit from outside the tool path was attributed and given a tree boundary. */
-			type: "chapter:external_change_recorded";
-			chapterId: string;
-			worktreePath: string;
-			treeHash: string;
-			narratorId: string;
-	  }
-	| { type: "chapter:commits_updated"; chapterId: string; newCount: number }
-	// 依赖关系：dependency 边已移除，四个事件（created/removed/upstream_updated/synced）随之删除。
-	// created/removed 曾真实发出但无人消费；后两个从未发出。详见 chapter-edge-service.ts。
-	// 探索组
-	| { type: "exploration:created"; groupId: string; chapterIds: string[] } // TODO: not yet emitted
-	| { type: "exploration:decided"; groupId: string; decidedChapterId: string } // TODO: not yet emitted
-	| { type: "exploration:abandoned"; groupId: string } // TODO: not yet emitted
-	| { type: "exploration:chapter_added"; groupId: string; chapterId: string } // TODO: not yet emitted
-	// Batch merge session
-	| {
-			type: "merge:started";
-			mergeSessionId: string;
-			projectId: string;
-			targetChapterId: string;
-			sourceChapterIds: string[];
-	  }
-	| {
-			type: "merge:step_ok";
-			mergeSessionId: string;
-			projectId: string;
-			targetChapterId: string;
-			sourceChapterId: string;
-			index: number;
-			total: number;
-			commitSha?: string;
-	  }
-	| {
-			type: "merge:conflict";
-			mergeSessionId: string;
-			projectId: string;
-			targetChapterId: string;
-			sourceChapterId: string;
-			index: number;
-			total: number;
-			conflictFiles: string[];
-			narratorId?: string;
-	  }
-	| {
-			type: "merge:ai_resolving";
-			mergeSessionId: string;
-			projectId: string;
-			targetChapterId: string;
-			sourceChapterId: string;
-			narratorId?: string;
-	  }
-	| {
-			type: "merge:completed";
-			mergeSessionId: string;
-			projectId: string;
-			targetChapterId: string;
-			mergedCount: number;
-	  }
-	| {
-			type: "merge:cancelled";
-			mergeSessionId: string;
-			projectId: string;
-			targetChapterId: string;
-			reason: string;
-	  }
-	| {
-			type: "merge:error";
-			mergeSessionId: string;
-			projectId: string;
-			targetChapterId: string;
-			sourceChapterId: string;
-			error: string;
-	  }
-	/** Data-free invalidation after a human decision source changes. */
 	| { type: "human_attention:changed" }
 	/**
 	 * Notification-center projection changed for one user (insert/mark-read/delete).
@@ -284,14 +166,6 @@ export type NarraForkEvent =
 			text: string;
 			isBroadcast: boolean;
 	  }
-	// Container lifecycle
-	| { type: "container:started"; chapterId: string }
-	| { type: "container:stopped"; chapterId: string }
-	| { type: "container:paused"; chapterId: string }
-	| { type: "container:resumed"; chapterId: string }
-	| { type: "container:error"; chapterId: string; error: string }
-	| { type: "container:log"; chapterId: string; line: string; phase?: "build" | "start" }
-	| { type: "container:starting"; chapterId: string }
 	// Browser session lifecycle
 	| { type: "browser:session_created"; sessionId: string; narratorId: string; url: string }
 	| { type: "browser:session_closed"; sessionId: string; narratorId: string }
@@ -302,25 +176,16 @@ export type NarraForkEvent =
 			type: "terminal:created";
 			terminalId: string;
 			narratorId: string | null;
-			chapterId: string | null;
 	  }
 	| {
 			type: "terminal:exited";
 			terminalId: string;
 			narratorId: string | null;
-			chapterId: string | null;
 	  }
 	// MCP server lifecycle
 	| { type: "mcp:server_connected"; serverId: string; name: string; toolCount: number }
 	| { type: "mcp:server_disconnected"; serverId: string; name: string; reason?: string }
 	| { type: "mcp:server_error"; serverId: string; name: string; error: string }
-	// Volume snapshots
-	| { type: "volume-snapshot:creating"; projectId: string; chapterId: string }
-	| { type: "volume-snapshot:created"; projectId: string; snapshotId: string }
-	| { type: "volume-snapshot:applying"; snapshotId: string; targetChapterId: string }
-	| { type: "volume-snapshot:applied"; snapshotId: string; targetChapterId: string }
-	| { type: "volume-snapshot:deleted"; projectId: string; snapshotId: string }
-	| { type: "volume-snapshot:error"; projectId: string; error: string }
 	// Hooks
 	| {
 			type: "hook:executed";
@@ -515,14 +380,16 @@ export type NarraForkEvent =
 	// listener (WS fan-out today, an IM bridge later) can route without holding a
 	// copy of content it has no authorization story for.
 	| {
-			/** A person posted in a chat room. */
+			/** A person (or a bot, through Send) posted in a chat room. */
 			type: "chat:message_created";
 			roomId: string;
 			messageId: string;
 			seq: number;
 			senderUserId: string | null;
-			roomKind: "dm" | "narrator";
-			/** Set for a narrator room, so a consumer can scope by narrator. */
+			/** Set when a bot wrote the message; `senderUserId` is then null. */
+			senderNarratorId?: string | null;
+			roomKind: ChatRoomKind;
+			/** Set for a narrator or bot room, so a consumer can scope by narrator. */
 			narratorId: string | null;
 	  }
 	| {

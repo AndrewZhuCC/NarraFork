@@ -67,11 +67,8 @@ function cancel(ws: Socket, id: string) {
 	if (!entries?.size) sockets.delete(ws);
 }
 async function authorize(ws: Socket, message: GitWorkspaceSubscribe, signal: AbortSignal) {
-	if (!ws.data.userId || !!message.narratorId === !!message.chapterId)
-		throw new Error("Invalid Git subscription target");
-	const origin = message.narratorId
-		? { narratorId: message.narratorId }
-		: { chapterId: message.chapterId ?? "" };
+	if (!ws.data.userId || !message.narratorId) throw new Error("Invalid Git subscription target");
+	const origin = { narratorId: message.narratorId };
 	const target = await authorizeGitTargetForPrincipal(
 		{ userId: ws.data.userId, isAdmin: ws.data.userRole === "admin" },
 		origin,
@@ -97,7 +94,6 @@ export async function handleGitWorkspaceMessage(
 		message.type === "git_workspace_subscribe" &&
 		existing &&
 		existing.target.narratorId === message.narratorId &&
-		existing.target.chapterId === message.chapterId &&
 		existing.target.workspaceKey === message.workspaceKey
 	) {
 		await existing.updateView?.(message.view ?? "details");
@@ -167,7 +163,6 @@ export async function handleGitWorkspaceMessage(
 			const identity = {
 				subscriptionId: message.subscriptionId,
 				narratorId: message.narratorId,
-				chapterId: message.chapterId,
 				workspaceKey,
 				repositoryKey,
 			};

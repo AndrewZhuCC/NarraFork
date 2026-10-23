@@ -2,13 +2,10 @@ import { Mark } from "@mantine/core";
 import type { ReactNode } from "react";
 import type { SearchFallback, SearchResponse } from "./api";
 
-export type SearchResultType = "all" | "chapter" | "narrator" | "message" | "knowledge";
+export type SearchResultType = "all" | "narrator" | "message" | "knowledge";
 
 export function normalizeSearchType(value: unknown): SearchResultType {
 	switch (value) {
-		case "chapter":
-		case "chapters":
-			return "chapter";
 		case "narrator":
 		case "narrators":
 			return "narrator";
@@ -50,21 +47,29 @@ export function normalizeSearchSort(value: unknown): SearchSortMode {
 	}
 }
 
+/**
+ * Conversation content global search skips unless asked: subagent sessions, system-written
+ * rows (injected knowledge hints, reminders, automation prompts) and tool calls.
+ */
+export const SEARCH_INCLUDES = ["subagents", "system", "tools"] as const;
+export type SearchInclude = (typeof SEARCH_INCLUDES)[number];
+
+/** Parse the `include` URL value (comma-separated) into known names, in canonical order. */
+export function normalizeSearchInclude(value: unknown): SearchInclude[] {
+	const raw = Array.isArray(value) ? value.map(String) : String(value ?? "").split(",");
+	const names = new Set(raw.map((name) => name.trim()));
+	return SEARCH_INCLUDES.filter((name) => names.has(name));
+}
+
 export function getSearchResultDisplayTitle(
 	result: {
 		id?: string;
 		title?: string | null;
 		narratorTitle?: string | null;
-		chapterTitle?: string | null;
 	},
 	untitled: (id: string) => string,
 ): string {
-	return (
-		result.title ||
-		result.narratorTitle ||
-		result.chapterTitle ||
-		untitled(String(result.id ?? "").slice(0, 8))
-	);
+	return result.title || result.narratorTitle || untitled(String(result.id ?? "").slice(0, 8));
 }
 
 interface SortableSearchResult {
@@ -72,7 +77,6 @@ interface SortableSearchResult {
 	type?: string;
 	title?: string | null;
 	narratorTitle?: string | null;
-	chapterTitle?: string | null;
 	updatedAt?: string | null;
 	createdAt?: string | null;
 	lastMessageAt?: string | null;

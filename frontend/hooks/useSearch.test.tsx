@@ -9,7 +9,7 @@ import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { api } from "../lib/api";
-import type { SearchSortMode } from "../lib/search-utils";
+import type { SearchInclude, SearchSortMode } from "../lib/search-utils";
 import { useSearch } from "./useSearch";
 
 let root: Root;
@@ -17,19 +17,27 @@ let client: QueryClient;
 let searchSpy: ReturnType<typeof spyOn<typeof api, "search">>;
 let result: ReturnType<typeof useSearch>;
 const originals = new Map<string, PropertyDescriptor | undefined>();
-const entities = "chapters,messages,narrators,knowledge";
+const entities = "messages,narrators,knowledge";
 const notificationTimers = new Map<ReturnType<typeof setTimeout>, () => void>();
 
-function Probe({ query, sort }: { query: string; sort?: SearchSortMode }) {
-	result = useSearch(query, entities, sort);
+function Probe({
+	query,
+	sort,
+	include,
+}: {
+	query: string;
+	sort?: SearchSortMode;
+	include?: SearchInclude[];
+}) {
+	result = useSearch(query, entities, sort, include);
 	return null;
 }
 
-async function render(query: string, sort?: SearchSortMode) {
+async function render(query: string, sort?: SearchSortMode, include?: SearchInclude[]) {
 	await act(async () => {
 		root.render(
 			<QueryClientProvider client={client}>
-				<Probe query={query} sort={sort} />
+				<Probe query={query} sort={sort} include={include} />
 			</QueryClientProvider>,
 		);
 	});
@@ -91,7 +99,13 @@ afterEach(async () => {
 for (const query of ["中", "中文", "a", "ab"]) {
 	test(`automatically searches trimmed short query ${query}`, async () => {
 		await render(`  ${query}  `);
-		expect(searchSpy).toHaveBeenCalledWith(query, entities, "relevance", expect.any(AbortSignal));
+		expect(searchSpy).toHaveBeenCalledWith(
+			query,
+			entities,
+			"relevance",
+			expect.any(AbortSignal),
+			[],
+		);
 		expect(result.isShortQuery).toBe(true);
 	});
 }
@@ -106,13 +120,19 @@ test("ignores whitespace-only input and debounces short terms for 300ms", async 
 		await Bun.sleep(350);
 	});
 	expect(searchSpy).toHaveBeenCalledTimes(1);
-	expect(searchSpy).toHaveBeenCalledWith("中文", entities, "relevance", expect.any(AbortSignal));
+	expect(searchSpy).toHaveBeenCalledWith(
+		"中文",
+		entities,
+		"relevance",
+		expect.any(AbortSignal),
+		[],
+	);
 });
 
 test("forwards sorting and separates cached candidates by sort", async () => {
 	await render("query", "relevance");
 	await render("query", "time");
-	expect(searchSpy).toHaveBeenCalledWith("query", entities, "time", expect.any(AbortSignal));
+	expect(searchSpy).toHaveBeenCalledWith("query", entities, "time", expect.any(AbortSignal), []);
 	for (const sort of ["title", "type"] as const) {
 		await render("query", sort);
 		expect(searchSpy).toHaveBeenLastCalledWith(
@@ -120,6 +140,7 @@ test("forwards sorting and separates cached candidates by sort", async () => {
 			entities,
 			"relevance",
 			expect.any(AbortSignal),
+			[],
 		);
 	}
 	const keys = client
@@ -127,7 +148,7 @@ test("forwards sorting and separates cached candidates by sort", async () => {
 		.getAll()
 		.map((query) => query.queryKey);
 	expect(keys).toEqual(
-		["relevance", "time", "title", "type"].map((sort) => ["search", "query", entities, sort]),
+		["relevance", "time", "title", "type"].map((sort) => ["search", "query", entities, sort, ""]),
 	);
 	await render("query", "time");
 	expect(searchSpy).toHaveBeenCalledTimes(4);
@@ -146,4 +167,25 @@ test("changing sort aborts the previous pending search request", async () => {
 	expect(signals).toHaveLength(2);
 	expect(signals[0].aborted).toBe(true);
 	expect(signals[1].aborted).toBe(false);
+});
+
+test("forwards included content and caches each scope separately", async () => {
+	await render("query", "relevance");
+	await render("query", "relevance", ["subagents", "tools"]);
+	expect(searchSpy).toHaveBeenLastCalledWith(
+		"query",
+		entities,
+		"relevance",
+		expect.any(AbortSignal),
+		["subagents", "tools"],
+	);
+	expect(searchSpy).toHaveBeenCalledTimes(2);
+	const keys = client
+		.getQueryCache()
+		.getAll()
+		.map((query) => query.queryKey);
+	expect(keys).toEqual([
+		["search", "query", entities, "relevance", ""],
+		["search", "query", entities, "relevance", "subagents,tools"],
+	]);
 });

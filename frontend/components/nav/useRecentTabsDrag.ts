@@ -288,12 +288,7 @@ export function useRecentTabsDrag(options: UseRecentTabsDragOptions) {
 			capturedRef.current = false;
 			setDraggingId(key);
 			const tab = entry.tab;
-			const narratorId =
-				tab?.type === "narrator" || tab?.type === "subagent"
-					? tab.id
-					: tab?.type === "chapter"
-						? tab.narratorId
-						: null;
+			const narratorId = tab?.type === "narrator" || tab?.type === "subagent" ? tab.id : null;
 			if (narratorId && tab && pointer) {
 				startDragManual(narratorId, tab.title, pointer.x, pointer.y);
 				ownedRef.current = getPanelDrag();

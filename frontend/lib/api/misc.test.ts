@@ -43,13 +43,16 @@ describe("misc APIs", () => {
 			},
 			configurable: true,
 		});
-		await api.search("中文", "chapters", "time");
+		await api.search("中文", "narrators", "time");
 		await api.search("ab", "messages", "relevance");
-		await api.search("legacy", "chapters");
-		expect(urls[0]).toContain("q=%E4%B8%AD%E6%96%87&entities=chapters&sort=time");
+		await api.search("legacy", "narrators");
+		await api.search("wider", "messages", "time", undefined, ["subagents", "tools"]);
+		expect(urls[0]).toContain("q=%E4%B8%AD%E6%96%87&entities=narrators&sort=time");
 		expect(urls[1]).toContain("q=ab&entities=messages&sort=relevance");
-		expect(urls[2]).toContain("q=legacy&entities=chapters");
+		expect(urls[2]).toContain("q=legacy&entities=narrators");
 		expect(urls[2]).not.toContain("sort=");
+		expect(urls[2]).not.toContain("include=");
+		expect(urls[3]).toContain("q=wider&entities=messages&sort=time&include=subagents,tools");
 	});
 
 	test("preserves search degraded metadata", async () => {
@@ -58,15 +61,17 @@ describe("misc APIs", () => {
 				JSON.stringify({
 					results: [],
 					degraded: true,
-					fallbacks: [{ entity: "chapters", from: "fts5", to: "like", reason: "fts_query_failed" }],
+					fallbacks: [
+						{ entity: "narrators", from: "fts5", to: "like", reason: "fts_query_failed" },
+					],
 					searchMetadata: {
 						degraded: true,
 						mode: "degraded-like-fallback",
 						ftsReady: false,
 						shortQuery: false,
-						requestedEntities: ["chapters"],
+						requestedEntities: ["narrators"],
 						fallbacks: [
-							{ entity: "chapters", from: "fts5", to: "like", reason: "fts_query_failed" },
+							{ entity: "narrators", from: "fts5", to: "like", reason: "fts_query_failed" },
 						],
 					},
 				}),
@@ -74,7 +79,7 @@ describe("misc APIs", () => {
 			),
 		);
 
-		const response = await api.search("AlphaBeta", "chapters");
+		const response = await api.search("AlphaBeta", "narrators");
 		expect(response.degraded).toBe(true);
 		expect(response.searchMetadata?.mode).toBe("degraded-like-fallback");
 		expect(response.searchMetadata?.fallbacks?.[0]?.reason).toBe("fts_query_failed");
@@ -86,17 +91,17 @@ describe("misc APIs", () => {
 				JSON.stringify({
 					results: [
 						{
-							type: "chapter",
-							id: "c_search_large_title",
-							title: "auroraanchor Chapter North",
+							type: "narrator",
+							id: "n_search_large_title",
+							title: "auroraanchor Narrator North",
 							snippet: "auroraanchor ranking fixture",
 							matchField: "title",
 							matchScore: 999,
 						},
 					],
 					projects: [{ id: "p_search_fixture", name: "Search Fixture Project" }],
-					chapters: [{ id: "c_search_large_title", type: "chapter" }],
-					narrators: [],
+					narrators: [{ id: "n_search_large_title", type: "narrator" }],
+					messages: [],
 					degraded: false,
 					fallbacks: [],
 					searchMetadata: {
@@ -104,7 +109,7 @@ describe("misc APIs", () => {
 						mode: "fts5-with-like-fallback",
 						ftsReady: true,
 						shortQuery: false,
-						requestedEntities: ["chapters", "messages", "narrators"],
+						requestedEntities: ["messages", "narrators"],
 						fallbacks: [],
 						backendDiagnostic: "ignored-by-frontend",
 					},
@@ -113,15 +118,15 @@ describe("misc APIs", () => {
 			),
 		);
 
-		const response = await api.search("auroraanchor", "chapters,messages,narrators");
+		const response = await api.search("auroraanchor", "messages,narrators");
 		expect(response.results).toHaveLength(1);
 		expect(response.degraded).toBe(false);
 		expect(response.fallbacks).toEqual([]);
 		expect(response.searchMetadata?.ftsReady).toBe(true);
 		expect(response.searchMetadata?.backendDiagnostic).toBe("ignored-by-frontend");
 		expect("projects" in response).toBe(true);
-		expect("chapters" in response).toBe(true);
 		expect("narrators" in response).toBe(true);
+		expect("messages" in response).toBe(true);
 	});
 
 	test("surfaces structured storage cleanup errors", async () => {

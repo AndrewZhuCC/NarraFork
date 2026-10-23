@@ -14,18 +14,25 @@ const { narratorRoutes } = await import("../../routes/narrators");
 const gitSummaryModule = await import("../narrator-git-summary");
 const displayReaderModule = await import("../narrator-display-page-reader");
 const time = "2026-10-12T00:00:00.000Z";
+/** `project` places the narrator in a project through its cwd's index link. */
 function narrator(
 	id: string,
 	owner = "viewer",
-	chapter: string | null = null,
+	project: string | null = null,
 	parent: string | null = null,
 	variant = "primary",
 ) {
 	sqlite
 		.prepare(
-			"INSERT INTO narrators (id, owner_user_id, visibility, write_audience, chapter_id, parent_narrator_id, variant, created_at, updated_at) VALUES (?, ?, 'private', 'owner', ?, ?, ?, ?, ?)",
+			"INSERT INTO narrators (id, owner_user_id, visibility, write_audience, cwd, parent_narrator_id, variant, created_at, updated_at) VALUES (?, ?, 'private', 'owner', ?, ?, ?, ?, ?)",
 		)
-		.run(id, owner, chapter, parent, variant, time, time);
+		.run(id, owner, project ? "/never-probe" : null, parent, variant, time, time);
+	if (project)
+		sqlite
+			.prepare(
+				"INSERT INTO narrator_project_links (narrator_id, project_id, role, source, directory, updated_at) VALUES (?, ?, 'primary', 'cwd', '/never-probe', ?)",
+			)
+			.run(id, project, time);
 }
 function queryTrace() {
 	const queries: string[] = [];
@@ -185,25 +192,20 @@ describe("request-local narrator loading", () => {
 		expect(queries.length).toBe(beforeReload + 1);
 	});
 
-	test("navigation uses only readable parent and project/chapter summaries", async () => {
+	test("navigation uses only readable parent and project summaries", async () => {
 		sqlite
 			.prepare(
 				"INSERT INTO projects (id, name, git_path, owner_user_id, visibility, created_at, updated_at) VALUES ('project', 'Project', '/never-probe', 'viewer', 'private', ?, ?)",
 			)
 			.run(time, time);
-		sqlite
-			.prepare(
-				"INSERT INTO chapters (id, project_id, title, branch, base_branch, created_at, updated_at) VALUES ('chapter', 'project', 'Chapter', 'branch', 'main', ?, ?)",
-			)
-			.run(time, time);
-		narrator("parent", "viewer", "chapter");
-		narrator("hidden", "other", "chapter");
+		narrator("parent", "viewer", "project");
+		narrator("hidden", "other", "project");
 		const principal = { userId: "viewer", isAdmin: false };
 		const result = await getNarratorNavigationSummary(
 			{
+				id: "child",
 				parentNarratorId: "parent",
 				variant: "subagent:general",
-				chapterId: null,
 				contextProjectId: null,
 			},
 			principal,
@@ -211,16 +213,14 @@ describe("request-local narrator loading", () => {
 		expect(result).toEqual({
 			parentNarratorId: "parent",
 			parentNarratorTitle: null,
-			chapterId: "chapter",
-			chapterTitle: "Chapter",
 			projectId: "project",
 		});
 		expect(
 			await getNarratorNavigationSummary(
 				{
+					id: "hidden-child",
 					parentNarratorId: "hidden",
 					variant: "subagent:general",
-					chapterId: null,
 					contextProjectId: null,
 				},
 				principal,
@@ -228,26 +228,19 @@ describe("request-local narrator loading", () => {
 		).toEqual({
 			parentNarratorId: null,
 			parentNarratorTitle: null,
-			chapterId: null,
-			chapterTitle: null,
 			projectId: null,
 		});
+		const primary = {
+			id: "parent",
+			parentNarratorId: null,
+			variant: "primary",
+			contextProjectId: null,
+		};
+		expect((await getNarratorNavigationSummary(primary, principal)).projectId).toBe("project");
 		sqlite.prepare("UPDATE projects SET owner_user_id = 'other' WHERE id = 'project'").run();
-		expect(
-			await getNarratorNavigationSummary(
-				{
-					parentNarratorId: null,
-					variant: "primary",
-					chapterId: "chapter",
-					contextProjectId: null,
-				},
-				principal,
-			),
-		).toEqual({
+		expect(await getNarratorNavigationSummary(primary, principal)).toEqual({
 			parentNarratorId: null,
 			parentNarratorTitle: null,
-			chapterId: null,
-			chapterTitle: null,
 			projectId: null,
 		});
 	});
@@ -264,9 +257,9 @@ describe("request-local narrator loading", () => {
 			)
 			.run(time);
 		const row = {
+			id: "standalone",
 			parentNarratorId: null,
 			variant: "primary",
-			chapterId: null,
 			contextProjectId: "project",
 		};
 		expect(

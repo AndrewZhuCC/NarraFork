@@ -217,8 +217,6 @@ export interface GatewayConfig {
 	enabled: boolean;
 	/** Default project ID to bind new IM sessions to (optional) */
 	defaultProjectId?: string;
-	/** Default chapter ID to bind new IM sessions to (optional) */
-	defaultChapterId?: string;
 	/** Default permission mode for IM-created narrators */
 	defaultPermissionMode?: PermissionMode;
 	/** Session idle timeout in minutes. Sessions older than this auto-reset. 0 = never. */

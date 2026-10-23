@@ -36,7 +36,6 @@ interface UsageHistoryRouteOptions {
 const listFilterShape = {
 	userId: z.string().trim().max(128).optional(),
 	narratorId: z.string().optional(),
-	chapterId: z.string().optional(),
 	projectId: z.string().optional(),
 	provider: z.string().optional(),
 	credentialId: z.string().optional(),
@@ -63,7 +62,6 @@ const cursorListQuerySchema = z.object({
 const statsQuerySchema = z.object({
 	userId: z.string().trim().max(128).optional(),
 	narratorId: z.string().optional(),
-	chapterId: z.string().optional(),
 	projectId: z.string().optional(),
 	provider: z.string().optional(),
 	credentialId: z.string().optional(),

@@ -523,8 +523,8 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 129 tables and 1773 columns including file IO outcomes and editor recovery", () => {
-		expect(target.tables.length).toBe(129);
+	test("covers 124 tables and 1662 columns including file IO outcomes, editor recovery and bot authors", () => {
+		expect(target.tables.length).toBe(124);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
 		// The numeric context stats replace the 5-column page cache with pins (3) and stats (4).
@@ -532,7 +532,10 @@ describe("real schema parity", () => {
 		// narrator_block_sync_queue (1), narrator_text_snapshots (4), narrator_turns (10), six
 		// envelope columns and two ledger columns. The P2 backfill adds narrator_block_backfill (6)
 		// and narrator_block_diagnostics (4).
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1773);
+		// Bot narrators add chat_messages.sender_narrator_id and reply_to_sender_narrator_id (2).
+		// Retiring the narrative line drops six tables (102 columns) and 19 columns elsewhere; the
+		// project index adds narrator_project_links (7) and projects.root_key.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1662);
 		expect(
 			target.tables
 				.find((table) => table.name === "narrator_context_pins")

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../../db";
-import { aclGrants, chapters, narrators, projects, users } from "../../db/schema";
+import { aclGrants, narratorProjectLinks, narrators, projects, users } from "../../db/schema";
 import { AppError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
 import { getHome } from "../../lib/platform";
@@ -94,36 +94,27 @@ async function row(id: string) {
 	return result;
 }
 
-test("HTTP project-only creation uses authenticated owner and metadata cwd without creating paths or chapters", async () => {
+test("HTTP project-only creation uses authenticated owner and metadata cwd without creating paths", async () => {
 	const response = await create({ contextProjectId: projectId, ownerUserId: stranger });
 	expect(response.status).toBe(201);
 	const created = await row((await response.json()).id);
 	expect(created.contextProjectId).toBe(projectId);
 	expect(created.ownerUserId).toBe(owner);
-	expect(created.chapterId).toBeNull();
 	expect(created.cwd).toBe(projectDir);
 	expect(created.visibility).toBe("project");
 	expect(created.writeAudience).toBe("project");
 	expect(existsSync(projectDir)).toBe(false);
-	expect(
-		await db.query.chapters.findFirst({ where: eq(chapters.projectId, projectId) }),
-	).toBeUndefined();
 });
 
-test("explicit cwd wins, mixed deprecated chapter input never creates or binds a chapter", async () => {
+test("explicit cwd wins over the project path, which wins over the global default", async () => {
 	settings.paths.defaultProjectDir = join(getHome(), "ignored-global-default");
 	const explicit = join(getHome(), "explicit-project-cwd");
-	const response = await create({
-		contextProjectId: projectId,
-		chapterId: "deprecated",
-		cwd: explicit,
-	});
+	const response = await create({ contextProjectId: projectId, cwd: explicit });
 	expect(response.status).toBe(201);
 	const created = await row((await response.json()).id);
 	expect(created.cwd).toBe(explicit);
-	expect(created.chapterId).toBeNull();
 	expect(created.contextProjectId).toBe(projectId);
-	const defaultResponse = await create({ contextProjectId: projectId, chapterId: "deprecated" });
+	const defaultResponse = await create({ contextProjectId: projectId });
 	expect((await row((await defaultResponse.json()).id)).cwd).toBe(projectDir);
 });
 
@@ -242,40 +233,48 @@ test("HTTP project write default is clamped while direct external provisioning s
 	expect(explicitExternal.visibility).toBe("private");
 });
 
-test("project listing includes legacy chapters and explicit contexts, leaving historical rows unchanged", async () => {
-	const chapterId = generateId();
-	const legacyId = generateId();
-	await db.insert(chapters).values({
-		id: chapterId,
-		projectId,
-		title: "Legacy",
-		branch: "legacy",
-		baseBranch: "main",
-		createdAt: now,
+async function link(
+	narratorId: string,
+	linkedProjectId: string,
+	role: "primary" | "additional",
+	source: "cwd" | "explicit" = "cwd",
+) {
+	await db.insert(narratorProjectLinks).values({
+		narratorId,
+		projectId: linkedProjectId,
+		role,
+		source,
+		directory: source === "cwd" ? projectDir : null,
 		updatedAt: now,
 	});
+}
+
+test("project listing includes indexed sessions and explicit contexts, leaving historical rows unchanged", async () => {
+	// A former chapter session: no explicit context, found through its cwd-derived link.
+	const indexedId = generateId();
 	await db.insert(narrators).values({
-		id: legacyId,
-		chapterId,
+		id: indexedId,
 		ownerUserId: owner,
+		cwd: projectDir,
 		visibility: "project",
 		writeAudience: "project",
 		createdAt: now,
 		updatedAt: now,
 	});
-	const before = await row(legacyId);
+	await link(indexedId, projectId, "primary");
+	const before = await row(indexedId);
 	const response = await create({ contextProjectId: projectId });
 	const createdId = (await response.json()).id;
-	const unboundId = (await (await create({ cwd: projectDir })).json()).id;
+	const unboundId = (await (await create({ cwd: join(getHome(), "unindexed-cwd") })).json()).id;
 	const listResponse = await appAs(owner).request(`/narrators?projectId=${projectId}`);
 	expect(listResponse.status).toBe(200);
 	const list = await listResponse.json();
 	const ids = list.items.map((item: { id: string }) => item.id);
-	expect(ids).toContain(legacyId);
+	expect(ids).toContain(indexedId);
 	expect(ids).toContain(createdId);
 	expect(ids).not.toContain(unboundId);
-	expect(await row(legacyId)).toEqual(before);
-	expect((await getAvailableCommands(legacyId, owner))[0]?.name).toBe("project-command");
+	expect(await row(indexedId)).toEqual(before);
+	expect((await getAvailableCommands(indexedId, owner))[0]?.name).toBe("project-command");
 });
 
 test("project-only children inherit configuration context but delegate authority to root, including after revocation", async () => {
@@ -289,7 +288,6 @@ test("project-only children inherit configuration context but delegate authority
 	});
 	for (const item of [child]) {
 		expect(item.contextProjectId).toBe(projectId);
-		expect(item.chapterId).toBeNull();
 		expect(item.aclRootNarratorId).toBe(root.id);
 		expect(item.ownerUserId).toBe(owner);
 		expect(item.visibility).toBe("private");
@@ -313,17 +311,7 @@ test("project-only children inherit configuration context but delegate authority
 	expect((await getAvailableCommands(root.id, owner))[0]?.name).toBe("project-command");
 });
 
-test("commands keep legacy chapter precedence over context project and no-project behavior", async () => {
-	const chapterId = generateId();
-	await db.insert(chapters).values({
-		id: chapterId,
-		projectId,
-		title: "Legacy",
-		branch: "legacy",
-		baseBranch: "main",
-		createdAt: now,
-		updatedAt: now,
-	});
+test("commands follow only the primary project; additional links and no project add nothing", async () => {
 	const conflictingProjectId = generateId();
 	await db.insert(projects).values({
 		id: conflictingProjectId,
@@ -333,18 +321,32 @@ test("commands keep legacy chapter precedence over context project and no-projec
 		createdAt: now,
 		updatedAt: now,
 	});
-	const narratorId = generateId();
+	// Explicit context is the primary project even when a cwd link points elsewhere.
+	const explicitId = generateId();
 	await db.insert(narrators).values({
-		id: narratorId,
-		chapterId,
-		contextProjectId: conflictingProjectId,
+		id: explicitId,
+		contextProjectId: projectId,
 		ownerUserId: owner,
 		createdAt: now,
 		updatedAt: now,
 	});
-	expect((await getAvailableCommands(narratorId, owner)).map((command) => command.name)).toEqual([
-		"project-command",
-	]);
+	await link(explicitId, projectId, "primary", "explicit");
+	await link(explicitId, conflictingProjectId, "additional");
+	// Without explicit context, the cwd-derived primary link decides.
+	const derivedId = generateId();
+	await db.insert(narrators).values({
+		id: derivedId,
+		ownerUserId: owner,
+		cwd: projectDir,
+		createdAt: now,
+		updatedAt: now,
+	});
+	await link(derivedId, projectId, "primary");
+	await link(derivedId, conflictingProjectId, "additional");
+	for (const narratorId of [explicitId, derivedId])
+		expect((await getAvailableCommands(narratorId, owner)).map((command) => command.name)).toEqual([
+			"project-command",
+		]);
 	const unbound = await narratorService.create({ ownerUserId: owner });
 	expect(await getAvailableCommands(unbound.id, owner)).toEqual([]);
 });

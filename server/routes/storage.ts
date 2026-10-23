@@ -130,7 +130,7 @@ storageRoutes.post("/cleanup", requireAdmin, async (c) => {
 			return c.json({ ok: true, ...result });
 		}
 		case "worktrees": {
-			const result = await storageService.cleanupOrphanedWorktrees();
+			const result = await storageService.repackTreeSnapshots();
 			return c.json({ ok: true, ...result });
 		}
 		case "containers": {

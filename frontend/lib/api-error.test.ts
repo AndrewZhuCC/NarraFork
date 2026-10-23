@@ -57,14 +57,14 @@ describe("messageCode lookup", () => {
 	test("renders the localized template with interpolated params", () => {
 		const described = describeApiError(
 			apiError(404, {
-				error: "Chapter not found: abc123",
+				error: "Narrator not found: abc123",
 				code: "NOT_FOUND",
 				messageCode: "RESOURCE_NOT_FOUND",
-				messageParams: { entity: "Chapter", id: "abc123" },
+				messageParams: { entity: "Narrator", id: "abc123" },
 			}),
 			tZh,
 		);
-		expect(described.message).toBe("未找到章节：abc123");
+		expect(described.message).toBe("未找到叙述者：abc123");
 		expect(described.localized).toBe(true);
 		expect(described.messageCode).toBe("RESOURCE_NOT_FOUND");
 	});
@@ -72,14 +72,14 @@ describe("messageCode lookup", () => {
 	test("keeps the server's English available untouched alongside the translation", () => {
 		const described = describeApiError(
 			apiError(404, {
-				error: "Chapter not found: abc123",
+				error: "Narrator not found: abc123",
 				code: "NOT_FOUND",
 				messageCode: "RESOURCE_NOT_FOUND",
-				messageParams: { entity: "Chapter", id: "abc123" },
+				messageParams: { entity: "Narrator", id: "abc123" },
 			}),
 			tZh,
 		);
-		expect(described.raw).toBe("Chapter not found: abc123");
+		expect(described.raw).toBe("Narrator not found: abc123");
 		expect(hasDistinctRawMessage(described)).toBe(true);
 	});
 
@@ -163,7 +163,7 @@ describe("param hygiene", () => {
 				error: "x",
 				code: "NOT_FOUND",
 				messageCode: "RESOURCE_NOT_FOUND",
-				messageParams: { entity: "Chapter", id: "z".repeat(500) },
+				messageParams: { entity: "Narrator", id: "z".repeat(500) },
 			}),
 			tEn,
 		);

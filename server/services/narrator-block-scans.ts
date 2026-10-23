@@ -19,7 +19,7 @@
 
 import { parseStored } from "@shared/narrator-blocks/plan";
 import * as database from "../db";
-import { blocksCurrentSql, readBodies } from "../lib/narrator-bodies";
+import { blocksCurrentSql } from "../lib/narrator-bodies";
 import { settings } from "../lib/settings";
 
 /** Whether scans go through the block tables: SQLite with `narratorBlocks.read`. */
@@ -46,58 +46,6 @@ export function storedElementsSql(
 		THEN (SELECT ${read("b.payload", "$.raw")} FROM narrator_blocks b
 			WHERE b.message_id = ${alias}.id ORDER BY b.ordinal LIMIT 1)
 		ELSE ${read(`${alias}.content_json`, "$")} END`;
-}
-
-export interface FoundEnvelope {
-	id: string;
-	createdAt: string;
-	/** The stored content, assembled from rows where they are current. */
-	content: unknown;
-}
-
-/**
- * Envelopes with a context block of `subtype` whose content contains every string in
- * `needles`, the substring match the `content_json` scans made. A block-format envelope is
- * found through the subtype index and matched on its block's payload; `marker` is the
- * `content_json` substring that finds the same envelopes where no rows answer. Only the
- * payload is searched, so needles must not be reader-only fields.
- */
-export function envelopesWithContext(
-	subtype: string,
-	marker: string,
-	needles: readonly string[],
-): FoundEnvelope[] {
-	const sqlite = database.sqlite;
-	const patterns = needles.map((needle) => `%${needle}%`);
-	const matching = (column: string) => needles.map(() => ` AND ${column} LIKE ?`).join("");
-	type Row = { id: string; createdAt: string; body: string | null };
-	const current = sqlite
-		.query(
-			`SELECT m.id, m.created_at AS createdAt, NULL AS body
-			 FROM narrator_blocks b JOIN narrator_messages m ON m.id = b.message_id
-			 WHERE b.kind = 'context' AND b.subtype = ? AND m.body_format = 2
-				AND ${NOT_QUEUED("m")}${matching("b.payload")}`,
-		)
-		.all(subtype, ...patterns) as Row[];
-	const queued = sqlite
-		.query(
-			`SELECT m.id, m.created_at AS createdAt, m.content_json AS body
-			 FROM narrator_block_sync_queue q JOIN narrator_messages m ON m.id = q.message_id
-			 WHERE m.content_json LIKE ?${matching("m.content_json")}`,
-		)
-		.all(`%${marker}%`, ...patterns) as Row[];
-	const legacy = sqlite
-		.query(
-			`SELECT id, created_at AS createdAt, content_json AS body
-			 FROM narrator_messages INDEXED BY idx_messages_legacy_body
-			 WHERE body_format = 1 AND content_json LIKE ?${matching("content_json")}`,
-		)
-		.all(`%${marker}%`, ...patterns) as Row[];
-	const rows = [
-		...new Map([...current, ...queued, ...legacy].map((row) => [row.id, row])).values(),
-	];
-	const bodies = readBodies(sqlite, rows);
-	return rows.map((row) => ({ id: row.id, createdAt: row.createdAt, content: bodies.get(row.id) }));
 }
 
 /**

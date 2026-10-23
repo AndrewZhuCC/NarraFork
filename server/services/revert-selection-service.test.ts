@@ -14,7 +14,7 @@ const DDL = `
 CREATE TABLE narrators (
  id TEXT PRIMARY KEY, owner_user_id TEXT, visibility TEXT NOT NULL DEFAULT 'private',
  write_audience TEXT NOT NULL DEFAULT 'owner', type TEXT NOT NULL DEFAULT 'primary',
- acl_root_narrator_id TEXT, chapter_id TEXT, context_project_id TEXT, message_version INTEGER NOT NULL DEFAULT 7,
+ acl_root_narrator_id TEXT, context_project_id TEXT, message_version INTEGER NOT NULL DEFAULT 7,
  refs_inherited_from TEXT, status TEXT NOT NULL DEFAULT 'idle', parent_narrator_id TEXT, origin_tool_call_id TEXT,
  fork_message_id TEXT
 );
@@ -73,8 +73,6 @@ CREATE TABLE file_change_effects (
 CREATE UNIQUE INDEX idx_fc_effect_operation_file ON file_change_effects(operation_id,file_key,phase);
 CREATE TABLE file_change_execution_segments (id TEXT PRIMARY KEY, narrator_id TEXT NOT NULL, parent_segment_id TEXT);
 CREATE INDEX idx_fc_segment_parent ON file_change_execution_segments(parent_segment_id);
-CREATE TABLE chapter_commits (id TEXT PRIMARY KEY, narrator_message_id TEXT);
-CREATE INDEX idx_chapter_commits_narrator_message ON chapter_commits(narrator_message_id);
 CREATE TABLE spec_file_revisions (id TEXT PRIMARY KEY, source_message_id TEXT);
 CREATE INDEX idx_spec_file_revisions_source_message ON spec_file_revisions(source_message_id);
 CREATE TABLE narrator_patches (id TEXT PRIMARY KEY, message_id TEXT);
@@ -456,17 +454,16 @@ describe("stable block boundary and COW history manifest", () => {
 		expect(result.history.budget.messageRefChanges).toBe(1);
 		expect(result.history.toolChanges[0].action).toBe("retain");
 	});
-	test("potential cascades and SET NULL rows include question/continuation/spec/commit/API pointers", async () => {
+	test("potential cascades and SET NULL rows include question/continuation/spec/API pointers", async () => {
 		const t = tool(1, "Read");
 		sqlite.query("INSERT INTO narrator_questions VALUES('q',?)").run(t.id);
 		sqlite.query("INSERT INTO narrator_tool_continuations VALUES('continue',?)").run(t.id);
 		sqlite.query("INSERT INTO knowledge_injection_events VALUES('k',?,?)").run(t.messageId, t.id);
 		sqlite.query("INSERT INTO spec_file_revisions VALUES('s',?)").run(t.messageId);
-		sqlite.query("INSERT INTO chapter_commits VALUES('c',?)").run(t.messageId);
 		sqlite.query("INSERT INTO api_requests VALUES('a',?)").run(t.messageId);
 		const result = await collect();
-		expect(result.history.associations).toHaveLength(7);
-		expect(result.history.budget.relatedRows).toBe(7); // one deleted call + 6 distinct dependent rows
+		expect(result.history.associations).toHaveLength(6);
+		expect(result.history.budget.relatedRows).toBe(6); // one deleted call + 5 distinct dependent rows
 	});
 });
 

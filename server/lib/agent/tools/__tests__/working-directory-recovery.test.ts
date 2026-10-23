@@ -90,14 +90,13 @@ describe("missing working directory recovery", () => {
 		}
 	});
 
-	test("suggests the active worktree when the narrator cwd is missing", async () => {
+	test("suggests the project root when the narrator cwd is missing", async () => {
 		const worktree = mkdtempSync(join(tmpdir(), "nf-recovery-worktree-"));
 		try {
 			const result = await bashTool.execute({ command: "pwd" }, {
 				narratorId: "test-narrator",
 				cwd: join(worktree, "missing"),
-				worktreePath: worktree,
-				projectGitPath: join(worktree, "project-missing"),
+				projectGitPath: worktree,
 				signal: new AbortController().signal,
 				locale: "en",
 				requestPermission: async () => ({ behavior: "allow" as const }),

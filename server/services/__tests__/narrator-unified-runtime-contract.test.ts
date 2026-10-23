@@ -10,9 +10,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { eq, inArray } from "drizzle-orm";
 import { db } from "../../db";
-import { chapters, narratorBlacklistCmds, narrators, projects, users } from "../../db/schema";
+import { narratorBlacklistCmds, narrators, users } from "../../db/schema";
 import { generateId } from "../../lib/id";
-import { parseRuntimePolicyTraits, withRuntimePolicyTrait } from "../../lib/runtime-policy-trait";
+import { withRuntimePolicyTrait } from "../../lib/runtime-policy-trait";
 import { settings } from "../../lib/settings";
 import {
 	CONTROLLER_ACTIONS,
@@ -25,7 +25,6 @@ import { materializeLegacyDelegations } from "../legacy-delegation-materializer"
 import { authorizeAgentControl } from "../narrator-control";
 import { setPolicySource, setRuntimeRegistration } from "../narrator-runtime-registration";
 import { narratorService } from "../narrator-service";
-import { reviewService } from "../review-service";
 import { resolveSubagentModelForRun } from "../subagent-model";
 import { resetTraitLayerCaches, resolveNarratorRuntimePolicy } from "../trait-layer-service";
 
@@ -344,71 +343,6 @@ describe.each(shapes)("%s session: control is a separate, explicit grant", (shap
 				userId: stranger,
 			}),
 		).rejects.toThrow("current user");
-	});
-});
-
-describe("every creation path stores its ceiling on the row", () => {
-	test("review conversion writes the compiled review ceiling and its relationships", async () => {
-		const now = new Date().toISOString();
-		const projectId = generateId();
-		const [sourceChapterId, reviewChapterId] = [generateId(), generateId()];
-		await db.insert(projects).values({
-			id: projectId,
-			name: "convert-ceiling",
-			gitPath: `/tmp/nf-convert-${projectId.slice(0, 6)}`,
-			createdAt: now,
-			updatedAt: now,
-		});
-		await db.insert(chapters).values([
-			{
-				id: sourceChapterId,
-				projectId,
-				title: "source",
-				status: "active",
-				role: "branch",
-				branch: "feat",
-				baseBranch: "main",
-				createdAt: now,
-				updatedAt: now,
-			},
-			{
-				id: reviewChapterId,
-				projectId,
-				title: "review",
-				status: "active",
-				role: "review",
-				branch: "review/feat",
-				baseBranch: "feat",
-				reviewSourceChapterId: sourceChapterId,
-				reviewStatus: "concluded",
-				createdAt: now,
-				updatedAt: now,
-			},
-		]);
-		try {
-			const source = await narratorService.create({ locale: "en", chapterId: sourceChapterId });
-			const review = await narratorService.create({ locale: "en", chapterId: reviewChapterId });
-			created.push(review.id, source.id);
-			await reviewService.convertToSubagent(reviewChapterId);
-			const row = await narratorService.getById(review.id);
-			// Read from the row, not through the legacy compile-on-read fallback.
-			expect(parseRuntimePolicyTraits(row.traits)).toEqual([
-				compileDelegationPolicy({ template: "review" }),
-			]);
-			expect(row.policySourceNarratorId).toBe(source.id);
-			expect(row.runtimeRegistrationJson).toMatchObject({
-				modelPool: "review",
-				controller: { narratorId: source.id },
-			});
-			expect((await resolveNarratorRuntimePolicy(review.id)).readOnlyGitShell).toBe(true);
-		} finally {
-			await db
-				.update(narrators)
-				.set({ chapterId: null })
-				.where(inArray(narrators.chapterId, [sourceChapterId, reviewChapterId]));
-			await db.delete(chapters).where(inArray(chapters.id, [reviewChapterId, sourceChapterId]));
-			await db.delete(projects).where(eq(projects.id, projectId));
-		}
 	});
 });
 

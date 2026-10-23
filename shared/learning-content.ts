@@ -120,9 +120,9 @@ const docs: LearningDocSource[] = [
 			{
 				title: { en: "Mental model", "zh-CN": "核心心智模型" },
 				body: {
-					en: "A narrator is an AI work session with tools. Projects connect NarraFork to your Git repositories. Supporting features such as routines, skills, terminals, containers, notifications, and reviews make that work repeatable and auditable.",
+					en: "A narrator is an AI work session with tools. A session working inside a Git repository joins that repository's project automatically. Supporting features such as routines, skills, terminals, containers, and notifications make that work repeatable and auditable.",
 					"zh-CN":
-						"叙述者是带工具的 AI 工作会话；叙事线把 NarraFork 连接到你的 Git 仓库；套路、技能、终端、容器、通知和评审让工作可复用、可审计。",
+						"叙述者是带工具的 AI 工作会话；在 Git 仓库里工作的会话会自动归入该仓库的项目；套路、技能、终端、容器和通知让工作可复用、可审计。",
 				},
 			},
 		],
@@ -132,8 +132,9 @@ const docs: LearningDocSource[] = [
 				"zh-CN": "先完成初始化：配置供应商与模型，再确认运行资源可用。",
 			},
 			{
-				en: "Create or open a project only when you need repository-bound work; otherwise start with a standalone narrator.",
-				"zh-CN": "需要绑定仓库时创建/打开叙事线；只想讨论、规划或查阅资料时可直接新建独立叙述者。",
+				en: "For repository work, point the narrator at the repository directory and it joins that project; for discussion, planning, or research, a standalone narrator is enough.",
+				"zh-CN":
+					"改仓库时把叙述者的工作目录设在仓库里，它会自动归入该项目；只想讨论、规划或查阅资料时直接新建独立叙述者即可。",
 			},
 			{
 				en: "Give narrators concrete objectives, let them plan larger changes, and review tool results before merging or releasing.",
@@ -170,7 +171,7 @@ const docs: LearningDocSource[] = [
 				label: { en: "New narrator", "zh-CN": "新建叙述者" },
 				description: {
 					en: "Start an AI session not bound to a specific project.",
-					"zh-CN": "启动不绑定具体叙事线的 AI 会话。",
+					"zh-CN": "启动不绑定具体项目的 AI 会话。",
 				},
 				href: "/narrators",
 			},
@@ -188,11 +189,11 @@ const docs: LearningDocSource[] = [
 		},
 		sections: [
 			{
-				title: { en: "Standalone vs project-bound", "zh-CN": "独立会话与叙事线会话" },
+				title: { en: "Standalone vs project sessions", "zh-CN": "独立会话与项目会话" },
 				body: {
-					en: "Standalone narrators are best for planning, research, and operations. Project-bound narrators inherit repository context and are better for code changes.",
+					en: "Standalone narrators are best for planning, research, and operations. A narrator working in a repository belongs to that repository's project and inherits its configuration, which suits code changes.",
 					"zh-CN":
-						"独立叙述者适合规划、研究和运维；绑定叙事线的叙述者继承仓库上下文，更适合实际代码修改。",
+						"独立叙述者适合规划、研究和运维；在仓库里工作的叙述者属于该仓库的项目并继承项目配置，更适合实际代码修改。",
 				},
 			},
 			{
@@ -206,8 +207,8 @@ const docs: LearningDocSource[] = [
 		],
 		workflow: [
 			{
-				en: "Choose the right context: standalone for thinking, project-bound for repository work.",
-				"zh-CN": "先选上下文：思考/调研用独立会话，仓库改动用叙事线会话。",
+				en: "Choose the right context: standalone for thinking, a repository directory for repository work.",
+				"zh-CN": "先选上下文：思考/调研用独立会话，仓库改动把工作目录设在仓库里。",
 			},
 			{
 				en: "State the objective, constraints, and what counts as done.",
@@ -490,7 +491,7 @@ const docs: LearningDocSource[] = [
 		pitfalls: [
 			{
 				en: "Do not hide critical project decisions inside a routine that users never see.",
-				"zh-CN": "不要把关键叙事线决策藏在用户看不到的套路里。",
+				"zh-CN": "不要把关键项目决策藏在用户看不到的套路里。",
 			},
 		],
 		agentHints: [
@@ -670,8 +671,8 @@ const docs: LearningDocSource[] = [
 		tags: ["terminal", "container", "podman", "runtime"],
 		title: { en: "Terminals and containers", "zh-CN": "终端与容器" },
 		summary: {
-			en: "Terminals provide interactive shells. Containers isolate project runtimes and allocate ports for services.",
-			"zh-CN": "终端提供交互式 shell；容器隔离叙事线运行环境，并为服务分配端口。",
+			en: "Terminals provide interactive shells. Containers (Podman) isolate plugin and benchmark runtimes.",
+			"zh-CN": "终端提供交互式 shell；容器（Podman）为插件和基准测试提供隔离运行环境。",
 		},
 		sections: [
 			{
@@ -685,8 +686,9 @@ const docs: LearningDocSource[] = [
 			{
 				title: { en: "Containers", "zh-CN": "容器" },
 				body: {
-					en: "Container support is optional and relies on Podman. It is useful when a project needs repeatable dependencies or isolated service processes.",
-					"zh-CN": "容器能力是可选的，依赖 Podman；当叙事线需要可复现依赖或隔离服务进程时很有用。",
+					en: "Container support is optional and relies on Podman. NarraFork uses it to run plugins and benchmarks in isolation; settings show whether Podman is available and can install it.",
+					"zh-CN":
+						"容器能力是可选的，依赖 Podman；NarraFork 用它隔离运行插件和基准测试，设置页可查看 Podman 状态并安装。",
 				},
 			},
 		],
@@ -699,19 +701,11 @@ const docs: LearningDocSource[] = [
 				en: "Configure terminal runtime and shell before expecting stable interactive sessions.",
 				"zh-CN": "期望稳定终端前，先配置终端运行时和 shell。",
 			},
-			{
-				en: "Use containers when local dependencies are risky or inconsistent across machines.",
-				"zh-CN": "本地依赖风险高或跨机器不一致时，使用容器。",
-			},
 		],
 		bestPractices: [
 			{
 				en: "Keep long-running development servers in terminals so their logs remain visible.",
 				"zh-CN": "把长期运行的开发服务器放在终端中，方便持续查看日志。",
-			},
-			{
-				en: "Document project port assumptions before enabling container automation.",
-				"zh-CN": "启用容器自动化前，先记录叙事线端口假设。",
 			},
 		],
 		pitfalls: [
@@ -823,22 +817,22 @@ const docs: LearningDocSource[] = [
 		tags: ["search", "navigation", "recent-tabs"],
 		title: { en: "Search, recent tabs, and navigation", "zh-CN": "搜索、最近访问与导航" },
 		summary: {
-			en: "Use global search for indexed chapters and messages, and use recent tabs to jump back to active projects or narrator sessions quickly.",
-			"zh-CN": "使用全局搜索查找已索引的章节和消息，并用最近访问快速回到活跃叙事线或叙述者会话。",
+			en: "Use global search for indexed sessions and messages, and use recent tabs to jump back to active projects or narrator sessions quickly.",
+			"zh-CN": "使用全局搜索查找已索引的会话和消息，并用最近访问快速回到活跃项目或叙述者会话。",
 		},
 		sections: [
 			{
 				title: { en: "Global search", "zh-CN": "全局搜索" },
 				body: {
 					en: "Search is useful when you remember a message, decision, or title but not the exact project or narrator where it happened.",
-					"zh-CN": "当你记得某条消息、决策或标题，却忘记具体叙事线/叙述者时，使用全局搜索。",
+					"zh-CN": "当你记得某条消息、决策或标题，却忘记具体项目/叙述者时，使用全局搜索。",
 				},
 			},
 			{
 				title: { en: "Recent tabs", "zh-CN": "最近访问" },
 				body: {
 					en: "Recent tabs keep active project and narrator contexts close at hand, including unread or working states.",
-					"zh-CN": "最近访问会保留活跃叙事线和叙述者上下文，并显示未读或工作中状态。",
+					"zh-CN": "最近访问会保留活跃项目和叙述者上下文，并显示未读或工作中状态。",
 				},
 			},
 		],
@@ -850,13 +844,13 @@ const docs: LearningDocSource[] = [
 			},
 			{
 				en: "Clear idle narrators or project tabs to reduce sidebar noise.",
-				"zh-CN": "清理空闲叙述者或叙事线标签，减少侧边栏噪音。",
+				"zh-CN": "清理空闲叙述者或项目标签，减少侧边栏噪音。",
 			},
 		],
 		bestPractices: [
 			{
 				en: "Use distinctive narrator and project titles to make later search easier.",
-				"zh-CN": "使用有辨识度的叙述者/叙事线标题，方便后续检索。",
+				"zh-CN": "使用有辨识度的叙述者/项目标题，方便后续检索。",
 			},
 			{
 				en: "Search messages before asking an agent to rediscover prior decisions.",
@@ -878,7 +872,7 @@ const docs: LearningDocSource[] = [
 		actions: [
 			{
 				label: { en: "Search", "zh-CN": "搜索" },
-				description: { en: "Find chapters and messages.", "zh-CN": "查找章节和消息。" },
+				description: { en: "Find sessions and messages.", "zh-CN": "查找会话和消息。" },
 				href: "/search",
 			},
 		],
@@ -894,7 +888,7 @@ const docs: LearningDocSource[] = [
 		},
 		sections: [
 			{
-				title: { en: "Review chapters and agents", "zh-CN": "评审章节与评审 Agent" },
+				title: { en: "Review agents", "zh-CN": "评审 Agent" },
 				body: {
 					en: "Review agents focus on finding correctness, maintainability, security, migration, and test issues without rewriting the whole solution by default.",
 					"zh-CN":

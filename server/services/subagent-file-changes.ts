@@ -10,7 +10,6 @@ import { and, asc, eq, inArray, like, or, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/sqlite-core";
 import { db } from "../db";
 import {
-	chapters,
 	fileAttributions,
 	fileChangeEffects,
 	fileChangeExecutionSegments,
@@ -145,7 +144,6 @@ interface ChildQuery {
 async function loadChildren(ids: string[], parentNarratorId?: string): Promise<ChildQuery[]> {
 	if (!ids.length) return [];
 	const parent = alias(narrators, "file_changes_parent");
-	const chapterProject = alias(projects, "file_changes_parent_chapter_project");
 	const contextProject = alias(projects, "file_changes_parent_context_project");
 	const rows = await db
 		.select({
@@ -153,16 +151,11 @@ async function loadChildren(ids: string[], parentNarratorId?: string): Promise<C
 			parentNarratorId: narrators.parentNarratorId,
 			parentId: parent.id,
 			parentCwd: parent.cwd,
-			parentChapterId: parent.chapterId,
-			parentWorktreePath: chapters.worktreePath,
-			parentChapterGitPath: chapterProject.gitPath,
 			parentContextGitPath: contextProject.gitPath,
 			parentDeviceId: parent.defaultDeviceId,
 		})
 		.from(narrators)
 		.leftJoin(parent, eq(parent.id, narrators.parentNarratorId))
-		.leftJoin(chapters, eq(chapters.id, parent.chapterId))
-		.leftJoin(chapterProject, eq(chapterProject.id, chapters.projectId))
 		.leftJoin(contextProject, eq(contextProject.id, parent.contextProjectId))
 		.where(
 			and(
@@ -181,14 +174,8 @@ async function loadChildren(ids: string[], parentNarratorId?: string): Promise<C
 		parentWorkspace: row.parentId
 			? normalizeParentWorkspace({
 					deviceId: row.parentDeviceId ?? "local",
-					// Same precedence as resolveNarratorCwd: a chapter/project narrator
-					// usually has no cwd of its own and works in the chapter worktree.
-					workspacePath:
-						row.parentCwd ||
-						(row.parentChapterId
-							? row.parentWorktreePath || row.parentChapterGitPath
-							: row.parentContextGitPath) ||
-						null,
+					// Same precedence as resolveNarratorSessionCwd: own cwd, then project root.
+					workspacePath: row.parentCwd || row.parentContextGitPath || null,
 				})
 			: null,
 	}));

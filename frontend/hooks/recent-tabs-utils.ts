@@ -19,7 +19,6 @@ export interface RecentTab extends PersistedRecentTab {
 	activeBackgroundServiceCount?: number;
 	viewers?: RecentTabViewer[];
 	viewerCount?: number;
-	containerStatus?: "created" | "running" | "paused" | "stopped" | null;
 	/** Runtime-enriched marker: this narrator has unsent draft text. */
 	hasDraft?: boolean;
 	/** Persisted marker (see `PersistedRecentTab`): this narrator was spawned by a scheduled task. */
@@ -120,7 +119,6 @@ const RECENT_TAB_RUNTIME_KEYS = [
 	"activeBackgroundServiceCount",
 	"viewers",
 	"viewerCount",
-	"containerStatus",
 	"hasDraft",
 ] as const satisfies ReadonlyArray<keyof RecentTab>;
 
@@ -202,7 +200,6 @@ export function mergeRecentTabRuntime(tab: PersistedRecentTab, previous?: Recent
 
 function recentTabNarratorId(tab: RecentTab): string | null {
 	if (tab.type === "narrator" || tab.type === "subagent") return tab.id;
-	if (tab.type === "chapter") return tab.narratorId ?? null;
 	return null;
 }
 
@@ -295,9 +292,6 @@ export function reconcileRecentTabsRuntimePatches(
 
 function recentTabMatchesPath(tab: RecentTab, pathname: string): boolean {
 	if (tab.type === "project") return pathname === `/projects/${tab.id}`;
-	if (tab.type === "chapter") {
-		return !!tab.narratorId && pathname === `/narrators/${tab.narratorId}`;
-	}
 	if (tab.type === "workspace") return pathname === `/narrators/workspace/${tab.id}`;
 	return pathname === `/narrators/${tab.id}`;
 }

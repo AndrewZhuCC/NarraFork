@@ -893,7 +893,6 @@ describe("history rollback refusal and independent file outcomes", () => {
 			const unavailable = snapshotRevert.unavailableSnapshotRevert("history_unavailable", path);
 			spyOn(scopedRevert, "revertNarratorScopedForMessages").mockResolvedValue(unavailable);
 			spyOn(scopedRevert, "revertNarratorScopedForToolUses").mockResolvedValue(unavailable);
-			const restore = spyOn(worktreeTreeSnapshot, "restore");
 			const action =
 				entry === "messages"
 					? narratorService.deleteMessage(narratorId, messageId)
@@ -901,7 +900,6 @@ describe("history rollback refusal and independent file outcomes", () => {
 						? narratorService.deleteMessageBlock(narratorId, messageId, 0)
 						: narratorService.deleteMessageBlocks(narratorId, [{ messageId, blockIndex: 0 }]);
 			await expect(action).rejects.toMatchObject({ result: unavailable });
-			expect(restore).not.toHaveBeenCalled();
 			expect(readFileSync(path, "utf8")).toBe("user's later bytes\n");
 			expect(messageBlocks(messageId)).toEqual([{ type: "tool_use", id: toolUseId }]);
 			expect(narratorState(narratorId)?.messageVersion).toBe(0);
@@ -928,7 +926,6 @@ describe("history rollback refusal and independent file outcomes", () => {
 		const toolUseId = generateId();
 		const messageId = addMessage(narratorId, [{ type: "tool_use", id: toolUseId }]);
 		addTool(narratorId, messageId, toolUseId, join(cwd, "workspace.txt"));
-		const restore = spyOn(worktreeTreeSnapshot, "restore");
 		const scoped = spyOn(scopedRevert, "revertNarratorScopedForMessages");
 		await expect(
 			narratorService.deleteMessage(narratorId, messageId, { scope: "workspace" }),
@@ -938,7 +935,6 @@ describe("history rollback refusal and independent file outcomes", () => {
 				scope: "workspace",
 			}),
 		).rejects.toMatchObject({ code: "SNAPSHOT_REVERT_FAILED" });
-		expect(restore).not.toHaveBeenCalled();
 		expect(scoped).not.toHaveBeenCalled();
 		expect(messageBlocks(messageId)).toEqual([{ type: "tool_use", id: toolUseId }]);
 	});
@@ -1192,8 +1188,6 @@ describe("keep-files range snapshot diagnostics", () => {
 			const warn = spyOn(logger, "warn").mockImplementation(() => {});
 			const capture = spyOn(worktreeTreeSnapshot, "capture");
 			const hotCapture = spyOn(worktreeTreeSnapshot, "tryCaptureHot");
-			const restore = spyOn(worktreeTreeSnapshot, "restore");
-			const reverse = spyOn(worktreeTreeSnapshot, "reverseAndRestore");
 			let lastBeat = performance.now();
 			let maxLagMs = 0;
 			const heartbeat = setInterval(() => {
@@ -1216,8 +1210,6 @@ describe("keep-files range snapshot diagnostics", () => {
 			expect(readFileSync(path, "utf8")).toBe("current workspace bytes\n");
 			expect(capture).not.toHaveBeenCalled();
 			expect(hotCapture).not.toHaveBeenCalled();
-			expect(restore).not.toHaveBeenCalled();
-			expect(reverse).not.toHaveBeenCalled();
 			const checkpoints = db
 				.select({
 					id: narratorToolCalls.id,

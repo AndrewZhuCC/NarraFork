@@ -7,7 +7,7 @@ import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "r
 import { useTranslation } from "react-i18next";
 import { useApplyAsyncQuestionChange } from "../../hooks/useAsyncQuestions";
 import { useCurrentUser } from "../../hooks/useAuth";
-import { invalidateGitStatusPushQueries, invalidateWorkspaceQueries } from "../../hooks/useGit";
+import { invalidateGitStatusPushQueries } from "../../hooks/useGit";
 import { useNarratorWS } from "../../hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
 import { api, type BufferMessageSummary } from "../../lib/api";
@@ -1386,36 +1386,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onBrowserSessionVisualChange: (sessionId) => {
 				setBrowserVisualChange((prev) => ({ sessionId, seq: (prev?.seq ?? 0) + 1 }));
 			},
-			onGitStatus: (data) => {
-				if (data.chapterId) {
-					qc.setQueryData(["chapterGitStatus", data.chapterId], {
-						commitsAhead: data.commitsAhead,
-						baseBranch: data.baseBranch,
-						linesAdded: data.linesAdded,
-						linesRemoved: data.linesRemoved,
-					});
-				}
-				// The workspace bars (NarratorGitBar / ChapterBar with a narrator) read
-				// workspace-keyed gitStatus queries, which the chapter badge patch above
-				// never touches — without this the bar kept pre-session numbers until a
-				// foreground/reconnect refetch. Open Git panels additionally have their
-				// own workspace subscription; double invalidation is idempotent.
-				invalidateGitStatusPushQueries(qc, narratorId, data.chapterId);
-			},
-			onCommitSyncError: (event) => {
-				qc.invalidateQueries({ queryKey: ["chapterGitStatus", event.chapterId] });
-				invalidateWorkspaceQueries(qc, event.chapterId);
-				notifications.show({
-					title: t("commitSyncErrorTitle"),
-					message:
-						event.reason ??
-						event.message ??
-						event.error ??
-						event.code ??
-						t("commitSyncErrorFallback"),
-					color: "yellow",
-					autoClose: 5000,
-				});
+			onGitStatus: () => {
+				// The workspace bar reads workspace-keyed gitStatus queries; open Git panels
+				// additionally have their own workspace subscription. Double invalidation is
+				// idempotent.
+				invalidateGitStatusPushQueries(qc, narratorId);
 			},
 			onCompacting: () => {
 				dispatchStatus({

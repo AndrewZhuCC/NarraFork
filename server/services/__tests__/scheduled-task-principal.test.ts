@@ -9,28 +9,26 @@
  * That claim is wrong for exactly the population where it does damage. Every narrator
  * predating access control has `owner_user_id = NULL`, so an admin-created task hit a
  * session with no owner, no write audience admitting it and no explicit grant: the run
- * was skipped with "Task creator no longer has write access to this chapter's narrator",
- * addressed to the one person who could open that very session in the UI and type into
- * it. Nothing about the message points at the ACL layer, which is why it reads as a
- * scheduler bug.
+ * was skipped with "Task creator no longer has write access", addressed to the one person
+ * who could open that very session in the UI and type into it. Nothing about the message
+ * points at the ACL layer, which is why it reads as a scheduler bug.
  *
  * The other direction has to keep holding, or fixing this would turn a schedule into a
  * way to inject prompts into a colleague's private session: a NON-admin creator with no
- * access must still be refused, and the refusal must still not create a narrator on that
- * chapter.
+ * access must still be refused, and the refusal must still not create a narrator in that
+ * project.
  *
  * Run: NARRAFORK_ALLOW_MULTIPLE=1 NARRAFORK_HOME=$(mktemp -d) \
  *      bun test server/services/__tests__/scheduled-task-principal.test.ts
  */
 import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { db } from "../../db";
-import { chapters, narrators, projects, type scheduledTasks, users } from "../../db/schema";
+import { narrators, projects, type scheduledTasks, users } from "../../db/schema";
 import { generateId } from "../../lib/id";
-import { safeSpawn } from "../../lib/spawn";
 
 type ScheduledTaskRow = typeof scheduledTasks.$inferSelect;
 
@@ -63,11 +61,6 @@ const tempDirs: string[] = [];
 const createdProjects: string[] = [];
 const createdUsers: string[] = [];
 
-async function git(args: string[], cwd: string): Promise<void> {
-	const result = await safeSpawn({ cmd: ["git", ...args], cwd, timeout: 15_000 });
-	if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
-}
-
 async function makeUser(role: "admin" | "user"): Promise<string> {
 	const id = generateId();
 	await db.insert(users).values({
@@ -81,25 +74,14 @@ async function makeUser(role: "admin" | "user"): Promise<string> {
 	return id;
 }
 
-/**
- * An ACTIVE chapter on a real repository, plus one primary narrator on it.
- *
- * Active because the status branches are covered elsewhere; this suite is only about the
- * reuse decision, which is the first thing after them.
- */
-async function makeChapterWithNarrator(narratorFields: {
+/** A project, plus one primary session in it that a task may want to reuse. */
+async function makeProjectWithNarrator(narratorFields: {
 	ownerUserId: string | null;
 	visibility: "private" | "project" | "public";
 	writeAudience: "owner" | "project" | "public";
-}): Promise<{ projectId: string; chapterId: string; narratorId: string }> {
+}): Promise<{ projectId: string; narratorId: string }> {
 	const gitPath = mkdtempSync(join(tmpdir(), "nf-sched-principal-"));
 	tempDirs.push(gitPath);
-	await git(["init"], gitPath);
-	await git(["config", "user.email", "test@example.com"], gitPath);
-	await git(["config", "user.name", "Test"], gitPath);
-	writeFileSync(join(gitPath, "app.txt"), "seed\n");
-	await git(["add", "-A"], gitPath);
-	await git(["commit", "-m", "seed"], gitPath);
 
 	const now = new Date().toISOString();
 	const projectId = generateId();
@@ -108,31 +90,19 @@ async function makeChapterWithNarrator(narratorFields: {
 		name: `sched-principal-${TAG}`,
 		gitPath,
 		// Owned by nobody and private, like a pre-ACL project that was never re-homed.
-		// This keeps the project gate from being the thing under test: only an admin or
-		// an explicit member passes it, which is exactly the situation being reproduced.
+		// Only an admin or an explicit member passes its gate, which is exactly the
+		// situation being reproduced.
 		createdAt: now,
 		updatedAt: now,
 	});
 	createdProjects.push(projectId);
 
-	const chapterId = generateId();
-	await db.insert(chapters).values({
-		id: chapterId,
-		projectId,
-		title: "Scheduled chapter",
-		branch: `chapter/sched-${generateId(6)}`,
-		baseBranch: "main",
-		worktreePath: null,
-		status: "active",
-		role: "branch",
-		createdAt: now,
-		updatedAt: now,
-	});
-
 	const narratorId = generateId();
 	await db.insert(narrators).values({
 		id: narratorId,
-		chapterId,
+		contextProjectId: projectId,
+		cwd: gitPath,
+		traits: ["standalone"],
 		title: "Existing session",
 		variant: "primary",
 		type: "primary",
@@ -143,12 +113,13 @@ async function makeChapterWithNarrator(narratorFields: {
 		updatedAt: now,
 	});
 
-	return { projectId, chapterId, narratorId };
+	return { projectId, narratorId };
 }
 
-function chapterTask(
+/** A project task that remembers `narratorId` as the session to reuse. */
+function projectTask(
 	projectId: string,
-	chapterId: string,
+	narratorId: string,
 	createdBy: string | null,
 ): ScheduledTaskRow {
 	const now = new Date().toISOString();
@@ -163,12 +134,11 @@ function chapterTask(
 		model: null,
 		permissionMode: "bypassPermissions",
 		locale: "en",
-		runContext: "chapter",
+		runContext: "project",
 		cwd: null,
 		projectId,
-		chapterId,
-		narratorMode: "new",
-		reuseNarratorId: null,
+		narratorMode: "reuse",
+		reuseNarratorId: narratorId,
 		createdBy,
 		lastRunAt: null,
 		nextRunAt: null,
@@ -200,15 +170,7 @@ async function launchAndCaptureTarget(
 
 afterEach(async () => {
 	for (const projectId of createdProjects.splice(0)) {
-		await db.delete(narrators).where(eq(narrators.chapterId, projectId));
-		const rows = await db.query.chapters.findMany({
-			where: eq(chapters.projectId, projectId),
-			columns: { id: true },
-		});
-		for (const row of rows) {
-			await db.delete(narrators).where(eq(narrators.chapterId, row.id));
-		}
-		await db.delete(chapters).where(eq(chapters.projectId, projectId));
+		await db.delete(narrators).where(eq(narrators.contextProjectId, projectId));
 		await db.delete(projects).where(eq(projects.id, projectId));
 	}
 	for (const userId of createdUsers.splice(0)) {
@@ -227,14 +189,14 @@ afterAll(() => {
 describe("the principal a scheduled task is judged as", () => {
 	test("an admin creator may reuse an ownerless pre-ACL narrator", async () => {
 		// The exact shape `backfillNarratorVisibility` leaves behind: published, unowned.
-		const env = await makeChapterWithNarrator({
+		const env = await makeProjectWithNarrator({
 			ownerUserId: null,
 			visibility: "public",
 			writeAudience: "owner",
 		});
 		const admin = await makeUser("admin");
 
-		const result = await launchAndCaptureTarget(chapterTask(env.projectId, env.chapterId, admin));
+		const result = await launchAndCaptureTarget(projectTask(env.projectId, env.narratorId, admin));
 
 		// Hard-coding `isAdmin: false` made this the skip branch, telling an administrator
 		// they had lost access to a session they can drive by hand.
@@ -243,7 +205,7 @@ describe("the principal a scheduled task is judged as", () => {
 	});
 
 	test("a non-admin creator with no access is still refused", async () => {
-		const env = await makeChapterWithNarrator({
+		const env = await makeProjectWithNarrator({
 			ownerUserId: await makeUser("user"),
 			visibility: "private",
 			writeAudience: "owner",
@@ -251,34 +213,34 @@ describe("the principal a scheduled task is judged as", () => {
 		const stranger = await makeUser("user");
 
 		const result = await launchAndCaptureTarget(
-			chapterTask(env.projectId, env.chapterId, stranger),
+			projectTask(env.projectId, env.narratorId, stranger),
 		);
 
 		expect(result.outcome).toBe("skipped");
 		if (result.outcome === "skipped") expect(result.error).toMatch(/write access/i);
 	});
 
-	test("the refusal creates no narrator on that chapter", async () => {
-		const env = await makeChapterWithNarrator({
+	test("the refusal creates no narrator in that project", async () => {
+		const env = await makeProjectWithNarrator({
 			ownerUserId: await makeUser("user"),
 			visibility: "private",
 			writeAudience: "owner",
 		});
 		const stranger = await makeUser("user");
 
-		await launchAndCaptureTarget(chapterTask(env.projectId, env.chapterId, stranger));
+		await launchAndCaptureTarget(projectTask(env.projectId, env.narratorId, stranger));
 
 		// A schedule that cannot reuse must not quietly accumulate sessions instead, which
 		// would also route the prompt around the very ACL that just refused it.
 		const rows = await db.query.narrators.findMany({
-			where: eq(narrators.chapterId, env.chapterId),
+			where: eq(narrators.contextProjectId, env.projectId),
 			columns: { id: true },
 		});
 		expect(rows.map((row) => row.id)).toEqual([env.narratorId]);
 	});
 
 	test("a task whose creator was deleted is refused rather than treated as admin", async () => {
-		const env = await makeChapterWithNarrator({
+		const env = await makeProjectWithNarrator({
 			ownerUserId: await makeUser("user"),
 			visibility: "private",
 			writeAudience: "owner",
@@ -286,20 +248,20 @@ describe("the principal a scheduled task is judged as", () => {
 
 		// `created_by` is `set null` on user deletion, so this is a reachable state and the
 		// fail-closed direction has to be the empty principal, not a missing-row shortcut.
-		const result = await launchAndCaptureTarget(chapterTask(env.projectId, env.chapterId, null));
+		const result = await launchAndCaptureTarget(projectTask(env.projectId, env.narratorId, null));
 
 		expect(result.outcome).toBe("skipped");
 		if (result.outcome === "skipped") expect(result.error).toMatch(/write access/i);
 	});
 
 	test("a demotion applies on the next tick, not at task-edit time", async () => {
-		const env = await makeChapterWithNarrator({
+		const env = await makeProjectWithNarrator({
 			ownerUserId: null,
 			visibility: "public",
 			writeAudience: "owner",
 		});
 		const wasAdmin = await makeUser("admin");
-		const task = chapterTask(env.projectId, env.chapterId, wasAdmin);
+		const task = projectTask(env.projectId, env.narratorId, wasAdmin);
 		// Reuse works while the role stands.
 		expect((await launchAndCaptureTarget(task)).outcome).toBe("sent");
 

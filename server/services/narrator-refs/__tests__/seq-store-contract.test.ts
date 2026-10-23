@@ -53,9 +53,12 @@ const { dbTransactionWithSeqFloor } = await import("../seq-floor-tx");
 
 const NOW = "2026-09-01T00:00:00.000Z";
 
+/** A current session: no cwd, but `standalone` (only former chapter sessions lack it). */
 function seedNarrator(id = "n1") {
 	sqlite
-		.prepare("INSERT INTO narrators (id, created_at, updated_at) VALUES (?, ?, ?)")
+		.prepare(
+			`INSERT INTO narrators (id, traits, created_at, updated_at) VALUES (?, '["standalone"]', ?, ?)`,
+		)
 		.run(id, NOW, NOW);
 }
 

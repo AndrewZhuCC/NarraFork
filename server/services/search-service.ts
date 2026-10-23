@@ -2,23 +2,36 @@ import { db } from "../db";
 import { knowledgeService } from "./knowledge-service";
 import { searchStore } from "./search/backend";
 import { canUseIndex, sanitizeQuery } from "./search/query";
-import type { InheritedSearchScope, SearchSort, SearchStrategy } from "./search/types";
+import {
+	CONVERSATION_MESSAGE_SCOPE,
+	type InheritedSearchScope,
+	type MessageSearchRow,
+	type MessageSearchScope,
+	type SearchSort,
+	type SearchStrategy,
+} from "./search/types";
 
 export { sanitizeQuery } from "./search/query";
-export type { InheritedSearchScope } from "./search/types";
+export type { InheritedSearchScope, MessageSearchScope } from "./search/types";
+
+/** One matching message inside a grouped conversation hit. */
+export interface MessageHit {
+	id: string;
+	snippet: string;
+	messageRole?: string;
+	createdAt?: string;
+	blockId?: string;
+}
 
 interface SearchResult {
-	type: "chapter" | "message" | "narrator" | "knowledge";
+	type: "message" | "narrator" | "knowledge";
 	id: string;
 	title?: string;
 	snippet: string;
-	chapterId?: string;
-	chapterTitle?: string;
 	narratorId?: string;
 	narratorTitle?: string;
 	projectName?: string;
 	status?: string;
-	role?: string;
 	model?: string;
 	messageRole?: string;
 	/** Knowledge hits: the collection the entry lives in. */
@@ -32,6 +45,15 @@ interface SearchResult {
 	matchScore: number;
 	/** Message hits: the block the match is in, when it is known. */
 	blockId?: string;
+	/**
+	 * Message hits are grouped per narrator: the result is the narrator's best hit, `hits`
+	 * holds its first few matches (best first, the best one included) and `hitCount` how many
+	 * matched among the candidates read. `hitCountIsLowerBound` means the candidate window
+	 * filled up, so the narrator may have more.
+	 */
+	hits?: MessageHit[];
+	hitCount?: number;
+	hitCountIsLowerBound?: boolean;
 }
 
 interface SearchOptions {
@@ -46,6 +68,54 @@ interface SearchOptions {
 	 * everything", and a caller that simply forgot would silently reopen the leak.
 	 */
 	principal: { userId: string; isAdmin: boolean };
+	/** Which conversation content to search. Defaults to {@link CONVERSATION_MESSAGE_SCOPE}. */
+	scope?: MessageSearchScope;
+}
+
+/** Matches shown per grouped narrator. */
+export const MESSAGE_HITS_PER_GROUP = 3;
+/** Message candidates read per requested group, so one long session cannot fill the page. */
+const MESSAGE_CANDIDATES_PER_GROUP = 5;
+/** Ceiling on message candidates per search, whatever the limit. */
+const MAX_MESSAGE_CANDIDATES = 500;
+
+/** How many message rows to read for `limit` groups. */
+export function messageCandidateLimit(limit: number): number {
+	return Math.min(limit * MESSAGE_CANDIDATES_PER_GROUP, MAX_MESSAGE_CANDIDATES);
+}
+
+export interface MessageHitGroup {
+	/** The narrator's best hit, in the order the rows arrived. */
+	best: MessageSearchRow;
+	hits: MessageSearchRow[];
+	hitCount: number;
+}
+
+/**
+ * Group message rows by narrator, keeping the store's order.
+ *
+ * Rows arrive best first (by rank or by time), so a group's first row is its best hit and
+ * groups come out in the order of their best hits. At most `limit` groups and
+ * `hitsPerGroup` hits per group are kept; `hitCount` still counts every row of the group.
+ * A row without a narrator is its own group.
+ */
+export function groupMessageHits(
+	rows: readonly MessageSearchRow[],
+	limit: number,
+	hitsPerGroup = MESSAGE_HITS_PER_GROUP,
+): MessageHitGroup[] {
+	const groups = new Map<string, MessageHitGroup>();
+	for (const row of rows) {
+		const key = row.narratorId ?? `message:${row.id}`;
+		const group = groups.get(key);
+		if (group) {
+			group.hitCount += 1;
+			if (group.hits.length < hitsPerGroup) group.hits.push(row);
+		} else if (groups.size < limit) {
+			groups.set(key, { best: row, hits: [row], hitCount: 1 });
+		}
+	}
+	return [...groups.values()];
 }
 
 export interface NarratorMessageSearchResult {
@@ -114,7 +184,14 @@ export function sortSearchResults(
 
 export const searchService = {
 	async search(options: SearchOptions): Promise<SearchResult[]> {
-		const { query, entities, limit = 50, principal, sort = "relevance" } = options;
+		const {
+			query,
+			entities,
+			limit = 50,
+			principal,
+			sort = "relevance",
+			scope = CONVERSATION_MESSAGE_SCOPE,
+		} = options;
 		const results: SearchResult[] = [];
 
 		// Sanitize: remove FTS5 special chars to prevent injection
@@ -122,9 +199,8 @@ export const searchService = {
 		if (!safeQuery) return results;
 
 		const strategy = strategyFor(safeQuery);
-		const safeQueryLower = safeQuery.toLowerCase();
-		// One query object for all three entity searches: the viewer travels with it, so a
-		// branch cannot accidentally run ungated.
+		// One query object for every entity search: the viewer travels with it, so a branch
+		// cannot accidentally run ungated.
 		const base = {
 			text: safeQuery,
 			strategy,
@@ -132,47 +208,37 @@ export const searchService = {
 			sort,
 			viewer: principal,
 			signal: options.signal,
+			scope,
 		};
 
-		if (entities.includes("chapters")) {
-			// A chapter hit exposes its title, description snippet and project name, so the
-			// backend gates it by the owning project inside the query.
-			for (const row of await searchStore.searchChapters(base)) {
-				results.push({
-					type: "chapter",
-					id: row.id,
-					title: row.title ?? undefined,
-					projectName: row.projectName ?? undefined,
-					status: row.status ?? undefined,
-					role: row.role ?? undefined,
-					createdAt: row.createdAt ?? undefined,
-					updatedAt: row.updatedAt ?? undefined,
-					matchField: row.title?.toLowerCase().includes(safeQueryLower) ? "title" : "description",
-					matchScore: scoreFromRank(row.rank, strategy === "index" ? 760 : 520),
-					snippet: row.snippet || row.description || "",
-				});
-			}
-		}
-
 		if (entities.includes("messages")) {
-			// A message hit exposes a transcript snippet, so the backend gates it by the
-			// owning narrator's visibility.
-			for (const row of await searchStore.searchMessages(base)) {
+			const candidateLimit = messageCandidateLimit(limit);
+			const rows = await searchStore.searchMessages({ ...base, limit: candidateLimit });
+			const fallbackScore = strategy === "index" ? 700 : 500;
+			for (const group of groupMessageHits(rows, limit)) {
+				const row = group.best;
 				results.push({
 					type: "message",
 					id: row.id,
 					narratorId: row.narratorId ?? undefined,
 					narratorTitle: row.narratorTitle ?? undefined,
-					chapterId: row.chapterId ?? undefined,
-					chapterTitle: row.chapterTitle ?? undefined,
 					projectName: row.projectName ?? undefined,
 					model: row.model ?? undefined,
 					messageRole: row.messageRole ?? undefined,
 					createdAt: row.createdAt ?? undefined,
 					matchField: "message",
-					matchScore: scoreFromRank(row.rank, strategy === "index" ? 700 : 500),
+					matchScore: scoreFromRank(row.rank, fallbackScore),
 					snippet: row.snippet || row.preview || "",
 					...(row.blockId ? { blockId: row.blockId } : {}),
+					hits: group.hits.map((hit) => ({
+						id: hit.id,
+						snippet: hit.snippet || hit.preview || "",
+						...(hit.messageRole ? { messageRole: hit.messageRole } : {}),
+						...(hit.createdAt ? { createdAt: hit.createdAt } : {}),
+						...(hit.blockId ? { blockId: hit.blockId } : {}),
+					})),
+					hitCount: group.hitCount,
+					hitCountIsLowerBound: rows.length >= candidateLimit,
 				});
 			}
 		}
@@ -183,8 +249,6 @@ export const searchService = {
 					type: "narrator",
 					id: row.id,
 					title: row.title ?? undefined,
-					chapterId: row.chapterId ?? undefined,
-					chapterTitle: row.chapterTitle ?? undefined,
 					projectName: row.projectName ?? undefined,
 					status: row.status ?? undefined,
 					model: row.model ?? undefined,
@@ -206,7 +270,7 @@ export const searchService = {
 	 *
 	 * Kept separate from `search()` because its visibility gate differs in kind: knowledge
 	 * visibility is a dual-axis (clearance + controlled tag) check that reads grants, so it
-	 * cannot be expressed as a SQL fragment the way the narrator/project gates are. The
+	 * cannot be expressed as a SQL fragment the way the narrator gate is. The
 	 * matched rows are post-filtered by `knowledgeService.filterReadable`, which
 	 * fails closed — the same gate the knowledge routes use.
 	 *

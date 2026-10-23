@@ -1,6 +1,7 @@
 import { AppError, NotFoundError, ValidationError, zodValidationError } from "@server/lib/errors";
 import { logger } from "@server/lib/logger";
 import { requireNarratorAccess } from "@server/lib/narrator-access";
+import { VIEW_SURFACES } from "@server/lib/plugins/manifest";
 import {
 	type Capability,
 	invocationScopeSchema,
@@ -71,7 +72,7 @@ const sessionInputSchema = z
 		hash: z.string().regex(/^[a-f0-9]{64}$/),
 		contributionId: z.string().min(1).max(128),
 		panelInstanceId: z.string().min(1).max(256),
-		surface: z.enum(["workspace", "director", "focus", "graph", "settings", "provider-settings"]),
+		surface: z.enum(VIEW_SURFACES),
 		surfaceScope: z.enum(["workspace", "narrator", "project", "global"]),
 		scope: invocationScopeSchema.optional(),
 	})
@@ -467,21 +468,14 @@ function bindUiCapability(
 }
 
 /**
- * Whether a view's declared surfaces admit the surface it is being opened on.
- *
- * An exact match always passes. Beyond that, `graph` (a chapter node's embedded
- * dock) accepts a view that declared only `focus`: both surfaces host exactly one
- * narrator and expose the same host context, so requiring authors to re-publish a
- * manifest would have made every existing focus plugin fail inside a node with
- * PLUGIN_UI_SCOPE_DENIED. The reverse is deliberately NOT allowed — a view that
- * opts into `graph` alone is stating it only makes sense at node size.
+ * Whether a view's declared surfaces admit the surface it is being opened on: only an
+ * exact match does. A view whose manifest listed nothing but the retired `graph`
+ * surface parses to an empty list and is admitted nowhere.
  *
  * Exported for unit testing.
  */
 export function isSurfaceAllowedForView(declared: readonly string[], surface: string): boolean {
-	if (declared.includes(surface)) return true;
-	if (surface === "graph") return declared.includes("focus");
-	return false;
+	return declared.includes(surface);
 }
 
 function assertUiContribution(
@@ -791,13 +785,8 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 							// dropping it silently forced every provider plugin onto the host's
 							// generated config form no matter what its manifest declared.
 							surfaces: Array.isArray(contribution.surfaces)
-								? contribution.surfaces.filter(
-										(surface): surface is string =>
-											surface === "workspace" ||
-											surface === "director" ||
-											surface === "focus" ||
-											surface === "settings" ||
-											surface === "provider-settings",
+								? contribution.surfaces.filter((surface): surface is string =>
+										(VIEW_SURFACES as readonly unknown[]).includes(surface),
 									)
 								: undefined,
 							status: status.desiredState === "enabled" ? "available" : "disabled",

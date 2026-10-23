@@ -297,13 +297,13 @@ const REVIEW_CONCLUSION_MD = [
 const ASK_QUESTION_DATA: AskUserQuestionData = {
 	questions: [
 		{
-			header: "Which flow mode should be the default for new projects?",
+			header: "Which layout should be the default for new workspaces?",
 			options: [
 				{
-					header: "Classic canvas",
-					description: "Interactive React Flow story-network graph.",
+					header: "Split panes",
+					description: "Narrators side by side in a resizable grid.",
 				},
-				{ header: "Ruler timeline", description: "Linear chronological view of chapters." },
+				{ header: "Single column", description: "One narrator at a time, full width." },
 			],
 			multiSelect: false,
 		},
@@ -313,16 +313,16 @@ const ASK_QUESTION_DATA: AskUserQuestionData = {
 const ASK_QUESTION_READONLY: AskUserQuestionData = {
 	questions: [
 		{
-			header: "Which flow mode should be the default for new projects?",
+			header: "Which layout should be the default for new workspaces?",
 			options: [
 				{
-					header: "Classic canvas",
-					description: "Interactive React Flow story-network graph.",
+					header: "Split panes",
+					description: "Narrators side by side in a resizable grid.",
 				},
-				{ header: "Ruler timeline", description: "Linear chronological view of chapters." },
+				{ header: "Single column", description: "One narrator at a time, full width." },
 			],
 			multiSelect: false,
-			savedCustomAnswer: "Classic canvas felt more intuitive for branching work.",
+			savedCustomAnswer: "Split panes felt more intuitive for parallel work.",
 			hasSavedAnswer: true,
 		},
 	],
@@ -383,7 +383,7 @@ const TOOL_CALL_TASKS: ToolCallData = {
 };
 const TOOL_CALL_ASK: ToolCallData = {
 	toolName: "AskUserQuestion",
-	summary: "Which flow mode should be the default for new projects?",
+	summary: "Which layout should be the default for new workspaces?",
 	category: "ask",
 	status: "success",
 	detail: {
@@ -396,21 +396,21 @@ const TOOL_CALL_ASK: ToolCallData = {
 					questions: [
 						{
 							// Single question → the card header already shows this text.
-							header: "Which flow mode should be the default for new projects?",
+							header: "Which layout should be the default for new workspaces?",
 							omitHeader: true,
 							options: [
 								{
-									header: "Classic canvas",
+									header: "Split panes",
 									description:
-										"Interactive React Flow story-network graph with drag, context menus.",
+										"Narrators side by side in a resizable grid, with drag and context menus.",
 								},
 								{
-									header: "Ruler timeline",
-									description: "Linear chronological view of chapters.",
+									header: "Single column",
+									description: "One narrator at a time, full width.",
 									selected: true,
 								},
 							],
-							answer: "Answer: Ruler timeline",
+							answer: "Answer: Single column",
 						},
 					],
 				},
@@ -741,7 +741,7 @@ const HARNESS_CASES: HarnessCase[] = [
 		color: "indigo",
 	}),
 	...systemTextCase("spec_fork_carryover", "System-text · spec fork carryover", {
-		text: "Carried over 3 protected tasks from the parent chapter's spec into this fork.",
+		text: "Carried over 3 protected tasks from the parent session's spec into this fork.",
 		badges: ["Fork carryover"],
 		buttons: ["View tasks", "Clear", "Reset"],
 		variant: "fork",
@@ -759,14 +759,13 @@ const HARNESS_CASES: HarnessCase[] = [
 					text: REVIEW_CONCLUSION_MD,
 					verdictLabel: "Changes Requested",
 					color: "orange",
-					actionLabel: "Handle",
 				},
 				w,
 			),
 		(m) => (
 			<RenderReviewCard
 				measured={m}
-				data={{ verdictLabel: "Changes Requested", color: "orange", actionLabel: "Handle" }}
+				data={{ verdictLabel: "Changes Requested", color: "orange" }}
 			/>
 		),
 	),

@@ -23,7 +23,7 @@
 import { beforeAll, describe, expect, test } from "bun:test";
 import { and, sql } from "drizzle-orm";
 import { db } from "../../db";
-import { aclGrants, chapters, narrators, projects, users } from "../../db/schema";
+import { aclGrants, narratorProjectLinks, narrators, projects, users } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import {
 	canReadNarrator,
@@ -39,7 +39,6 @@ let owner: string;
 let member: string;
 let outsider: string;
 let projectId: string;
-let chapterId: string;
 
 const asUser = (userId: string): NarratorPrincipal => ({ userId, isAdmin: false });
 const asAdmin = (): NarratorPrincipal => ({ userId: "gate-admin", isAdmin: true });
@@ -56,21 +55,37 @@ async function makeUser(label: string): Promise<string> {
 	return id;
 }
 
+/**
+ * `indexedProjectId` places the narrator in a project through its working directory (the
+ * primary link the project index derives from its cwd); `contextProjectId` explicitly.
+ */
 async function makeNarrator(options: {
 	ownerUserId?: string | null;
 	visibility: "private" | "project" | "public";
-	chapterId?: string | null;
+	indexedProjectId?: string | null;
+	contextProjectId?: string | null;
 }): Promise<string> {
 	const id = generateId();
 	const now = new Date().toISOString();
+	const directory = `/tmp/gate-${TAG}/work`;
 	await db.insert(narrators).values({
 		id,
-		chapterId: options.chapterId ?? null,
+		cwd: options.indexedProjectId ? directory : null,
+		contextProjectId: options.contextProjectId ?? null,
 		ownerUserId: options.ownerUserId ?? null,
 		visibility: options.visibility,
 		createdAt: now,
 		updatedAt: now,
 	});
+	if (options.indexedProjectId)
+		await db.insert(narratorProjectLinks).values({
+			narratorId: id,
+			projectId: options.indexedProjectId,
+			role: "primary",
+			source: "cwd",
+			directory,
+			updatedAt: now,
+		});
 	return id;
 }
 
@@ -134,17 +149,6 @@ beforeAll(async () => {
 		updatedAt: now,
 	});
 
-	chapterId = generateId();
-	await db.insert(chapters).values({
-		id: chapterId,
-		projectId,
-		title: "chapter",
-		branch: `chapter/gate-${TAG}`,
-		baseBranch: "main",
-		createdAt: now,
-		updatedAt: now,
-	});
-
 	await grantProject(projectId, member, "read");
 });
 
@@ -155,20 +159,32 @@ describe("a project member and a teammate's private session", () => {
 		// The reason this whole design uses a gate rather than inheritance: project
 		// membership must not dissolve personal drafts.
 		const row = await rowOf(
-			await makeNarrator({ ownerUserId: owner, visibility: "private", chapterId }),
+			await makeNarrator({
+				ownerUserId: owner,
+				visibility: "private",
+				indexedProjectId: projectId,
+			}),
 		);
 		expect(await canReadNarrator(row, asUser(member))).toBe(false);
 	});
 
 	test("can read it once it is shared with them specifically", async () => {
-		const id = await makeNarrator({ ownerUserId: owner, visibility: "private", chapterId });
+		const id = await makeNarrator({
+			ownerUserId: owner,
+			visibility: "private",
+			indexedProjectId: projectId,
+		});
 		await grantNarrator(id, member, "read");
 		expect(await canReadNarrator(await rowOf(id), asUser(member))).toBe(true);
 	});
 
 	test("can read a project-visible session in the same project", async () => {
 		const row = await rowOf(
-			await makeNarrator({ ownerUserId: owner, visibility: "project", chapterId }),
+			await makeNarrator({
+				ownerUserId: owner,
+				visibility: "project",
+				indexedProjectId: projectId,
+			}),
 		);
 		expect(await canReadNarrator(row, asUser(member))).toBe(true);
 	});
@@ -180,7 +196,11 @@ describe("a non-member", () => {
 	test("cannot read a project-visible session (behaviour change)", async () => {
 		// Before project membership existed, `project` was as wide as `public`.
 		const row = await rowOf(
-			await makeNarrator({ ownerUserId: owner, visibility: "project", chapterId }),
+			await makeNarrator({
+				ownerUserId: owner,
+				visibility: "project",
+				indexedProjectId: projectId,
+			}),
 		);
 		expect(await canReadNarrator(row, asUser(outsider))).toBe(false);
 	});
@@ -188,7 +208,11 @@ describe("a non-member", () => {
 	test("cannot read a session shared directly with them inside a project they cannot reach", async () => {
 		// Sharing must not smuggle access past the gate: otherwise any member could hand
 		// out entry to a project by sharing one session in it.
-		const id = await makeNarrator({ ownerUserId: owner, visibility: "private", chapterId });
+		const id = await makeNarrator({
+			ownerUserId: owner,
+			visibility: "private",
+			indexedProjectId: projectId,
+		});
 		await grantNarrator(id, outsider, "read");
 		expect(await canReadNarrator(await rowOf(id), asUser(outsider))).toBe(false);
 	});
@@ -196,7 +220,7 @@ describe("a non-member", () => {
 	test("can still read a public session inside that project", async () => {
 		// `public` means "anyone signed in" and is deliberately wider than the project.
 		const row = await rowOf(
-			await makeNarrator({ ownerUserId: owner, visibility: "public", chapterId }),
+			await makeNarrator({ ownerUserId: owner, visibility: "public", indexedProjectId: projectId }),
 		);
 		expect(await canReadNarrator(row, asUser(outsider))).toBe(true);
 	});
@@ -206,13 +230,21 @@ describe("a non-member", () => {
 
 describe("write", () => {
 	test("a write grant is void without project access", async () => {
-		const id = await makeNarrator({ ownerUserId: owner, visibility: "private", chapterId });
+		const id = await makeNarrator({
+			ownerUserId: owner,
+			visibility: "private",
+			indexedProjectId: projectId,
+		});
 		await grantNarrator(id, outsider, "write");
 		expect(await canWriteNarrator(await rowOf(id), asUser(outsider))).toBe(false);
 	});
 
 	test("a write grant works for a project member", async () => {
-		const id = await makeNarrator({ ownerUserId: owner, visibility: "private", chapterId });
+		const id = await makeNarrator({
+			ownerUserId: owner,
+			visibility: "private",
+			indexedProjectId: projectId,
+		});
 		await grantNarrator(id, member, "write");
 		expect(await canWriteNarrator(await rowOf(id), asUser(member))).toBe(true);
 	});
@@ -220,7 +252,11 @@ describe("write", () => {
 	test("project-visible does not grant write to members", async () => {
 		// Seeing the team's work is not permission to drive it.
 		const row = await rowOf(
-			await makeNarrator({ ownerUserId: owner, visibility: "project", chapterId }),
+			await makeNarrator({
+				ownerUserId: owner,
+				visibility: "project",
+				indexedProjectId: projectId,
+			}),
 		);
 		expect(await canWriteNarrator(row, asUser(member))).toBe(false);
 	});
@@ -229,14 +265,22 @@ describe("write", () => {
 		// The project owner here is also the narrator owner; an owner is never locked out
 		// of their own session by a project-level rule.
 		const row = await rowOf(
-			await makeNarrator({ ownerUserId: owner, visibility: "private", chapterId }),
+			await makeNarrator({
+				ownerUserId: owner,
+				visibility: "private",
+				indexedProjectId: projectId,
+			}),
 		);
 		expect(await canWriteNarrator(row, asUser(owner))).toBe(true);
 	});
 
 	test("an admin passes both levels", async () => {
 		const row = await rowOf(
-			await makeNarrator({ ownerUserId: owner, visibility: "private", chapterId }),
+			await makeNarrator({
+				ownerUserId: owner,
+				visibility: "private",
+				indexedProjectId: projectId,
+			}),
 		);
 		expect(await canReadNarrator(row, asAdmin())).toBe(true);
 		expect(await canWriteNarrator(row, asAdmin())).toBe(true);
@@ -273,24 +317,35 @@ describe("the list predicate agrees with the single-row decision", () => {
 		const privateInProject = await makeNarrator({
 			ownerUserId: owner,
 			visibility: "private",
-			chapterId,
+			indexedProjectId: projectId,
 		});
 		const projectInProject = await makeNarrator({
 			ownerUserId: owner,
 			visibility: "project",
-			chapterId,
+			indexedProjectId: projectId,
 		});
 		const publicInProject = await makeNarrator({
 			ownerUserId: owner,
 			visibility: "public",
-			chapterId,
+			indexedProjectId: projectId,
 		});
 		const sharedInProject = await makeNarrator({
 			ownerUserId: owner,
 			visibility: "private",
-			chapterId,
+			indexedProjectId: projectId,
 		});
 		await grantNarrator(sharedInProject, member, "read");
+		// The explicit project context must be gated exactly like an indexed directory.
+		const explicitProject = await makeNarrator({
+			ownerUserId: owner,
+			visibility: "project",
+			contextProjectId: projectId,
+		});
+		const explicitPrivate = await makeNarrator({
+			ownerUserId: owner,
+			visibility: "private",
+			contextProjectId: projectId,
+		});
 		const standalonePrivate = await makeNarrator({ ownerUserId: owner, visibility: "private" });
 		const standaloneProject = await makeNarrator({ ownerUserId: owner, visibility: "project" });
 		const ids = [
@@ -298,6 +353,8 @@ describe("the list predicate agrees with the single-row decision", () => {
 			projectInProject,
 			publicInProject,
 			sharedInProject,
+			explicitProject,
+			explicitPrivate,
 			standalonePrivate,
 			standaloneProject,
 		];
@@ -317,16 +374,23 @@ describe("the list predicate agrees with the single-row decision", () => {
 		// Sanity: the matrix is genuinely mixed for the member.
 		const memberVisible = await readableIdsViaSql(asUser(member), ids);
 		expect(memberVisible.has(projectInProject)).toBe(true);
+		expect(memberVisible.has(explicitProject)).toBe(true);
 		expect(memberVisible.has(privateInProject)).toBe(false);
+		expect(memberVisible.has(explicitPrivate)).toBe(false);
+		expect((await readableIdsViaSql(asUser(outsider), ids)).has(projectInProject)).toBe(false);
 	});
 
 	test("filterReadableNarrators agrees with the SQL predicate", async () => {
 		const projectVisible = await makeNarrator({
 			ownerUserId: owner,
 			visibility: "project",
-			chapterId,
+			indexedProjectId: projectId,
 		});
-		const hidden = await makeNarrator({ ownerUserId: owner, visibility: "private", chapterId });
+		const hidden = await makeNarrator({
+			ownerUserId: owner,
+			visibility: "private",
+			indexedProjectId: projectId,
+		});
 		const ids = [projectVisible, hidden];
 
 		const rows = await Promise.all(ids.map((id) => rowOf(id)));

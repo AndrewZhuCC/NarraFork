@@ -22,7 +22,6 @@ export interface HumanAttentionItem {
 	/** Only subagents inherit display grouping from their parent/root. */
 	parentNarratorId: string | null;
 	rootNarratorId: string | null;
-	chapterId: string | null;
 	createdAt: string;
 	blocking: boolean;
 	/** Read visibility does not imply permission to answer or approve. */

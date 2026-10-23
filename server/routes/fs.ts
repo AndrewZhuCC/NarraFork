@@ -767,29 +767,14 @@ fsRoutes.post("/write", async (c) => {
 		);
 	} finally {
 		if (diskMayHaveChanged && claimPath) {
-			// Compatibility tree observation, OUTSIDE the coordinator lease: never acquire
-			// an old worktree/shadow lock in the reverse order. A watcher may miss a
-			// same-size dirty-file edit, so invalidate caches immediately and capture a
-			// bounded boundary for the DAG. This is not proof of human ownership; the
-			// immutable file receipt above is. Even an uncertain dispatch invalidates the
-			// cache, and no postprocessing failure may change the disk outcome.
+			// Invalidate the session tree cache immediately: a same-size dirty-file edit
+			// would otherwise keep serving the stale listing. No postprocessing failure may
+			// change the disk outcome.
 			try {
 				const { invalidateWorkspaceTreeCache } = await import("../services/narrator-session-state");
 				invalidateWorkspaceTreeCache(cwd);
-				if (settings.chapters.treeSnapshotsEnabled) {
-					const { worktreeTreeSnapshot } = await import("../services/worktree-tree-snapshot");
-					// The hot-path variant: a save is a user-facing request and must not stall
-					// behind (or trigger) an unbounded full-tree scan on a huge worktree.
-					const treeHash = await worktreeTreeSnapshot.tryCaptureHot(cwd, LOCAL_DEVICE_ID);
-					if (treeHash) {
-						// Linked into the snapshot DAG for the same reason the watcher does it: a fork
-						// taken after this save must start from a state that includes it.
-						const { advanceChapterSnapshot } = await import("../services/chapter-snapshot-ref");
-						await advanceChapterSnapshot(cwd, treeHash, "human editor save");
-					}
-				}
 			} catch (err) {
-				logger.debug("Tree snapshot boundary failed after human save", {
+				logger.debug("Tree cache invalidation failed after human save", {
 					narratorId,
 					path: claimPath,
 					error: String(err),

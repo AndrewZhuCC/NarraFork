@@ -2,7 +2,7 @@
  * Cache for per-file commit boundaries.
  *
  * {@link gitService.getLastCommitTimes} spawns a `git log` walk (~0.3 s on the NarraFork
- * repository). The Git panel refetches every 30 s per open chapter, so an uncached call
+ * repository). The Git panel refetches every 30 s per open workspace, so an uncached call
  * would put a recurring subprocess on the request path for every viewer — exactly the
  * pattern the project's main-thread rules forbid.
  *
@@ -36,7 +36,7 @@ export interface CommitBoundaries {
  *
  * It must be LONGER than the panel's refetch interval, or the cache cannot hit in the
  * steady state: at 15 s against a 30 s refetch, every entry had always expired by the time
- * the next request arrived, so each open chapter paid for a ~0.3 s `git log --name-only`
+ * the next request arrived, so each open workspace paid for a ~0.3 s `git log --name-only`
  * every 30 s forever and the cache only ever de-duplicated concurrent viewers. Five
  * minutes is well clear of the interval while still bounding the one case the two real
  * invalidation signals do not cover.
@@ -98,7 +98,7 @@ function touch(key: string, entry: CacheEntry): void {
  * cache entry, so whichever is queried first supplies boundaries for both. Keying on the
  * raw path instead would fix that and simultaneously break invalidation: `invalidateStatus`
  * and `invalidateBoundaries` are called with paths that reach them through different code
- * routes (the watcher, chapter records, tool execution), and the folded key is what makes
+ * routes (git routes, workspace subscriptions, tool execution), and the folded key is what makes
  * those agree today. Two worktrees whose absolute paths differ only in case is a case
  * nothing in this repository produces; silently failing to invalidate is not. Left as is
  * deliberately — change both caches together or neither.

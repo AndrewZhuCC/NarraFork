@@ -62,6 +62,46 @@ const MIGRATIONS_FOLDER = "drizzle-postgres";
 /** One container, sequentially: image pull plus ~800 statements plus ~40 paged reads. */
 const RUN_TIMEOUT_MS = 420_000;
 
+/**
+ * Baseline constraints the narrative-line retirement (`0035_retire_narrative_line`) drops on
+ * purpose: the chapter tables' own constraints and every foreign key to `chapters`. Listed by
+ * name so the upgrade check below still fails on any other lost constraint.
+ */
+const RETIRED_CONSTRAINTS: [table: string, constraint: string][] = [
+	["chapter_commits", "chapter_commits_chapter_id_chapters_id_fk"],
+	["chapter_commits", "chapter_commits_narrator_id_narrators_id_fk"],
+	["chapter_commits", "chapter_commits_narrator_message_id_narrator_messages_id_fk"],
+	["chapter_commits", "chapter_commits_pkey"],
+	["chapter_edges", "chapter_edges_pkey"],
+	["chapter_edges", "chapter_edges_project_id_projects_id_fk"],
+	["chapter_edges", "chapter_edges_source_id_chapters_id_fk"],
+	["chapter_edges", "chapter_edges_target_id_chapters_id_fk"],
+	["chapters", "chapters_exploration_group_id_exploration_groups_id_fk"],
+	["chapters", "chapters_merged_into_chapter_id_chapters_id_fk"],
+	["chapters", "chapters_parent_chapter_id_chapters_id_fk"],
+	["chapters", "chapters_pkey"],
+	["chapters", "chapters_project_id_projects_id_fk"],
+	["chapters", "chapters_review_source_chapter_id_chapters_id_fk"],
+	["container_instances", "container_instances_chapter_id_chapters_id_fk"],
+	["exploration_groups", "exploration_groups_base_chapter_id_chapters_id_fk"],
+	["exploration_groups", "exploration_groups_decided_chapter_id_chapters_id_fk"],
+	["exploration_groups", "exploration_groups_pkey"],
+	["exploration_groups", "exploration_groups_project_id_projects_id_fk"],
+	["gateway_session_mappings", "gateway_session_mappings_chapter_id_chapters_id_fk"],
+	["merge_sessions", "merge_sessions_pkey"],
+	["merge_sessions", "merge_sessions_target_chapter_id_chapters_id_fk"],
+	["narrators", "narrators_chapter_id_chapters_id_fk"],
+	["port_allocations", "port_allocations_chapter_id_chapters_id_fk"],
+	["review_conclusions", "review_conclusions_pkey"],
+	["review_conclusions", "review_conclusions_review_chapter_id_chapters_id_fk"],
+	["review_conclusions", "review_conclusions_source_chapter_id_chapters_id_fk"],
+	["scheduled_tasks", "scheduled_tasks_chapter_id_chapters_id_fk"],
+	["terminal_view_state", "terminal_view_state_chapter_id_chapters_id_fk"],
+	["terminals", "terminals_chapter_id_chapters_id_fk"],
+	["volume_snapshot_applications", "volume_snapshot_applications_chapter_id_chapters_id_fk"],
+	["volume_snapshots", "volume_snapshots_source_chapter_id_chapters_id_fk"],
+];
+
 async function loadJournal(): Promise<{
 	entries: JournalEntry[];
 	hashes: string[];
@@ -215,8 +255,10 @@ describe("PostgreSQL baseline", () => {
 				}
 				// The SQL itself must NOT be idempotent: if it were, applying it over an existing
 				// database would silently do nothing and the ledger would be the only guard.
+				// Never committed: a migration that opens with a DROP would otherwise succeed at
+				// that statement before failing, and the catalog read below would see the damage.
 				const rawReplay = await exec(
-					await readFile(`${MIGRATIONS_FOLDER}/${entries.at(-1)?.tag}.sql`, "utf8"),
+					`BEGIN;\n${await readFile(`${MIGRATIONS_FOLDER}/${entries.at(-1)?.tag}.sql`, "utf8")}\n;ROLLBACK;`,
 				);
 				if (rawReplay.code === 0) {
 					problems.push("re-applying the migration SQL succeeded; it is not creating anything");
@@ -305,9 +347,9 @@ ALTER TABLE "resource_protection_paths" ADD CONSTRAINT "resource_protection_path
 					},
 					{
 						label: "dropped foreign key",
-						sql: `ALTER TABLE "chapters" DROP CONSTRAINT "chapters_project_id_projects_id_fk";`,
+						sql: `ALTER TABLE "narrators" DROP CONSTRAINT "narrators_context_project_id_projects_id_fk";`,
 						facets: ["foreignKeys"],
-						match: /^foreign key chapters_project_id_projects_id_fk: missing/,
+						match: /^foreign key narrators_context_project_id_projects_id_fk: missing/,
 					},
 					{
 						label: "changed partial index predicate",
@@ -513,7 +555,10 @@ INSERT INTO background_tasks (id,parent_narrator_id,type,status,started_at,creat
 CREATE TABLE nf_upgrade_constraint_probe.before AS
 SELECT c.relname AS table_name, k.conname AS constraint_name, pg_get_constraintdef(k.oid) AS definition
 FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid
-WHERE k.connamespace='public'::regnamespace;`);
+WHERE k.connamespace='public'::regnamespace;
+DELETE FROM nf_upgrade_constraint_probe.before WHERE (table_name, constraint_name) IN (VALUES ${RETIRED_CONSTRAINTS.map(([table, name]) => `('${table}','${name}')`).join(",")});`);
+						// Every retired constraint must have been in the baseline, or the list is stale.
+						const prior = oldConstraints.count - RETIRED_CONSTRAINTS.length;
 						await apply(MIGRATIONS_FOLDER);
 						const preservationSql = `SELECT json_build_object(
 'prior', count(*),
@@ -525,7 +570,7 @@ LEFT JOIN pg_constraint k ON k.conrelid=c.oid AND k.conname=old.constraint_name;
 						const preservation = () =>
 							readJson(exec, preservationSql, "old constraint preservation");
 						expect(await preservation()).toEqual({
-							prior: oldConstraints.count,
+							prior,
 							missing: 0,
 							changed: 0,
 						});
@@ -533,7 +578,7 @@ LEFT JOIN pg_constraint k ON k.conrelid=c.oid AND k.conname=old.constraint_name;
 						await run(`UPDATE nf_upgrade_constraint_probe.before SET definition='__nf_changed__'||definition
 WHERE (table_name,constraint_name)=(SELECT table_name,constraint_name FROM nf_upgrade_constraint_probe.before ORDER BY table_name,constraint_name LIMIT 1);`);
 						expect(await preservation()).toEqual({
-							prior: oldConstraints.count,
+							prior,
 							missing: 0,
 							changed: 1,
 						});
@@ -542,14 +587,14 @@ WHERE left(definition,length('__nf_changed__'))='__nf_changed__';
 UPDATE nf_upgrade_constraint_probe.before SET table_name='__nf_missing__'||table_name
 WHERE (table_name,constraint_name)=(SELECT table_name,constraint_name FROM nf_upgrade_constraint_probe.before ORDER BY table_name,constraint_name LIMIT 1);`);
 						expect(await preservation()).toEqual({
-							prior: oldConstraints.count,
+							prior,
 							missing: 1,
 							changed: 0,
 						});
 						await run(`UPDATE nf_upgrade_constraint_probe.before SET table_name=substr(table_name,length('__nf_missing__')+1)
 WHERE left(table_name,length('__nf_missing__'))='__nf_missing__';`);
 						expect(await preservation()).toEqual({
-							prior: oldConstraints.count,
+							prior,
 							missing: 0,
 							changed: 0,
 						});

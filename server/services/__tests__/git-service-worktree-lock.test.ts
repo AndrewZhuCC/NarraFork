@@ -1,41 +1,32 @@
 /**
- * The safety net for the unified worktree mutex.
+ * The safety net for the worktree mutex behind `gitService`'s write methods.
  *
- * A worktree is guarded by exactly one lock: `worktreeLock` from `lib/async-mutex`. The
- * multi-step orchestrations (`chapter-merge`, `routes/ruler`, `snapshot-dirty-git-op`)
- * hold it across a whole sequence — settle, park, rebase, reapply — because each step
- * reads the state the previous one produced. `git-service`'s individual write methods
- * take the same lock.
+ * A worktree is guarded by exactly one lock: `worktreeLock` from `lib/async-mutex`. Every
+ * `gitService` write method (stage, unstage, commit, discard, stash, reset) wraps its whole
+ * command sequence in it, so two writes on one worktree run one after the other instead of
+ * interleaving `git` invocations on the same index.
  *
- * That makes nesting fatal. `AsyncMutex.acquire` chains behind the current tail with no
- * owner tracking, so a locked write method called from inside a held block waits on the
- * lock its own caller holds. It is a deterministic self-deadlock, not a race, and its
- * symptom is an HTTP request that never returns — nothing throws, nothing logs. Hence the
- * `*Unlocked` variants, which every lock-holding caller uses.
+ * Three properties are pinned here:
  *
- * Three properties are pinned here, because the refactor is only safe if all three hold:
- *
- *   1. Every `*Unlocked` variant completes, and does its work, while the lock is held.
- *      This is the exact shape of the production call sites.
- *   2. Every locked public method still works for callers that hold nothing — the plain
- *      `POST /api/git/...` routes must be unaffected.
- *   3. A locked method called from inside a held block *does* hang. This pins the hazard
- *      as real rather than hypothetical, so the unlocked variants cannot be "simplified"
- *      away by someone who assumes the mutex is re-entrant.
+ *   1. The locked methods still do their work for callers that hold nothing — the
+ *      `POST /api/git/...` routes — including the early-return guards for empty lists.
+ *   2. Writes on one worktree are serialized (also across differently spelled paths),
+ *      while writes on unrelated worktrees are not.
+ *   3. A write method called from inside a held `worktreeLock` block *does* hang. The
+ *      mutex is not re-entrant, so this pins the hazard as real: code that ever holds a
+ *      worktree across several commands must not call these methods from inside its block.
  *
  * Real repositories throughout: the behaviour under test is git's own (which options
- * exist, what exit codes mean), and a mock would encode whatever misunderstanding made
- * the deadlock possible. The bounded `Promise.race` is essential — a plain `await` on a
+ * exist, what exit codes mean), and a mock would encode whatever misunderstanding made a
+ * deadlock possible. The bounded `Promise.race` is essential — a plain `await` on a
  * self-deadlock wedges the test runner instead of failing it, so a regression would look
  * like CI hanging rather than a red test.
  */
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { realpath } from "node:fs/promises";
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PathKeyedMutex, worktreeLock } from "../../lib/async-mutex";
-import * as spawn from "../../lib/spawn";
+import { worktreeLock } from "../../lib/async-mutex";
 import { safeSpawn } from "../../lib/spawn";
 import { gitService } from "../git-service";
 
@@ -51,7 +42,7 @@ async function git(args: string[], cwd: string): Promise<string> {
 
 const SEED_FILE = "app.txt";
 
-/** A repository with two commits on `main`, so `HEAD~1` and a revertable commit exist. */
+/** A repository with two commits on `main`. */
 async function createRepo(): Promise<string> {
 	const dir = mkdtempSync(join(tmpdir(), "nf-wtlock-"));
 	tempDirs.push(dir);
@@ -68,7 +59,7 @@ async function createRepo(): Promise<string> {
 }
 
 /**
- * How long a nested git write may take before we call it a deadlock.
+ * How long a git write may take before we call it a deadlock.
  *
  * Pinned from both sides. It must exceed a slow-but-healthy run — these spawn real `git`
  * processes on whatever filesystem CI provides, and observed cases finish in under 120ms,
@@ -76,13 +67,14 @@ async function createRepo(): Promise<string> {
  * per-test timeout, because otherwise bun kills the test first and reports a bare "timed
  * out" with no hint that a lock caused it.
  */
-const NESTED_CALL_TIMEOUT_MS = 3_000;
+const WRITE_TIMEOUT_MS = 3_000;
 
 /**
- * Deadline for the case that is *expected* to hang. Much shorter, since it is paid on
- * every green run, and no amount of waiting would change a self-deadlock's outcome.
+ * How long a queued write is watched to confirm it is NOT running. Much shorter, since it
+ * is paid on every green run, and no amount of waiting would change a blocked write's
+ * outcome.
  */
-const EXPECTED_DEADLOCK_TIMEOUT_MS = 300;
+const BLOCKED_WRITE_WATCH_MS = 300;
 
 class LockDeadlineError extends Error {}
 
@@ -90,7 +82,7 @@ class LockDeadlineError extends Error {}
 async function withinDeadline<T>(
 	label: string,
 	fn: () => Promise<T>,
-	ms = NESTED_CALL_TIMEOUT_MS,
+	ms = WRITE_TIMEOUT_MS,
 ): Promise<T> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
@@ -98,14 +90,7 @@ async function withinDeadline<T>(
 			fn(),
 			new Promise<never>((_, reject) => {
 				timer = setTimeout(
-					() =>
-						reject(
-							new LockDeadlineError(
-								`${label} did not settle within ${ms}ms while worktreeLock was held — ` +
-									"a nested gitService write is waiting on a lock its own caller holds; " +
-									"lock-holding callers must use the *Unlocked variant",
-							),
-						),
+					() => reject(new LockDeadlineError(`${label} did not settle within ${ms}ms`)),
 					ms,
 				);
 			}),
@@ -115,321 +100,7 @@ async function withinDeadline<T>(
 	}
 }
 
-/**
- * Run `fn` the way production does: inside `worktreeLock` for the same worktree.
- *
- * The lock is taken with the *raw* path, matching every real caller, which is what makes
- * the key-normalization change part of what is under test.
- */
-async function whileHoldingWorktreeLock<T>(
-	worktreePath: string,
-	label: string,
-	fn: () => Promise<T>,
-): Promise<T> {
-	return worktreeLock.acquire(worktreePath, () => withinDeadline(label, fn));
-}
-
-afterEach(() => {
-	for (const dir of tempDirs.splice(0)) {
-		rmSync(dir, { recursive: true, force: true });
-	}
-});
-
-describe("gitService *Unlocked writes called while worktreeLock is held", () => {
-	// One case per write method. Listed individually rather than looped over a name array
-	// so each can set up the state its command requires — a `stashPop` with nothing
-	// stashed or a `revertCommit` on an empty history would exit non-zero for reasons
-	// unrelated to locking and mask the property under test.
-	//
-	// Each asserts a positive outcome, not merely that nothing threw: a no-op that
-	// returned would satisfy a timeout check while doing none of the work.
-
-	test("autoCommitUnlocked", async () => {
-		const dir = await createRepo();
-		writeFileSync(join(dir, SEED_FILE), "dirty\n");
-		const sha = await whileHoldingWorktreeLock(dir, "autoCommitUnlocked", () =>
-			gitService.autoCommitUnlocked(dir, "nested auto-commit"),
-		);
-		expect(sha).toBeTruthy();
-		expect(await gitService.getStatus(dir)).toBe("");
-	});
-
-	test("stageAllUnlocked and unstageAllUnlocked", async () => {
-		const dir = await createRepo();
-		writeFileSync(join(dir, SEED_FILE), "dirty\n");
-		await whileHoldingWorktreeLock(dir, "stageAll/unstageAll", async () => {
-			await gitService.stageAllUnlocked(dir);
-			expect(await git(["diff", "--cached", "--name-only"], dir)).toBe(SEED_FILE);
-			await gitService.unstageAllUnlocked(dir);
-			expect(await git(["diff", "--cached", "--name-only"], dir)).toBe("");
-		});
-	});
-
-	test("stageFilesUnlocked and unstageFilesUnlocked", async () => {
-		const dir = await createRepo();
-		writeFileSync(join(dir, SEED_FILE), "dirty\n");
-		await whileHoldingWorktreeLock(dir, "stageFiles/unstageFiles", async () => {
-			await gitService.stageFilesUnlocked(dir, [SEED_FILE]);
-			expect(await git(["diff", "--cached", "--name-only"], dir)).toBe(SEED_FILE);
-			await gitService.unstageFilesUnlocked(dir, [SEED_FILE]);
-			expect(await git(["diff", "--cached", "--name-only"], dir)).toBe("");
-		});
-	});
-
-	test("commitUnlocked", async () => {
-		const dir = await createRepo();
-		writeFileSync(join(dir, SEED_FILE), "dirty\n");
-		await git(["add", "-A"], dir);
-		const sha = await whileHoldingWorktreeLock(dir, "commitUnlocked", () =>
-			gitService.commitUnlocked(dir, "nested commit"),
-		);
-		expect(sha).toBeTruthy();
-		expect(await git(["log", "-1", "--format=%s"], dir)).toBe("nested commit");
-	});
-
-	test("discardFilesUnlocked", async () => {
-		const dir = await createRepo();
-		writeFileSync(join(dir, SEED_FILE), "dirty\n");
-		await whileHoldingWorktreeLock(dir, "discardFilesUnlocked", () =>
-			gitService.discardFilesUnlocked(dir, [SEED_FILE]),
-		);
-		expect(await gitService.getStatus(dir)).toBe("");
-	});
-
-	test("discardAllUnlocked", async () => {
-		const dir = await createRepo();
-		writeFileSync(join(dir, SEED_FILE), "dirty\n");
-		writeFileSync(join(dir, "extra.txt"), "untracked\n");
-		await whileHoldingWorktreeLock(dir, "discardAllUnlocked", () =>
-			gitService.discardAllUnlocked(dir),
-		);
-		expect(await gitService.getStatus(dir)).toBe("");
-	});
-
-	test("stashUnlocked, stashPopUnlocked and stashDropUnlocked", async () => {
-		const dir = await createRepo();
-		writeFileSync(join(dir, SEED_FILE), "dirty\n");
-		await whileHoldingWorktreeLock(dir, "stash/stashPop/stashDrop", async () => {
-			await gitService.stashUnlocked(dir, "nested stash");
-			expect(await gitService.getStatus(dir)).toBe("");
-			const popped = await gitService.stashPopUnlocked(dir);
-			expect(popped.hasConflicts).toBe(false);
-			// Re-stash so there is an entry for drop to remove.
-			await gitService.stashUnlocked(dir, "nested stash again");
-			await gitService.stashDropUnlocked(dir, 0);
-			expect(await gitService.stashList(dir)).toEqual([]);
-		});
-	});
-
-	test("resetSoftUnlocked", async () => {
-		const dir = await createRepo();
-		await whileHoldingWorktreeLock(dir, "resetSoftUnlocked", () =>
-			gitService.resetSoftUnlocked(dir, "HEAD~1"),
-		);
-		expect(await git(["log", "-1", "--format=%s"], dir)).toBe("seed");
-	});
-
-	test("resetHardUnlocked", async () => {
-		const dir = await createRepo();
-		writeFileSync(join(dir, SEED_FILE), "dirty\n");
-		const head = (await gitService.getHeadCommit(dir)).trim();
-		await whileHoldingWorktreeLock(dir, "resetHardUnlocked", () =>
-			gitService.resetHardUnlocked(dir, head),
-		);
-		expect(await gitService.getStatus(dir)).toBe("");
-	});
-
-	test("resetMergeUnlocked", async () => {
-		const dir = await createRepo();
-		// No target: resets to HEAD, which is what the `--no-commit` merge cleanup does.
-		await whileHoldingWorktreeLock(dir, "resetMergeUnlocked", () =>
-			gitService.resetMergeUnlocked(dir),
-		);
-		expect(await gitService.getStatus(dir)).toBe("");
-	});
-
-	test("cleanUntrackedUnlocked", async () => {
-		const dir = await createRepo();
-		writeFileSync(join(dir, "junk.txt"), "untracked\n");
-		await whileHoldingWorktreeLock(dir, "cleanUntrackedUnlocked", () =>
-			gitService.cleanUntrackedUnlocked(dir),
-		);
-		expect(await gitService.getStatus(dir)).toBe("");
-	});
-
-	test("revertCommitUnlocked", async () => {
-		const dir = await createRepo();
-		const head = (await gitService.getHeadCommit(dir)).trim();
-		const sha = await whileHoldingWorktreeLock(dir, "revertCommitUnlocked", () =>
-			gitService.revertCommitUnlocked(dir, head),
-		);
-		expect(sha).toBeTruthy();
-		expect(await git(["show", `HEAD:${SEED_FILE}`], dir)).toBe("one");
-	});
-
-	test("revertMergeCommitUnlocked", async () => {
-		const dir = await createRepo();
-		// Build a real merge commit: the method passes `-m 1`, which git rejects outright
-		// on a single-parent commit, so this cannot be faked.
-		await git(["checkout", "-b", "side", "HEAD~1"], dir);
-		writeFileSync(join(dir, "side.txt"), "side\n");
-		await git(["add", "-A"], dir);
-		await git(["commit", "-m", "side work"], dir);
-		await git(["checkout", "main"], dir);
-		await git(["merge", "--no-ff", "-m", "merge side", "side"], dir);
-
-		const mergeSha = (await gitService.getHeadCommit(dir)).trim();
-		const sha = await whileHoldingWorktreeLock(dir, "revertMergeCommitUnlocked", () =>
-			gitService.revertMergeCommitUnlocked(dir, mergeSha),
-		);
-		expect(sha).toBeTruthy();
-	});
-
-	test("the full park sequence: resetHard then cleanUntracked under one holder", async () => {
-		// The shape `snapshot-dirty-git-op.parkUncommittedWork` relies on. These two must
-		// run adjacently under a single holder: a write landing between them would be
-		// deleted by the clean without ever having been snapshotted.
-		const dir = await createRepo();
-		writeFileSync(join(dir, SEED_FILE), "dirty\n");
-		writeFileSync(join(dir, "untracked.txt"), "junk\n");
-		const head = (await gitService.getHeadCommit(dir)).trim();
-		await whileHoldingWorktreeLock(dir, "park sequence", async () => {
-			await gitService.resetHardUnlocked(dir, head);
-			await gitService.cleanUntrackedUnlocked(dir);
-		});
-		expect(await gitService.getStatus(dir)).toBe("");
-	});
-
-	test("a path variant of the held worktree is still serialized, not deadlocked", async () => {
-		// Both halves of the refactor interact here: normalization must make a
-		// differently-spelled path hit the *same* key (so it queues instead of running
-		// concurrently), while the nested unlocked write must still complete (so unifying
-		// the instances did not turn queueing into self-deadlock).
-		const dir = await createRepo();
-		const variant = `${dir}/`;
-		expect(worktreeLock.key(variant)).toBe(worktreeLock.key(dir));
-
-		const order: string[] = [];
-		const outer = worktreeLock.acquire(dir, async () => {
-			order.push("outer-start");
-			writeFileSync(join(dir, SEED_FILE), "dirty\n");
-			await withinDeadline("autoCommitUnlocked under held lock", () =>
-				gitService.autoCommitUnlocked(dir, "outer auto-commit"),
-			);
-			order.push("outer-end");
-		});
-		// Queued behind the holder via the variant spelling.
-		const queued = worktreeLock.acquire(variant, async () => {
-			order.push("variant");
-		});
-
-		await withinDeadline("outer holder", () => outer);
-		await withinDeadline("queued variant", () => queued);
-		expect(order).toEqual(["outer-start", "outer-end", "variant"]);
-	});
-});
-
-describe("gitService locked writes for callers holding no lock", () => {
-	// The public API must be unchanged for the plain route handlers, which take no lock of
-	// their own. Splitting the methods could have left a wrapper calling the wrong body or
-	// dropping the early-return guards, and none of that shows up in the tests above.
-
-	test("locked wrappers still perform their work", async () => {
-		const dir = await createRepo();
-		writeFileSync(join(dir, SEED_FILE), "dirty\n");
-		await gitService.stageAll(dir);
-		expect(await git(["diff", "--cached", "--name-only"], dir)).toBe(SEED_FILE);
-		const sha = await gitService.commit(dir, "locked commit");
-		expect(sha).toBeTruthy();
-		expect(await git(["log", "-1", "--format=%s"], dir)).toBe("locked commit");
-		expect(await gitService.getStatus(dir)).toBe("");
-	});
-
-	test("empty file lists remain no-ops rather than staging everything", async () => {
-		const dir = await createRepo();
-		writeFileSync(join(dir, SEED_FILE), "dirty\n");
-		// The early return lives in both the wrapper and the unlocked body. If the split had
-		// dropped it from the body, `git add --` with no pathspec would stage the whole
-		// worktree — a silent behaviour change rather than an error.
-		await gitService.stageFiles(dir, []);
-		await gitService.stageFilesUnlocked(dir, []);
-		expect(await git(["diff", "--cached", "--name-only"], dir)).toBe("");
-		await gitService.unstageFiles(dir, []);
-		await gitService.unstageFilesUnlocked(dir, []);
-		await gitService.discardFiles(dir, []);
-		await gitService.discardFilesUnlocked(dir, []);
-		// Nothing was discarded either.
-		expect(await gitService.getStatus(dir)).not.toBe("");
-	});
-
-	test("concurrent locked writes on one worktree do not interleave", async () => {
-		const dir = await createRepo();
-		// What the lock is actually for. Two commits racing on one index would otherwise
-		// produce `index.lock` contention or a commit containing the other's staged state.
-		writeFileSync(join(dir, "a.txt"), "a\n");
-		writeFileSync(join(dir, "b.txt"), "b\n");
-		const results = await Promise.all([
-			gitService.autoCommit(dir, "concurrent one"),
-			gitService.autoCommit(dir, "concurrent two"),
-		]);
-		// Exactly one had changes to commit; the other found a clean tree and returned null.
-		expect(results.filter(Boolean)).toHaveLength(1);
-		expect(await gitService.getStatus(dir)).toBe("");
-	});
-
-	test("two distinct worktrees are not serialized against each other", async () => {
-		const a = await createRepo();
-		const b = await createRepo();
-		// Normalization must not over-merge keys: serializing unrelated chapters' merges
-		// would be a throughput regression invisible to every other test here.
-		const holder = worktreeLock.acquire(a, () => new Promise<void>((r) => setTimeout(r, 200)));
-		writeFileSync(join(b, SEED_FILE), "dirty\n");
-		const sha = await withinDeadline("autoCommit on an unrelated worktree", () =>
-			gitService.autoCommit(b, "independent"),
-		);
-		expect(sha).toBeTruthy();
-		await holder;
-	});
-});
-
-describe("the hazard the unlocked variants exist for", () => {
-	test("a locked write makes no progress while its own caller holds the lock", async () => {
-		const dir = await createRepo();
-		writeFileSync(join(dir, SEED_FILE), "dirty\n");
-		let innerSettled = false;
-
-		// Deliberately the wrong call, to pin that the danger is real rather than
-		// hypothetical. If someone makes `AsyncMutex` re-entrant or re-splits these methods,
-		// this test fails and says so — at which point the `*Unlocked` variants can be
-		// reconsidered on purpose instead of removed on an assumption.
-		//
-		// The waiter is *launched* inside the block and awaited outside it, which is what
-		// makes the mechanism visible: the nested call is queued behind its own caller, so
-		// it can only proceed once that caller returns. Production code awaits it inline
-		// instead, so the caller never returns and the wait never ends — an HTTP request
-		// that hangs forever with nothing thrown and nothing logged.
-		let inner!: Promise<string | null>;
-		await worktreeLock.acquire(dir, async () => {
-			inner = gitService.autoCommit(dir, "queued behind its own caller");
-			void inner.then(() => {
-				innerSettled = true;
-			});
-			// Long enough that a non-blocked call would have finished several times over:
-			// the *Unlocked cases above complete in well under 120ms.
-			await new Promise((r) => setTimeout(r, EXPECTED_DEADLOCK_TIMEOUT_MS));
-			expect(innerSettled).toBe(false);
-		});
-
-		// Only now, with the holder gone, can it run. Note this also means the orphaned
-		// call is not cancelled — it eventually performs its write, out of order with
-		// respect to whatever the holder did afterwards, which is its own hazard.
-		expect(
-			await withinDeadline("the queued write, after its caller returned", () => inner),
-		).toBeTruthy();
-	});
-});
-
-/** Explicit barriers, not sleeps: a held backend command must exclude queued mutations. */
+/** Explicit barriers, not sleeps: the holder releases exactly when the test says so. */
 function barrier() {
 	let release!: () => void;
 	const promise = new Promise<void>((resolve) => {
@@ -438,114 +109,174 @@ function barrier() {
 	return { promise, release };
 }
 
-describe("gitService shared worktree registry", () => {
-	test("add/remove/prune share a common-dir queue across linked checkouts and aliases", async () => {
-		const dir = await createRepo();
-		const other = await createRepo();
-		const source = join(dir, ".worktrees", "source");
-		const removable = join(dir, ".worktrees", "removable");
-		await git(["worktree", "add", source, "-b", "source"], dir);
-		await git(["worktree", "add", removable, "-b", "removable"], dir);
-		await git(["branch", "first"], dir);
-		await git(["branch", "second"], dir);
-		await git(["branch", "independent"], other);
-		const aliasRoot = mkdtempSync(join(tmpdir(), "nf-wtlock-alias-"));
-		tempDirs.push(aliasRoot);
-		const alias = join(aliasRoot, "source");
-		symlinkSync(source, alias, process.platform === "win32" ? "junction" : "dir");
-		const commonDirectory = await realpath(join(dir, ".git"));
-		const entered = barrier();
-		const release = barrier();
-		const queued = barrier();
-		const commands: string[] = [];
-		let acquisitions = 0;
-		const acquire = PathKeyedMutex.prototype.acquire;
-		const lockSpy = spyOn(PathKeyedMutex.prototype, "acquire").mockImplementation(function <T>(
-			this: PathKeyedMutex,
-			path: string,
-			fn: () => Promise<T>,
-		): Promise<T> {
-			const result = acquire.call(this, path, fn) as Promise<T>;
-			if (path === commonDirectory && ++acquisitions === 4) queued.release();
-			return result;
-		});
-		const originalSpawn = spawn.safeSpawn;
-		const spawnSpy = spyOn(spawn, "safeSpawn").mockImplementation(async (options) => {
-			const index = options.cmd.indexOf("worktree");
-			if (index >= 0 && options.cwd !== other) {
-				const operation = options.cmd[index + 1];
-				commands.push(operation);
-				if (operation === "add" && options.cmd.at(-1) === "first") {
-					entered.release();
-					await release.promise;
-				}
-			}
-			return originalSpawn(options);
-		});
-		const pending: Promise<void>[] = [];
-		try {
-			// A distinct leaf lock must also remain safe for existing worktreeLock holders.
-			pending.push(
-				worktreeLock.acquire(dir, () =>
-					gitService.createWorktree(dir, join(dir, ".worktrees", "first"), "first"),
-				),
-			);
-			await withinDeadline("first worktree add entered", () => entered.promise);
-			pending.push(
-				gitService.createWorktree(alias, join(dir, ".worktrees", "second"), "second"),
-				gitService.pruneWorktrees(source),
-				gitService.removeWorktree(dir, removable),
-			);
-			// Observe that every waiter is enqueued before checking dispatch exclusion.
-			await withinDeadline("all registry mutations queued", () => queued.promise);
-			await withinDeadline("an unrelated repository is not blocked", () =>
-				gitService.createWorktree(other, join(other, ".worktrees", "independent"), "independent"),
-			);
-			expect(commands).toEqual(["add"]);
-			release.release();
-			await Promise.all(pending);
-			expect(commands.filter((command) => command === "add")).toHaveLength(2);
-			expect(commands.filter((command) => command === "remove")).toHaveLength(1);
-			expect(commands.filter((command) => command === "prune")).toHaveLength(1);
-			const worktrees = await git(["worktree", "list", "--porcelain"], dir);
-			expect(worktrees).toContain("branch refs/heads/first");
-			expect(worktrees).toContain("branch refs/heads/second");
-			expect(worktrees).not.toContain("branch refs/heads/removable");
-		} finally {
-			release.release();
-			await Promise.allSettled(pending);
-			spawnSpy.mockRestore();
-			lockSpy.mockRestore();
-		}
-	}, 15_000);
+async function stagedFiles(dir: string): Promise<string> {
+	return git(["diff", "--cached", "--name-only"], dir);
+}
 
-	test("a failed add releases the registry queue without retrying or swallowing the error", async () => {
+afterEach(() => {
+	for (const dir of tempDirs.splice(0)) {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+describe("gitService locked writes for callers holding no lock", () => {
+	test("locked writes still perform their work", async () => {
 		const dir = await createRepo();
-		await git(["branch", "valid"], dir);
-		let attempts = 0;
-		const originalSpawn = spawn.safeSpawn;
-		const spawnSpy = spyOn(spawn, "safeSpawn").mockImplementation((options) => {
-			if (options.cmd.includes("worktree") && options.cmd.at(-1) === "missing") attempts++;
-			return originalSpawn(options);
+		writeFileSync(join(dir, SEED_FILE), "dirty\n");
+		await gitService.stageAll(dir);
+		expect(await stagedFiles(dir)).toBe(SEED_FILE);
+		await gitService.unstageAll(dir);
+		expect(await stagedFiles(dir)).toBe("");
+		await gitService.stageFiles(dir, [SEED_FILE]);
+		expect(await stagedFiles(dir)).toBe(SEED_FILE);
+		await gitService.unstageFiles(dir, [SEED_FILE]);
+		expect(await stagedFiles(dir)).toBe("");
+		await gitService.stageAll(dir);
+		const sha = await gitService.commit(dir, "locked commit");
+		expect(sha).toMatch(/^[0-9a-f]{40}$/);
+		expect(await git(["log", "-1", "--format=%s"], dir)).toBe("locked commit");
+		expect(await git(["status", "--porcelain"], dir)).toBe("");
+	});
+
+	test("stash, pop and drop round-trip", async () => {
+		const dir = await createRepo();
+		writeFileSync(join(dir, SEED_FILE), "dirty\n");
+		await gitService.stash(dir, "locked stash");
+		expect(await git(["status", "--porcelain"], dir)).toBe("");
+		expect((await gitService.stashPop(dir)).hasConflicts).toBe(false);
+		expect(await git(["status", "--porcelain"], dir)).not.toBe("");
+		await gitService.stash(dir, "locked stash again");
+		await gitService.stashDrop(dir, 0);
+		expect(await gitService.stashList(dir)).toEqual([]);
+	});
+
+	test("discard and reset restore the worktree", async () => {
+		const dir = await createRepo();
+		writeFileSync(join(dir, SEED_FILE), "dirty\n");
+		await gitService.discardFiles(dir, [SEED_FILE]);
+		expect(await git(["status", "--porcelain"], dir)).toBe("");
+		writeFileSync(join(dir, SEED_FILE), "dirty\n");
+		writeFileSync(join(dir, "extra.txt"), "untracked\n");
+		await gitService.discardAll(dir);
+		expect(await git(["status", "--porcelain"], dir)).toBe("");
+		await gitService.resetSoft(dir, "HEAD~1");
+		expect(await git(["log", "-1", "--format=%s"], dir)).toBe("seed");
+		await gitService.resetHard(dir, "HEAD");
+		expect(await git(["status", "--porcelain"], dir)).toBe("");
+	});
+
+	test("empty file lists remain no-ops rather than staging everything", async () => {
+		const dir = await createRepo();
+		writeFileSync(join(dir, SEED_FILE), "dirty\n");
+		// Without the early return, discard's status query would carry no pathspec, list
+		// every change in the worktree, and then check out / clean all of it.
+		await gitService.stageFiles(dir, []);
+		expect(await stagedFiles(dir)).toBe("");
+		await gitService.unstageFiles(dir, []);
+		await gitService.discardFiles(dir, []);
+		// Nothing was discarded either.
+		expect(await git(["status", "--porcelain"], dir)).not.toBe("");
+	});
+});
+
+describe("gitService write serialization", () => {
+	test("queued writes on one worktree run one after the other, in call order", async () => {
+		// What the lock is actually for. A stage racing a commit on one index would
+		// otherwise produce `index.lock` contention or a commit holding the other's file.
+		const dir = await createRepo();
+		writeFileSync(join(dir, "a.txt"), "a\n");
+		writeFileSync(join(dir, "b.txt"), "b\n");
+		await Promise.all([
+			gitService.stageFiles(dir, ["a.txt"]),
+			gitService.commit(dir, "commit a"),
+			gitService.stageFiles(dir, ["b.txt"]),
+			gitService.commit(dir, "commit b"),
+		]);
+		expect(await git(["log", "-2", "--format=%s"], dir)).toBe("commit b\ncommit a");
+		expect(await git(["show", "--name-only", "--format=", "HEAD~1"], dir)).toBe("a.txt");
+		expect(await git(["show", "--name-only", "--format=", "HEAD"], dir)).toBe("b.txt");
+		expect(await git(["status", "--porcelain"], dir)).toBe("");
+	});
+
+	test("a write through a path variant waits for the holder of the canonical spelling", async () => {
+		// Normalization must make a differently-spelled path hit the *same* key, so the
+		// write queues instead of running concurrently with the holder.
+		const dir = await createRepo();
+		const variant = `${dir}/`;
+		expect(worktreeLock.key(variant)).toBe(worktreeLock.key(dir));
+		writeFileSync(join(dir, SEED_FILE), "dirty\n");
+
+		const release = barrier();
+		const holder = worktreeLock.acquire(dir, () => release.promise);
+		let staged = false;
+		const write = gitService.stageAll(variant).then(() => {
+			staged = true;
 		});
-		const pending: Promise<unknown>[] = [];
 		try {
-			const failed = gitService.createWorktree(dir, join(dir, ".worktrees", "failed"), "missing");
-			// Attach the rejection assertion before another asynchronous Git probe can finish.
-			pending.push(
-				(async () => {
-					await expect(failed).rejects.toThrow("Failed to create worktree:");
-				})(),
-			);
-			pending.push(gitService.createWorktree(dir, join(dir, ".worktrees", "valid"), "valid"));
-			await Promise.all(pending);
-			expect(attempts).toBe(1);
-			expect(await git(["branch", "--show-current"], join(dir, ".worktrees", "valid"))).toBe(
-				"valid",
-			);
+			await new Promise((r) => setTimeout(r, BLOCKED_WRITE_WATCH_MS));
+			expect(staged).toBe(false);
+			expect(await stagedFiles(dir)).toBe("");
 		} finally {
-			await Promise.allSettled(pending);
-			spawnSpy.mockRestore();
+			release.release();
 		}
+		await withinDeadline("holder", () => holder);
+		await withinDeadline("queued variant write", () => write);
+		expect(await stagedFiles(dir)).toBe(SEED_FILE);
+	});
+
+	test("two distinct worktrees are not serialized against each other", async () => {
+		// Normalization must not over-merge keys: serializing unrelated worktrees would be
+		// a throughput regression invisible to every other test here.
+		const a = await createRepo();
+		const b = await createRepo();
+		const release = barrier();
+		const holder = worktreeLock.acquire(a, () => release.promise);
+		try {
+			writeFileSync(join(b, SEED_FILE), "dirty\n");
+			await withinDeadline("stageAll on an unrelated worktree", () => gitService.stageAll(b));
+			const sha = await withinDeadline("commit on an unrelated worktree", () =>
+				gitService.commit(b, "independent"),
+			);
+			expect(sha).toMatch(/^[0-9a-f]{40}$/);
+		} finally {
+			release.release();
+		}
+		await holder;
+	});
+});
+
+describe("the hazard of calling a write method while holding worktreeLock", () => {
+	test("a write makes no progress while its own caller holds the lock", async () => {
+		const dir = await createRepo();
+		writeFileSync(join(dir, SEED_FILE), "dirty\n");
+		await git(["add", "-A"], dir);
+		let innerSettled = false;
+
+		// Deliberately the wrong call, to pin that the danger is real rather than
+		// hypothetical. If someone makes `AsyncMutex` re-entrant, this test fails and says
+		// so — at which point the guidance on `withWorktreeLock` can be revisited on purpose.
+		//
+		// The waiter is *launched* inside the block and awaited outside it, which is what
+		// makes the mechanism visible: the nested call is queued behind its own caller, so
+		// it can only proceed once that caller returns. Awaiting it inline instead would
+		// mean the caller never returns and the wait never ends — a request that hangs
+		// forever with nothing thrown and nothing logged.
+		let inner!: Promise<string>;
+		await worktreeLock.acquire(dir, async () => {
+			inner = gitService.commit(dir, "queued behind its own caller");
+			void inner.then(() => {
+				innerSettled = true;
+			});
+			// Long enough that a non-blocked commit would have finished several times over.
+			await new Promise((r) => setTimeout(r, BLOCKED_WRITE_WATCH_MS));
+			expect(innerSettled).toBe(false);
+		});
+
+		// Only now, with the holder gone, can it run. Note this also means the orphaned
+		// call is not cancelled — it eventually performs its write, out of order with
+		// respect to whatever the holder did afterwards, which is its own hazard.
+		expect(
+			await withinDeadline("the queued write, after its caller returned", () => inner),
+		).toMatch(/^[0-9a-f]{40}$/);
 	});
 });

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
 	DEFAULT_SEARCH_SORT,
+	normalizeSearchInclude,
 	normalizeSearchSort,
 	normalizeSearchType,
 	sortVisibleSearchResults,
@@ -31,7 +32,6 @@ describe("normalizeSearchType", () => {
 	});
 
 	test("still normalizes the plural entity names and unknown input", () => {
-		expect(normalizeSearchType("chapters")).toBe("chapter");
 		expect(normalizeSearchType("narrators")).toBe("narrator");
 		expect(normalizeSearchType("messages")).toBe("message");
 		expect(normalizeSearchType(undefined)).toBe("all");
@@ -44,15 +44,15 @@ describe("summarizeSearchRuntimeState", () => {
 		const status = summarizeSearchRuntimeState({
 			results: [],
 			degraded: true,
-			fallbacks: [{ entity: "chapters", from: "fts5", to: "like", reason: "fts_query_failed" }],
+			fallbacks: [{ entity: "narrators", from: "fts5", to: "like", reason: "fts_query_failed" }],
 			searchMetadata: {
 				degraded: true,
 				mode: "degraded-like-fallback",
 				ftsReady: false,
 				shortQuery: false,
-				requestedEntities: ["chapters"],
+				requestedEntities: ["narrators"],
 				fallbacks: [
-					{ entity: "chapters", from: "fts5", to: "like", reason: "fts_query_failed" },
+					{ entity: "narrators", from: "fts5", to: "like", reason: "fts_query_failed" },
 					{ entity: "messages", from: "fts5", to: "like", message: "message fallback" },
 				],
 			},
@@ -62,7 +62,7 @@ describe("summarizeSearchRuntimeState", () => {
 			degraded: true,
 			mode: "degraded-like-fallback",
 			fallbackMessages: [
-				"chapters: fts_query_failed (fts5 → like)",
+				"narrators: fts_query_failed (fts5 → like)",
 				"messages: message fallback (fts5 → like)",
 			],
 		});
@@ -81,7 +81,7 @@ describe("summarizeSearchRuntimeState", () => {
 
 	test("tolerates additive backend metadata on ready Search responses", () => {
 		const status = summarizeSearchRuntimeState({
-			results: [{ type: "chapter", id: "c1", title: "Ready chapter" }],
+			results: [{ type: "narrator", id: "n1", title: "Ready narrator" }],
 			degraded: false,
 			fallbacks: [],
 			searchMetadata: {
@@ -89,7 +89,7 @@ describe("summarizeSearchRuntimeState", () => {
 				mode: "fts5-with-like-fallback",
 				ftsReady: true,
 				shortQuery: false,
-				requestedEntities: ["chapters", "messages", "narrators"],
+				requestedEntities: ["messages", "narrators"],
 				fallbacks: [],
 				backendDiagnostic: "safe-to-ignore",
 			},
@@ -128,5 +128,17 @@ describe("all results share the selected ordering", () => {
 		expect(sortVisibleSearchResults(hits, "narrator", "time", (id) => id).map((r) => r.id)).toEqual(
 			["n-new", "n-old"],
 		);
+	});
+});
+
+describe("normalizeSearchInclude", () => {
+	test("keeps known names in canonical order and drops the rest", () => {
+		expect(normalizeSearchInclude("tools,nonsense, subagents")).toEqual(["subagents", "tools"]);
+		expect(normalizeSearchInclude(["system", "system"])).toEqual(["system"]);
+	});
+
+	test("treats a missing value as the default scope", () => {
+		expect(normalizeSearchInclude(undefined)).toEqual([]);
+		expect(normalizeSearchInclude("")).toEqual([]);
 	});
 });

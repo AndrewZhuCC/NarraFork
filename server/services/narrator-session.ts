@@ -22,7 +22,6 @@ import {
 import { and, asc, desc, eq, exists, gt, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
-	chapters,
 	narratorBufferedMessages,
 	narratorMessageRefs,
 	narratorMessages,
@@ -161,7 +160,7 @@ import {
 	formatBackgroundCompletionNotifications,
 } from "./bg-completion-queue";
 import { gitService } from "./git-service";
-import { resolveLegacyNarratorCwd, resolveNarratorSessionCwd } from "./narrator-cwd";
+import { isFormerChapterSessionWithoutDirectory, resolveNarratorSessionCwd } from "./narrator-cwd";
 import {
 	clearStreamingSnapshot,
 	type EventHooks,
@@ -189,6 +188,7 @@ import {
 	type PendingInjection,
 	projectPendingInjection,
 } from "./parent-injection-queue";
+import { syncNarratorProjectLinksSafely } from "./project-index";
 import { broadcastSpecChanged } from "./spec-broadcast";
 import { buildBehaviorFenceBody, buildSpecTaskDigestBody } from "./spec-reminder";
 import { compileSpecTasks, parseSpecTasksDocument } from "./spec-task-service";
@@ -207,11 +207,15 @@ import {
 	type SpecContinuationCause,
 	type SpecContinuationState,
 } from "./turn-continuation-decisions";
-import { worktreeWatcher } from "./worktree-watcher";
 
 // === In-memory state (imported from narrator-session-state) ===
 
-import type { ActiveNarrator, BufferedMessage, NarratorEvent } from "./narrator-session-state";
+import type {
+	ActiveNarrator,
+	BufferedExecutionIntent,
+	BufferedMessage,
+	NarratorEvent,
+} from "./narrator-session-state";
 import {
 	activeNarrators,
 	claimNarratorRuntime,
@@ -433,7 +437,9 @@ export function parseQueuedNewCommand(
 	message: string,
 	commandText?: string | null,
 	composerDocument?: import("@shared/composer-document").ComposerDocument,
+	intent?: BufferedExecutionIntent,
 ) {
+	if (intent?.literal) return null;
 	if (
 		composerDocument?.paragraphs.some((paragraph) =>
 			paragraph.children.some((node) => node.type !== "text" && node.type !== "break"),
@@ -456,7 +462,9 @@ export function parseQueuedGoalCommand(
 	message: string,
 	commandText?: string | null,
 	composerDocument?: import("@shared/composer-document").ComposerDocument,
+	intent?: BufferedExecutionIntent,
 ) {
+	if (intent?.literal) return null;
 	if (
 		composerDocument?.paragraphs.some((paragraph) =>
 			paragraph.children.some((node) => node.type !== "text" && node.type !== "break"),
@@ -597,7 +605,7 @@ export async function applySessionDefaultDevice(
 async function resolveNarratorProjectId(narratorId: string): Promise<string | null> {
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { chapterId: true, contextProjectId: true },
+		columns: { id: true, contextProjectId: true },
 	});
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 	return await resolveSharedNarratorProjectId(narrator);
@@ -673,7 +681,6 @@ export async function executeQueuedNewCommand(
 				).model
 			: (sourceNarrator.model ?? undefined);
 	const newNarrator = await narratorService.create({
-		chapterId: null,
 		model: newModel,
 		systemPrompt: sourceNarrator.systemPrompt ?? undefined,
 		permissionMode: sourceNarrator.permissionMode ?? undefined,
@@ -862,11 +869,17 @@ async function resumeNextBufferedMessageUnlocked(
 		// differently: a terminal command owns its attachments from here on, while a
 		// plain message keeps its files on disk until delivery has actually succeeded —
 		// they are what a restore needs when it has not.
-		const newCommand = parseQueuedNewCommand(first.text, first.commandText, first.composerDocument);
+		const newCommand = parseQueuedNewCommand(
+			first.text,
+			first.commandText,
+			first.composerDocument,
+			first.executionIntent,
+		);
 		const goalCommand = parseQueuedGoalCommand(
 			first.text,
 			first.commandText,
 			first.composerDocument,
+			first.executionIntent,
 		);
 		const controlCommand = first.executionIntent?.controlCommand;
 		if (newCommand || controlCommand) {
@@ -1177,72 +1190,50 @@ async function createNarrator(
 	const effectiveConversationId = narrator.apiConversationId;
 	const effectiveContextSummary = narrator.contextSummary;
 
-	// Resolve CWD and cache chapter info for git tracking
+	// Resolve CWD and the project context
 	let narratorCwd: string;
-	let narratorChapterId: string | undefined;
 	let narratorProjectId: string | undefined;
-	let narratorChapterRole: string | undefined;
-	let narratorWorktreePath: string | undefined;
-	let narratorBaseBranch: string | undefined;
 	let projectGitPath: string | null = null;
 	// Project-level optional tool modes. Read from the project row that is fetched
 	// anyway, so the preload decision below can honour a project override — without
 	// it, setting a tool to "resident" for one project changed nothing.
 	let projectRoutineConfig: RoutineModeConfig | undefined;
-	if (narrator.chapterId) {
-		const ch = await db.query.chapters.findFirst({
-			where: eq(chapters.id, narrator.chapterId),
-		});
-		if (!ch) throw new NotFoundError("Chapter", narrator.chapterId);
-		// Always try to resolve project gitPath for skill loading
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, ch.projectId),
-		});
-		projectGitPath = project?.gitPath ?? null;
-		projectRoutineConfig = parseProjectRoutineConfig(project?.chapterSettings);
-		narratorProjectId = ch.projectId;
-		const executionDeviceId =
-			initialOAuthRuntime?.defaultDeviceId ?? narrator.defaultDeviceId ?? "local";
-		const committedLocalCwd =
-			narrator.workspaceContext?.revision === narrator.workspaceRevision &&
-			narrator.workspaceContext.deviceId === "local"
-				? narrator.workspaceContext.cwd
-				: null;
-		const chapterCwd = resolveLegacyNarratorCwd(
-			committedLocalCwd ?? narrator.cwd,
-			ch.worktreePath,
-			projectGitPath,
-			ch.isRoot === 1,
+	const executionDeviceId =
+		initialOAuthRuntime?.defaultDeviceId ?? narrator.defaultDeviceId ?? "local";
+	const committedLocalCwd =
+		narrator.workspaceContext?.revision === narrator.workspaceRevision &&
+		narrator.workspaceContext.deviceId === "local"
+			? narrator.workspaceContext.cwd
+			: null;
+	// A former chapter session's directory came from its committed workspace first (its
+	// own cwd column was often never written); every other session keeps its own cwd first.
+	const storedCwd = isFormerChapterSessionWithoutDirectory({ cwd: null, traits: narrator.traits })
+		? committedLocalCwd || narrator.cwd
+		: narrator.cwd || committedLocalCwd;
+	if (
+		executionDeviceId === "local" &&
+		isFormerChapterSessionWithoutDirectory({ cwd: storedCwd, traits: narrator.traits })
+	) {
+		throw new AppError(
+			"This legacy workspace has no directory. Choose a working directory to continue.",
+			409,
+			"WORKSPACE_DIRECTORY_REQUIRED",
 		);
-		if (!chapterCwd && executionDeviceId === "local") {
-			throw new AppError(
-				"This legacy workspace has no directory. Choose a working directory to continue.",
-				409,
-				"WORKSPACE_DIRECTORY_REQUIRED",
-			);
-		}
-		// Remote tools use their executor/committed workspace cwd. This host cwd is
-		// only the pre-existing prompt/skill context, not a fallback execution target.
-		narratorCwd =
-			chapterCwd ?? resolveNarratorSessionCwd(narrator.cwd, null, projectGitPath, getHome());
-		if (ch.worktreePath) {
-			narratorChapterId = ch.id;
-			narratorChapterRole = ch.role;
-			narratorWorktreePath = ch.worktreePath;
-			narratorBaseBranch = ch.baseBranch;
-		}
-	} else if (narrator.contextProjectId) {
+	}
+	// Bring the project index up to date before the project decides configuration: the
+	// directory may have moved, or the session predates the index.
+	await syncNarratorProjectLinksSafely(narrator.id);
+	const resolvedProjectId = await resolveSharedNarratorProjectId(narrator);
+	if (resolvedProjectId) {
 		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, narrator.contextProjectId),
+			where: eq(projects.id, resolvedProjectId),
 		});
-		if (!project) throw new NotFoundError("Project", narrator.contextProjectId);
+		if (!project) throw new NotFoundError("Project", resolvedProjectId);
 		narratorProjectId = project.id;
 		projectGitPath = project.gitPath;
 		projectRoutineConfig = parseProjectRoutineConfig(project.chapterSettings);
-		narratorCwd = resolveNarratorSessionCwd(narrator.cwd, null, project.gitPath, getHome());
-	} else {
-		narratorCwd = resolveNarratorSessionCwd(narrator.cwd, null, null, getHome());
 	}
+	narratorCwd = resolveNarratorSessionCwd(storedCwd, projectGitPath, getHome());
 
 	// Restore or create the persistent plan file ID if the narrator is already in plan mode
 	// (e.g. server restart recovery). Keeping this stable prevents file-based plans from
@@ -1312,15 +1303,13 @@ async function createNarrator(
 		// Skill root resolution failure is non-fatal
 	}
 
-	// For standalone narrators, only enable Bash git-status-based file tracking
-	// if cwd is inside a git repo. This prevents running `git status` on non-repo dirs.
-	let narratorIsInGitRepo = !!narratorChapterId;
-	if (!narratorChapterId) {
-		try {
-			narratorIsInGitRepo = await gitService.isGitRepo(narratorCwd);
-		} catch {
-			// Non-fatal — Bash file tracking just won't be enabled
-		}
+	// Only enable Bash git-status-based file tracking if cwd is inside a git repo.
+	// This prevents running `git status` on non-repo dirs.
+	let narratorIsInGitRepo = false;
+	try {
+		narratorIsInGitRepo = await gitService.isGitRepo(narratorCwd);
+	} catch {
+		// Non-fatal — Bash file tracking just won't be enabled
 	}
 
 	const abortController = new AbortController();
@@ -1362,11 +1351,7 @@ async function createNarrator(
 		locale,
 		_usedCompactSummary: usedCompactSummary,
 		_replyInUserLanguage: replyInUserLanguage,
-		_chapterId: narratorChapterId,
 		_projectId: narratorProjectId,
-		_chapterRole: narratorChapterRole,
-		_worktreePath: narratorWorktreePath,
-		_baseBranch: narratorBaseBranch,
 		_isInGitRepo: narratorIsInGitRepo,
 		_planFileId: planFileId,
 		_planFilePath: planFilePath,
@@ -1419,11 +1404,6 @@ async function createNarrator(
 	}
 
 	activeNarrators.set(narratorId, active);
-
-	// Start file watcher for the worktree (covers terminal/editor changes)
-	if (narratorWorktreePath && narratorChapterId) {
-		worktreeWatcher.watch(narratorWorktreePath, narratorChapterId, narratorId, locale);
-	}
 
 	return active;
 }
@@ -1722,12 +1702,10 @@ export async function updateActiveNarratorCwdAndSkillContext(
 	} catch {
 		active._skillRoot = active._projectGitPath ?? null;
 	}
-	if (!active._chapterId) {
-		try {
-			active._isInGitRepo = await gitService.isGitRepo(cwd);
-		} catch {
-			active._isInGitRepo = false;
-		}
+	try {
+		active._isInGitRepo = await gitService.isGitRepo(cwd);
+	} catch {
+		active._isInGitRepo = false;
 	}
 	await ensureSkillCacheFreshForActiveNarrator(active);
 }
@@ -3786,8 +3764,18 @@ export async function acceptUserMessage(
 						// exits. Leave it to the command-aware buffered consumer, not feedMessage.
 						const queuedCommand =
 							options.executionIntent?.controlCommand ||
-							parseQueuedNewCommand(prompt, options.commandText, options.composerDocument) ||
-							parseQueuedGoalCommand(prompt, options.commandText, options.composerDocument);
+							parseQueuedNewCommand(
+								prompt,
+								options.commandText,
+								options.composerDocument,
+								options.executionIntent,
+							) ||
+							parseQueuedGoalCommand(
+								prompt,
+								options.commandText,
+								options.composerDocument,
+								options.executionIntent,
+							);
 						claimed = queuedCommand
 							? undefined
 							: await claimInboxHead(
@@ -3968,7 +3956,6 @@ export interface CreateNarratorForPluginInput {
 	title?: string;
 	model?: string;
 	cwd?: string;
-	chapterId?: string | null;
 	permissionMode?: string;
 	planReflectionAutoApproveOverride?: BooleanOverride;
 	/** "subagent" creates a team temp worker owned by `parentNarratorId`. */
@@ -4026,7 +4013,6 @@ export async function createNarratorForPlugin(
 		};
 	}
 	const narrator = await narratorService.create({
-		chapterId: input.chapterId ?? null,
 		title: input.title,
 		model: input.model,
 		cwd: input.cwd,
@@ -4343,19 +4329,10 @@ export function isQuestionAnswerWakeEligible(recipient: {
 async function canWakeQuestionAnswer(
 	recipient: Pick<
 		Awaited<ReturnType<typeof narratorService.getById>>,
-		"status" | "lastStopReason" | "substatus" | "chapterId"
+		"status" | "lastStopReason" | "substatus"
 	>,
 ): Promise<boolean> {
-	if (!isQuestionAnswerWakeEligible(recipient)) return false;
-	if (recipient.chapterId) {
-		const chapter = db
-			.select({ status: chapters.status })
-			.from(chapters)
-			.where(eq(chapters.id, recipient.chapterId))
-			.get();
-		if (!chapter || chapter.status !== "active") return false;
-	}
-	return true;
+	return isQuestionAnswerWakeEligible(recipient);
 }
 
 export async function recoverPendingQuestionAnswerDeliveries(
@@ -4391,7 +4368,6 @@ export async function recoverPendingQuestionAnswerDeliveries(
 			.select({
 				cursor: narratorRowid,
 				id: narrators.id,
-				chapterId: narrators.chapterId,
 				status: narrators.status,
 				lastStopReason: narrators.lastStopReason,
 				substatus: narrators.substatus,
@@ -5411,9 +5387,6 @@ export type ReExecuteDeniedResult =
 
 function disposeInactiveNarratorSession(narratorId: string, active: ActiveNarrator): void {
 	if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
-	if (active._worktreePath) {
-		worktreeWatcher.unwatch(active._worktreePath, narratorId);
-	}
 	persistConversationIdIfUnchanged(narratorId, active, "inactive narrator session");
 	active._preparedPlanModes?.clear();
 	activeNarrators.delete(narratorId);
@@ -5755,7 +5728,6 @@ async function reExecuteDeniedToolCallUnlocked(
 					cwd: active.cwd,
 					locale,
 					signal: active.abortController.signal,
-					chapterId: active._chapterId,
 					parentNarratorId,
 					parentToolUseId,
 					reviewReadOnlyBash: runtimePolicy.readOnlyGitShell,
@@ -7284,7 +7256,7 @@ async function restoreOutputBlockUnlocked(
 
 /**
  * Start or feed a message into a narrator.
- * Yields NarratorEvent objects for consumption (used by chapter-merge).
+ * Yields NarratorEvent objects for consumption.
  */
 export async function* startSession(
 	narratorId: string,
@@ -8431,14 +8403,6 @@ export async function restorePendingModelOverrides(): Promise<void> {
 	}
 }
 
-/** Update the cached chapter role for a live narrator (e.g. after promote). */
-export function updateNarratorChapterRole(narratorId: string, role: string): void {
-	const active = activeNarrators.get(narratorId);
-	if (active) {
-		active._chapterRole = role;
-	}
-}
-
 export async function updateNarratorPermissionMode(
 	_narratorId: string,
 	_mode: string,
@@ -8576,11 +8540,6 @@ export async function recoverOnStartup(
 	}
 	// biome-ignore lint/suspicious/noExplicitAny: globalThis symbol key
 	(globalThis as any)[HOT_RELOAD_GUARD] = true;
-
-	// Clean up any residual worktree watchers from a previous server run.
-	// On restart (or hot reload), old fs.watch handles may leak if the previous
-	// process didn't shut down cleanly, causing phantom CPU usage from inotify.
-	worktreeWatcher.shutdown();
 
 	// A restart invalidates attempt-bound approval authority, including approved
 	// rows whose tool had not reached consume. Never apply yesterday's receipt.
@@ -8887,9 +8846,9 @@ export async function resolveOptionalToolState(
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
 		columns: {
+			id: true,
 			enabledTools: true,
 			traits: true,
-			chapterId: true,
 			contextProjectId: true,
 			...RUNTIME_SOURCE_COLUMNS,
 		},

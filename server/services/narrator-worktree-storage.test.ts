@@ -1,11 +1,11 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { db, sqlite } from "../db";
-import { chapters, narrators, narratorWorktreeResources, projects, users } from "../db/schema";
+import { narrators, narratorWorktreeResources, projects, users } from "../db/schema";
 import { localBackend } from "../lib/agent/execution/registry";
 import { generateId } from "../lib/id";
 import { getNarraforkPath } from "../lib/narrafork-home";
@@ -16,7 +16,7 @@ import { narratorWorktreeResourceRegistry } from "./narrator-worktree-resources"
 import { narratorWorktreeService } from "./narrator-worktree-runtime";
 import { NarratorWorktreeService, type WorktreeTarget } from "./narrator-worktree-service";
 import { maintainProtectionIndex } from "./resource-protection-index";
-import { cleanupOrphanedWorktrees } from "./storage-service";
+import { storageService } from "./storage-service";
 import { withWorkspaceRepositoryLock, workspaceContextService } from "./workspace-context-service";
 import { inspect } from "./worktree-lifecycle-guard";
 
@@ -177,7 +177,6 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-	await db.delete(chapters).where(eq(chapters.projectId, projectId));
 	await db.delete(narrators).where(eq(narrators.contextProjectId, projectId));
 	await db
 		.delete(narratorWorktreeResources)
@@ -188,8 +187,15 @@ afterEach(async () => {
 	await rm(temporary, { recursive: true, force: true });
 });
 
-describe("production worktree storage cleanup", () => {
-	test("actual runtime create before switch survives cleanup, restart and owner deletion", async () => {
+async function assertProtected(path: string) {
+	expect(await inspect([{ path }], "worktree protection fixture")).toMatchObject({
+		complete: true,
+		status: "protected",
+	});
+}
+
+describe("narrator worktree protection and storage cleanup", () => {
+	test("actual runtime create before switch keeps durable protection through restart and owner deletion", async () => {
 		const context = await workspaceContextService.get(narratorId);
 		const prepared = await narratorWorktreeService.prepare(
 			{ userId: owner, isAdmin: false },
@@ -226,8 +232,7 @@ describe("production worktree storage cleanup", () => {
 				.where(eq(narratorWorktreeResources.worktreePath, prepared.destinationPath))
 				.get()?.state,
 		).toBe("ready");
-		await cleanupOrphanedWorktrees();
-		await assertDirty(prepared.destinationPath);
+		await assertProtected(prepared.destinationPath);
 		// Remove receipt evidence, rebuild journal/service objects, then delete owner.
 		// Remaining durable DB ownership alone must protect after restart/owner removal.
 		await removeReceipts();
@@ -249,19 +254,6 @@ describe("production worktree storage cleanup", () => {
 				.where(eq(narratorWorktreeResources.worktreePath, prepared.destinationPath))
 				.get()?.owner,
 		).toBeNull();
-		// A fresh OS process has no parent service objects, cwd sets or live registry cache.
-		const restarted = await safeSpawn({
-			cmd: [
-				"bun",
-				"--eval",
-				'const { cleanupOrphanedWorktrees } = await import("./server/services/storage-service"); console.log(JSON.stringify(await cleanupOrphanedWorktrees())); process.exit(0);',
-			],
-			env: { ...process.env, NARRAFORK_ALLOW_MULTIPLE: "1" },
-			timeout: 15_000,
-			maxOutputBytes: 64 * 1024,
-		});
-		expect(restarted.exitCode).toBe(0);
-		expect(restarted.stdout).toContain('"removed":0');
 		expect(
 			(
 				await service.list(
@@ -272,7 +264,8 @@ describe("production worktree storage cleanup", () => {
 				)
 			).entries.some((entry) => entry.path === prepared.destinationPath),
 		).toBe(true);
-		await cleanupOrphanedWorktrees();
+		// Remaining durable DB ownership alone protects it.
+		await assertProtected(prepared.destinationPath);
 		await assertDirty(prepared.destinationPath);
 	});
 
@@ -321,16 +314,11 @@ describe("production worktree storage cleanup", () => {
 		}
 		await removeReceipts();
 		// Both worktrees are clean: protection here cannot be credited to a dirty-check.
-		expect((await cleanupOrphanedWorktrees()).removed).toBe(0);
-		for (const leaf of ["unknown-Ab1234", "unfinished-Cd1234"]) {
-			const path = registration(leaf).worktreePath;
-			await dirty(path);
-			await cleanupOrphanedWorktrees();
-			await assertDirty(path);
-		}
+		for (const leaf of ["unknown-Ab1234", "unfinished-Cd1234"])
+			await assertProtected(registration(leaf).worktreePath);
 	});
 
-	test("every resource state protects even a clean chapter-shaped directory, plus dirty binary markers", async () => {
+	test("every resource state protects even a clean chapter-shaped directory, also after owner deletion", async () => {
 		const paths: string[] = [];
 		for (const [leaf, state] of [
 			["ready-Ab1234", "ready"],
@@ -342,12 +330,10 @@ describe("production worktree storage cleanup", () => {
 			if (state !== "preparing")
 				await narratorWorktreeResourceRegistry.setState(registration(leaf), state);
 		}
-		// A clean positively-identifiable orphan would otherwise be eligible for deletion.
-		expect(await cleanupOrphanedWorktrees()).toMatchObject({ removed: 0 });
-		for (const path of paths) await dirty(path);
+		for (const path of paths) await assertProtected(path);
+		// Owner deletion keeps the inventory rows, and with them the protection.
 		await db.delete(narrators).where(eq(narrators.id, narratorId));
-		await cleanupOrphanedWorktrees();
-		for (const path of paths) await assertDirty(path);
+		for (const path of paths) await assertProtected(path);
 	});
 
 	test("legacy durable journal and cwd/context protect old resources without registry after restart", async () => {
@@ -389,9 +375,7 @@ describe("production worktree storage cleanup", () => {
 			.where(eq(narrators.id, narratorId));
 		beginLegacyReceiptImport();
 		await finishProtectionMaintenance();
-		await cleanupOrphanedWorktrees();
-		for (const path of [receiptPath, cwdPath, contextPath])
-			expect(await Bun.file(join(path, "tracked.txt")).exists()).toBe(true);
+		for (const path of [receiptPath, cwdPath, contextPath]) await assertProtected(path);
 		for (const path of [cwdPath, contextPath]) {
 			const resource = db
 				.select({
@@ -402,15 +386,9 @@ describe("production worktree storage cleanup", () => {
 				.from(narratorWorktreeResources)
 				.where(eq(narratorWorktreeResources.worktreePath, path))
 				.get();
-			// Cleanup only observes protection evidence; it never invents durable ownership.
+			// Protection only observes evidence; it never invents durable ownership.
 			expect(resource).toBeUndefined();
 		}
-		// Without a durable receipt/inventory, deleted cwd owners leave no ownership
-		// evidence. Their actual dirty bytes still disqualify them from orphan cleanup.
-		for (const path of [cwdPath, contextPath]) await dirty(path);
-		await db.delete(narrators).where(eq(narrators.id, narratorId));
-		await cleanupOrphanedWorktrees();
-		for (const path of [cwdPath, contextPath]) await assertDirty(path);
 		// The migrated pin is frozen: corrupting and then deleting its old file cannot release it.
 		const receiptFile = getNarraforkPath(
 			"worktree-requests",
@@ -426,25 +404,13 @@ describe("production worktree storage cleanup", () => {
 				status: "protected",
 			},
 		);
-		expect((await cleanupOrphanedWorktrees()).removed).toBe(0);
+		// Receipt protection remains independently durable even once its files are gone.
 		await removeReceipts();
-		const restarted = await safeSpawn({
-			cmd: [
-				"bun",
-				"--eval",
-				'const { cleanupOrphanedWorktrees } = await import("./server/services/storage-service"); console.log(JSON.stringify(await cleanupOrphanedWorktrees())); process.exit(0);',
-			],
-			env: { ...process.env, NARRAFORK_ALLOW_MULTIPLE: "1" },
-			timeout: 15_000,
-			maxOutputBytes: 64 * 1024,
-		});
-		expect(restarted.exitCode).toBe(0);
-		expect(restarted.stdout).toContain('"removed":0');
-		// Receipt protection remains independently durable even for this CLEAN worktree.
+		await assertProtected(receiptPath);
 		expect(await readFile(join(receiptPath, "tracked.txt"), "utf8")).toBe("initial\n");
 	});
 
-	test("ordinary journal publication after migration does not invent a clean orphan owner", async () => {
+	test("ordinary journal publication after migration does not invent an owner", async () => {
 		const path = await add("journal-Ab1234");
 		const request = proposal("journal-Ab1234");
 		await new FileWorktreeJournal(getNarraforkPath("worktree-requests")).claim(
@@ -462,118 +428,35 @@ describe("production worktree storage cleanup", () => {
 			complete: true,
 			status: "clear",
 		});
-		expect((await cleanupOrphanedWorktrees()).removed).toBe(1);
-		expect(await Bun.file(join(path, "tracked.txt")).exists()).toBe(false);
 	});
 
-	test("create/cleanup repository race protects the window before inventory and interrupted preparing registration", async () => {
-		const leaf = "race-Ab1234";
-		const removable = await add("otherwise-Ef1234");
-		let enter!: () => void;
-		let release!: () => void;
-		const entered = new Promise<void>((resolve) => {
-			enter = resolve;
-		});
-		const released = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		let writes = 0;
-		const racing = new NarratorWorktreeService({
-			authorize: async () => target,
-			withRevision: async (_id, _revision, action) => action(),
-			withRepositoryLock: withWorkspaceRepositoryLock,
-			journal: new FileWorktreeJournal(
-				getNarraforkPath("worktree-requests-v2"),
-				getNarraforkPath("worktree-requests"),
-			),
-			resources: {
-				register: async (resource) => {
-					enter();
-					await released;
-					await narratorWorktreeResourceRegistry.register(resource);
-				},
-				setState: narratorWorktreeResourceRegistry.setState,
-			},
-			runGit: async (workspace, args, abort, writing) => {
-				if (writing) {
-					writes++;
-					await git(args);
-					enter();
-					await released;
-					throw new Error("Process response lost");
-				}
-				return safeSpawn({
-					cmd: ["git", "-C", workspace.workspace.rootPath ?? "", ...args],
-					timeout: 5000,
-					maxOutputBytes: 128 * 1024,
-					signal: abort,
-				});
-			},
-		});
-		const creation = racing.create("actor", narratorId, proposal(leaf), signal());
-		await entered;
-		const result = await cleanupOrphanedWorktrees();
-		expect(result.removed).toBe(0);
-		expect(writes).toBe(0);
-		expect(await Bun.file(join(removable, "tracked.txt")).exists()).toBe(true);
-		expect(
-			db
-				.select({ id: narratorWorktreeResources.id })
-				.from(narratorWorktreeResources)
-				.where(eq(narratorWorktreeResources.worktreePath, registration(leaf).worktreePath))
-				.get(),
-		).toBeUndefined();
-		release();
-		expect((await creation).outcome).toBe("created");
-		expect(writes).toBe(1);
-		await dirty(join(source, ".worktrees", leaf));
-		await cleanupOrphanedWorktrees();
-		await assertDirty(join(source, ".worktrees", leaf));
-	});
-
-	test("only a verified clean old chapter orphan is removed; dirty, ignored, active and unknown paths survive", async () => {
+	test("storage cleanup never removes checkouts under .worktrees, even clean unowned chapter ones", async () => {
+		// Chapters are gone, so nothing records who owns these; a clean one is exactly what an
+		// orphan sweep would have deleted. They and their branches must stay.
 		const clean = await add("clean-Ab1234");
 		const dirtyPath = await add("dirty-Cd1234");
 		await dirty(dirtyPath);
-		const ignored = await add("ignored-Ef1234");
-		await writeFile(join(ignored, ".gitignore"), "secret.bin\n");
-		await git(["add", ".gitignore"], ignored);
-		await git(
-			[
-				"-c",
-				"user.name=Fixture",
-				"-c",
-				"user.email=fixture@example.test",
-				"commit",
-				"-m",
-				"ignore secret",
-			],
-			ignored,
-		);
-		await writeFile(join(ignored, "secret.bin"), binary);
-		const active = await add("active-Gh1234");
-		await db.insert(chapters).values({
-			id: generateId(),
-			projectId,
-			title: "active",
-			branch: "chapter/active-Gh1234",
-			baseBranch: "main",
-			worktreePath: active,
-			createdAt: new Date().toISOString(),
-			updatedAt: new Date().toISOString(),
-		});
 		const unknown = await add("custom-Ij1234", "ordinary-user-branch");
 		const random = join(source, ".worktrees", "unregistered-Kl1234");
 		await mkdir(random);
 		await writeFile(join(random, "marker.bin"), binary);
-		const result = await cleanupOrphanedWorktrees();
-		expect(result.removed).toBe(1);
-		expect(await Bun.file(join(clean, "tracked.txt")).exists()).toBe(false);
+		await finishProtectionMaintenance();
+		expect(await inspect([{ path: clean }], "unowned legacy checkout fixture")).toMatchObject({
+			complete: true,
+			status: "clear",
+		});
+		// The storage page's "worktrees" target.
+		expect(await storageService.repackTreeSnapshots()).toEqual({ removed: 0, freedBytes: 0 });
+		expect(await readFile(join(clean, "tracked.txt"), "utf8")).toBe("initial\n");
 		await assertDirty(dirtyPath);
-		expect(await readFile(join(ignored, "secret.bin"))).toEqual(binary);
-		for (const path of [active, unknown])
-			expect(await Bun.file(join(path, "tracked.txt")).exists()).toBe(true);
+		expect(await Bun.file(join(unknown, "tracked.txt")).exists()).toBe(true);
 		expect(await readFile(join(random, "marker.bin"))).toEqual(binary);
+		const worktrees = await git(["worktree", "list", "--porcelain"]);
+		for (const path of [clean, dirtyPath, unknown]) expect(worktrees).toContain(path);
+		for (const branch of ["chapter/clean-Ab1234", "chapter/dirty-Cd1234", "ordinary-user-branch"])
+			expect(await git(["rev-parse", "--verify", `refs/heads/${branch}`])).toMatch(
+				/^[0-9a-f]{40}$/,
+			);
 	});
 
 	test("corrupt, truncated or oversized legacy evidence fails closed rather than deleting a clean candidate", async () => {
@@ -587,8 +470,6 @@ describe("production worktree storage cleanup", () => {
 			await maintainProtectionIndex(performance.now() + 5000);
 			await maintainProtectionIndex(performance.now() + 5000);
 			expect((await inspect([{ path }], "legacy invalid evidence fixture")).complete).toBe(false);
-			expect((await cleanupOrphanedWorktrees()).removed).toBe(0);
-			expect(await Bun.file(join(path, "tracked.txt")).exists()).toBe(true);
 		}
 	});
 
@@ -607,15 +488,11 @@ describe("production worktree storage cleanup", () => {
 			);
 		beginLegacyReceiptImport();
 		expect((await inspect([{ path }], "legacy pending import fixture")).complete).toBe(false);
-		expect((await cleanupOrphanedWorktrees()).removed).toBe(0);
-		expect(await Bun.file(join(path, "tracked.txt")).exists()).toBe(true);
 		await finishProtectionMaintenance();
 		expect(await inspect([{ path }], "legacy imported owner fixture")).toMatchObject({
 			complete: true,
 			status: "protected",
 		});
-		expect((await cleanupOrphanedWorktrees()).removed).toBe(0);
-		expect(await readFile(join(path, "tracked.txt"), "utf8")).toBe("initial\n");
 	});
 
 	test("paged legacy cwd maintenance never makes a clean owned directory appear orphaned", async () => {
@@ -640,24 +517,10 @@ describe("production worktree storage cleanup", () => {
 		expect((await inspect([{ path }], "legacy cwd pending maintenance fixture")).complete).toBe(
 			false,
 		);
-		expect((await cleanupOrphanedWorktrees()).removed).toBe(0);
-		expect(await Bun.file(join(path, "tracked.txt")).exists()).toBe(true);
 		await finishProtectionMaintenance();
 		expect(await inspect([{ path }], "legacy cwd maintained owner fixture")).toMatchObject({
 			complete: true,
 			status: "protected",
 		});
-		expect((await cleanupOrphanedWorktrees()).removed).toBe(0);
-		expect(await readFile(join(path, "tracked.txt"), "utf8")).toBe("initial\n");
-	});
-
-	test("a symlink worktrees parent cannot redirect cleanup into another repository", async () => {
-		const outside = join(temporary, "outside");
-		await mkdir(outside);
-		await writeFile(join(outside, "marker.bin"), binary);
-		await rm(join(source, ".worktrees"), { recursive: true });
-		await symlink(outside, join(source, ".worktrees"));
-		expect((await cleanupOrphanedWorktrees()).removed).toBe(0);
-		expect(await readFile(join(outside, "marker.bin"))).toEqual(binary);
 	});
 });

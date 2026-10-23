@@ -19,15 +19,9 @@ export const createProjectSchema = z.object({
 	cloneBranch: gitBranchName.optional(),
 	cloneUsername: z.string().max(200).optional(),
 	clonePassword: z.string().max(200).optional(),
-	/**
-	 * `ruler` is DEPRECATED and no longer developed. It stays selectable so existing
-	 * projects keep working, but `classic` is the default for anything new.
-	 */
-	flowMode: z.enum(["classic", "ruler"]).default("classic"),
 });
 
 export const projectChapterSettingsSchema = z.object({
-	autoCreateNarrator: z.boolean().optional(),
 	commands: z.array(commandSchema).max(100).optional(),
 	routines: z
 		.object({
@@ -41,7 +35,6 @@ export const projectChapterSettingsSchema = z.object({
 	blacklistDirs: z.array(blacklistDirEntrySchema).max(50).optional(),
 	commandWhitelist: z.array(commandWhitelistEntrySchema).max(50).optional(),
 	commandBlacklist: z.array(commandBlacklistEntrySchema).max(50).optional(),
-	requireReviewBeforeMerge: z.boolean().optional(),
 });
 
 export const updateProjectSchema = z.object({
@@ -49,22 +42,7 @@ export const updateProjectSchema = z.object({
 	description: z.string().max(2000).optional(),
 	gitPath: z.string().trim().min(1).max(4096).optional(),
 	status: z.enum(["active", "archived"]).optional(),
-	/**
-	 * Which canvas the project's story network renders in.
-	 *
-	 * Accepted here because it used to be settable ONLY at creation time: the column
-	 * existed and the create schema wrote it, but no update path read it, so a project
-	 * created as `ruler` was locked in that view permanently with no way back. The Ruler
-	 * is now deprecated, which makes an escape hatch mandatory rather than nice to have.
-	 *
-	 * Purely a view preference — no worktree, branch or chapter data depends on it, so
-	 * flipping it is reversible and safe at any time.
-	 */
-	flowMode: z.enum(["classic", "ruler"]).optional(),
 	defaultBranch: gitBranchName.optional(),
-	startupScript: z.string().max(5000).nullable().optional(),
-	copyFiles: z.string().max(5000).nullable().optional(),
-	proxyDomain: z.string().max(200).nullable().optional(),
 	chapterSettings: projectChapterSettingsSchema.optional(),
 });
 

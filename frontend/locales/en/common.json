@@ -214,7 +214,6 @@
 	"terminalId": "Terminal ID",
 	"terminalName": "Name",
 	"terminalStatus": "Status",
-	"terminalChapter": "Chapter",
 	"terminalNarrator": "Narrator",
 	"terminalDtach": "dtach",
 	"terminalCreated": "Created",
@@ -316,15 +315,6 @@
 	"licensesDistributedVia": "How it ships:",
 	"licensesProblemsTitle": "License data problems",
 	"status": {
-		"chapterActive": "Active",
-		"chapterDormant": "Dormant",
-		"chapterMerged": "Merged",
-		"chapterAbandoned": "Abandoned",
-		"chapterFrozen": "Frozen",
-		"roleTrunk": "Trunk",
-		"roleBranch": "Branch",
-		"roleExploration": "Exploration",
-		"roleReview": "Review",
 		"narratorIdle": "Idle",
 		"narratorWorking": "Working",
 		"narratorWaiting": "Waiting",
@@ -357,11 +347,6 @@
 		"toolCancelled": "Cancelled",
 		"projectActive": "Active",
 		"projectArchived": "Archived",
-		"edgeFork": "Fork",
-		"edgeMerge": "Merge",
-		"edgeDependency": "Dependency",
-		"edgeCherryPick": "Cherry Pick",
-		"edgeReview": "Review",
 		"gitModified": "Modified",
 		"gitAdded": "Added",
 		"gitDeleted": "Deleted",
@@ -769,5 +754,6 @@
 	"imageViewer_copySuccess": "Image copied to clipboard",
 	"imageViewer_copyUnavailableDownloaded": "Clipboard is unavailable in this environment; image downloaded instead",
 	"imageViewer_copyFailed": "Failed to copy image",
-	"imageViewer_downloadFailed": "Failed to download image"
+	"imageViewer_downloadFailed": "Failed to download image",
+	"botBadge": "Bot"
 }

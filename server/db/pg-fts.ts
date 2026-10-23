@@ -95,14 +95,6 @@ const DRAFT_TITLE_EXPR =
 
 const SHADOW_SPECS: readonly ShadowSpec[] = [
 	{
-		base: "chapters",
-		shadow: "search_chapters",
-		columns: ["title", "description"],
-		indexable: "TRUE",
-		select: ["b.title", "b.description"],
-		mismatch: "f.title IS DISTINCT FROM b.title OR f.description IS DISTINCT FROM b.description",
-	},
-	{
 		base: "narrator_messages",
 		shadow: "search_narrator_messages",
 		columns: ["content_text"],
@@ -141,13 +133,32 @@ const SHADOW_SPECS: readonly ShadowSpec[] = [
 	},
 ];
 
+/** The shadow spec of one base table, looked up by name rather than by array position. */
+function specFor(base: string): ShadowSpec {
+	const spec = SHADOW_SPECS.find((s) => s.base === base);
+	if (!spec) throw new Error(`no search shadow spec for ${base}`);
+	return spec;
+}
+
+/**
+ * Search objects of retired features, dropped by {@link ensurePgFts}.
+ *
+ * An upgrade's migration drops the base table, and PostgreSQL drops the table's triggers with
+ * it, but the shadow table (with its GIN indexes) and the trigger function are this module's
+ * runtime objects that no migration knows about. `CASCADE` on the function also removes a
+ * trigger that still uses it. Every statement is a no-op once the objects are gone.
+ */
+const RETIRED_DDL = [
+	`DROP FUNCTION IF EXISTS "nf_search_chapters_sync"() CASCADE`,
+	`DROP TABLE IF EXISTS "search_chapters"`,
+] as const;
+
 /** Every named object the catalog probe checks. A missing name is a durable retry signal. */
 const EXPECTED = {
 	extensions: ["pg_trgm"],
 	tables: SHADOW_SPECS.map((s) => s.shadow),
 	indexes: SHADOW_SPECS.flatMap((s) => s.columns.map((c) => `idx_${s.shadow}_${c}`)),
 	functions: [
-		"nf_search_chapters_sync",
 		"nf_search_narrator_messages_sync",
 		"nf_search_narrators_sync",
 		"nf_search_knowledge_entries_sync",
@@ -155,9 +166,6 @@ const EXPECTED = {
 		"nf_search_drafts_entry_title_sync",
 	],
 	triggers: [
-		"chapters_fts_insert",
-		"chapters_fts_update",
-		"chapters_fts_delete",
 		"narrator_messages_fts_insert",
 		"narrator_messages_fts_update",
 		"narrator_messages_fts_delete",
@@ -340,11 +348,8 @@ function triggerDdl(): string[] {
 		`CREATE OR REPLACE TRIGGER "${spec.base}_fts_delete" AFTER DELETE ON "${spec.base}"
 			FOR EACH ROW EXECUTE FUNCTION "nf_${spec.shadow}_sync"()`,
 	];
-	const narrators = SHADOW_SPECS[2];
-	if (narrators.base !== "narrators") throw new Error("shadow spec order changed");
 	return [
-		...mirror(SHADOW_SPECS[0]),
-		...mirror(SHADOW_SPECS[1]),
+		...mirror(specFor("narrator_messages")),
 		// WHEN clauses mirror SQLite's firing conditions exactly: they keep unrelated-column
 		// updates from touching the index at all (the UPDATE OF title clause), and keep
 		// null-title transitions out of the shadow.
@@ -355,8 +360,8 @@ function triggerDdl(): string[] {
 			EXECUTE FUNCTION "nf_search_narrators_sync"()`,
 		`CREATE OR REPLACE TRIGGER "narrators_fts_delete" AFTER DELETE ON "narrators"
 			FOR EACH ROW WHEN (OLD.title IS NOT NULL) EXECUTE FUNCTION "nf_search_narrators_sync"()`,
-		...mirror(SHADOW_SPECS[3]),
-		...mirror(SHADOW_SPECS[4]),
+		...mirror(specFor("knowledge_entries")),
+		...mirror(specFor("knowledge_drafts")),
 		`CREATE OR REPLACE TRIGGER "knowledge_drafts_fts_entry_title" AFTER UPDATE OF title ON "knowledge_entries"
 			FOR EACH ROW EXECUTE FUNCTION "nf_search_drafts_entry_title_sync"()`,
 	];
@@ -372,6 +377,7 @@ function triggerDdl(): string[] {
  * CONCURRENTLY variant for large existing deployments is a deliberate follow-up.
  */
 export async function ensurePgFts(sql: PgExecutor): Promise<void> {
+	for (const ddl of RETIRED_DDL) await sql.unsafe(ddl);
 	await sql.unsafe("CREATE EXTENSION IF NOT EXISTS pg_trgm");
 	for (const spec of SHADOW_SPECS) {
 		await sql.unsafe(shadowTableDdl(spec));
@@ -379,10 +385,9 @@ export async function ensurePgFts(sql: PgExecutor): Promise<void> {
 	for (const spec of SHADOW_SPECS) {
 		for (const ddl of ginIndexDdl(spec)) await sql.unsafe(ddl);
 	}
-	await sql.unsafe(mirrorFunctionDdl(SHADOW_SPECS[0]));
-	await sql.unsafe(mirrorFunctionDdl(SHADOW_SPECS[1]));
+	await sql.unsafe(mirrorFunctionDdl(specFor("narrator_messages")));
 	await sql.unsafe(NARRATORS_FUNCTION_DDL);
-	await sql.unsafe(mirrorFunctionDdl(SHADOW_SPECS[3]));
+	await sql.unsafe(mirrorFunctionDdl(specFor("knowledge_entries")));
 	await sql.unsafe(DRAFTS_FUNCTION_DDL);
 	await sql.unsafe(ENTRY_TITLE_FUNCTION_DDL);
 	for (const ddl of triggerDdl()) await sql.unsafe(ddl);
@@ -440,8 +445,8 @@ async function reconcileTable(sql: PgExecutor, spec: ShadowSpec): Promise<PgFtsR
  *
  * The catalog probe names every expected object; a missing trigger or function is a durable
  * retry signal — it stays missing until repaired, so a caller can poll this after a failed
- * repair without any crash-flag machinery. Content reconciliation runs five aggregate
- * scans (one per table) and belongs in a startup or maintenance window, not a request path.
+ * repair without any crash-flag machinery. Content reconciliation runs aggregate scans
+ * (one per table) and belongs in a startup or maintenance window, not a request path.
  */
 export async function probePgFtsDrift(sql: PgExecutor): Promise<PgFtsDriftReport> {
 	const schema = "current_schema()";

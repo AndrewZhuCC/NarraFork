@@ -84,7 +84,7 @@ import { AppError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { isSecretPlatformPath } from "../lib/fs-secret-paths";
 import { logger } from "../lib/logger";
-import { isPlanModeTrait } from "../lib/narrator-utils";
+import { isBotNarrator, isPlanModeTrait } from "../lib/narrator-utils";
 import {
 	type DeviceAccessPolicy,
 	intersectOAuthClientPolicies,
@@ -464,16 +464,6 @@ function formatBlacklistReason(dir: DirectoryBlacklistRule, matchedPath: string)
 	return `Blacklisted by ${src}-level rule: "${dir.path}" (${level}), matched path: ${matchedPath}`;
 }
 
-function getChapterGitPermissionIssues(bashAnalysis?: BashAnalysis): string[] {
-	return [...(bashAnalysis?.gitBranchViolations ?? []), ...(bashAnalysis?.gitBranchWarnings ?? [])];
-}
-
-function resolveChapterGitIssueDecision(effectiveMode: string): "allow" | "deny" | "ask" {
-	if (effectiveMode === "bypassPermissions") return "allow";
-	if (effectiveMode === "dontAsk" || effectiveMode === "readOnly") return "deny";
-	return "ask";
-}
-
 function isSpecTasksPath(value: unknown): boolean {
 	if (!specVfsService.isSpecUri(value)) return false;
 	try {
@@ -766,7 +756,6 @@ export function resolvePermissionDecision(
 		permMode,
 		cwd,
 		bashAnalysis,
-		isChapter = false,
 		planFileId,
 		planFilePath: designatedPlanFilePath,
 		relaxedPlan = false,
@@ -965,11 +954,6 @@ export function resolvePermissionDecision(
 			return "deny";
 		}
 		return "allow";
-	}
-
-	const chapterGitIssues = isChapter ? getChapterGitPermissionIssues(bashAnalysis) : [];
-	if (isBashToolName(toolName) && chapterGitIssues.length > 0) {
-		return resolveChapterGitIssueDecision(effectiveMode);
 	}
 
 	// Showing existing files is read-only; an allowlist must never let create
@@ -1420,7 +1404,6 @@ export interface PermissionDecisionOpts {
 	permMode: string;
 	cwd: string;
 	bashAnalysis?: BashAnalysis;
-	isChapter?: boolean;
 	planFileId?: string;
 	/**
 	 * Resolved relative path of the designated plan file. Supplied by the caller
@@ -2544,7 +2527,6 @@ function classifyShellDanger(
 		bashAnalysis,
 		commandWhitelist,
 	);
-	const chapterGitIssues = getChapterGitPermissionIssues(bashAnalysis);
 	for (const cmd of bashAnalysis.commands) {
 		const [name, ...args] = cmd.tokens;
 		if (name === "git") {
@@ -2608,20 +2590,6 @@ function classifyShellDanger(
 				);
 			}
 		}
-	}
-	if (chapterGitIssues.length > 0) {
-		return danger(
-			"Git command changes chapter branch/worktree state.",
-			[
-				"The command can switch, create, delete, rewrite, or otherwise move branch/worktree state outside the normal chapter workflow.",
-				"NarraFork may lose track of which chapter owns the resulting git state.",
-			],
-			[
-				"Prefer NarraFork chapter/fork/merge operations for branch and worktree changes.",
-				"If this git operation is intentional, confirm the exact target branch or worktree first.",
-			],
-			chapterGitIssues.map((issue) => `Chapter git issue: ${issue}`),
-		);
 	}
 	if (bashAnalysis.hasEnvInjection) {
 		return danger(
@@ -2704,7 +2672,7 @@ function classifyShellDanger(
 		return danger(
 			"Shell command accesses paths outside the current working directory.",
 			[
-				"The command may read or modify files outside this chapter/worktree boundary.",
+				"The command may read or modify files outside this worktree boundary.",
 				"Those files may not be covered by NarraFork snapshots or git recovery.",
 			],
 			[
@@ -2885,7 +2853,7 @@ export function classifyDanger(
 		return danger(
 			`${toolName} targets paths outside the current working directory.`,
 			[
-				"The operation crosses the chapter/worktree boundary.",
+				"The operation crosses the worktree boundary.",
 				"External files may not be covered by project git history or NarraFork snapshots.",
 			],
 			[
@@ -3107,6 +3075,10 @@ export async function shouldAutoAllowSendWithinScope(
 ): Promise<boolean> {
 	try {
 		if (!caller) return false;
+		// A bot's message to a person is its only voice; asking approval for every reply
+		// would make it mute. Delivery re-reads the bot trait, so a non-bot never gets here
+		// to a successful send.
+		if (input.user !== undefined) return isBotNarrator(caller.traits);
 		const root = teamRootOf({ ...caller, id: narratorId });
 		const callerIsSubagent = root !== narratorId;
 		const teamParentId = callerIsSubagent ? root : null;
@@ -4420,7 +4392,6 @@ function finalPermissionSnapshot(check: FinalToolPermissionCheck) {
 	const narrator = db
 		.select({
 			id: narrators.id,
-			chapterId: narrators.chapterId,
 			contextProjectId: narrators.contextProjectId,
 			parentNarratorId: narrators.parentNarratorId,
 			type: narrators.type,
@@ -4660,7 +4631,6 @@ export async function recheckFinalToolExecutionPermission(
 			check.input.command,
 			cwd,
 			resolvePermissionShellType(context?.backend),
-			!!before.narrator.chapterId,
 			context?.paths ?? localPathSemantics,
 		);
 		if (context) analysis = await canonicalizeShellAnalysisPaths(analysis, context, check.signal);
@@ -4802,7 +4772,6 @@ export async function recheckFinalToolExecutionPermission(
 					permMode: mode,
 					cwd,
 					bashAnalysis: analysis,
-					isChapter: !!before.narrator.chapterId,
 					compiledPolicy: policy,
 					executionContext: context,
 					projectGitPath: policy.projectGitPath ?? undefined,
@@ -4973,7 +4942,6 @@ export async function handlePermission(
 		where: eq(narrators.id, narratorId),
 		columns: {
 			permissionMode: true,
-			chapterId: true,
 			relaxedPlan: true,
 			previousPermissionMode: true,
 			planFileId: true,
@@ -4991,7 +4959,6 @@ export async function handlePermission(
 		? false
 		: resolveEffectiveRelaxedPlan(permMode, narrator?.relaxedPlan);
 	const isPlanMode = runtimeConstraint ? false : isPlanModeTrait(narrator?.traits);
-	const isChapter = !!narrator?.chapterId;
 
 	if (toolName === "RequestPermissionRule") {
 		if (runtimeConstraint || reviewReadOnlyBash || !binding || !executionContext) {
@@ -5051,7 +5018,6 @@ export async function handlePermission(
 				input.command,
 				shellCwd,
 				shellType,
-				isChapter,
 				executionContext?.paths ?? localPathSemantics,
 			);
 			if (executionContext) {
@@ -5330,7 +5296,6 @@ export async function handlePermission(
 					permMode: decisionPermMode,
 					cwd,
 					bashAnalysis,
-					isChapter,
 					planFileId,
 					planFilePath: designatedPlanFilePath,
 					planMode: isPlanMode,
@@ -5657,12 +5622,10 @@ export async function handlePermission(
 	// Plan mode soft deny → ask the user once before falling back to auto-deny.
 	let promotedPlanSoftDeny = false;
 	if (decision === "deny") {
-		const hasChapterGitIssues = isChapter && getChapterGitPermissionIssues(bashAnalysis).length > 0;
 		const isPlanModeSoftDeny =
 			isPlanMode &&
 			!isRelaxedPlan &&
 			!permMeta.commandBlacklistReason &&
-			!hasChapterGitIssues &&
 			(permMeta.planModeSoftDeny || !permMeta.blacklistReason);
 		if (isPlanModeSoftDeny && !planModeAskedOnce.has(narratorId)) {
 			planModeAskedOnce.add(narratorId);
@@ -5750,7 +5713,6 @@ export async function handlePermission(
 				.where(and(eq(narratorToolCalls.id, permissionToolCallId)));
 			return { behavior: "deny", message: denyMsg };
 		}
-		const chapterGitIssues = isChapter ? getChapterGitPermissionIssues(bashAnalysis) : [];
 		const isReadToolPathDenied =
 			(permMode === "readOnly" || isPlanMode) &&
 			(READ_ONLY_TOOLS.includes(toolName) ||
@@ -5760,23 +5722,18 @@ export async function handlePermission(
 					bashAnalysis.nonWhitelisted.length === 0 &&
 					!bashAnalysis.dangerousPatterns.length &&
 					!bashAnalysis.hasEnvInjection));
-		const denyMsg =
-			chapterGitIssues.length > 0
-				? `DENIED: Chapter mode restricts git branch/worktree operations. Issues: ${chapterGitIssues.join("; ")}. Use NarraFork chapter operations or request explicit permission in an interactive mode.`
-				: isReadToolPathDenied
-					? getToolMessage("permissionDeniedPathOutsideScope", locale)
-					: isPlanMode
-						? getToolMessage("permissionDeniedPlanMode", locale)
-						: permMode === "readOnly"
-							? getToolMessage("permissionDeniedReadOnly", locale)
-							: getToolMessage("permissionDeniedNonInteractive", locale);
-		const decisionReason = chapterGitIssues.length > 0 ? chapterGitIssues.join("; ") : undefined;
+		const denyMsg = isReadToolPathDenied
+			? getToolMessage("permissionDeniedPathOutsideScope", locale)
+			: isPlanMode
+				? getToolMessage("permissionDeniedPlanMode", locale)
+				: permMode === "readOnly"
+					? getToolMessage("permissionDeniedReadOnly", locale)
+					: getToolMessage("permissionDeniedNonInteractive", locale);
 		logger.debug("Permission auto-denied", {
 			narratorId,
 			toolName,
 			toolUseId,
 			permMode,
-			...(decisionReason ? { reason: decisionReason } : {}),
 		});
 		await db
 			.update(narratorToolCalls)
@@ -5785,7 +5742,6 @@ export async function handlePermission(
 				errorMessage: denyMsg,
 				permissionDecidedBy: "auto",
 				permissionDecidedAt: new Date().toISOString(),
-				...(decisionReason ? { permissionDecisionReason: decisionReason } : {}),
 			})
 			.where(and(eq(narratorToolCalls.id, permissionToolCallId)));
 		return {
@@ -5828,20 +5784,6 @@ export async function handlePermission(
 		}
 		decisionReason = parts.join("; ");
 	}
-	if (isChapter && bashAnalysis) {
-		const chapterGitParts: string[] = [];
-		if (bashAnalysis.gitBranchViolations.length > 0) {
-			chapterGitParts.push(`Chapter git issues: ${bashAnalysis.gitBranchViolations.join("; ")}`);
-		}
-		if (bashAnalysis.gitBranchWarnings.length > 0) {
-			chapterGitParts.push(`Chapter git warnings: ${bashAnalysis.gitBranchWarnings.join("; ")}`);
-		}
-		if (chapterGitParts.length > 0) {
-			const chapterGitMsg = chapterGitParts.join("; ");
-			decisionReason = decisionReason ? `${decisionReason}; ${chapterGitMsg}` : chapterGitMsg;
-		}
-	}
-
 	if (toolName === "Agent" && typeof input.workdir === "string" && input.workdir) {
 		const resolvedWorkdir = resolvePath(cwd, input.workdir);
 		decisionReason = `Subagent requests custom working directory: ${resolvedWorkdir} (parent cwd: ${cwd})`;

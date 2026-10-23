@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { and, eq, gt, inArray, sql } from "drizzle-orm";
 import {
-	chapters,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -29,28 +28,17 @@ function seedProject() {
 	db.insert(projects)
 		.values({ id: "p1", name: "Proj", gitPath: "/tmp/repo", createdAt: now, updatedAt: now })
 		.run();
-	db.insert(chapters)
-		.values({
-			id: "ch1",
-			projectId: "p1",
-			title: "Chapter 1",
-			branch: "chapter/ch1-abc",
-			baseBranch: "main",
-			createdAt: now,
-			updatedAt: now,
-		})
-		.run();
 }
 
 function seedNarrator(
 	id = "n1",
-	chapterId: string | null = "ch1",
+	contextProjectId: string | null = "p1",
 	apiConversationId?: string | null,
 ) {
 	db.insert(narrators)
 		.values({
 			id,
-			chapterId,
+			contextProjectId,
 			apiConversationId,
 			type: "primary",
 			inheritMode: "fresh",
@@ -326,7 +314,7 @@ async function simulateRollbackPreview(narratorId: string, messageId: string, bl
 describe("rollbackToBlock", () => {
 	it("preserves apiConversationId so rollback keeps the provider cache key", async () => {
 		seedProject();
-		seedNarrator("n1", "ch1", "cache-conv-1");
+		seedNarrator("n1", "p1", "cache-conv-1");
 		seedMessage("m0", "n1", "assistant", "first", [
 			{ type: "text", text: "first" },
 			{ type: "text", text: "discard" },

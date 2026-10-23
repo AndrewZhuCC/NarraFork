@@ -30,7 +30,6 @@ const scanCursors = new Map<string, { policy: string; createdAt: string; id: str
 const cleanupColumns = {
 	id: narrators.id,
 	parentNarratorId: narrators.parentNarratorId,
-	chapterId: narrators.chapterId,
 	scheduledTaskId: narrators.scheduledTaskId,
 	ownerUserId: narrators.ownerUserId,
 	type: narrators.type,

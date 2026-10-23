@@ -4,8 +4,8 @@
  * Provides lifecycle management for SWE-bench evaluation containers:
  * create → exec → collect results → destroy.
  *
- * Uses podman (rootless) directly, independent of NarraFork's container-service
- * which is designed around chapter-level compose workflows.
+ * Uses podman (rootless) directly; container-service only detects and installs
+ * Podman and parses compose files.
  */
 
 import { logger } from "../lib/logger";

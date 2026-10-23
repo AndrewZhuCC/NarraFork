@@ -106,8 +106,6 @@ function analysis(filePaths = inputs): BashAnalysis {
 		hasEnvInjection: false,
 		commandEnvVars: [],
 		isCatastrophic: false,
-		gitBranchViolations: [],
-		gitBranchWarnings: [],
 		hasWriteOperation: false,
 		allReadOnly: true,
 	};

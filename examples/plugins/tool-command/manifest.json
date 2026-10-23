@@ -48,14 +48,14 @@
 				"id": "open-tool",
 				"title": "Open example tool",
 				"handler": "server",
-				"when": "chapter.exists"
+				"when": "narrator.exists"
 			}
 		],
 		"events": [],
 		"views": []
 	},
 	"permissions": {
-		"host": ["query.read.chapters"],
+		"host": ["query.read.narrators"],
 		"network": { "mode": "none", "allow": [] },
 		"filesystem": { "package": "readOnly", "pluginData": "readWrite", "workspace": "none" },
 		"process": { "spawn": "none" }

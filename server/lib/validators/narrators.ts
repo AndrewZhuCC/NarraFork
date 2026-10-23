@@ -71,7 +71,6 @@ export const narratorHandleSchema = z
 export const createNarratorSchema = z.object({
 	/** 自定义会话标题；留空（或不传）时由首条消息自动命名。 */
 	title: z.string().trim().min(1).max(200).optional(),
-	chapterId: z.string().min(1).nullish(),
 	contextProjectId: z.string().min(1).max(128).nullish(),
 	type: z.enum(["primary"]).optional(),
 	model: z.string().optional(),
@@ -113,12 +112,14 @@ export const createNarratorSchema = z.object({
 	// mentionable via @handle in any session.
 	makeNamed: z.boolean().optional(),
 	handle: narratorHandleSchema.optional(),
-	// Specialized standalone narrator kind. Both must be standalone.
+	// Specialized standalone narrator kind. All must be standalone.
 	//   "knowledge" → Knowledge Steward (knowledge-base mgmt): preinstalls the knowledge
 	//                 toolset and a steward system prompt.
 	//   "setup"     → Setup Assistant (installs missing system dependencies): preinstalls
 	//                 Terminal and a setup-assistant system prompt.
-	kind: z.enum(["knowledge", "setup"]).optional(),
+	//   "bot"       → a bot: people talk to it in a chat room and see only what it sends
+	//                 them with Send({ user }). Requires `title`, its name in that room.
+	kind: z.enum(["knowledge", "setup", "bot"]).optional(),
 });
 
 /**

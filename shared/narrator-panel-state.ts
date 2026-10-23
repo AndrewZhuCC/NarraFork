@@ -14,8 +14,6 @@ export interface NarratorPanelState<
 export interface NarratorNavigationSummary {
 	parentNarratorId: string | null;
 	parentNarratorTitle: string | null;
-	chapterId: string | null;
-	chapterTitle: string | null;
 	projectId: string | null;
 }
 

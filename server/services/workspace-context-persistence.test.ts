@@ -7,10 +7,10 @@ import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { ZodError } from "zod";
 import {
-	chapters,
 	narratorBlacklistDirs,
 	narratorMessageRefs,
 	narratorMessages,
+	narratorProjectLinks,
 	narrators,
 	narratorToolCalls,
 	projects,
@@ -261,50 +261,46 @@ describe("real SQLite workspace CAS", () => {
 			setRemoteBackendResolver(null);
 		}
 	});
-	test("project-filtered pagination preserves narrator ACL and gives legacy chapter authority precedence", async () => {
+	test("project-filtered pagination preserves narrator ACL and lists every linked project", async () => {
 		const router = app(owner);
 		const query = `/api/narrators?standalone=all&projectId=${projectId}&limit=10`;
 		const first = await router.request(query);
 		expect(first.status).toBe(200);
 		expect((await first.json()).items.map((item: { id: string }) => item.id)).toContain(id);
 		const otherProject = generateId();
-		const chapterId = generateId();
+		const otherQuery = `/api/narrators?standalone=all&projectId=${otherProject}&limit=10`;
 		const now = new Date().toISOString();
 		await db.insert(projects).values({
 			id: otherProject,
-			name: "legacy project",
+			name: "linked project",
 			gitPath: join(root, "other"),
 			ownerUserId: owner,
 			createdAt: now,
 			updatedAt: now,
 		});
 		try {
-			await db.insert(chapters).values({
-				id: chapterId,
-				projectId: otherProject,
-				title: "legacy chapter",
-				branch: "main",
-				baseBranch: "main",
-				worktreePath: join(root, "other"),
-				createdAt: now,
-				updatedAt: now,
-			});
-			await db.update(narrators).set({ chapterId }).where(eq(narrators.id, id));
-			const original = await router.request(query);
-			expect(original.status).toBe(200);
-			expect((await original.json()).items.map((item: { id: string }) => item.id)).not.toContain(
+			const unlinked = await router.request(otherQuery);
+			expect(unlinked.status).toBe(200);
+			expect((await unlinked.json()).items.map((item: { id: string }) => item.id)).not.toContain(
 				id,
 			);
-			const actual = await router.request(
-				`/api/narrators?standalone=all&projectId=${otherProject}&limit=10`,
-			);
-			expect(actual.status).toBe(200);
-			expect((await actual.json()).items.map((item: { id: string }) => item.id)).toContain(id);
+			// An additional working directory in another project only adds it to that page.
+			await db.insert(narratorProjectLinks).values({
+				narratorId: id,
+				projectId: otherProject,
+				role: "additional",
+				source: "cwd",
+				directory: join(root, "other"),
+				updatedAt: now,
+			});
+			const linked = await router.request(otherQuery);
+			expect(linked.status).toBe(200);
+			expect((await linked.json()).items.map((item: { id: string }) => item.id)).toContain(id);
+			const primary = await router.request(query);
+			expect((await primary.json()).items.map((item: { id: string }) => item.id)).toContain(id);
 			const denied = await app("unrelated-user").request(query);
 			expect([403, 404]).toContain(denied.status);
 		} finally {
-			await db.update(narrators).set({ chapterId: null }).where(eq(narrators.id, id));
-			await db.delete(chapters).where(eq(chapters.id, chapterId));
 			await db.delete(projects).where(eq(projects.id, otherProject));
 		}
 	});
@@ -563,7 +559,6 @@ describe("history-only HTTP actions after a workspace switch", () => {
 	async function forbidFileRollback() {
 		const preview = await import("./revert-planner-local-access");
 		const scoped = await import("./narrator-scoped-revert");
-		const snapshot = await import("./worktree-tree-snapshot");
 		const forbidden = () => {
 			throw new Error("History-only operation accessed file rollback");
 		};
@@ -572,7 +567,6 @@ describe("history-only HTTP actions after a workspace switch", () => {
 			spyOn(preview, "prepareLocalRevertPlan").mockImplementation(forbidden),
 			spyOn(preview, "applyLocalRevertPlan").mockImplementation(forbidden),
 			spyOn(scoped, "revertNarratorScopedForMessages").mockImplementation(forbidden),
-			spyOn(snapshot.worktreeTreeSnapshot, "restore").mockImplementation(forbidden),
 		];
 		for (const spy of spies) restorers.push(() => spy.mockRestore());
 		return spies;

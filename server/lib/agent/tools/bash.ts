@@ -491,7 +491,6 @@ export const bashTool: ToolDefinition = {
 				missingCwd: cwd,
 				suggestedCwd: await firstExistingRecoveryCwd(backend, [
 					base,
-					ctx.worktreePath,
 					ctx.projectGitPath,
 					getHome(),
 				]),

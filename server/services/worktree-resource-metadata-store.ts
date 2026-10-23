@@ -316,7 +316,6 @@ export function createWorktreeResourceMetadataStore(ports: ResourceMetadataFixtu
 								.values({
 									id: action.id,
 									worktreeResourceId: resource.id,
-									chapterId: null,
 									narratorId: null,
 									name: action.name,
 									status: "exited",
@@ -329,7 +328,6 @@ export function createWorktreeResourceMetadataStore(ports: ResourceMetadataFixtu
 								.values({
 									id: action.id,
 									worktreeResourceId: resource.id,
-									chapterId: null,
 									serviceName: action.serviceName,
 									status: "stopped",
 									createdAt: now,
@@ -342,7 +340,6 @@ export function createWorktreeResourceMetadataStore(ports: ResourceMetadataFixtu
 								.values({
 									port: action.port,
 									worktreeResourceId: resource.id,
-									chapterId: null,
 									serviceName: action.serviceName,
 									allocatedAt: now,
 								})
@@ -371,7 +368,6 @@ export function createWorktreeResourceMetadataStore(ports: ResourceMetadataFixtu
 										id: action.id,
 										userId: auth.actorUserId,
 										worktreeResourceId: resource.id,
-										chapterId: null,
 										narratorId: null,
 										layout: action.layout,
 										updatedAt: now,

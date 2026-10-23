@@ -59,7 +59,6 @@ async function insertTasks(count: number): Promise<void> {
 			runContext: "standalone" as const,
 			cwd: null,
 			projectId: null,
-			chapterId: null,
 			narratorMode: "new" as const,
 			reuseNarratorId: null,
 			// Ordered so the cap's `asc(createdAt)` slice is deterministic and the row

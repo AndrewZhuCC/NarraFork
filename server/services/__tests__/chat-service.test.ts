@@ -60,8 +60,8 @@ import {
 	discardChatAttachment,
 	getUnreadSummary,
 	hydrateMessageForBroadcast,
+	listConversationRooms,
 	listDirectory,
-	listDmRooms,
 	listMessages,
 	loadChatAttachmentForRead,
 	markRead,
@@ -389,7 +389,7 @@ describe("unread", () => {
 		for (let i = 0; i < over; i++) {
 			await postMessage({ roomId: room.id, senderUserId: b, text: `c${i}` });
 		}
-		const rooms = await listDmRooms(a);
+		const rooms = await listConversationRooms(a);
 		const summary = rooms.find((r) => r.id === room.id);
 		expect(summary?.unread).toBe(CHAT_UNREAD_PROBE_LIMIT);
 		expect(summary?.unreadCapped).toBe(true);
@@ -504,7 +504,7 @@ describe("room list and deletion", () => {
 		const room = await resolveDmRoom(a, b);
 		const long = "x".repeat(500);
 		await postMessage({ roomId: room.id, senderUserId: b, text: long });
-		const summary = (await listDmRooms(a)).find((r) => r.id === room.id);
+		const summary = (await listConversationRooms(a)).find((r) => r.id === room.id);
 		expect(summary?.lastMessagePreview).toBeTruthy();
 		expect((summary?.lastMessagePreview ?? "").length).toBeLessThan(long.length);
 	});
@@ -518,7 +518,7 @@ describe("room list and deletion", () => {
 		// The list is bounded and ordered by activity, so a freshly opened room
 		// (null `last_message_at`) must not be dropped by that bound — the user
 		// would lose a conversation they just started.
-		const rooms = await listDmRooms(viewer);
+		const rooms = await listConversationRooms(viewer);
 		const ids = rooms.map((room) => room.id);
 		expect(ids).toContain(silent.id);
 		expect(ids.indexOf(chatty.id)).toBeLessThan(ids.indexOf(silent.id));
@@ -526,7 +526,7 @@ describe("room list and deletion", () => {
 
 	test("the room list is bounded and keeps the most recently active rooms", async () => {
 		const viewer = await makeUser("bound-viewer");
-		const rooms = await listDmRooms(viewer);
+		const rooms = await listConversationRooms(viewer);
 		// Nothing to slice yet; the assertion that matters is the invariant itself,
 		// which holds for any member count.
 		expect(rooms.length).toBeLessThanOrEqual(CHAT_ROOM_SCAN_LIMIT);
@@ -1086,7 +1086,7 @@ describe("attachments", () => {
 			text: "",
 			attachmentIds: [attachment.id],
 		});
-		const rooms = await listDmRooms(alice);
+		const rooms = await listConversationRooms(alice);
 		expect(rooms.find((r) => r.id === room.id)?.lastMessagePreview).toBe("preview-me.png");
 	});
 });

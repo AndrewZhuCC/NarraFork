@@ -62,7 +62,7 @@ function isPackageHash(value: string | undefined): value is string {
 
 /**
  * Scope ids a surface can actually provide: the session context built for that
- * surface has exactly these ids (focus/graph → narratorId; workspace/director →
+ * surface has exactly these ids (focus → narratorId; workspace/director →
  * workspaceId; settings/provider-settings → neither).
  *
  * Every surface must appear. A missing key makes the lookup below return `undefined`
@@ -71,8 +71,6 @@ function isPackageHash(value: string | undefined): value is string {
  */
 const SURFACE_ALLOWED_SCOPES: Record<PluginUiHostSurface, ReadonlySet<string>> = {
 	focus: new Set(["global", "narrator"]),
-	// A graph node's embedded dock is the focus family: one surface, one narrator.
-	graph: new Set(["global", "narrator"]),
 	workspace: new Set(["global", "workspace"]),
 	director: new Set(["global", "workspace"]),
 	settings: new Set(["global"]),
@@ -298,7 +296,7 @@ export function buildPluginDockPanelOpenRequest<TGroup>(input: {
 		const host = input.hostContext;
 		// Record the narrator so the panel can resolve it on any surface;
 		// focus-family surfaces can still fall back to their live narrator context.
-		if ((host?.surface === "focus" || host?.surface === "graph") && host.narratorId) {
+		if (host?.surface === "focus" && host.narratorId) {
 			return { kind: "focus-current-narrator", narratorId: host.narratorId };
 		}
 		if (
