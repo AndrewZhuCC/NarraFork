@@ -34,6 +34,7 @@
  * in-memory database; production never substitutes a synchronous main-thread driver.
  */
 
+import { isEnvelopeIndexRetired } from "../../db/fts";
 import { ValidationError } from "../../lib/errors";
 import { narratorReadableSqlFragment } from "../narrator-acl";
 import { narratorProjectIdText } from "../read/acl-sql";
@@ -155,8 +156,15 @@ function compareText(a: string, b: string): number {
 	return a < b ? -1 : a > b ? 1 : 0;
 }
 
-/** Every executor gets its own bounded set of fixed SQL templates. */
-export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchStore {
+/**
+ * Every executor gets its own bounded set of fixed SQL templates. `blockOnly` says whether the
+ * envelope index (`narrator_messages_fts`) has retired, so index queries read blocks alone
+ * (docs/BLOCK_STORAGE-DESIGN.md §4.6, P3c); `ensureFts` decides that at startup.
+ */
+export function createSqliteSearchStore(
+	execute: SearchQueryExecutor,
+	mode: { blockOnly: () => boolean } = { blockOnly: isEnvelopeIndexRetired },
+): SearchStore {
 	const templates = new Map<string, string>();
 
 	function cached(key: string, build: () => string): QueryTemplate {
@@ -421,6 +429,18 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 		return [];
 	}
 
+	/** How Recall reaches a message's narrator; see {@link recallStmt}. */
+	function recallSource(global: boolean) {
+		return {
+			source: global
+				? `JOIN narrators n ON n.id = m.narrator_id`
+				: `JOIN narrator_message_refs r ON r.message_id = m.id
+		 JOIN narrators n ON n.id = r.narrator_id`,
+			narratorIdColumn: global ? "n.id AS narrator_id" : "r.narrator_id",
+			scopeFilter: global ? "" : " AND r.narrator_id = ?",
+		};
+	}
+
 	/**
 	 * Recall's statement.
 	 *
@@ -439,12 +459,7 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 	): QueryTemplate {
 		const key = `recall:${strategy}:${global ? "global" : "scoped"}:${timeKey}:${likes}`;
 		return cached(key, () => {
-			const source = global
-				? `JOIN narrators n ON n.id = m.narrator_id`
-				: `JOIN narrator_message_refs r ON r.message_id = m.id
-		 JOIN narrators n ON n.id = r.narrator_id`;
-			const narratorIdColumn = global ? "n.id AS narrator_id" : "r.narrator_id";
-			const scopeFilter = global ? "" : " AND r.narrator_id = ?";
+			const { source, narratorIdColumn, scopeFilter } = recallSource(global);
 			if (strategy === "index") {
 				return `SELECT m.id, ${narratorIdColumn}, m.role, m.created_at,
 		        n.title AS narrator_title,
@@ -555,6 +570,7 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 	 */
 	function sessionHitsCte(
 		query: EntitySearchQuery,
+		blockOnly: boolean,
 		extra: { sql: string; values: readonly string[] } = { sql: "", values: [] },
 	): { sql: string; values: Array<string | number> } {
 		const gated = !query.viewer.isAdmin;
@@ -573,6 +589,24 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 				 WHERE 1 = 1 ${contains} ${gate} ${messageScopeSql(query.scope)} ${filter.sql} ${extra.sql}
 			)`,
 				values: [...likes, ...tail],
+			};
+		}
+		if (blockOnly) {
+			const where = (scope: string): Bound => ({
+				sql: `${gate} ${scope} ${filter.sql} ${extra.sql}`,
+				values: tail,
+			});
+			const hits = blockOnlyHits(query, {
+				join: { sql: "JOIN narrators n ON n.id = m.narrator_id", values: [] },
+				blockWhere: where(blockScopeSql(query.scope)),
+				legacyWhere: where(messageScopeSql(query.scope)),
+			});
+			return {
+				sql: `WITH hits AS (${hits.sql}), per_msg AS (
+				SELECT hits.id, m.narrator_id, m.created_at, hits.r, hits.block_id
+				 FROM hits JOIN narrator_messages m ON m.id = hits.id
+			)`,
+				values: hits.values,
 			};
 		}
 		const envelope = `SELECT m.id, m.narrator_id, m.created_at, narrator_messages_fts.rank AS r, NULL AS block_id
@@ -606,8 +640,13 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 	/** Excerpt for a session hit: FTS5's own on the index path, a window around the first
 	 *  term's first occurrence on the substring path. Returns SQL plus its values, in textual
 	 *  order. */
-	function sessionSnippet(query: EntitySearchQuery): { sql: string; values: string[] } {
+	function sessionSnippet(
+		query: EntitySearchQuery,
+		blockOnly: boolean,
+	): { sql: string; values: Array<string | number> } {
 		const { match } = globalNeedles(query);
+		// Once only blocks are indexed: the text's own window, NULL where only a block matched.
+		if (match !== null && blockOnly) return textWindowSql(query, PREVIEW_CHARS);
 		if (match !== null) {
 			return {
 				sql: `(SELECT ${snippetCall("narrator_messages_fts", 0, GLOBAL_SNIPPET)}
@@ -635,7 +674,10 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 	 * {@link BLOCK_EXCERPT_SOURCE_CHARS} first, so a huge tool output costs a bounded scan.
 	 * The first term is looked up as a plain substring, which every index match contains.
 	 */
-	function blockExcerptSql(query: EntitySearchQuery): { sql: string; values: string[] } {
+	function blockExcerptSql(query: Pick<EntitySearchQuery, "text">): {
+		sql: string;
+		values: string[];
+	} {
 		const { indexed, short } = globalQueryTerms(query.text);
 		const term = [...indexed, ...short][0] ?? query.text;
 		const cut = (expr: string) => `substr(${expr}, 1, ${BLOCK_EXCERPT_SOURCE_CHARS})`;
@@ -654,6 +696,87 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 				 WHERE bb.id IS NOT NULL AND pos > 0
 				 ORDER BY ord LIMIT 1)`,
 			values: [term],
+		};
+	}
+
+	// ─────────────────────────────────────────────────────────────────────────────
+	// Block-only search (docs/BLOCK_STORAGE-DESIGN.md §4.6, P3c)
+	// ─────────────────────────────────────────────────────────────────────────────
+
+	/** SQL with the values its placeholders bind, in textual order. */
+	type Bound = { sql: string; values: Array<string | number> };
+	const NONE: Bound = { sql: "", values: [] };
+
+	/**
+	 * `SELECT id, r, block_id` for the messages an index query matches once only blocks are
+	 * indexed, one row each:
+	 *   - a message one of whose blocks holds every indexed term, with its best rank and the
+	 *     block that has it;
+	 *   - a legacy envelope (no blocks yet: imported, written with block writes off, or not
+	 *     decodable) whose text contains every term; `idx_messages_legacy_body` holds the few
+	 *     the backfill has not converted. It has no rank.
+	 * Short terms filter the message text in both, as they did on the envelope index. `join`
+	 * adds what the predicates read (aliases `m`, `n`, `r`); `blockWhere` applies to block hits
+	 * (alias `b` too), `legacyWhere` to legacy ones.
+	 */
+	function blockOnlyHits(
+		query: Pick<EntitySearchQuery, "text" | "strategy">,
+		parts: { join: Bound; blockWhere: Bound; legacyWhere: Bound },
+	): Bound {
+		const { match, likes } = globalNeedles(query);
+		const terms = globalQueryTerms(query.text).indexed.map(rawContains);
+		return {
+			sql: `SELECT id, MIN(r) AS r, block_id FROM (
+				SELECT b.message_id AS id, narrator_blocks_fts.rank AS r, b.id AS block_id
+				 FROM narrator_blocks_fts
+				 JOIN narrator_blocks b ON b.rowid = narrator_blocks_fts.rowid
+				 JOIN narrator_messages m ON m.id = b.message_id
+				 ${parts.join.sql}
+				 WHERE narrator_blocks_fts MATCH ? ${likeSql("m.content_text", likes.length)} ${parts.blockWhere.sql}
+				UNION ALL
+				SELECT m.id, NULL, NULL
+				 FROM narrator_messages m
+				 ${parts.join.sql}
+				 WHERE m.body_format = 1 ${likeSql("m.content_text", terms.length + likes.length)} ${parts.legacyWhere.sql}
+			) GROUP BY id`,
+			values: [
+				...parts.join.values,
+				match ?? "",
+				...likes,
+				...parts.blockWhere.values,
+				...parts.join.values,
+				...terms,
+				...likes,
+				...parts.legacyWhere.values,
+			],
+		};
+	}
+
+	/**
+	 * An excerpt of `m.content_text` around the first term's first occurrence, or NULL when
+	 * the text does not hold it (the hit is a block's: a tool's input or output, a context).
+	 * `mark` brackets the occurrence, as Recall's FTS5 snippet did.
+	 */
+	function textWindowSql(
+		query: Pick<EntitySearchQuery, "text">,
+		length: number,
+		mark?: { open: string; close: string },
+	): Bound {
+		const chars = Math.max(1, Math.trunc(length) || PREVIEW_CHARS);
+		const { indexed, short } = globalQueryTerms(query.text);
+		const term = [...indexed, ...short][0] ?? query.text;
+		const quote = (value: string) => `'${value.replaceAll("'", "''")}'`;
+		const lead = `CASE WHEN pos > ${SUBSTRING_LEAD} THEN '...' ELSE '' END`;
+		const start = `max(1, pos - ${SUBSTRING_LEAD})`;
+		const body = mark
+			? `${lead} || substr(t, ${start}, pos - ${start}) || ${quote(mark.open)}
+				 || substr(t, pos, len) || ${quote(mark.close)} || substr(t, pos + len, ${chars})`
+			: `${lead} || substr(t, ${start}, ${chars})`;
+		return {
+			sql: `(SELECT CASE WHEN pos = 0 THEN NULL ELSE ${body} END
+				 FROM (SELECT m.content_text AS t, instr(lower(m.content_text), lower(?)) AS pos,
+					length(?) AS len))`,
+			values: [term, term],
 		};
 	}
 
@@ -699,8 +822,6 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 				...(gated ? gateParams(query.viewer.userId, NARRATOR_GATE_PARAMS) : []),
 				...filter.values,
 			];
-			const needles = match === null ? likes : [match, ...likes];
-			const rows: RawRow[] = await stmt.all(options, ...needles, ...gate, query.limit);
 			const toRow = (row: RawRow): MessageSearchRow => ({
 				id: row.id,
 				narratorId: row.narrator_id ?? null,
@@ -709,11 +830,44 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 				model: row.model ?? null,
 				messageRole: row.message_role ?? null,
 				createdAt: row.created_at ?? null,
-				snippet: row.snippet ?? "",
+				snippet: row.snippet || (row.block_snippet ? jsonExcerptText(row.block_snippet) : ""),
 				preview: row.content_preview ?? "",
 				rank: rankOf(row, query.strategy),
 				...(row.block_id ? { blockId: row.block_id } : {}),
 			});
+			if (match !== null && mode.blockOnly()) {
+				const where = (scope: string): Bound => ({
+					sql: `${gated ? `AND ${NARRATOR_GATE_SQL}` : ""} ${scope} ${filter.sql}`,
+					values: gate,
+				});
+				const hits = blockOnlyHits(query, {
+					join: { sql: "JOIN narrators n ON n.id = m.narrator_id", values: [] },
+					blockWhere: where(blockScopeSql(query.scope)),
+					legacyWhere: where(messageScopeSql(query.scope)),
+				});
+				const window = textWindowSql(query, PREVIEW_CHARS);
+				const excerpt = blockExcerptSql(query);
+				const order =
+					query.sort === "time"
+						? "m.created_at DESC, m.id ASC"
+						: "hits.r IS NULL, hits.r ASC, m.created_at DESC, m.id ASC";
+				const rows: RawRow[] = await execute(
+					`WITH hits AS (${hits.sql})
+					SELECT ${MESSAGE_COLUMNS}, hits.block_id, hits.r AS rank_score,
+					  ${window.sql} AS snippet, ${excerpt.sql} AS block_snippet
+					 FROM hits
+					 JOIN narrator_messages m ON m.id = hits.id
+					 JOIN narrators n ON n.id = m.narrator_id
+					 ${PROJECT_JOIN}
+					 LEFT JOIN narrator_blocks bb ON bb.id = hits.block_id
+					 ORDER BY ${order} LIMIT ?`,
+					[...hits.values, ...window.values, ...excerpt.values, query.limit],
+					options,
+				);
+				return rows.map(toRow);
+			}
+			const needles = match === null ? likes : [match, ...likes];
+			const rows: RawRow[] = await stmt.all(options, ...needles, ...gate, query.limit);
 			// Blocks cannot be checked for terms the index cannot tokenize; see messageBlockStmt.
 			if (match === null || likes.length > 0) return rows.map(toRow);
 			const blockRows: RawRow[] = await messageBlockStmt(
@@ -764,7 +918,8 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 		},
 
 		async searchSessionAggregates(query: SessionAggregateQuery): Promise<SessionAggregateRow[]> {
-			const cte = sessionHitsCte(query);
+			const blockOnly = globalNeedles(query).match !== null && mode.blockOnly();
+			const cte = sessionHitsCte(query, blockOnly);
 			const order =
 				query.sort === "time"
 					? "agg.last_hit_at DESC, agg.narrator_id ASC"
@@ -792,7 +947,8 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 			const ids = query.narratorIds.filter((id) => NARRATOR_ID_PATTERN.test(id));
 			if (ids.length === 0) return [];
 			// The id list varies per page, so this statement is not cached; ids are bound.
-			const cte = sessionHitsCte(query, {
+			const blockOnly = globalNeedles(query).match !== null && mode.blockOnly();
+			const cte = sessionHitsCte(query, blockOnly, {
 				sql: `AND m.narrator_id IN (${ids.map(() => "?").join(", ")})`,
 				values: ids,
 			});
@@ -800,7 +956,7 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 				query.sort === "time"
 					? "created_at DESC, id ASC"
 					: "r IS NULL, r ASC, created_at DESC, id ASC";
-			const snippet = sessionSnippet(query);
+			const snippet = sessionSnippet(query, blockOnly);
 			const blockExcerpt = blockExcerptSql(query);
 			const offset = Math.max(0, Math.trunc(query.offset ?? 0));
 			const rows: RawRow[] = await execute(
@@ -879,11 +1035,38 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 				messageId: row.id,
 				seq: typeof row.seq === "number" ? row.seq : Number(row.seq) || 0,
 				role: row.message_role ?? "",
-				snippet: row.snippet ?? "",
+				snippet: row.snippet || (row.block_snippet ? jsonExcerptText(row.block_snippet) : ""),
 				preview: row.content_preview ?? "",
 				createdAt: row.created_at,
 				...(row.block_id ? { blockId: row.block_id } : {}),
 			});
+			if (match !== null && mode.blockOnly()) {
+				const scope: Bound =
+					query.inheritedScopes.length === 0
+						? { sql: "r.narrator_id = ?", values: [query.narratorId] }
+						: { sql: timelineScopeSql(query.narratorId, query.inheritedScopes), values: [] };
+				const refs: Bound = {
+					sql: `JOIN narrator_message_refs r
+					   ON r.message_id = m.id AND ${scope.sql} AND r.segment_compact_id IS NULL`,
+					values: scope.values,
+				};
+				const hits = blockOnlyHits(query, { join: refs, blockWhere: NONE, legacyWhere: NONE });
+				const window = textWindowSql(query, PREVIEW_CHARS);
+				const excerpt = blockExcerptSql(query);
+				const rows: RawRow[] = await execute(
+					`WITH hits AS (${hits.sql})
+					SELECT ${TIMELINE_COLUMNS}, hits.block_id,
+					  ${window.sql} AS snippet, ${excerpt.sql} AS block_snippet
+					 FROM hits
+					 JOIN narrator_messages m ON m.id = hits.id
+					 ${refs.sql}
+					 LEFT JOIN narrator_blocks bb ON bb.id = hits.block_id
+					 ORDER BY r.seq DESC LIMIT ?`,
+					[...hits.values, ...window.values, ...excerpt.values, ...refs.values, query.limit],
+					options,
+				);
+				return rows.map(toRow);
+			}
 			const rows = (await run(mainStrategy)).map(toRow);
 			// Blocks cannot be checked for terms the index cannot tokenize; see messageBlockStmt.
 			if (match === null || likes.length > 0) return rows;
@@ -909,6 +1092,42 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 			);
 			const timeParams = recallTimeParams(query);
 			const scope = global ? [] : [query.narratorId as string];
+			const toRow = (row: RawRow): RecallMessageRow => ({
+				messageId: row.id,
+				narratorId: row.narrator_id,
+				narratorTitle: row.narrator_title ?? null,
+				role: row.role,
+				createdAt: row.created_at,
+				snippet: row.snippet || (row.block_snippet ? jsonExcerptText(row.block_snippet) : ""),
+			});
+			if (match !== null && mode.blockOnly()) {
+				const { source, narratorIdColumn, scopeFilter } = recallSource(global);
+				const where: Bound = {
+					sql: `${scopeFilter}${recallTimeSuffix(query)}`,
+					values: [...scope, ...timeParams],
+				};
+				const hits = blockOnlyHits(query, {
+					join: { sql: source, values: [] },
+					blockWhere: where,
+					legacyWhere: where,
+				});
+				const window = textWindowSql(query, query.previewChars, RECALL_SNIPPET);
+				const excerpt = blockExcerptSql(query);
+				const rows: RawRow[] = await execute(
+					`WITH hits AS (${hits.sql})
+					SELECT m.id, ${narratorIdColumn}, m.role, m.created_at, n.title AS narrator_title,
+					  ${window.sql} AS snippet, ${excerpt.sql} AS block_snippet
+					 FROM hits
+					 JOIN narrator_messages m ON m.id = hits.id
+					 ${source}
+					 LEFT JOIN narrator_blocks bb ON bb.id = hits.block_id
+					 WHERE 1 = 1 ${scopeFilter}
+					 ORDER BY hits.r IS NULL, hits.r ASC, m.created_at DESC LIMIT ?`,
+					[...hits.values, ...window.values, ...excerpt.values, ...scope, query.limit],
+					options,
+				);
+				return rows.map(toRow);
+			}
 			const rows: RawRow[] =
 				match === null
 					? await stmt.all(
@@ -920,14 +1139,7 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 							query.limit,
 						)
 					: await stmt.all(options, match, ...likes, ...scope, ...timeParams, query.limit);
-			return rows.map((row) => ({
-				messageId: row.id,
-				narratorId: row.narrator_id,
-				narratorTitle: row.narrator_title ?? null,
-				role: row.role,
-				createdAt: row.created_at,
-				snippet: row.snippet ?? "",
-			}));
+			return rows.map(toRow);
 		},
 
 		async searchKnowledgeEntries(query: KnowledgeSearchQuery): Promise<KnowledgeSearchRow[]> {

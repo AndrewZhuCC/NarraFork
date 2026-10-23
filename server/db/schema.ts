@@ -1819,6 +1819,8 @@ export const narratorTurns = sqliteTable(
  * Progress of the background block jobs, one row per job:
  *   - `convert` turns legacy (`body_format = 1`) envelopes into block rows;
  *   - `verify` checks block-format envelopes' rows against their stored content;
+ *   - `reindex` (P3c) rewrites every block's search index text from its rows; the envelope
+ *     index retires once it has completed, and it starts over if the block index is lost;
  *   - `clear` / `restore` (admin-started, P3b) drop verified envelopes' `content_json`
  *     projections (`body_rows_only`) and write them back from the rows.
  * `cursor` is the last `narrator_messages.rowid` the job handled; it resumes after it.
@@ -1826,7 +1828,7 @@ export const narratorTurns = sqliteTable(
 export const narratorBlockBackfill = sqliteTable(
 	"narrator_block_backfill",
 	{
-		job: text("job", { enum: ["convert", "verify", "clear", "restore"] }).primaryKey(),
+		job: text("job", { enum: ["convert", "verify", "reindex", "clear", "restore"] }).primaryKey(),
 		cursor: integer("cursor").notNull().default(0),
 		complete: integer("complete", { mode: "boolean" }).notNull().default(false),
 		paused: integer("paused", { mode: "boolean" }).notNull().default(false),
@@ -1835,7 +1837,10 @@ export const narratorBlockBackfill = sqliteTable(
 		updatedAt: text("updated_at").notNull(),
 	},
 	(table) => [
-		check("ck_block_backfill_job", sql`${table.job} in ('convert', 'verify', 'clear', 'restore')`),
+		check(
+			"ck_block_backfill_job",
+			sql`${table.job} in ('convert', 'verify', 'reindex', 'clear', 'restore')`,
+		),
 	],
 );
 

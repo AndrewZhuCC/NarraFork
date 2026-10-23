@@ -281,6 +281,13 @@
 			"when": 1792728129984,
 			"tag": "0039_block_projection_jobs",
 			"breakpoints": true
+		},
+		{
+			"idx": 40,
+			"version": "7",
+			"when": 1792731579735,
+			"tag": "0040_block_reindex_job",
+			"breakpoints": true
 		}
   ]
 }

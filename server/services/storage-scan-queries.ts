@@ -45,7 +45,8 @@ export type DatabaseStorageCategoryKey = (typeof DATABASE_STORAGE_CATEGORY_KEYS)
 
 export type DatabaseTableKind = "table" | "virtual" | "shadow" | "internal";
 
-const SEARCH_TABLE_PREFIXES = ["narrator_messages_fts", "narrators_fts"];
+/** Search indexes: the envelope index (until it retires, P3c), the block index, titles. */
+const SEARCH_TABLE_PREFIXES = ["narrator_messages_fts", "narrator_blocks_fts", "narrators_fts"];
 
 export interface DatabaseStorageCategorySummary {
 	key: DatabaseStorageCategoryKey;

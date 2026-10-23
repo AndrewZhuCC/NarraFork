@@ -161,6 +161,20 @@ export function syncEnvelopeNow(
 }
 
 /**
+ * Rewrite the search index text of every sealed block of one envelope, computed as a sync
+ * computes it (the reindex job, §4.6): the block index is contentless, so its text can only
+ * be recomputed from the rows and the ledger. The rows themselves change only where they
+ * differ from the body, as in any sync.
+ */
+export function reindexEnvelope(messageId: string): void {
+	if (!hasBlockSchema()) return;
+	syncEnvelope(messageId, "keep", {}, undefined, { reindex: true });
+	database.sqlite
+		.prepare("DELETE FROM narrator_block_sync_queue WHERE message_id = ?")
+		.run(messageId);
+}
+
+/**
  * Rebuild an envelope's rows from what `content_json` stores, for a check that found them
  * differing from it (the dual-write audit and the backfill's verify): the column is the
  * reference they are checked against.
@@ -409,6 +423,7 @@ export function syncEnvelope(
 	mode: SyncMode = "keep",
 	stamp: BlockStamp = {},
 	given?: unknown,
+	options: { reindex?: boolean } = {},
 ): void {
 	const row = envelopeRow(messageId);
 	if (!row || row.bodyFormat !== 2) return;
@@ -563,7 +578,7 @@ export function syncEnvelope(
 			bindLedger.run(plan.id, messageId, draft.wireId, plan.id);
 		// Searchable once it stops streaming (§4.6): a step's open items are not indexed yet.
 		if (plan.phase === "open") dropBlockIndex(plan.id);
-		else if (!current || changed || output !== undefined)
+		else if (!current || changed || output !== undefined || options.reindex)
 			writeBlockIndex(plan.id, blockIndexText(draft.canonical, output));
 	}
 	database.sqlite

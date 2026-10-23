@@ -320,6 +320,14 @@
 			"prevId": "4b2b3cbc-bad3-4cef-a238-234de6ae6642",
 			"version": "7",
 			"snapshotDigest": "68b9403a288280826e61609c728574dcbbcf638e05b8f447a94067fcb4909306"
+		},
+		{
+			"idx": 40,
+			"tag": "0040_block_reindex_job",
+			"id": "37ee90e1-966f-4646-8711-b18d17576d47",
+			"prevId": "3c8f5a32-e1a8-4bc5-99ef-7489da1a1cdc",
+			"version": "7",
+			"snapshotDigest": "2dba7d428fd7926fc02c936fa76436d811253158ef0bb2d6ec82be9ec427526f"
 		}
 	]
 }

@@ -327,3 +327,89 @@ describe("block backfill", () => {
 		expect(rest.done).toBe(true);
 	});
 });
+
+describe("block reindex", () => {
+	/** Every block id the block index finds for `term`. */
+	const indexed = (term: string) =>
+		(
+			sqlite
+				.prepare(
+					`SELECT b.id FROM narrator_blocks_fts JOIN narrator_blocks b ON b.rowid = narrator_blocks_fts.rowid
+					 WHERE narrator_blocks_fts MATCH ? ORDER BY b.id`,
+				)
+				.all(`"${term}"`) as Array<{ id: string }>
+		).map((row) => row.id);
+
+	async function conversation(): Promise<string> {
+		await narratorStore.appendInput("n1", "where are the gooseberries");
+		const step = await narratorStore.openStep("n1", { uuid: "u", session_id: "s" });
+		await narratorStore.writeStepItem(step.id, "n1", {
+			type: "text",
+			id: "t1",
+			text: "The gooseberries are in the cellar.",
+			completed: true,
+			outputIndex: 0,
+		});
+		const toolCallId = await narratorStore.writeStepItem(step.id, "n1", {
+			type: "tool_use",
+			id: "c1",
+			name: "Grep",
+			input: { pattern: "quince" },
+			outputIndex: 1,
+		});
+		await narratorStore.settleTool(
+			"c1",
+			{ output: "jam/quince.md", status: "success" },
+			step.id,
+			toolCallId,
+		);
+		return step.id;
+	}
+
+	test("runs after verify and leaves every revision where it was", async () => {
+		await conversation();
+		const revisions = () =>
+			sqlite
+				.prepare("SELECT id, body_revision, state_revision FROM narrator_messages ORDER BY id")
+				.all();
+		const before = revisions();
+		const history = historyRevision();
+		await drain();
+		const status = backfill.blockBackfillStatus();
+		expect([status.convert?.complete, status.verify?.complete, status.reindex?.complete]).toEqual([
+			true,
+			true,
+			true,
+		]);
+		expect(status.reindex?.processed).toBe(2);
+		expect(revisions()).toEqual(before);
+		expect(historyRevision()).toBe(history);
+	});
+
+	test("rebuilds a cleared block index as the store wrote it", async () => {
+		await conversation();
+		const terms = ["gooseberries", "cellar", "quince", "Grep"];
+		const written = terms.map(indexed);
+		expect(written.every((ids) => ids.length > 0)).toBe(true);
+		await drain();
+		sqlite.run("DELETE FROM narrator_blocks_fts");
+		expect(terms.map(indexed)).toEqual(terms.map(() => []));
+		sqlite.run("UPDATE narrator_block_backfill SET cursor = 0, complete = 0 WHERE job = 'reindex'");
+		await drain();
+		expect(terms.map(indexed)).toEqual(written);
+	});
+
+	test("reaches rows-only envelopes too", async () => {
+		const stepId = await conversation();
+		await drain();
+		sqlite.run(
+			"UPDATE narrator_messages SET content_json = '[]', body_rows_only = 1 WHERE id = ?",
+			[stepId],
+		);
+		sqlite.run("DELETE FROM narrator_blocks_fts");
+		sqlite.run("UPDATE narrator_block_backfill SET cursor = 0, complete = 0 WHERE job = 'reindex'");
+		await drain();
+		expect(indexed("quince")).toHaveLength(1);
+		expect(indexed("cellar")).toHaveLength(1);
+	});
+});

@@ -2130,6 +2130,7 @@
 	"storageBlocksDescription": "Older messages are moved to block storage in the background. Only how they are stored changes; conversations read the same.",
 	"storageBlocksConvert": "Converting older messages",
 	"storageBlocksVerify": "Checking converted messages",
+	"storageBlocksReindex": "Indexing messages for search",
 	"storageBlocksProcessed_one": "{{count}} message",
 	"storageBlocksProcessed_other": "{{count}} messages",
 	"storageBlocksComplete": "Complete",
