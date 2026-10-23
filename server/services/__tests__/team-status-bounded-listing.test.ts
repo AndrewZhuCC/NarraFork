@@ -76,10 +76,11 @@ async function seedBashTask(opts: {
 	title?: string;
 	alias?: string;
 	completed?: boolean;
+	parentNarratorId?: string;
 }): Promise<void> {
 	await backgroundTaskService.createBashTask({
 		id: opts.id,
-		parentNarratorId: PARENT,
+		parentNarratorId: opts.parentNarratorId ?? PARENT,
 		command: opts.command ?? `cmd ${opts.id}`,
 		title: opts.title,
 		alias: opts.alias,
@@ -517,6 +518,75 @@ describe("listTeamBashTasks", () => {
 			recentTerminalLimit: 5,
 		});
 		expect(view).toEqual({ tasks: [], omitted: 0, omittedCapped: false });
+	});
+});
+
+describe("listTeamBashTasks team scope", () => {
+	test("resolves thousands of members in SQL instead of binding one parameter each", async () => {
+		await seedParent();
+		for (let batch = 0; batch < 10; batch++) {
+			await db.insert(narrators).values(
+				Array.from({ length: 500 }, (_, i) => ({
+					id: `member-${batch * 500 + i}`,
+					type: "subagent" as const,
+					variant: "subagent:general",
+					parentNarratorId: PARENT,
+					...MEMBER,
+					createdAt: isoAt(0),
+					updatedAt: isoAt(0),
+				})),
+			);
+		}
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({
+			id: "stranger",
+			type: "subagent",
+			variant: "subagent:general",
+			parentNarratorId: PARENT,
+			runtimeRegistrationJson: delegationRegistration("someone-else", "general"),
+			createdAt: now,
+			updatedAt: now,
+		});
+		await seedBashTask({ id: "root-task", createdAt: isoAt(1) });
+		await seedBashTask({
+			id: "far-member-task",
+			createdAt: isoAt(2),
+			parentNarratorId: "member-4999",
+		});
+		await seedBashTask({ id: "stranger-task", createdAt: isoAt(3), parentNarratorId: "stranger" });
+
+		const statements: Array<{ sql: string; bindings: number }> = [];
+		const prepare = sqlite.prepare.bind(sqlite);
+		const query = sqlite.query.bind(sqlite);
+		const record = (text: string) => {
+			if (text.includes("background_tasks")) {
+				statements.push({ sql: text, bindings: (text.match(/\?/g) ?? []).length });
+			}
+		};
+		sqlite.prepare = ((text: string, ...rest: unknown[]) => {
+			record(text);
+			return (prepare as (...args: unknown[]) => unknown)(text, ...rest);
+		}) as typeof sqlite.prepare;
+		sqlite.query = ((text: string) => {
+			record(text);
+			return query(text);
+		}) as typeof sqlite.query;
+		let view: Awaited<ReturnType<typeof backgroundTaskService.listTeamBashTasks>>;
+		try {
+			view = await backgroundTaskService.listTeamBashTasks({
+				parentNarratorIds: [PARENT],
+				teamRootId: PARENT,
+				limit: 20,
+				recentTerminalLimit: 5,
+			});
+		} finally {
+			sqlite.prepare = prepare;
+			sqlite.query = query;
+		}
+
+		expect(view.tasks.map((t) => t.id).sort()).toEqual(["far-member-task", "root-task"]);
+		expect(statements.length).toBeGreaterThan(0);
+		for (const statement of statements) expect(statement.bindings).toBeLessThan(20);
 	});
 });
 

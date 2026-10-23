@@ -81,11 +81,17 @@ const fakeBackgroundTaskService = {
 	// terminal tail, with the remainder reported rather than dropped silently.
 	async listTeamBashTasks(input: {
 		parentNarratorIds: string[];
+		teamRootId?: string;
 		limit: number;
 		recentTerminalLimit: number;
 		query?: string;
 	}) {
 		const parentIds = new Set(input.parentNarratorIds);
+		if (input.teamRootId) {
+			for (const n of narrators.values()) {
+				if (n.parentNarratorId === input.teamRootId) parentIds.add(n.id);
+			}
+		}
 		const needle = input.query?.trim().toLowerCase();
 		const matching = [...tasks.values()]
 			.filter((t) => t.type === "bash" && parentIds.has(t.parentNarratorId))

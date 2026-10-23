@@ -42,6 +42,7 @@ import { hotSafe } from "../lib/hot-safe";
 import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { parseSubstatus, parseTraits } from "../lib/narrator-utils";
+import { teamMembersWhere } from "../lib/runtime-source";
 import { escapeLikeNeedle } from "../lib/sql-like";
 import type { RunBindingInput, RunDeliverTo } from "../lib/validators/runtime-registration";
 import type { RuntimeTx } from "./agent-runtime/mailbox-types";
@@ -1914,6 +1915,12 @@ class BackgroundTaskService {
 	 */
 	async listTeamBashTasks(input: {
 		parentNarratorIds: string[];
+		/**
+		 * Also include tasks started by every member of this root's team. Membership is
+		 * resolved by a subquery inside the same statement, so a team with thousands of
+		 * members never expands into thousands of bound parameters.
+		 */
+		teamRootId?: string;
 		/** Max rows returned in total (running + terminal tail). */
 		limit: number;
 		/** Max terminal rows included when no `query` is given. */
@@ -1928,14 +1935,20 @@ class BackgroundTaskService {
 		omittedCapped: boolean;
 	}> {
 		const parentIds = [...new Set(input.parentNarratorIds)].filter(Boolean);
-		if (parentIds.length === 0) return { tasks: [], omitted: 0, omittedCapped: false };
+		const teamRootId = input.teamRootId || undefined;
+		if (parentIds.length === 0 && !teamRootId) {
+			return { tasks: [], omitted: 0, omittedCapped: false };
+		}
 
 		const limit = Math.max(1, Math.trunc(input.limit));
 		const needle = escapeLikeNeedle(input.query);
-		const scope = [
-			inArray(backgroundTasks.parentNarratorId, parentIds),
-			eq(backgroundTasks.type, "bash"),
-		];
+		const owners = or(
+			parentIds.length > 0 ? inArray(backgroundTasks.parentNarratorId, parentIds) : undefined,
+			teamRootId
+				? sql`${backgroundTasks.parentNarratorId} IN (SELECT ${narrators.id} FROM ${narrators} WHERE ${teamMembersWhere(teamRootId)})`
+				: undefined,
+		);
+		const scope = [owners, eq(backgroundTasks.type, "bash")];
 		if (needle) {
 			const like = `%${needle}%`;
 			const match = or(
