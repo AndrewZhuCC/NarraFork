@@ -1049,10 +1049,33 @@ describe("ordered streaming tool scheduling", () => {
 		expectSuccess(await result);
 	});
 
+	for (const name of ["Agent", "Await", "Send"]) {
+		test(`${name} starts mid-stream together with a following parallel Read`, async () => {
+			const control = watch("control", true);
+			const read = watch("read", true);
+			const streamPending = gate();
+			const endStream = gate();
+			script = async function* () {
+				yield { toolUses: [tool(name, "control", 0), tool("Read", "read", 1)] };
+				streamPending.resolve();
+				await endStream.promise;
+			};
+			const result = run();
+			try {
+				await streamPending.promise;
+				await control.started;
+				await read.started;
+				expect(started).toEqual(["control", "read"]);
+			} finally {
+				control.release();
+				read.release();
+				endStream.resolve();
+			}
+			expectSuccess(await result);
+		});
+	}
+
 	for (const name of [
-		"Agent",
-		"Await",
-		"Send",
 		"EnterPlanMode",
 		"DangerConfirm",
 		"TaskReflectConfirm",
@@ -1061,7 +1084,9 @@ describe("ordered streaming tool scheduling", () => {
 		"Edit",
 	]) {
 		const virtualWrite = name === "Write" || name === "Edit";
-		test(`${virtualWrite ? `virtual spec ${name}` : name} defers itself and following Read until stream end`, async () => {
+		test(`${virtualWrite ? `virtual spec ${name}` : name} runs mid-stream and releases a following Read only once its result is consumed`, async () => {
+			const control = watch("control", true);
+			const read = watch("read");
 			const streamPending = gate();
 			const endStream = gate();
 			script = async function* () {
@@ -1072,14 +1097,26 @@ describe("ordered streaming tool scheduling", () => {
 					],
 				};
 				streamPending.resolve();
+				// The provider goes quiet: nothing but a settled tool can move the loop now.
 				await endStream.promise;
 			};
-			const result = run();
+			const startedWhenConsumed: string[][] = [];
+			const result = run({}, (event) => {
+				if (event.type === "tool_result" && event.toolUseId === "control")
+					startedWhenConsumed.push([...started]);
+			});
 			try {
 				await streamPending.promise;
+				await control.started;
 				await nextTick();
-				expect(started).toEqual([]);
+				expect(started).toEqual(["control"]);
+				control.release();
+				// Read starts while the stream is still open, after control's result was
+				// consumed: effects applied by the consumer are visible to it.
+				await read.started;
+				expect(startedWhenConsumed).toEqual([["control"]]);
 			} finally {
+				control.release();
 				endStream.resolve();
 			}
 			expectSuccess(await result);

@@ -555,7 +555,9 @@ export class CriticalEventPersistenceError extends Error {
 export interface EventHooks {
 	/** Title tracking after assistant_message */
 	onTitleCheck?: (savedId: string) => Promise<{ titleUpdate?: boolean } | null>;
-	/** Prepare EnterPlanMode after its assistant message is persisted, without committing state. */
+	/** Runs after an assistant message is finalized, persisted and broadcast. */
+	onAssistantMessageFinalized?: () => Promise<void>;
+	/** Prepare EnterPlanMode once its tool call row is persisted, without committing state. */
 	onPrepareEnterPlanMode?: (
 		toolCallId: string,
 		toolUseId: string,
@@ -2177,6 +2179,14 @@ export async function processEvent(
 				ctx.toolCallIdsMap.set(block.toolUseId, toolCallId);
 				ctx.toolExecutionReceipts ??= new Map();
 				ctx.toolExecutionReceipts.set(block.toolUseId, { messageId: partialId, binding });
+				// Prepare plan-mode state at the call's own persistence, before the loop can
+				// start it: tools run as soon as their input is complete, not after the
+				// response ends, and the plan file path must already be in the tool context.
+				if (block.name === "EnterPlanMode" && hooks?.onPrepareEnterPlanMode) {
+					ctx.preparedPlanModeToolCalls ??= new Map();
+					ctx.preparedPlanModeToolCalls.set(block.toolUseId, toolCallId);
+					await hooks.onPrepareEnterPlanMode(toolCallId, block.toolUseId, block.input);
+				}
 				event.onToolPersisted?.(binding);
 				recordTurnToolCall(narratorId);
 				if (block.name === "Write" && typeof block.input.content === "string") {
@@ -2447,6 +2457,13 @@ export async function processEvent(
 							tu.toolUseId,
 							rows[0].id,
 						);
+						// A call bound only now never passed block_complete, so it cannot have
+						// started (execution needs the binding) nor been prepared there.
+						if (tu.name === "EnterPlanMode" && hooks?.onPrepareEnterPlanMode) {
+							ctx.preparedPlanModeToolCalls ??= new Map();
+							ctx.preparedPlanModeToolCalls.set(tu.toolUseId, binding.toolCallId);
+							await hooks.onPrepareEnterPlanMode(binding.toolCallId, tu.toolUseId, tu.input);
+						}
 					}
 					ctx.toolCallIdsMap.set(tu.toolUseId, binding.toolCallId);
 					ctx.toolExecutionReceipts.set(tu.toolUseId, { messageId: savedId, binding });
@@ -2454,29 +2471,6 @@ export async function processEvent(
 					if (tu.name === "Write" && typeof tu.input.content === "string") {
 						await handoffWriteInput(ctx, tu.toolUseId, tu.input.content, savedId, binding);
 					}
-				}
-			}
-
-			if (
-				hooks?.onPrepareEnterPlanMode &&
-				event.toolUses.some((toolUse) => toolUse.name === "EnterPlanMode")
-			) {
-				if (!fullMessage) {
-					throw new Error(
-						`Cannot prepare EnterPlanMode: persisted message ${savedId} was not found.`,
-					);
-				}
-				for (const tu of event.toolUses) {
-					if (tu.name !== "EnterPlanMode") continue;
-					const toolCall = fullMessage.toolCalls.find((tc) => tc.toolUseId === tu.toolUseId);
-					if (!toolCall?.id) {
-						throw new Error(
-							`Cannot prepare EnterPlanMode without an exact tool-call row for ${tu.toolUseId}.`,
-						);
-					}
-					ctx.preparedPlanModeToolCalls ??= new Map();
-					ctx.preparedPlanModeToolCalls.set(tu.toolUseId, toolCall.id);
-					await hooks.onPrepareEnterPlanMode(toolCall.id, tu.toolUseId, tu.input);
 				}
 			}
 
@@ -2532,6 +2526,11 @@ export async function processEvent(
 
 			const savedMsg = fullMessage ?? { id: savedId };
 			ctx.sseEmitter?.emit("event", { type: "assistant_message", data: savedMsg });
+
+			// Effects deferred until the response is persisted whole (plan approval restart).
+			if (hooks?.onAssistantMessageFinalized) {
+				await hooks.onAssistantMessageFinalized();
+			}
 
 			// Main narrator: title tracking
 			if (hooks?.onTitleCheck) {

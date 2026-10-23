@@ -1901,6 +1901,86 @@ describe("narrator event handler persistence", () => {
 		}
 	});
 
+	test("EnterPlanMode 在自身 block_complete 落库时准备，assistant_message 不再重复准备", async () => {
+		const narratorId = `enter-plan-prepare-${Date.now()}`;
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({ id: narratorId, createdAt: now, updatedAt: now });
+		let partialId: string | undefined;
+		let savedMessageId: string | undefined;
+		const ctx: EventHandlerContext = {
+			...makeSubagentContext(),
+			narratorId,
+			broadcastTargetId: narratorId,
+			parentToolUseId: undefined,
+			conversationId: `conversation-${narratorId}`,
+			getPartialMessageId: () => partialId,
+			setPartialMessageId: (id) => {
+				partialId = id;
+			},
+			provider: "test",
+			model: "test-model",
+		};
+		const order: string[] = [];
+		const prepared: Array<[string, string]> = [];
+		const hooks = {
+			onPrepareEnterPlanMode: async (toolCallId: string, toolUseId: string) => {
+				order.push("prepare");
+				prepared.push([toolCallId, toolUseId]);
+			},
+			onAssistantMessageFinalized: async () => {
+				order.push("finalized");
+			},
+		};
+
+		try {
+			await processEvent(
+				{
+					type: "block_complete",
+					block: { type: "tool_use", toolUseId: "enter-plan", name: "EnterPlanMode", input: {} },
+					// The loop may start the call once it holds the binding: prepared state
+					// must already exist by then.
+					onToolPersisted: () => {
+						order.push("persisted");
+					},
+				},
+				ctx,
+				hooks,
+			);
+			savedMessageId = partialId;
+			expect(order).toEqual(["prepare", "persisted"]);
+			expect(prepared).toHaveLength(1);
+			expect(prepared[0]?.[1]).toBe("enter-plan");
+			expect(ctx.preparedPlanModeToolCalls?.get("enter-plan")).toBe(prepared[0]?.[0]);
+
+			await processEvent(
+				{
+					type: "assistant_message",
+					text: "",
+					toolUses: [{ toolUseId: "enter-plan", name: "EnterPlanMode", input: {} }],
+				},
+				ctx,
+				hooks,
+			);
+			expect(prepared).toHaveLength(1);
+			expect(order).toEqual(["prepare", "persisted", "finalized"]);
+			expect(partialId).toBeUndefined();
+		} finally {
+			sqlite.run("PRAGMA foreign_keys = OFF");
+			try {
+				if (savedMessageId) {
+					await db.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, savedMessageId));
+					await db
+						.delete(narratorMessageRefs)
+						.where(eq(narratorMessageRefs.messageId, savedMessageId));
+					await db.delete(narratorMessages).where(eq(narratorMessages.id, savedMessageId));
+				}
+				await db.delete(narrators).where(eq(narrators.id, narratorId));
+			} finally {
+				sqlite.run("PRAGMA foreign_keys = ON");
+			}
+		}
+	});
+
 	test("EnterPlanMode 仅在成功结果落库后按 row id 提交一次", async () => {
 		const ctx = makeSubagentContext();
 		ctx.preparedPlanModeToolCalls = new Map([["reused-call", "tool-row-new"]]);

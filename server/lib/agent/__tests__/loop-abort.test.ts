@@ -24,6 +24,7 @@ let providerScenario:
 	| "enter_plan_prepared_order"
 	| "interleaved_tool_chunk_order" = "abort";
 let providerAttempts = 0;
+let enterPlanPermissionRequested = false;
 let streamingBoundaryClock = 0;
 let streamingBoundaryTool = "Write";
 let streamingBoundaryChunks: Array<{
@@ -298,6 +299,11 @@ const testProvider: ProviderAdapter = {
 			yield {
 				toolUses: [{ toolUseId: "tu_enter_plan", name: "EnterPlanMode", input: {} }],
 			};
+			// Keep the response open until the call asked for permission: it starts mid-stream.
+			while (!enterPlanPermissionRequested) {
+				if (params.signal.aborted) throw new Error("Aborted");
+				await new Promise((resolve) => setTimeout(resolve, 1));
+			}
 			return;
 		}
 		yield {
@@ -914,27 +920,41 @@ describe("agentLoop abort result draining", () => {
 		expect(events.at(-1)).toEqual({ type: "done" });
 	});
 
-	test("EnterPlanMode 在 assistant_message 建立准备态之后才请求执行权限", async () => {
+	test("EnterPlanMode 在自身 block_complete 建立准备态之后、流结束之前请求执行权限", async () => {
 		providerScenario = "enter_plan_prepared_order";
 		providerAttempts = 0;
+		enterPlanPermissionRequested = false;
 		const ac = new AbortController();
 		const order: string[] = [];
 
 		for await (const event of agentLoop(
 			makeConfig(ac.signal, {
-				shouldStop: () => true,
+				maxTurns: 1,
 				permissionHandler: async (toolName) => {
-					if (toolName === "EnterPlanMode") order.push("permission");
+					if (toolName === "EnterPlanMode") {
+						order.push("permission");
+						enterPlanPermissionRequested = true;
+					}
 					return { behavior: "deny" };
 				},
 			}),
 			"enter plan mode",
 			{ rows: [] },
 		)) {
+			// The host prepares plan-mode state while consuming the call's own block_complete
+			// (asynchronously); the loop must not start the call before that returns.
+			if (
+				event.type === "block_complete" &&
+				event.block.type === "tool_use" &&
+				event.block.name === "EnterPlanMode"
+			) {
+				await new Promise((resolve) => setTimeout(resolve, 5));
+				order.push("prepared");
+			}
 			if (event.type === "assistant_message") order.push("assistant_message");
 		}
 
-		expect(order).toEqual(["assistant_message", "permission"]);
+		expect(order).toEqual(["prepared", "permission", "assistant_message"]);
 	});
 
 	test("宽松计划模式下的计划提醒不会污染工具输出，且被中断时不投递", async () => {
