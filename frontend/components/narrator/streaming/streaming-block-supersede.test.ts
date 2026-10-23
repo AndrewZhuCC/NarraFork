@@ -109,6 +109,20 @@ describe("dropSupersededStreamingBlocks — provider tool blocks", () => {
 	});
 });
 
+/** `row`, counting each read of its role. */
+function countRoleReads(
+	row: SupersedeCandidateMessage,
+	onRead: () => void,
+): SupersedeCandidateMessage {
+	return Object.defineProperty(row, "role", {
+		get() {
+			onRead();
+			return "assistant";
+		},
+		enumerable: true,
+	});
+}
+
 describe("dropSupersededStreamingBlocks — cost is bounded to the current turn", () => {
 	/**
 	 * This runs on every `committedMessages` identity change — several times per turn,
@@ -122,17 +136,8 @@ describe("dropSupersededStreamingBlocks — cost is bounded to the current turn"
 	it("examines only messages after the last user turn, not the whole window", () => {
 		let inspected = 0;
 		const older = Array.from({ length: 1200 }, () =>
-			rowWithElements(
-				{
-					get role() {
-						inspected++;
-						return "assistant";
-					},
-					parentToolUseId: null,
-				},
-				[{ type: "web_search", id: "ws_1" }],
-			),
-		) as unknown as SupersedeCandidateMessage[];
+			countRoleReads(assistantWith([{ type: "web_search", id: "ws_1" }]), () => inspected++),
+		);
 
 		const committed: SupersedeCandidateMessage[] = [
 			...older,
@@ -154,17 +159,8 @@ describe("dropSupersededStreamingBlocks — cost is bounded to the current turn"
 	it("does reach those same rows when no turn boundary bounds them", () => {
 		let inspected = 0;
 		const reachable = Array.from({ length: 3 }, () =>
-			rowWithElements(
-				{
-					get role() {
-						inspected++;
-						return "assistant";
-					},
-					parentToolUseId: null,
-				},
-				[{ type: "web_search", id: "ws_other" }],
-			),
-		) as unknown as SupersedeCandidateMessage[];
+			countRoleReads(assistantWith([{ type: "web_search", id: "ws_other" }]), () => inspected++),
+		);
 
 		const blocks: StreamingBlock[] = [{ type: "web_search", id: "ws_1", status: "searching" }];
 		expect(dropSupersededStreamingBlocks(blocks, reachable)).toBe(false);

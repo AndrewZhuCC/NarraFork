@@ -15,7 +15,9 @@ import {
 	upsertSubagentToolCallHeader,
 } from "./message-tree-utils";
 
+/** A row; a body in `overrides` is split again as this row's, as the server would. */
 function message(overrides: Partial<TreeMessage> = {}): TreeMessage {
+	const { blocks, ...rest } = overrides;
 	return rowWithElements(
 		{
 			id: "msg-1",
@@ -28,9 +30,9 @@ function message(overrides: Partial<TreeMessage> = {}): TreeMessage {
 			costUsd: null,
 			createdAt: "2026-05-14T00:00:00.000Z",
 			children: [],
-			...overrides,
+			...rest,
 		},
-		[],
+		messageBody({ blocks }),
 	);
 }
 

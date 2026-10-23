@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import {
 	type AppendCandidate,
 	appendLoadedMessage,
@@ -7,16 +7,18 @@ import {
 	upsertLoadedMessage,
 } from "./vlist-message-append";
 
+/** A row; a body in `extra` is split again as this row's, as the server would. */
 function msg(id: string, seq: number, extra: Partial<AppendCandidate> = {}): AppendCandidate {
+	const { blocks, ...rest } = extra;
 	return rowWithElements(
 		{
 			id,
 			seq,
 			role: "assistant",
 			parentToolUseId: null,
-			...extra,
+			...rest,
 		},
-		[{ type: "text", text: "hello" }],
+		blocks ? messageBody({ blocks }) : [{ type: "text", text: "hello" }],
 	);
 }
 

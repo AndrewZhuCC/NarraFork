@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import type { NarratorMsg, PendingPermission } from "../narrator-panel-types";
 import {
 	buildReflectionSourceIndex,
@@ -26,7 +26,9 @@ function toolBlock(overrides: ToolBlockOverrides) {
 	return { type: "tool_use", name: "Bash", ...overrides };
 }
 
+/** A row; a body in `overrides` is split again as this row's, as the server would. */
 function msg(overrides: Partial<NarratorMsg> & { id: string }): NarratorMsg {
+	const { blocks, ...rest } = overrides;
 	return rowWithElements(
 		{
 			role: "assistant",
@@ -36,9 +38,9 @@ function msg(overrides: Partial<NarratorMsg> & { id: string }): NarratorMsg {
 			narratorId: "n1",
 			parentToolUseId: null,
 			createdAt: "2026-01-01T00:00:00.000Z",
-			...overrides,
+			...rest,
 		},
-		[],
+		messageBody({ blocks }),
 	) as unknown as NarratorMsg;
 }
 
@@ -291,11 +293,7 @@ describe("buildReflectionSourceIndex", () => {
 	it("tolerates empty / malformed input", () => {
 		expect(buildReflectionSourceIndex([]).size).toBe(0);
 		expect(buildReflectionSourceIndex(undefined as unknown as NarratorMsg[]).size).toBe(0);
-		expect(
-			buildReflectionSourceIndex([
-				msg(rowWithElements({ id: "m1" }, null as unknown as [])) as NarratorMsg,
-			]).size,
-		).toBe(0);
+		expect(buildReflectionSourceIndex([msg({ id: "m1", blocks: null as never })]).size).toBe(0);
 		// A tool_use block without an id cannot be keyed.
 		expect(
 			buildReflectionSourceIndex([

@@ -11,8 +11,16 @@
 
 import { beforeAll, describe, expect, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
-import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
-import { type AdapterContext, adaptSegment } from "@shared/pretext-layout/segment-adapter";
+import {
+	type MessageBodySource,
+	messageBody,
+	rowWithElements,
+} from "@shared/narrator-blocks/message-blocks";
+import {
+	type AdapterContentBlock,
+	type AdapterContext,
+	adaptSegment,
+} from "@shared/pretext-layout/segment-adapter";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { measureMessageBubble } from "./measure/measure-message-bubble";
@@ -34,7 +42,9 @@ const WIDTH = 600;
 /** Full detail level, matching segment-adapter.test.ts. */
 const CTX: AdapterContext = { lod: 5 };
 
+/** A user row; a body in `extra` is split again as this row's, as the server would. */
 function userMessage(extra: Record<string, unknown>) {
+	const { blocks, ...rest } = extra as Record<string, unknown> & MessageBodySource;
 	return {
 		kind: "message" as const,
 		msg: rowWithElements(
@@ -42,9 +52,11 @@ function userMessage(extra: Record<string, unknown>) {
 				id: "m1",
 				role: "user",
 				createdAt: "2026-07-28T10:00:00.000Z",
-				...extra,
+				...rest,
 			},
-			[{ type: "text", text: "continue the task" }],
+			(blocks
+				? messageBody({ blocks })
+				: [{ type: "text", text: "continue the task" }]) as AdapterContentBlock[],
 		),
 	};
 }

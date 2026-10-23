@@ -15,7 +15,9 @@ import {
 } from "./narrator-message-helpers";
 import type { NarratorMsg } from "./narrator-panel-types";
 
+/** A row; a body in `overrides` is split again as this row's, as the server would. */
 function msg(overrides: Partial<NarratorMsg> = {}): NarratorMsg {
+	const { blocks, ...rest } = overrides;
 	return rowWithElements(
 		{
 			id: "m1",
@@ -26,9 +28,9 @@ function msg(overrides: Partial<NarratorMsg> = {}): NarratorMsg {
 			toolCalls: [],
 			children: [],
 			createdAt: "2026-01-01T00:00:00.000Z",
-			...overrides,
+			...rest,
 		},
-		[],
+		messageBody({ blocks }),
 	) as NarratorMsg;
 }
 
