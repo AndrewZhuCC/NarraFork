@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api/types";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { segmentMessages } from "../message/message-segments";
 import { type AdapterSegment, adaptSegments } from "./segment-adapter";
 import { resolveVListBlockTarget } from "./vlist-block-target";
@@ -9,22 +10,18 @@ import { resolveVListBlockTarget } from "./vlist-block-target";
  * before it is deleted: the blocks a message names, or for a row the client builds, the
  * blocks the server would split it into.
  */
-type Ref = NonNullable<TreeMessage["blockRefs"]>[number];
-const ref = (id: string, from: number, to = from + 1): Ref => ({
-	id,
-	kind: "output",
-	subtype: null,
-	phase: "done",
-	revision: 1,
-	wireId: null,
-	attemptId: null,
-	hasOriginal: false,
-	from,
-	to,
-});
 
-function message(texts: string[], blockRefs?: Ref[]): TreeMessage {
-	return {
+/** A block the server named, over the elements `[from, to)` of the row's texts. */
+interface Named {
+	id: string;
+	from: number;
+	to: number;
+}
+const ref = (id: string, from: number, to = from + 1): Named => ({ id, from, to });
+
+function message(texts: string[], named?: Named[]): TreeMessage {
+	const elements = texts.map((text) => ({ type: "text", text }));
+	const row = {
 		id: "m1",
 		narratorId: "n1",
 		parentToolUseId: null,
@@ -33,9 +30,23 @@ function message(texts: string[], blockRefs?: Ref[]): TreeMessage {
 		createdAt: "2026-10-01T00:00:00.000Z",
 		toolCalls: [],
 		children: [],
-		contentJson: texts.map((text) => ({ type: "text", text })),
-		...(blockRefs ? { blockRefs } : {}),
 	} as unknown as TreeMessage;
+	if (!named) return rowWithElements(row, elements);
+	return {
+		...row,
+		blocks: named.map(({ id, from, to }) => ({
+			id,
+			kind: "output",
+			subtype: null,
+			phase: "done",
+			revision: 1,
+			wireId: null,
+			attemptId: null,
+			hasOriginal: false,
+			named: true,
+			elements: elements.slice(from, to),
+		})),
+	};
 }
 
 const keysOf = (msg: TreeMessage) =>

@@ -7,7 +7,7 @@
 import { mergeSendDeliveryTargetCount, mergeSendDeliveryTargets } from "@shared/communication-tool";
 import type { FileReferenceContext } from "@shared/file-reference";
 import { normalizeFileReferenceContext } from "@shared/file-reference-context";
-import { messageBody } from "@shared/narrator-blocks/message-blocks";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { isEmptyReasoningBlock } from "@shared/reasoning-content";
 import { appendStreamingTextPreview } from "../narrator-message-helpers";
 import type { ContentBlock, NarratorMsg, ToolCallRow } from "../narrator-panel-types";
@@ -94,7 +94,7 @@ export function isToolOnlyMessage(msg: NarratorMsg): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Tool call resolution (from contentJson blocks → ToolCallData)
+// Tool call resolution (from tool_use elements → ToolCallData)
 // ---------------------------------------------------------------------------
 
 function parseToolTimestamp(value: unknown): number | undefined {
@@ -247,7 +247,7 @@ type MessageMaterials = {
 type CachedMessageMaterials = {
 	msg: NarratorMsg;
 	role: NarratorMsg["role"];
-	contentJson: NarratorMsg["contentJson"];
+	body: readonly unknown[];
 	toolCalls: NarratorMsg["toolCalls"];
 	children: NarratorMsg["children"];
 	materials: MessageMaterials;
@@ -255,7 +255,7 @@ type CachedMessageMaterials = {
 
 /**
  * Owned by one message-list coordinator, never shared globally. Direct message/
- * role/contentJson/toolCalls/children replacement invalidates automatically.
+ * role/body/toolCalls/children replacement invalidates automatically.
  * Nested in-place edits require invalidate(id), or invalidate()/clear() for all.
  * Only per-message materials are retained: runs are assembled afresh each time.
  */
@@ -309,7 +309,7 @@ export class MessageSegmentationCache {
 			entry &&
 			entry.msg === msg &&
 			entry.role === msg.role &&
-			entry.contentJson === msg.contentJson &&
+			entry.body === messageBody(msg) &&
 			entry.toolCalls === msg.toolCalls &&
 			entry.children === msg.children
 		) {
@@ -328,7 +328,7 @@ export class MessageSegmentationCache {
 			this.entries.set(msg.id, {
 				msg,
 				role: msg.role,
-				contentJson: msg.contentJson,
+				body: messageBody(msg),
 				toolCalls: msg.toolCalls,
 				children: msg.children,
 				materials,
@@ -896,14 +896,13 @@ export function buildStreamingMsg(opts: {
 		}
 	}
 
-	return {
+	const row = {
 		id: "__streaming__",
 		narratorId,
 		...(opts.model !== undefined ? { model: opts.model } : {}),
 		...(opts.provider !== undefined ? { provider: opts.provider } : {}),
 		parentToolUseId: null,
 		role: "assistant",
-		contentJson: blocks,
 		contentText: null,
 		toolCalls: toolChunksMsg?.toolCalls ?? [],
 		createdAt: toolChunksMsg?.createdAt ?? new Date().toISOString(),
@@ -912,6 +911,7 @@ export function buildStreamingMsg(opts: {
 		// `streamingBlocks`, so the accumulator's index carries over unchanged.
 		...(liveBlockIndex != null ? { liveBlockIndex } : {}),
 	} as NarratorMsg;
+	return rowWithElements(row, blocks);
 }
 
 /**

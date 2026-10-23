@@ -1,4 +1,10 @@
 import type { BaseContentBlock, TreeMessage } from "@frontend/lib/api/types";
+import {
+	filterRowElements,
+	type MessageBodySource,
+	mapRowElements,
+	messageBody,
+} from "@shared/narrator-blocks/message-blocks";
 import { isReasoningBlock } from "@shared/pretext-layout/reasoning-segments";
 import { resolveLiveBlockIndex } from "@shared/pretext-layout/streaming-live-blocks";
 import type { StreamingBlock } from "../message/message-segments";
@@ -7,11 +13,10 @@ import { collectPersistedToolUseIds } from "./streaming-tool-chunks";
 
 export { STREAMING_MESSAGE_ID } from "@shared/pretext-layout/streaming-live-blocks";
 
-export interface HandoffMessage {
+export interface HandoffMessage extends MessageBodySource {
 	id?: unknown;
 	role?: unknown;
 	parentToolUseId?: unknown;
-	contentJson?: unknown;
 	toolCalls?: unknown;
 	children?: readonly unknown[];
 }
@@ -35,8 +40,8 @@ export function projectStreamingMessage(
 	isSubagent = false,
 ): TreeMessage | null {
 	if (!streaming) return null;
-	const persisted = currentTurn(committed, isSubagent).flatMap((message) =>
-		Array.isArray(message.contentJson) ? (message.contentJson as BaseContentBlock[]) : [],
+	const persisted = currentTurn(committed, isSubagent).flatMap(
+		(message) => messageBody(message) as readonly BaseContentBlock[],
 	);
 	// Modern ids are global, not turn coordinates. A user can interject while an
 	// earlier assistant block is still active, so index the whole loaded document.
@@ -45,11 +50,10 @@ export function projectStreamingMessage(
 		if (
 			message.id === "__streaming__" ||
 			message.role !== "assistant" ||
-			(!isSubagent && message.parentToolUseId) ||
-			!Array.isArray(message.contentJson)
+			(!isSubagent && message.parentToolUseId)
 		)
 			continue;
-		for (const block of message.contentJson as BaseContentBlock[]) {
+		for (const block of messageBody(message) as readonly BaseContentBlock[]) {
 			const identity = contentBlockIdentity(block);
 			if (identity && identity.revision >= (versions.get(identity.id)?.revision ?? -1))
 				versions.set(identity.id, block);
@@ -58,7 +62,7 @@ export function projectStreamingMessage(
 	const tools = collectPersistedToolUseIds(committed);
 	const liveIndex = resolveLiveBlockIndex(true, streaming);
 	let nextLiveIndex = -1;
-	const contentJson = (streaming.contentJson as BaseContentBlock[]).filter((block, index) => {
+	const filtered = filterRowElements(streaming, (block, index) => {
 		if (block.type === "tool_use") return !tools.has(block.id ?? "");
 		if (
 			block.type !== "text" &&
@@ -77,17 +81,14 @@ export function projectStreamingMessage(
 		if (!covered && index === liveIndex) nextLiveIndex = index;
 		return !covered;
 	});
-	if (contentJson.length === 0) return null;
+	const body = messageBody(filtered);
+	if (body.length === 0) return null;
 	// Filtering may have shifted the lane. Compare immutable published block objects, not indices.
-	if (nextLiveIndex >= 0)
-		nextLiveIndex = contentJson.indexOf((streaming.contentJson as BaseContentBlock[])[liveIndex]);
+	if (nextLiveIndex >= 0) nextLiveIndex = body.indexOf(messageBody(streaming)[liveIndex]);
 	const toolCalls = (streaming.toolCalls ?? []).filter((call) => !tools.has(call.toolUseId));
-	if (
-		contentJson.length === (streaming.contentJson as BaseContentBlock[]).length &&
-		toolCalls.length === (streaming.toolCalls ?? []).length
-	)
+	if (filtered === streaming && toolCalls.length === (streaming.toolCalls ?? []).length)
 		return streaming;
-	return { ...streaming, contentJson, toolCalls, liveBlockIndex: nextLiveIndex } as TreeMessage;
+	return { ...filtered, toolCalls, liveBlockIndex: nextLiveIndex };
 }
 
 /**
@@ -102,7 +103,7 @@ export function projectStreamingDocument(
 	if (!streaming) return committed;
 	const projected = projectStreamingMessage(streaming, committed, true);
 	if (!projected) return committed;
-	const liveBlocks = projected.contentJson as BaseContentBlock[];
+	const liveBlocks = messageBody(projected);
 	const byId = new Map(
 		liveBlocks.flatMap((block) => {
 			const identity = contentBlockIdentity(block);
@@ -112,10 +113,9 @@ export function projectStreamingDocument(
 	const mergedIds = new Set<string>();
 	const liveIndex = resolveLiveBlockIndex(true, projected);
 	const messages = committed.map((message) => {
-		if (message.role !== "assistant" || !Array.isArray(message.contentJson)) return message;
-		let changed = false;
+		if (message.role !== "assistant") return message;
 		let liveBlockIndex = -1;
-		const contentJson = (message.contentJson as BaseContentBlock[]).map((block, index) => {
+		const merged = mapRowElements(message, (block, index) => {
 			const identity = contentBlockIdentity(block);
 			const live = identity ? byId.get(identity.id) : undefined;
 			if (
@@ -125,7 +125,6 @@ export function projectStreamingDocument(
 				(live.revision as number) <= identity.revision
 			)
 				return block;
-			changed = true;
 			mergedIds.add(identity.id);
 			if (liveBlocks[liveIndex] === live) liveBlockIndex = index;
 			// Citations/translations reference the committed text, not the raw newer revision.
@@ -147,31 +146,25 @@ export function projectStreamingDocument(
 			}
 			return { ...base, ...live };
 		});
-		return changed
-			? ({
-					...message,
+		return merged !== message
+			? {
+					...merged,
 					// The matched newer block belongs to this actual upstream request.
 					// Older checkpoints can still carry no identity (or a configured alias).
 					model: projected.model ?? message.model,
 					provider: projected.provider ?? message.provider,
-					contentJson,
 					liveBlockIndex,
 					liveContentProjection: true,
-				} as TreeMessage)
+				}
 			: message;
 	});
-	const remaining = liveBlocks.filter((block) => !block.id || !mergedIds.has(block.id));
-	if (remaining.length > 0) {
-		messages.push(
-			remaining.length === liveBlocks.length
-				? projected
-				: ({
-						...projected,
-						contentJson: remaining,
-						liveBlockIndex: remaining.indexOf(liveBlocks[liveIndex]),
-					} as TreeMessage),
-		);
-	}
+	const remaining = filterRowElements(projected, (block) => !block.id || !mergedIds.has(block.id));
+	if (remaining === projected) messages.push(projected);
+	else if (messageBody(remaining).length > 0)
+		messages.push({
+			...remaining,
+			liveBlockIndex: messageBody(remaining).indexOf(liveBlocks[liveIndex]),
+		});
 	return messages;
 }
 
@@ -190,9 +183,9 @@ export function projectPendingEmptyReasoning(
 		const message = messages[index];
 		if (!message || (!isSubagent && message.parentToolUseId)) continue;
 		if (message.role !== "assistant") return messages;
-		const blocks = message.contentJson as BaseContentBlock[];
+		const blocks = messageBody(message);
 		if (message.toolCalls?.length) return messages;
-		if (!Array.isArray(blocks) || blocks.length === 0) continue;
+		if (blocks.length === 0) continue;
 		const blockIndex = blocks.length - 1;
 		const block = blocks[blockIndex];
 		if (

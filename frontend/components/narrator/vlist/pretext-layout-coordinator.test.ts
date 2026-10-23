@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { clearToken, setToken } from "@frontend/lib/api/client";
 import type { PretextDocumentPageResult, TreeMessage } from "@frontend/lib/api/types";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { MessageSegmentationCache } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { installCanvasStub } from "./measure/test-canvas-stub";
@@ -880,7 +881,7 @@ function toolPage(status: string): PretextDocumentPageResult {
 }
 
 function loadedToolStatus(snapshot: { input?: { messages: TreeMessage[] } }): string | undefined {
-	const block = snapshot.input?.messages[0]?.contentJson?.find((b) => b.type === "tool_use");
+	const block = messageBody(snapshot.input?.messages[0])?.find((b) => b.type === "tool_use");
 	return (block as { status?: string } | undefined)?.status;
 }
 
@@ -899,7 +900,7 @@ describe("PretextLayoutCoordinator.applyLivePatch", () => {
 		const applied = coordinator.applyLivePatch((messages) => ({
 			messages: messages.map((msg) => ({
 				...msg,
-				contentJson: msg.contentJson.map((block) =>
+				contentJson: messageBody(msg).map((block) =>
 					block.type === "tool_use" ? { ...block, status: "success" } : block,
 				),
 			})) as TreeMessage[],
@@ -962,7 +963,7 @@ describe("PretextLayoutCoordinator.applyLivePatch", () => {
 			(messages) => ({
 				messages: messages.map((msg) => ({
 					...msg,
-					contentJson: msg.contentJson.map((block) =>
+					contentJson: messageBody(msg).map((block) =>
 						block.type === "tool_use"
 							? { ...block, status: "success", outputJson: "line\nline\nline" }
 							: block,
@@ -1026,7 +1027,7 @@ describe("PretextLayoutCoordinator — scrollTopSmoothFollow stamping", () => {
 			(messages) => ({
 				messages: messages.map((msg) => ({
 					...msg,
-					contentJson: msg.contentJson.map((block) =>
+					contentJson: messageBody(msg).map((block) =>
 						block.type === "tool_use" ? { ...block, status: "success" } : block,
 					),
 				})) as TreeMessage[],
@@ -1201,7 +1202,7 @@ describe("transient preparation lifecycle", () => {
 		expect(owned.segments.size).toBe(2);
 		// An in-place edit keeps the message/array identity; a non-stream rebuild
 		// must invalidate rather than trusting reference equality.
-		(historical.contentJson as { text: string }[])[0].text = "edited historical text";
+		(messageBody(historical) as ReadonlyArray<{ text: string }>)[0].text = "edited historical text";
 		coordinator.rebuild(buildOptions);
 		expect(owned.segments.getMaterials(historical)).not.toBe(initial);
 		coordinator.reset();

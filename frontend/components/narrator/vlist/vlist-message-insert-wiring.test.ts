@@ -21,6 +21,7 @@
 
 import { beforeAll, describe, expect, it } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api/types";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 
 beforeAll(() => {
@@ -170,11 +171,12 @@ describe("ask-in-passing canonical document mutations", () => {
 			const rows = coordinator.getSnapshot().input?.messages ?? [];
 			expect(rows.map((row) => row.id)).toEqual(canonical.map((row) => row.id));
 			if (eventKind === "resolved") {
-				expect(rows.find((row) => row.id === pending.id)?.contentJson[0]?.status).toBe("resolved");
+				expect(messageBody(rows.find((row) => row.id === pending.id))[0]?.status).toBe("resolved");
 				coordinator.upsertMessage(pending, false, scrolledUp);
 				expect(
-					coordinator.getSnapshot().input?.messages.find((row) => row.id === pending.id)
-						?.contentJson[0]?.status,
+					messageBody(
+						coordinator.getSnapshot().input?.messages.find((row) => row.id === pending.id),
+					)[0]?.status,
 				).toBe("resolved");
 			}
 		});

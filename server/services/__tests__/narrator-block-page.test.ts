@@ -23,10 +23,13 @@ const { decodeBlockPage } = await import("@frontend/lib/block-protocol");
 const { messageBlocks } = await import("@shared/narrator-blocks/message-blocks");
 
 /** A decoded value without the block sidecar the client adds to every row. */
-function withoutBlockRefs<T>(value: T): T {
-	return JSON.parse(JSON.stringify(value), (key, field) =>
-		key === "blockRefs" ? undefined : field,
-	);
+/** The value with each decoded row's body back as the elements its blocks hold. */
+function withBodies<T>(value: T): T {
+	return JSON.parse(JSON.stringify(value), (_key, field) => {
+		if (!field || typeof field !== "object" || !Array.isArray(field.blocks)) return field;
+		const { blocks, ...row } = field as { blocks: Array<{ elements: unknown[] }> };
+		return { ...row, contentJson: blocks.flatMap((block) => block.elements) };
+	});
 }
 
 const NOW = "2026-10-01T00:00:00.000Z";
@@ -171,16 +174,19 @@ describe("the message page in protocol v2", () => {
 });
 
 describe("the client's decoder", () => {
-	test("gives back the v1 page, each row's blocks alongside", async () => {
+	test("gives back the page's rows, each holding its named blocks", async () => {
 		const { stepId } = await conversation();
 		const v1 = await narratorService.getPretextDocumentPage("n1");
 		const decoded = decodeBlockPage(
 			page.toBlockPage(structuredClone(v1)) as unknown as PretextDocumentPageResult,
 		);
-		expect(withoutBlockRefs(decoded)).toEqual(JSON.parse(JSON.stringify(v1)));
+		expect(withBodies(decoded)).toEqual(JSON.parse(JSON.stringify(v1)));
 		const step = decoded.messages.find((message) => message.id === stepId);
-		expect(step?.blockRefs?.map((block) => block.id)).toEqual(rowIds(stepId));
-		expect(step?.blockRefs?.map((block) => [block.from, block.to])).toEqual([
+		if (!step) throw new Error("step row missing");
+		const blocks = messageBlocks(step);
+		expect(blocks.map((block) => block.id)).toEqual(rowIds(stepId));
+		expect(blocks.every((block) => block.named)).toBe(true);
+		expect(blocks.map((block) => [block.from, block.from + block.elements.length])).toEqual([
 			[0, 1],
 			[1, 2],
 			[2, 3],
@@ -213,6 +219,6 @@ describe("the client's decoder", () => {
 			hasPrev: false,
 		};
 		const decoded = decodeBlockPage(page.toBlockPage(structuredClone(v1)) as unknown as typeof v1);
-		expect(withoutBlockRefs(decoded)).toEqual(v1);
+		expect(withBodies(decoded)).toEqual(v1);
 	});
 });

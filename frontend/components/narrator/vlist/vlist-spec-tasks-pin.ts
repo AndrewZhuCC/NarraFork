@@ -1,4 +1,4 @@
-import { messageBody } from "@shared/narrator-blocks/message-blocks";
+import { type MessageWithBody, messageBody } from "@shared/narrator-blocks/message-blocks";
 
 /**
  * vlist-spec-tasks-pin.ts — Pure "latest spec://tasks.json call" identification
@@ -27,13 +27,8 @@ export interface SpecTasksToolCallLike {
 }
 
 /** Structural minimum of a message (its tool_use elements + toolCalls). */
-export interface SpecTasksMessageLike {
-	contentJson?: ReadonlyArray<{
-		type?: unknown;
-		id?: unknown;
-		name?: unknown;
-		input?: unknown;
-	}> | null;
+export interface SpecTasksMessageLike
+	extends MessageWithBody<{ type?: unknown; id?: unknown; name?: unknown; input?: unknown }> {
 	toolCalls?: readonly SpecTasksToolCallLike[] | null;
 }
 

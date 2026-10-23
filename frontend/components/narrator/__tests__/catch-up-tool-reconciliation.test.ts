@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { ToolCallRecord, TreeMessage } from "../../../lib/api";
 import { mergeToolCallFieldsInTree } from "../message/message-tree-utils";
 import {
@@ -85,7 +86,7 @@ function mergedToolState(messages: TreeMessage[]) {
 		startedAt?: number;
 		_streamingOutput?: string;
 	};
-	const toolBlock = message.contentJson.find(
+	const toolBlock = messageBody(message).find(
 		(block) => block.type === "tool_use" && block.id === TOOL_USE_ID,
 	);
 	return { toolCall, toolBlock };
@@ -133,7 +134,7 @@ describe("catch-up top-level tool reconciliation", () => {
 		);
 		expect(result.synthetic).toHaveLength(0);
 		expect(result.messages[0].toolCalls).toHaveLength(0);
-		const toolBlock = result.messages[0].contentJson.find(
+		const toolBlock = messageBody(result.messages[0]).find(
 			(block) => block.type === "tool_use" && block.id === TOOL_USE_ID,
 		);
 		expect(toolBlock?.status).toBe("running");

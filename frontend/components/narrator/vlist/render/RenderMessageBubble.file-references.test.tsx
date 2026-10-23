@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import type { FileReference, FileReferenceSnapshot, FileTarget } from "@shared/file-reference";
 import { fileReferenceLabel } from "@shared/file-reference-display";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import { type AdapterMessage, adaptSegments } from "@shared/pretext-layout/segment-adapter";
 import { parseHTML } from "linkedom";
 import { act } from "react";
@@ -212,7 +213,7 @@ describe("captured message file references", () => {
 			{
 				...streamed,
 				id: "reloaded",
-				contentJson: JSON.parse(JSON.stringify(streamed.contentJson)),
+				contentJson: JSON.parse(JSON.stringify(messageBody(streamed))),
 			},
 		]) {
 			const opened: FileTarget[] = [];

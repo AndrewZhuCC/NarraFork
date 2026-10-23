@@ -2,12 +2,16 @@ import { describe, expect, test } from "bun:test";
 import {
 	type BlockSourceMessage,
 	blockAtIndex,
-	type MessageBlockRefLike,
+	filterRowElements,
+	mapRowElements,
 	messageBlocks,
+	messageBody,
+	type RowBlock,
+	rowWithElements,
 } from "./message-blocks";
 
 type ContentBlock = Record<string, unknown>;
-type Row = BlockSourceMessage<ContentBlock> & { contentJson: ContentBlock[] };
+type Row = BlockSourceMessage<ContentBlock>;
 
 function row(overrides: Partial<Row>): Row {
 	return {
@@ -15,13 +19,12 @@ function row(overrides: Partial<Row>): Row {
 		narratorId: "n1",
 		parentToolUseId: null,
 		role: "assistant",
-		contentJson: [],
 		contentText: null,
 		...overrides,
 	};
 }
 
-const ref = (id: string, kind: string, from: number, to: number): MessageBlockRefLike => ({
+const named = (id: string, kind: string, elements: ContentBlock[]): RowBlock<ContentBlock> => ({
 	id,
 	kind,
 	subtype: null,
@@ -30,93 +33,124 @@ const ref = (id: string, kind: string, from: number, to: number): MessageBlockRe
 	wireId: null,
 	attemptId: "a1",
 	hasOriginal: false,
-	from,
-	to,
+	named: true,
+	elements,
 });
 
+const think = { type: "reasoning", text: "think" };
+const hello = { type: "text", text: "hello" };
+
 describe("messageBlocks", () => {
-	test("a row from the block protocol is its named blocks over its elements", () => {
-		const contentJson = [
-			{ type: "reasoning", text: "think" },
-			{ type: "text", text: "hello" },
-		];
-		const blocks = messageBlocks(
-			row({ contentJson, blockRefs: [ref("b1", "reasoning", 0, 1), ref("b2", "output", 1, 2)] }),
-		);
+	test("a row from the block protocol is its named blocks, placed over its body", () => {
+		const message = row({
+			blocks: [named("b1", "reasoning", [think]), named("b2", "output", [hello])],
+		});
+		const blocks = messageBlocks(message);
 		expect(blocks.map((block) => [block.id, block.kind, block.revision, block.from])).toEqual([
 			["b1", "reasoning", 3, 0],
 			["b2", "output", 3, 1],
 		]);
-		expect(blocks[1].elements).toEqual([{ type: "text", text: "hello" }]);
+		expect(blocks[1].elements).toEqual([hello]);
+		expect(messageBody(message)).toEqual([think, hello]);
 	});
 
 	test("a client-built row is split as the server splits a legacy envelope", () => {
-		const assistant = row({
-			contentJson: [
-				{ type: "reasoning", text: "think" },
-				{ type: "text", text: "hello" },
-				{ type: "tool_use", id: "toolu_1", name: "Read", input: { path: "a" } },
-			],
-		});
+		const assistant = rowWithElements(row({}), [
+			think,
+			hello,
+			{ type: "tool_use", id: "toolu_1", name: "Read", input: { path: "a" } },
+		]);
 		expect(messageBlocks(assistant).map((block) => [block.id, block.kind, block.wireId])).toEqual([
 			["m1:0", "reasoning", null],
 			["m1:1", "output", null],
 			["m1:2", "tool", "toolu_1"],
 		]);
+		expect(messageBlocks(assistant).every((block) => !block.named)).toBe(true);
 		// An injection and its legacy companion text are one context block.
-		const injection = row({
-			id: "s1",
-			role: "sys",
-			contentJson: [
-				{ type: "text", text: "legacy" },
-				{ type: "sidecar", source: "spec_update" },
-			],
-		});
+		const injection = rowWithElements(row({ id: "s1", role: "sys" }), [
+			{ type: "text", text: "legacy" },
+			{ type: "sidecar", source: "spec_update" },
+		]);
 		const [context] = messageBlocks(injection);
 		expect(messageBlocks(injection)).toHaveLength(1);
 		expect(context).toMatchObject({ kind: "context", subtype: "system_injection", from: 0 });
 		expect(context.elements).toHaveLength(2);
 		// System-written user turns are context; human turns are input.
-		const continued = row({
-			id: "u1",
-			role: "user",
-			origin: "system",
-			contentJson: [{ type: "text", text: "continue" }],
-		});
-		expect(messageBlocks(continued)[0]).toMatchObject({ kind: "context" });
-		expect(messageBlocks({ ...continued, origin: "user" })[0]).toMatchObject({
-			kind: "input",
-		});
-	});
-
-	test("refs that do not cover the elements are not trusted; the row is split", () => {
-		const contentJson = [
-			{ type: "text", text: "a" },
-			{ type: "text", text: "b" },
-		];
-		const blocks = messageBlocks(row({ contentJson, blockRefs: [ref("b1", "output", 0, 1)] }));
-		expect(blocks.map((block) => block.id)).toEqual(["m1:0", "m1:1"]);
-	});
-
-	test("the same body and refs give the same array; a new body is split again", () => {
-		const contentJson = [{ type: "text", text: "a" }];
-		const first = row({ contentJson });
-		expect(messageBlocks(first)).toBe(messageBlocks({ ...first }));
-		expect(messageBlocks({ ...first, contentJson: [...contentJson] })).not.toBe(
-			messageBlocks(first),
+		const continued = row({ id: "u1", role: "user", origin: "system" });
+		const text = [{ type: "text", text: "continue" }];
+		expect(messageBlocks(rowWithElements(continued, text))[0]).toMatchObject({ kind: "context" });
+		expect(messageBlocks(rowWithElements({ ...continued, origin: "user" }, text))[0]).toMatchObject(
+			{ kind: "input" },
 		);
-		expect(messageBlocks(row({ contentJson: [] }))).toEqual([]);
+	});
+
+	test("a row built with only its elements is split on read", () => {
+		const legacy = row({ contentJson: [think, hello] });
+		expect(messageBlocks(legacy).map((block) => block.id)).toEqual(["m1:0", "m1:1"]);
+		expect(messageBody(legacy)).toEqual([think, hello]);
+	});
+
+	test("the same blocks give the same arrays", () => {
+		const blocks = [named("b1", "reasoning", [think]), named("b2", "output", [hello])];
+		const first = row({ blocks });
+		expect(messageBlocks(first)).toBe(messageBlocks({ ...first }));
+		expect(messageBody(first)).toBe(messageBody({ ...first }));
+		expect(messageBlocks({ ...first, blocks: [...blocks] })).not.toBe(messageBlocks(first));
+		expect(messageBlocks(row({ blocks: [] }))).toEqual([]);
+		expect(messageBody(row({}))).toEqual([]);
 	});
 
 	test("blockAtIndex names the block holding an element", () => {
 		const message = row({
-			contentJson: [
-				{ type: "reasoning", text: "think" },
-				{ type: "text", text: "hello" },
-			],
-			blockRefs: [ref("b1", "reasoning", 0, 1), ref("b2", "output", 1, 2)],
+			blocks: [named("b1", "reasoning", [think]), named("b2", "output", [hello])],
 		});
 		expect(blockAtIndex(message, 1)?.id).toBe("b2");
 		expect(blockAtIndex(message, 2)).toBeUndefined();
+	});
+});
+
+describe("rewriting a row's body", () => {
+	const tool = { type: "tool_use", id: "t1", status: "running" };
+	const source = () =>
+		row({
+			blocks: [
+				named("b1", "output", [hello]),
+				named("b2", "tool", [tool]),
+				named("b3", "output", [{ type: "text", text: "bye" }]),
+			],
+		});
+
+	test("mapRowElements keeps each block's identity and every unchanged block", () => {
+		const message = source();
+		const mapped = mapRowElements(message, (element, index) =>
+			element.type === "tool_use" ? { ...element, status: "success", index } : element,
+		);
+		expect(mapped.blocks?.map((block) => block.id)).toEqual(["b1", "b2", "b3"]);
+		expect(mapped.blocks?.[0]).toBe(message.blocks?.[0]);
+		expect(mapped.blocks?.[2]).toBe(message.blocks?.[2]);
+		expect(mapped.blocks?.[1]).toMatchObject({ id: "b2", named: true, revision: 3 });
+		expect(messageBody(mapped)[1]).toEqual({ ...tool, status: "success", index: 1 });
+		expect(mapRowElements(message, (element) => element)).toBe(message);
+	});
+
+	test("filterRowElements drops emptied blocks and keeps the rest", () => {
+		const message = source();
+		const filtered = filterRowElements(message, (element) => element.type !== "tool_use");
+		expect(filtered.blocks?.map((block) => block.id)).toEqual(["b1", "b3"]);
+		expect(filtered.blocks?.[0]).toBe(message.blocks?.[0]);
+		expect(filterRowElements(message, () => true)).toBe(message);
+	});
+
+	test("a rewritten row built with only its elements holds blocks afterwards", () => {
+		const legacy = row({ contentJson: [hello, tool] });
+		const mapped = mapRowElements(legacy, (element) =>
+			element.type === "tool_use" ? { ...element, status: "success" } : element,
+		);
+		expect(mapped).not.toHaveProperty("contentJson");
+		expect(mapped.blocks?.map((block) => [block.id, block.named])).toEqual([
+			["m1:0", false],
+			["m1:1", false],
+		]);
+		expect(messageBody(mapped)).toEqual([hello, { ...tool, status: "success" }]);
 	});
 });

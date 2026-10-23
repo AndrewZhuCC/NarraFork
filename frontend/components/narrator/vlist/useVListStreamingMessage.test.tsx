@@ -2,6 +2,7 @@ import { describe, expect, it, spyOn } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api/types";
 import { textDocumentStore } from "@frontend/lib/text-document-store";
 import { MantineProvider } from "@mantine/core";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import { isTextDocumentRef } from "@shared/pretext-layout/tool-detail";
 import { parseHTML } from "linkedom";
 import { act, useEffect, useSyncExternalStore } from "react";
@@ -390,11 +391,11 @@ describe("snapshot animation through real WS / hook / coordinator / DOM", () => 
 				await h.delta(content("text", "new-live-block", "真正实时的新块", 1, 0));
 				await h.raf();
 				expect(h.animationText()).toBe("真正实时的新块");
-				expect(h.live()?.contentJson.find((block) => block.id === "snapshot-b")).toHaveProperty(
+				expect(messageBody(h.live()).find((block) => block.id === "snapshot-b")).toHaveProperty(
 					"_streamAnimSnapshotEpoch",
 				);
 				expect(
-					h.live()?.contentJson.find((block) => block.id === "new-live-block"),
+					messageBody(h.live()).find((block) => block.id === "new-live-block"),
 				).not.toHaveProperty("_streamAnimSnapshotEpoch");
 			},
 			{ animateStreaming: true },
@@ -423,7 +424,7 @@ describe("snapshot animation through real WS / hook / coordinator / DOM", () => 
 						await snapshot();
 					}
 					await h.raf();
-					expect(h.live()?.contentJson).toEqual([
+					expect(messageBody(h.live())).toEqual([
 						expect.objectContaining({ text: `${body}+TAIL`, textOffset: 0 }),
 					]);
 					expect(h.text()).toContain("PREFIX-CATCHUP");
@@ -848,13 +849,13 @@ describe("real streaming hook / local WS / coordinator / DOM handoff", () => {
 					});
 					if (!deltaFirst) await delta();
 					await h.raf();
-					expect(h.live()?.contentJson).toEqual([
+					expect(messageBody(h.live())).toEqual([
 						expect.objectContaining({ type, text: "PREFIX+TAIL", textOffset: 0 }),
 					]);
 					await h.commit([content(type, "active-block", "PREFIX+TAIL", 2, 0)]);
 					await h.delta(content(type, "active-block", "+NEXT", 3, 11));
 					await h.raf();
-					expect(h.live()?.contentJson).toEqual([
+					expect(messageBody(h.live())).toEqual([
 						expect.objectContaining({ type, text: "PREFIX+TAIL+NEXT", textOffset: 0 }),
 					]);
 				});
@@ -886,7 +887,7 @@ describe("real streaming hook / local WS / coordinator / DOM handoff", () => {
 			expect(h.text()).not.toContain("INTERNAL-MARKER");
 			await h.delta(content("text", "t", "+TAIL", 3, raw.length));
 			await h.raf();
-			expect(h.live()?.contentJson).toEqual([
+			expect(messageBody(h.live())).toEqual([
 				expect.objectContaining({ text: `${raw}+TAIL`, revision: 3 }),
 			]);
 			await h.commit([content("text", "t", "RAW+TAIL", 4)], true);

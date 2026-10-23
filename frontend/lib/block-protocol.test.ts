@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { messageBlocks, messageBody } from "@shared/narrator-blocks/message-blocks";
+import type { TreeMessage } from "./api/types";
 import { decodeBlockFrame, decodeBlockPage } from "./block-protocol";
 import { NarratorWSManager } from "./narrator-ws-manager";
 
@@ -32,7 +34,7 @@ describe("block protocol decoding", () => {
 		expect(decodeBlockFrame(frame)).toEqual([frame]);
 	});
 
-	test("a block holding several elements maps to their range of contentJson", () => {
+	test("each row holds its named blocks, a block holding several elements", () => {
 		const decoded = decodeBlockPage({
 			protocol: 2,
 			messages: [envelope("m1", ["b1", "b2"])],
@@ -46,16 +48,14 @@ describe("block protocol decoding", () => {
 				block("b2", "m1", [{ type: "text", text: "b" }]),
 			],
 			hasPrev: true,
-		}) as unknown as {
-			hasPrev: boolean;
-			messages: Array<{ contentJson: unknown[]; blockRefs: Array<Record<string, unknown>> }>;
-		};
+		}) as unknown as { hasPrev: boolean; messages: TreeMessage[] };
 		expect(decoded.hasPrev).toBe(true);
-		expect(decoded.messages[0].contentJson).toHaveLength(3);
-		expect(decoded.messages[0].blockRefs).toEqual([
-			expect.objectContaining({ id: "b1", kind: "reasoning", from: 0, to: 2 }),
-			expect.objectContaining({ id: "b2", kind: "output", from: 2, to: 3 }),
+		expect(messageBody(decoded.messages[0])).toHaveLength(3);
+		expect(messageBlocks(decoded.messages[0])).toEqual([
+			expect.objectContaining({ id: "b1", kind: "reasoning", named: true, from: 0 }),
+			expect.objectContaining({ id: "b2", kind: "output", named: true, from: 2 }),
 		]);
+		expect(decoded.messages[0]).not.toHaveProperty("contentJson");
 	});
 
 	test("a block opening reaches no listener", () => {
@@ -71,7 +71,7 @@ describe("block protocol decoding", () => {
 		).toEqual([]);
 	});
 
-	test("a message frame decodes to the v1 frame named by its cause", () => {
+	test("a message frame decodes to the frame named by its cause", () => {
 		const [frame] = decodeBlockFrame({
 			type: "message_upserted",
 			narratorId: "n1",
@@ -79,11 +79,8 @@ describe("block protocol decoding", () => {
 			messages: [envelope("m1", ["b1"])],
 			blocks: [block("b1", "m1", [{ type: "text", text: "hi" }], "input")],
 		});
-		expect(frame).toMatchObject({
-			type: "user_message",
-			narratorId: "n1",
-			message: { id: "m1", contentJson: [{ type: "text", text: "hi" }] },
-		});
+		expect(frame).toMatchObject({ type: "user_message", narratorId: "n1", message: { id: "m1" } });
+		expect(messageBody(frame.message as TreeMessage)).toEqual([{ type: "text", text: "hi" }]);
 		expect(frame).not.toHaveProperty("cause");
 	});
 });

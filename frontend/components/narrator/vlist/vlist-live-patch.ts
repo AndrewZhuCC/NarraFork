@@ -21,12 +21,12 @@
  * Two invariants this module exists to uphold
  * -------------------------------------------
  * 1. BOTH SIDES MUST BE WRITTEN. A tool's facts live twice: on the
- *    `toolCalls[]` row AND on the enriched `tool_use` block in `contentJson`
+ *    `toolCalls[]` row AND on the enriched `tool_use` element of the message body
  *    (the backend's `enrichToolUseBlocks` copies the row onto the block). The
  *    layout adapter reads the BLOCK FIRST (`segment-adapter.mergeSource`), so
  *    patching only the row leaves the adapter seeing the stale status and the
  *    fix silently does nothing. The shared tree helpers reused below already
- *    write both (`syncContentJsonFields`), which is precisely why they are
+ *    write both (`syncToolElementFields`), which is precisely why they are
  *    reused rather than reimplemented.
  * 2. NO-OP MUST BE REFERENTIALLY DETECTABLE. When nothing matched we return the
  *    original array reference and `changed: false`, so the caller can skip the
@@ -56,7 +56,7 @@ import {
 	type SendDeliveryTarget,
 } from "@shared/communication-tool";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
-import { messageBody } from "@shared/narrator-blocks/message-blocks";
+import { mapRowElements, messageBlocks, messageBody } from "@shared/narrator-blocks/message-blocks";
 import {
 	ACTIVE_REFLECTION_STATUSES,
 	getPermissionReflectionSuggestion,
@@ -377,7 +377,7 @@ function patchRowHoldingBlock(
 ): LivePatchResult | undefined {
 	for (let i = rows.length - 1; i >= 0; i--) {
 		const row = rows[i];
-		if (row.blockRefs?.some((block) => block.id === blockId)) {
+		if (messageBlocks(row).some((block) => block.named && block.id === blockId)) {
 			const result = patch(row);
 			if (!result.changed) return { messages: rows as TreeMessage[], changed: false };
 			const updated = [...rows];
@@ -693,16 +693,15 @@ function markTakenOverForNarrator(
 	let changed = false;
 	const updated = messages.map((message) => {
 		let next = message;
-		let localChanged = false;
-		const nextContent = (message.contentJson ?? []).map((block) => {
+		const withContent = mapRowElements(message, (block) => {
 			if (block.type !== "tool_use") return block;
 			const record = block as unknown as Record<string, unknown>;
 			if (!ownsSubagent(record, subagentNarratorId)) return block;
 			const patched = withTakenOverEntry(record, takenOver);
 			if (patched === record) return block;
-			localChanged = true;
 			return patched as unknown as typeof block;
 		});
+		let localChanged = withContent !== message;
 		const nextCalls = (message.toolCalls ?? []).map((call) => {
 			const record = call as unknown as Record<string, unknown>;
 			if (!ownsSubagent(record, subagentNarratorId)) return call;
@@ -713,7 +712,7 @@ function markTakenOverForNarrator(
 		});
 		if (localChanged) {
 			changed = true;
-			next = { ...message, contentJson: nextContent, toolCalls: nextCalls };
+			next = { ...withContent, toolCalls: nextCalls };
 		}
 		if (next.children?.length) {
 			const child = markTakenOverForNarrator(next.children, subagentNarratorId, takenOver);

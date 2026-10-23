@@ -23,7 +23,7 @@ import { type FileReference, fileReferenceDisplay } from "../file-reference";
 import { normalizeFileReferenceContext } from "../file-reference-context";
 import { knowledgeExcerpt } from "../knowledge-excerpt";
 import { isSubagentModelInheritance } from "../model-inheritance";
-import { blockAtIndex, messageBody } from "../narrator-blocks/message-blocks";
+import { blockAtIndex, type MessageWithBody, messageBody } from "../narrator-blocks/message-blocks";
 import {
 	contextBlockViews,
 	injectionBlockViews,
@@ -199,32 +199,23 @@ export interface AdapterContentBlock {
 	[key: string]: unknown;
 }
 
-/** One block of a message in the block-keyed protocol: its id and its elements `[from, to)`. */
-export interface AdapterBlockRef {
-	id: string;
-	from: number;
-	to: number;
-}
-
-export interface AdapterMessage {
-	/**
-	 * The message's blocks, when it arrived in the block-keyed protocol: its elements are
-	 * then keyed by block id (`elementKey`), so a row keeps its key when blocks before it
-	 * are deleted or inserted.
-	 */
-	blockRefs?: readonly AdapterBlockRef[];
+/**
+ * A message as the adapter reads it. Its body is its blocks (`messageBody` /
+ * `messageBlocks`); its elements are keyed by block id (`elementKey`), so a row keeps its
+ * key when blocks before it are deleted or inserted.
+ */
+export interface AdapterMessage extends MessageWithBody<AdapterContentBlock> {
 	/** Actual per-message identity; absent legacy identity must not enable GPT parsing. */
 	model?: string | null;
 	provider?: string | null;
 	id?: string;
 	role: string;
-	contentJson: AdapterContentBlock[];
 	createdAt?: string;
 	/**
 	 * Slash command the user typed, when this user message was produced by one.
 	 *
 	 * The server EXPANDS a command into its full prompt template before storing
-	 * it, so `contentJson`'s text block holds the whole (often multi-thousand
+	 * it, so the body's text element holds the whole (often multi-thousand
 	 * character) expansion while this field keeps the short `/name args` the user
 	 * actually wrote. Rendering the expansion as the bubble body is what turned a
 	 * one-line command into a screen-filling wall of text in the virtual list;

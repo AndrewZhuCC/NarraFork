@@ -7,6 +7,7 @@
 
 import { describe, expect, it } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import { mergeToolCallFieldsInTree } from "./message-tree-utils";
 
 function msg(status: string, extra: Record<string, unknown> = {}): TreeMessage {
@@ -35,7 +36,7 @@ describe("mergeToolCallFieldsInTree", () => {
 		const tc = message.toolCalls?.[0] as { status?: string; durationMs?: number };
 		expect(tc.status).toBe("success");
 		expect(tc.durationMs).toBe(12_000);
-		const block = message.contentJson?.find((b) => b.id === "tu-1") as {
+		const block = messageBody(message)?.find((b) => b.id === "tu-1") as {
 			status?: string;
 			durationMs?: number;
 		};

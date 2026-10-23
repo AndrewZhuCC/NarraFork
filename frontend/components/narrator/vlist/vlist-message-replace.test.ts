@@ -118,7 +118,7 @@ describe("replaceLoadedMessage — only a trailing truncation may land in place"
 		expect(replaceLoadedMessage(loaded, { id: "m2", contentJson: null }).reason).toBe(
 			"not-a-truncation",
 		);
-		const messyLoaded = [{ id: "m2", contentJson: "not an array" }];
+		const messyLoaded: ReplaceCandidate[] = [{ id: "m2", contentJson: "not an array" }];
 		expect(replaceLoadedMessage(messyLoaded, msg("m2", [block("text", "a")])).reason).toBe(
 			"not-a-truncation",
 		);

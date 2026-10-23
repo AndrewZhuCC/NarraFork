@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import { createSourceText } from "@shared/pretext-layout/source-text";
 import {
 	buildTopLevelStreamingChunksMsg,
@@ -140,7 +141,7 @@ describe("preserveLiveSubagentActivity", () => {
 
 		const preserved = preserveLiveSubagentActivity(existing, incoming);
 
-		expect(preserved.contentJson[0]._subagentActivity?.model).toBe("known-model");
+		expect(messageBody(preserved)[0]._subagentActivity?.model).toBe("known-model");
 		expect(preserved.toolCalls?.[0]._subagentActivity?.model).toBe("known-model");
 	});
 });

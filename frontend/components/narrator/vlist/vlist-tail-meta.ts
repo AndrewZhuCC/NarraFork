@@ -1,4 +1,4 @@
-import { messageBody } from "@shared/narrator-blocks/message-blocks";
+import { type MessageWithBody, messageBody } from "@shared/narrator-blocks/message-blocks";
 /**
  * vlist-tail-meta.ts — Pure replication of ChunkedMessageList's buildChunkTailMeta,
  * operating on a FLAT message list (PretextMessageList already flattens chunks).
@@ -13,12 +13,11 @@ import { messageBody } from "@shared/narrator-blocks/message-blocks";
  */
 
 /** Structural subset of NarratorMsg this computation needs. */
-export interface TailMetaMessage {
+export interface TailMetaMessage extends MessageWithBody<{ type?: unknown }> {
 	id?: string;
 	role: string;
 	contextPercent?: number | null;
 	turnUsageJson?: unknown;
-	contentJson?: ReadonlyArray<{ type?: unknown }>;
 }
 
 export interface TailMetaResult {

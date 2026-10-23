@@ -12,6 +12,7 @@
  */
 
 import { afterAll, describe, expect, it } from "bun:test";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import { segmentMessages } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { groupRenderUnits } from "../trace/render-units";
@@ -214,7 +215,7 @@ describe("communication × real messages, manifest and selection", () => {
 	] as const)("L%s maps a real fail completion without errorMessage through adapter and measurement", (lod) => {
 		for (const toolName of ["Send", "TeamStatus"]) {
 			const running = send("live-failure", 1, "running");
-			running.contentJson = running.contentJson.map((block) => ({
+			running.contentJson = messageBody(running).map((block) => ({
 				...block,
 				name: toolName,
 				input: { name: "worker", target_id: "worker", action: "send", message: "**hello**" },
@@ -233,7 +234,7 @@ describe("communication × real messages, manifest and selection", () => {
 					durationMs: 123,
 				})([running]);
 				expect(patched.changed).toBe(true);
-				expect(patched.messages[0]?.contentJson[0]?.errorMessage).toBeUndefined();
+				expect(messageBody(patched.messages[0])[0]?.errorMessage).toBeUndefined();
 				const failed = layout([...patched.messages], lod).items[0];
 				if (!before || !failed) throw new Error("missing communication item");
 				const data = failed.spec.data as CommunicationBubbleData;
