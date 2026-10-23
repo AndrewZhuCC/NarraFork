@@ -30,7 +30,7 @@ export interface MessageBlockRefLike {
 /** What a message needs for its blocks: its body, and its refs when it has them. */
 export interface BlockSourceMessage<E> {
 	id?: string;
-	narratorId?: string;
+	narratorId?: string | null;
 	role: string;
 	contentJson: readonly E[] | unknown;
 	contentText?: string | null;
@@ -140,7 +140,7 @@ function split<E>(message: BlockSourceMessage<E>, elements: readonly E[]): Messa
 	const messageId = message.id ?? "msg";
 	const { blocks } = splitEnvelope({
 		id: messageId,
-		narratorId: message.narratorId,
+		narratorId: message.narratorId ?? undefined,
 		role: message.role as EnvelopeRole,
 		contentJson: elements,
 		contentText: message.contentText ?? null,

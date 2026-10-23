@@ -367,7 +367,7 @@ describe("snapshot animation through real WS / hook / coordinator / DOM", () => 
 	it("seals an offscreen snapshot block on late mount but animates a genuinely new live block", async () => {
 		await withStream(
 			async (h) => {
-				await h.showOnlyKeys(["__streaming__-b0"]);
+				await h.showOnlyKeys(["__streaming__-blk[__streaming__:0]"]);
 				await h.frame({
 					type: "streaming_snapshot",
 					streamingBlocks: [

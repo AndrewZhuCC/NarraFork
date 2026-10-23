@@ -4560,7 +4560,7 @@ describe("adaptSegment — a concluded review", () => {
 					message(id, "assistant", [{ type: "reasoning", text: "whole source" }]),
 					{
 						lod: 5,
-						isTextExpanded: (key) => key === `${id}-b0`,
+						isTextExpanded: (key) => key === `${id}-blk[${id}:0]`,
 					},
 				);
 				expect(spec!.opts!.textExpanded).toBe(true);
@@ -4615,7 +4615,7 @@ describe("adaptSegment — a concluded review", () => {
 				{
 					lod: 5,
 					expandedRows: () => [0],
-					isTextExpanded: (key, bodyKey) => key === "steps-b0" && bodyKey === "seg0",
+					isTextExpanded: (key, bodyKey) => key === "steps-blk[steps:0]" && bodyKey === "seg0",
 				},
 			);
 			expect(spec!.kind).toBe("reasoning-steps");
@@ -4716,7 +4716,7 @@ describe("adaptSegment — a concluded review", () => {
 			expect(specs).toHaveLength(1);
 			expect(specs[0]).toMatchObject({
 				kind: "system-simple",
-				key: "publication-result:run-b0",
+				key: "publication-result:run-blk[publication-result:run:0]",
 				data: {
 					kind: "publication_result",
 					text: "",
