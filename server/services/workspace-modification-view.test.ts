@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
-import { db } from "../db";
+import { db, sqlite } from "../db";
 import {
 	fileAttributions,
 	narratorMessages,
@@ -967,6 +967,55 @@ describe("scoped per-path history", () => {
 		expect(group?.recentEvents.map((event) => event.id)).toEqual(ids.slice(-5).reverse());
 		expect(group?.completeness.fileHistoryComplete).toBe(false);
 		expect(view.byFile.map((entry) => entry.filePath)).toEqual(["p28.ts"]);
+	});
+
+	test("SQL text stays the same size however many path x cwd targets are queried", async () => {
+		const ws = makeWorkspace("nf-view-scoped-sql-size-");
+		const scopes = Array.from({ length: 32 }, (_, i) => subdirScope(ws, `d${i}`));
+		await seedScoped(
+			scopes.map((scope) => ({
+				workspacePath: scope.workspacePath,
+				filePath: "../p0.ts",
+				changedAt: "2026-03-01T00:00:00Z",
+			})),
+		);
+
+		// A UNION ALL branch per (path, cwd) pair reached 414 KiB and timed out in production.
+		const longestAttributionStatement = async (filePaths: string[]) => {
+			const lengths: number[] = [];
+			const prepare = sqlite.prepare.bind(sqlite);
+			const query = sqlite.query.bind(sqlite);
+			const record = (text: string) => {
+				if (text.includes("file_attributions")) lengths.push(Buffer.byteLength(text));
+			};
+			sqlite.prepare = ((text: string, ...rest: unknown[]) => {
+				record(text);
+				return (prepare as (...args: unknown[]) => unknown)(text, ...rest);
+			}) as typeof sqlite.prepare;
+			sqlite.query = ((text: string) => {
+				record(text);
+				return query(text);
+			}) as typeof sqlite.query;
+			try {
+				await getWorkspaceModificationView(ws, {
+					additionalScopes: scopes,
+					filePaths,
+					projection: "byFile",
+				});
+			} finally {
+				sqlite.prepare = prepare;
+				sqlite.query = query;
+			}
+			expect(lengths.length).toBeGreaterThan(0);
+			return Math.max(...lengths);
+		};
+
+		const one = await longestAttributionStatement(["p0.ts"]);
+		const many = await longestAttributionStatement(
+			Array.from({ length: 30 }, (_, i) => `p${i}.ts`),
+		);
+		expect(many).toBe(one);
+		expect(many).toBeLessThan(8 * 1024);
 	});
 
 	test("cwd spellings without stored rows cannot crowd out the ones that hold history", async () => {
