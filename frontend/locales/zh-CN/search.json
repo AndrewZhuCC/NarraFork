@@ -45,5 +45,7 @@
 	"messageRole_assistant": "助手",
 	"messageRole_system": "系统",
 	"messageRole_sys": "系统",
-	"messageRole_disp": "展示"
+	"messageRole_disp": "展示",
+	"recentOnly": "搜索词都很短，只搜索了最近 {{days}} 天的会话。",
+	"searchFullHistory": "搜索全部历史"
 }

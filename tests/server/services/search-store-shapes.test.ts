@@ -227,7 +227,14 @@ describe("global time search orders the full matching corpus before LIMIT", () =
 				// message, which this corpus pins elsewhere on purpose.
 				const section = entity === "messages" ? "sessions" : null;
 				for (const sort of section ? ["time", "relevance", "invalid", undefined] : []) {
-					const params = new URLSearchParams({ q: query, sections: section ?? "", limit: "2" });
+					// "PR" is a short-term query; its fixed fixture dates must not age out of the
+					// recent window, so these ordering checks search the full history.
+					const params = new URLSearchParams({
+						q: query,
+						sections: section ?? "",
+						limit: "2",
+						history: "all",
+					});
 					if (sort !== undefined) params.set("sort", sort);
 					const response = await searchApp.request(`/api/search?${params}`);
 					expect(response.status).toBe(200);
@@ -278,7 +285,7 @@ describe("global time search orders the full matching corpus before LIMIT", () =
 		}
 		for (const query of ["PR", "chronometer"]) {
 			const response = await searchApp.request(
-				`/api/search?q=${query}&sort=time&sections=sessions`,
+				`/api/search?q=${query}&sort=time&sections=sessions&history=all`,
 			);
 			expect(response.status).toBe(200);
 			const body = (await response.json()) as {

@@ -21,6 +21,8 @@ const searchBaseQuerySchema = z.object({
 	to: isoTime.optional(),
 	/** Only sessions the viewer owns. */
 	mine: z.enum(["1", "true", "0", "false"]).optional(),
+	/** `all` searches the full history even for a query of only short terms. */
+	history: z.enum(["all", "recent"]).optional(),
 	cursor: z.string().max(512).optional(),
 });
 

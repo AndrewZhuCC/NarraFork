@@ -217,6 +217,8 @@ export interface SearchSectionPage<T> {
 	/** The window filled up, so there may be more than `total`. */
 	totalIsLowerBound: boolean;
 	nextCursor: string | null;
+	/** The search limited itself to this many recent days (a query of only short terms). */
+	recentDays?: number;
 }
 
 /** A message hit listed under its session. */
@@ -283,6 +285,8 @@ export interface SearchRequest {
 	to?: string;
 	/** Only the viewer's own sessions. */
 	mine?: boolean;
+	/** Search all of history even for a query of only short terms. */
+	fullHistory?: boolean;
 	cursor?: string;
 	limit?: number;
 }

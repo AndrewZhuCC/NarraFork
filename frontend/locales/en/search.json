@@ -45,5 +45,7 @@
 	"messageRole_assistant": "Assistant",
 	"messageRole_system": "System",
 	"messageRole_sys": "System",
-	"messageRole_disp": "Display"
+	"messageRole_disp": "Display",
+	"recentOnly": "Every search term is short, so only the last {{days}} days of sessions were searched.",
+	"searchFullHistory": "Search full history"
 }

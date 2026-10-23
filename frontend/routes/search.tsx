@@ -1,4 +1,4 @@
-import { Button, Group, Loader, SegmentedControl, Stack, Text, Title } from "@mantine/core";
+import { Alert, Button, Group, Loader, SegmentedControl, Stack, Text, Title } from "@mantine/core";
 import { createFileRoute } from "@tanstack/react-router";
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
@@ -35,6 +35,8 @@ interface SearchParams {
 	project?: string;
 	range?: string;
 	mine?: string;
+	/** `all` lifts the recent-days limit on a query of only short terms. */
+	history?: string;
 }
 
 const optionalId = (value: unknown) =>
@@ -54,6 +56,7 @@ export const Route = createFileRoute("/search")({
 			project: optionalId(search.project),
 			range: normalizeSearchRange(search.range),
 			mine: search.mine === "1" || search.mine === 1 || search.mine === true ? "1" : undefined,
+			history: search.history === "all" ? "all" : undefined,
 		};
 	},
 });
@@ -168,8 +171,9 @@ function SearchPage() {
 			projectId: filters.projectId,
 			from: filters.range ? searchRangeStart(filters.range) : undefined,
 			mine: filters.mine,
+			fullHistory: params.history === "all",
 		}),
-		[params.q, filters],
+		[params.q, params.history, filters],
 	);
 	const overview = useSearchOverview(request);
 	const sections = overview.data?.sections ?? {};
@@ -193,6 +197,10 @@ function SearchPage() {
 			search: (prev) => ({ ...prev, tab: value === "all" ? undefined : value }),
 			replace: true,
 		});
+
+	const recentDays = sections.sessions?.recentDays;
+	const searchFullHistory = () =>
+		navigate({ search: (prev) => ({ ...prev, history: "all" }), replace: true });
 
 	const tabLabel = (name: SearchSectionName) =>
 		t(`tab_${name}`, { count: formatSearchTotal(sections[name]) });
@@ -221,6 +229,16 @@ function SearchPage() {
 						]}
 						style={{ alignSelf: "flex-start" }}
 					/>
+					{recentDays && (
+						<Alert color="blue" variant="light" p="xs">
+							<Group gap="xs" justify="space-between" wrap="wrap">
+								<Text size="sm">{t("recentOnly", { days: recentDays })}</Text>
+								<Button size="compact-sm" variant="light" onClick={searchFullHistory}>
+									{t("searchFullHistory")}
+								</Button>
+							</Group>
+						</Alert>
+					)}
 					{tab === "all" ? (
 						overview.isLoading ? (
 							<Loader />

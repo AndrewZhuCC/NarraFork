@@ -27,7 +27,9 @@ const {
 	encodeSearchCursor,
 	mergeSessionCandidates,
 	rankSessions,
+	SHORT_QUERY_RECENT_DAYS,
 	searchService,
+	sessionSearchWindow,
 } = await import("../../../server/services/search-service");
 const { searchRoutes } = await import("../../../server/routes/search");
 
@@ -187,7 +189,8 @@ describe("session results", () => {
 		const lead = "这是一段很长的前文，用来把命中位置推到预览窗口之外。".repeat(6);
 		seedMessage("cjk", `${lead}登录失败的原因已经找到`, day(3));
 
-		const page = await sessions("登录");
+		// The fixed fixture date ages out of the recent window, so search the full history.
+		const page = await sessions("登录", { fullHistory: true });
 		expect(page.items.map((s) => s.id)).toEqual(["cjk"]);
 		const snippet = page.items[0]?.hits[0]?.snippet ?? "";
 		expect(snippet.startsWith("...")).toBe(true);
@@ -381,5 +384,67 @@ describe("cursors", () => {
 		expect(decodeSearchCursor(undefined)).toBe(0);
 		expect(decodeSearchCursor("not-a-cursor")).toBe(0);
 		expect(decodeSearchCursor(Buffer.from('{"o":-3}').toString("base64url"))).toBe(0);
+	});
+});
+
+describe("short queries search recent history by default", () => {
+	const daysAgo = (days: number) => new Date(Date.now() - days * 86_400_000).toISOString();
+
+	beforeEach(() => {
+		seedNarrator("recent");
+		seedMessage("recent", "登录失败", daysAgo(5));
+		seedNarrator("old");
+		seedMessage("old", "登录超时", daysAgo(200));
+	});
+
+	it("limits a query of only short terms to the recent window and says so", async () => {
+		const page = await sessions("登录");
+		expect(page.items.map((s) => s.id)).toEqual(["recent"]);
+		expect(page.recentDays).toBe(SHORT_QUERY_RECENT_DAYS);
+	});
+
+	it("searches everything when asked, or when the caller set its own time bound", async () => {
+		const full = await sessions("登录", { fullHistory: true });
+		expect(full.items.map((s) => s.id).sort()).toEqual(["old", "recent"]);
+		expect(full.recentDays).toBeUndefined();
+
+		const ranged = await sessions("登录", { filters: { from: daysAgo(365) } });
+		expect(ranged.items.map((s) => s.id).sort()).toEqual(["old", "recent"]);
+		expect(ranged.recentDays).toBeUndefined();
+	});
+
+	it("leaves queries the index can serve alone", async () => {
+		seedMessage("old", "登录 kestrel", daysAgo(200));
+		const page = await sessions("登录 kestrel");
+		expect(page.items.map((s) => s.id)).toEqual(["old"]);
+		expect(page.recentDays).toBeUndefined();
+	});
+
+	it("applies the same window when a card's hits are expanded", async () => {
+		seedMessage("old", "登录重试", daysAgo(3));
+		const recent = await searchService.searchSessionHits({
+			query: "登录",
+			narratorId: "old",
+			principal: ADMIN,
+		});
+		expect(recent.hits).toHaveLength(1);
+		const full = await searchService.searchSessionHits({
+			query: "登录",
+			narratorId: "old",
+			principal: ADMIN,
+			fullHistory: true,
+		});
+		expect(full.hits).toHaveLength(2);
+	});
+
+	it("rounds the window to the UTC day", () => {
+		const morning = Date.parse("2026-10-23T01:00:00.000Z");
+		const evening = Date.parse("2026-10-23T23:00:00.000Z");
+		const at = (now: number) => sessionSearchWindow("登录", undefined, false, now).filters?.from;
+		expect(at(morning)).toBe("2026-07-25T00:00:00.000Z");
+		expect(at(evening)).toBe(at(morning));
+		expect(sessionSearchWindow("登录", { projectId: "p" }, false, morning).filters).toMatchObject({
+			projectId: "p",
+		});
 	});
 });

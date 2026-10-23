@@ -255,6 +255,11 @@ export interface SectionPage<T> {
 	/** The window filled up, so there may be more than `total`. */
 	totalIsLowerBound: boolean;
 	nextCursor: string | null;
+	/**
+	 * Set when the search was limited to this many recent days on its own (a query of only
+	 * short terms, see {@link sessionSearchWindow}), so the page can offer the full history.
+	 */
+	recentDays?: number;
 }
 
 export interface SectionSearchResponse {
@@ -441,7 +446,35 @@ export interface SectionSearchOptions {
 	limits: Partial<Record<SearchSection, number>>;
 	/** Continues one section; ignored unless exactly one section is requested. */
 	cursor?: string;
+	/** Search all of history even when the query would otherwise be limited to recent days. */
+	fullHistory?: boolean;
 	signal?: AbortSignal;
+}
+
+/** Days a session search of only short terms covers unless asked for more. */
+export const SHORT_QUERY_RECENT_DAYS = 90;
+
+/**
+ * The filters a session search runs with, and whether it limited itself.
+ *
+ * A query made only of terms too short for the index (most two-character Chinese words)
+ * takes the unindexed path, which reads every message in range. Unless the caller set a
+ * lower time bound or asked for the full history, such a search covers the last
+ * {@link SHORT_QUERY_RECENT_DAYS} days, which the `(narrator_id, created_at)` index turns into
+ * a range scan per session instead of a read of every message. The bound is rounded down to
+ * the UTC day, so repeated searches share one cache entry and one plan.
+ */
+export function sessionSearchWindow(
+	safeQuery: string,
+	filters: SearchFilters | undefined,
+	fullHistory: boolean | undefined,
+	now: number = Date.now(),
+): { filters: SearchFilters | undefined; recentDays?: number } {
+	if (fullHistory || filters?.from || globalStrategy(safeQuery) === "index") return { filters };
+	const from = new Date(
+		Math.floor(now / DAY_MS) * DAY_MS - SHORT_QUERY_RECENT_DAYS * DAY_MS,
+	).toISOString();
+	return { filters: { ...filters, from }, recentDays: SHORT_QUERY_RECENT_DAYS };
 }
 
 /** The shared part of every entity query a sectioned search makes. */
@@ -475,7 +508,8 @@ async function searchSessionSection(
 	offset: number,
 	limit: number,
 ): Promise<SectionPage<SessionResult>> {
-	const base = entityBase(options, safeQuery);
+	const window = sessionSearchWindow(safeQuery, options.filters, options.fullHistory);
+	const base = entityBase({ ...options, filters: window.filters }, safeQuery);
 	const [aggregates, titleHits] = await Promise.all([
 		searchStore.searchSessionAggregates({ ...base, limit: SESSION_AGGREGATE_CAP }),
 		searchStore.searchNarrators({ ...base, limit: SESSION_TITLE_CAP }),
@@ -510,6 +544,7 @@ async function searchSessionSection(
 	}
 	return {
 		...page,
+		...(window.recentDays ? { recentDays: window.recentDays } : {}),
 		items: page.items.map(({ candidate, score }) => ({
 			type: "session" as const,
 			id: candidate.narratorId,
@@ -674,8 +709,9 @@ export const searchService = {
 		const offset = decodeSearchCursor(options.cursor);
 		const limit = Math.max(1, Math.min(options.limit ?? 20, MAX_SESSION_HITS_PAGE));
 		// One extra row tells whether another page exists.
+		const window = sessionSearchWindow(safeQuery, options.filters, options.fullHistory);
 		const rows = await searchStore.searchSessionHits({
-			...entityBase(options, safeQuery),
+			...entityBase({ ...options, filters: window.filters }, safeQuery),
 			sort: SESSION_HIT_ORDER,
 			limit,
 			narratorIds: [options.narratorId],
