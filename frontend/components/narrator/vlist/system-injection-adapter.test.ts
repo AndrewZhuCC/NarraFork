@@ -375,7 +375,7 @@ describe("communication delivery — protocol role is not the speaker", () => {
 				const measured = VLIST_REGISTRY["injection-bubble"].measure(spec.data, 600, lod);
 				expect(measured.height).toBeGreaterThan(0);
 				expect(measured.usedWidth).toBeLessThan(600);
-				const target = resolveVListBlockTarget(spec.kind, spec.key, ["m1"]);
+				const target = resolveVListBlockTarget(spec.kind, spec.key, ["m1"], () => row);
 				expect(target).toEqual({ blockId: "msg-m1-1", messageId: "m1", blockIndex: 1 });
 				if (!target) throw new Error("Missing communication block target");
 				const index = buildSelectionIndex([row as NarratorMsg]);
@@ -486,7 +486,7 @@ describe("communication delivery — protocol role is not the speaker", () => {
 				modelFacing: text,
 				markdown: text,
 			});
-			const target = resolveVListBlockTarget(spec.kind, spec.key, [row.id]);
+			const target = resolveVListBlockTarget(spec.kind, spec.key, [row.id], () => row);
 			if (!target) throw new Error("Missing legacy block target");
 			const index = buildSelectionIndex([row as unknown as NarratorMsg]);
 			expect(index.byBlockId.get(target.blockId)?.blockIndex).toBe(0);
@@ -522,7 +522,8 @@ describe("spoken injections — one bubble per message row", () => {
 		expect(specs.map((s) => s.kind)).toEqual(["injection-bubble"]);
 		// The key carries the SENDER, with no positional suffix — there is no second
 		// bubble on the row to collide with.
-		expect(specs[0]?.key).toBe("m1-b1-m-sub-aaaaaaaa11");
+		// The injection and its companion text are one context block; the bubble is its second element.
+		expect(specs[0]?.key).toBe("m1-blk[m1:0]+1-m-sub-aaaaaaaa11");
 	});
 
 	it("names the speaker, falling back to a short id prefix", () => {
@@ -811,7 +812,7 @@ describe("background completions — one bubble per task row", () => {
 			{ id: "t1", title: "explore auth", status: "success", preview: "found it" },
 		]);
 		expect(specs.map((s) => s.kind)).toEqual(["injection-bubble"]);
-		expect(specs[0]?.key).toBe("m1-b1-t-t1");
+		expect(specs[0]?.key).toBe("m1-blk[m1:0]+1-t-t1");
 	});
 
 	it("names an agent completion by its current subagent title", () => {
@@ -1222,7 +1223,7 @@ describe("knowledge hits — bubbles only when there is an excerpt", () => {
 			{ entryId: "k2", title: "Merge policy", summary: "Squash exploration branches." },
 		]);
 		expect(specs.map((s) => s.kind)).toEqual(["injection-bubble", "injection-bubble"]);
-		expect(specs.map((s) => s.key)).toEqual(["m1-b1-k-k1", "m1-b1-k-k2"]);
+		expect(specs.map((s) => s.key)).toEqual(["m1-blk[m1:0]+1-k-k1", "m1-blk[m1:0]+1-k-k2"]);
 		const first = specs[0]?.data as { speaker: string; markdown: string };
 		expect(first.speaker).toBe("Rebase policy");
 		expect(first.markdown).toBe("Always rebase onto trunk first.");

@@ -23,6 +23,7 @@ import { type FileReference, fileReferenceDisplay } from "../file-reference";
 import { normalizeFileReferenceContext } from "../file-reference-context";
 import { knowledgeExcerpt } from "../knowledge-excerpt";
 import { isSubagentModelInheritance } from "../model-inheritance";
+import { blockAtIndex } from "../narrator-blocks/message-blocks";
 import {
 	contextBlockViews,
 	injectionBlockViews,
@@ -1616,15 +1617,15 @@ function longSingleReasoningStep(key: string, text: string): ReasoningSegment[] 
 }
 
 /**
- * The key base of a message's element `index`. A message from the block-keyed protocol
- * keys it by its block — `${idBase}-blk[<blockId>]`, plus `+<offset>` for a later element
- * of a multi-element block — so the key stays put when blocks before it come or go
- * (docs/BLOCK_STORAGE-DESIGN.md §8.3). Otherwise it is the positional `${idBase}-b<index>`.
- * Block ids hold no `[` or `]`, so the id is recoverable from the key
- * (`blockIdFromElementKey`).
+ * The key base of a message's element `index`: its block — `${idBase}-blk[<blockId>]`,
+ * plus `+<offset>` for a later element of a multi-element block — so the key stays put
+ * when blocks before it come or go (docs/BLOCK_STORAGE-DESIGN.md §8.3). The blocks are the
+ * ones the message names, or, for a row built on the client, the ones the server would
+ * split it into (`messageBlocks`). Block ids hold no `[` or `]`, so the id is recoverable
+ * from the key (`blockIdFromElementKey`). An index past the body keeps a positional key.
  */
 export function elementKey(idBase: string, msg: AdapterMessage, index: number): string {
-	const block = msg.blockRefs?.find((ref) => index >= ref.from && index < ref.to);
+	const block = blockAtIndex(msg, index);
 	if (!block) return `${idBase}-b${index}`;
 	const offset = index - block.from;
 	return `${idBase}-blk[${block.id}]${offset ? `+${offset}` : ""}`;

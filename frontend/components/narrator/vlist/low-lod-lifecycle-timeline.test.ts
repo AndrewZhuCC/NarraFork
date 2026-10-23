@@ -389,8 +389,8 @@ describe("content blocks carry a hand-off-stable lifecycle id", () => {
 		);
 		const liveCard = live.items.find((item) => item.spec.kind === "reasoning");
 		const settledCard = settled.items.find((item) => item.spec.kind === "reasoning");
-		expect(liveCard?.spec.key).toBe("__streaming__-b0");
-		expect(settledCard?.spec.key).toBe("a1-b0");
+		expect(liveCard?.spec.key).toBe("__streaming__-blk[__streaming__:0]");
+		expect(settledCard?.spec.key).toBe("a1-blk[a1:0]");
 		expect(liveCard?.spec.lifecycleId).toBe("blk:rs-1");
 		expect(settledCard?.spec.lifecycleId).toBe("blk:rs-1");
 		// The trap the id exists for: after the hand-off the STILL-LIVE text block took
@@ -398,7 +398,7 @@ describe("content blocks carry a hand-off-stable lifecycle id", () => {
 		const liveText = settled.items.find(
 			(item) => item.spec.kind === "markdown" && item.spec.key.startsWith("__streaming__"),
 		);
-		expect(liveText?.spec.key).toBe("__streaming__-b0");
+		expect(liveText?.spec.key).toBe("__streaming__-blk[__streaming__:0]");
 		expect(liveText?.spec.lifecycleId).toBe("blk:tx-1");
 	});
 

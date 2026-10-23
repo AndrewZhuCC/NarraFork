@@ -4969,7 +4969,9 @@ export const PretextExactMessageList = memo(
 					if (!item) continue;
 					const manifestItem = manifestByKey.get(item.spec.key);
 					const sourceIds = manifestItem?.sourceMessageIds ?? [];
-					const target = resolveVListBlockTarget(item.spec.kind, item.spec.key, sourceIds);
+					const target = resolveVListBlockTarget(item.spec.kind, item.spec.key, sourceIds, (id) =>
+						messagesById.get(id),
+					);
 					if (!target) continue;
 					const entry = selectionIndex.byBlockId.get(target.blockId);
 					// Authoritative message id / block index come from the selection entry
