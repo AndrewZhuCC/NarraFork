@@ -3,8 +3,8 @@
  * (docs/BLOCK_STORAGE-DESIGN.md §5.5, P3d).
  *
  * Delete, rollback and edit act on whole blocks. The block holding the element is read
- * from the message's row when the action starts; a row the server did not name (one
- * built on the client) has no block id, and the action keeps its index route.
+ * from the message's row when the action starts. Only a block the server named can be
+ * acted on: a row built on the client (the live streaming row) has none yet.
  */
 
 import { blockAtIndex, messageBlocks } from "@shared/narrator-blocks/message-blocks";
@@ -13,15 +13,15 @@ import type { MessageListHandle } from "./message-list-handle";
 
 type MessageLookup = Pick<MessageListHandle, "messageOf"> | null | undefined;
 
-/** Element `blockIndex` of the message, with the block holding it when the server named it. */
+/** Element `blockIndex` of the message with the block holding it; null unless the server named it. */
 export function blockTargetOf(
 	list: MessageLookup,
 	messageId: string,
 	blockIndex: number,
-): BlockTarget {
+): BlockTarget | null {
 	const message = list?.messageOf(messageId);
 	const block = message ? blockAtIndex(message, blockIndex) : undefined;
-	return block?.named ? { messageId, blockIndex, blockId: block.id } : { messageId, blockIndex };
+	return block?.named ? { messageId, blockIndex, blockId: block.id } : null;
 }
 
 /** The message's input block, when the server named exactly one. */

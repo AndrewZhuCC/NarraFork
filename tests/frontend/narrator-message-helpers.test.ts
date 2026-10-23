@@ -1,10 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import {
-	buildToolUseIndex,
-	mergeFieldsByIndex,
-} from "../../frontend/components/narrator/message/message-tree-utils";
-import {
 	hasToolUse,
 	isToolOnlyMessage,
 	resolveAllToolCallsFromMsg,
@@ -117,44 +113,6 @@ describe("narrator-message-helpers", () => {
 		const [bashCall, awaitCall] = resolveAllToolCallsFromMsg(msg);
 		expect(bashCall).toMatchObject(bashTiming);
 		expect(awaitCall).toMatchObject(awaitTiming);
-	});
-
-	test("实时工具从 running 合并为 success 后仍保留 runtime startedAt", () => {
-		const startedAt = Date.parse("2025-01-01T00:02:00.000Z");
-		const msg = makeMessage(
-			rowWithElements(
-				{
-					id: "m-live-tool",
-					role: "assistant",
-					toolCalls: [
-						{
-							toolUseId: "tu-live",
-							toolName: "Bash",
-							status: "initializing",
-							createdAt: "2025-01-01T00:01:59.000Z",
-						},
-					],
-				},
-				[{ type: "tool_use", id: "tu-live", name: "Bash", input: {} }],
-			),
-		);
-		const cache = {
-			pages: [{ messages: [msg], hasMore: false, nextCursor: null }],
-			pageParams: [undefined],
-		};
-		const index = buildToolUseIndex(cache.pages);
-		const running = mergeFieldsByIndex(cache, "tu-live", { status: "running", startedAt }, index);
-		const completed = mergeFieldsByIndex(
-			running,
-			"tu-live",
-			{ status: "success", completedAt: "2025-01-01T00:02:05.000Z" },
-			index,
-		);
-
-		const [call] = resolveAllToolCallsFromMsg(completed.pages[0].messages[0]);
-		expect(call.status).toBe("success");
-		expect(call.startedAt).toBe(startedAt);
-		expect(call.completedAt).toBe("2025-01-01T00:02:05.000Z");
 	});
 
 	test("completed 普通工具同样保留 timing，并从对应 toolCalls 回退", () => {

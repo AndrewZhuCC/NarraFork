@@ -702,10 +702,6 @@ describe("structured edit layout details", () => {
 			],
 			textFiles: [],
 		});
-		qc.setQueryData(["narrators", owner, "edit-regenerate-preview", "message"], {
-			affectedFiles: [],
-			deletedMessageCount: 0,
-		});
 		const save = mock(
 			async (..._args: Parameters<NonNullable<MessageEditorPanelProps["onEditAndRegenerate"]>>) =>
 				false,
@@ -759,10 +755,6 @@ describe("structured edit layout details", () => {
 				},
 			],
 			textFiles: [],
-		});
-		qc.setQueryData(["narrators", owner, "edit-regenerate-preview", "message"], {
-			affectedFiles: [],
-			deletedMessageCount: 0,
 		});
 		const save = mock(
 			async (..._args: Parameters<NonNullable<MessageEditorPanelProps["onEditAndRegenerate"]>>) =>
@@ -830,10 +822,6 @@ describe("structured edit layout details", () => {
 			images: [],
 			textFiles: [],
 		});
-		qc.setQueryData(["narrators", owner, "edit-regenerate-preview", "message"], {
-			affectedFiles: [],
-			deletedMessageCount: 0,
-		});
 		const save = mock(
 			async (..._args: Parameters<NonNullable<MessageEditorPanelProps["onEditAndRegenerate"]>>) =>
 				false,
@@ -848,10 +836,6 @@ describe("structured edit layout details", () => {
 	});
 	test("a rich layout without its same-snapshot resource detail cannot bind stale attachments", async () => {
 		spyOn(api, "getMessageComposerDocument").mockResolvedValue({ composerDocument: layout });
-		qc.setQueryData(["narrators", owner, "edit-regenerate-preview", "message"], {
-			affectedFiles: [],
-			deletedMessageCount: 0,
-		});
 		await render(editor({ narratorId: owner, initialText: "stale body" }));
 		expect(document.querySelector(".ProseMirror")).toBeNull();
 		expect(button(en.editSubmit).disabled).toBe(true);
@@ -860,10 +844,6 @@ describe("structured edit layout details", () => {
 		const load = spyOn(api, "getMessageComposerDocument").mockRejectedValue(
 			new Error("unavailable"),
 		);
-		qc.setQueryData(["narrators", owner, "edit-regenerate-preview", "message"], {
-			affectedFiles: [],
-			deletedMessageCount: 0,
-		});
 		await render(editor({ narratorId: owner, initialText: "must not overwrite unknown layout" }));
 		expect(document.querySelector(".ProseMirror")).toBeNull();
 		expect(button(en.editSubmit).disabled).toBe(true);

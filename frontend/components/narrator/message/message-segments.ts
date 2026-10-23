@@ -486,25 +486,6 @@ export function segmentMessages(
 }
 
 // ---------------------------------------------------------------------------
-// Target ID collection (for virtualization / scroll-to)
-// ---------------------------------------------------------------------------
-
-export function collectSegmentTargetIds(seg: RenderSegment): string[] {
-	if (seg.kind === "message") return seg.msg.id ? [seg.msg.id] : [];
-	const ids = new Set<string>();
-	for (const item of seg.items) {
-		if (item.msg.id) ids.add(item.msg.id);
-		if (item.tc.toolUseId) ids.add(item.tc.toolUseId);
-	}
-	for (const srcMsg of seg.sourceMessages) {
-		for (const child of srcMsg.children ?? []) {
-			if (child.id) ids.add(child.id);
-		}
-	}
-	return [...ids];
-}
-
-// ---------------------------------------------------------------------------
 // Streaming message builder
 // ---------------------------------------------------------------------------
 
@@ -525,6 +506,11 @@ function trimToolBlockCache() {
 		if (oldestKey === undefined) return;
 		toolBlockCache.delete(oldestKey);
 	}
+}
+
+/** Reset the tool-use block reference cache (between tests). */
+export function clearToolBlockCache(): void {
+	toolBlockCache.clear();
 }
 
 function stabilizeToolUseBlock(block: ContentBlock): ContentBlock {
@@ -550,11 +536,6 @@ function stabilizeToolUseBlock(block: ContentBlock): ContentBlock {
 // comparison (e.g. shallowEqual(a.input, b.input)).
 function shallowBlockEqual(a: ContentBlock, b: ContentBlock): boolean {
 	return a.type === b.type && a.id === b.id && a.name === b.name && a.input === b.input;
-}
-
-/** Clear the tool-use block reference cache (call when streaming ends). */
-export function clearToolBlockCache(): void {
-	toolBlockCache.clear();
 }
 
 /** A streaming block tracked in temporal order (by event arrival / provider output order). */
@@ -912,45 +893,4 @@ export function buildStreamingMsg(opts: {
 		...(liveBlockIndex != null ? { liveBlockIndex } : {}),
 	} as Omit<NarratorMsg, "blocks">;
 	return rowWithElements(row, blocks);
-}
-
-/**
- * Generate stable React keys for a list of content blocks.
- *
- * Blocks that already carry an `id` (tool_use, web_search from the API,
- * streaming blocks with synthetic ids) use that id directly.
- * For blocks without an id, the block *type* is used as the key since each
- * type typically appears at most once per message.  When multiple blocks
- * share the same type and both lack an id, a dedup counter is appended so
- * every key remains unique.
- */
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-export function generateBlockKeys(blocks: any[]): string[] {
-	const typeCount: Record<string, number> = {};
-	return blocks.map((block) => {
-		if (block.id) return block.id as string;
-		const t = block.type as string;
-		// Known content types typically appear at most once per message,
-		// so the first occurrence uses the bare type name as the key
-		// (e.g. "text") for maximum stability during streaming.
-		// Subsequent occurrences append a dedup counter (e.g. "text-1").
-		if (
-			t === "text" ||
-			t === "reasoning" ||
-			t === "thinking" ||
-			t === "web_search" ||
-			t === "image_generation" ||
-			t === "image" ||
-			t === "text_file"
-		) {
-			const count = typeCount[t] ?? 0;
-			typeCount[t] = count + 1;
-			return count === 0 ? t : `${t}-${count}`;
-		}
-		// Unknown types always include a counter (e.g. "custom-0") since
-		// we cannot assume they appear at most once per message.
-		const count = typeCount[t] ?? 0;
-		typeCount[t] = count + 1;
-		return `${t}-${count}`;
-	});
 }

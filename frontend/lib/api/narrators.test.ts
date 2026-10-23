@@ -36,18 +36,23 @@ describe("narrators API", () => {
 			configurable: true,
 			value: async (url: unknown, init: RequestInit) => {
 				requests.push({ url: String(url), init });
-				return Response.json({ ok: true });
+				return Response.json({ ok: true, deleted: 1, failed: 0, results: [] });
 			},
 		});
 		await api.deleteMessage("n", "m");
-		await api.deleteMessageBlock("n", { messageId: "m", blockIndex: 2 });
-		await api.deleteMessageBlocks("n", [{ messageId: "m", blockIndex: 0 }]);
+		await api.deleteMessageBlock("n", { messageId: "m", blockIndex: 2, blockId: "b2" });
+		await api.deleteMessageBlocks("n", [{ messageId: "m", blockIndex: 0, blockId: "b0" }]);
 		expect(requests[0].url).toEndWith("/narrators/n/messages/m?skipRevert=1");
-		expect(requests[1].url).toEndWith("/narrators/n/messages/m/blocks/2?skipRevert=1");
-		expect(JSON.parse(String(requests[2].init.body))).toEqual({
-			blocks: [{ messageId: "m", blockIndex: 0 }],
-			skipRevert: true,
-		});
+		for (const [index, blockId] of [
+			[1, "b2"],
+			[2, "b0"],
+		] as const) {
+			expect(requests[index].url).toEndWith("/narrators/n/blocks");
+			expect(JSON.parse(String(requests[index].init.body))).toEqual({
+				blockIds: [blockId],
+				skipRevert: true,
+			});
+		}
 	});
 
 	test.each([
@@ -301,7 +306,12 @@ describe("narrators API", () => {
 				return Response.json({});
 			},
 		});
-		const target = { messageId: "m", blockIndex: 2, action: "rollback_to_block" as const };
+		const target = {
+			messageId: "m",
+			blockIndex: 2,
+			blockId: "b2",
+			action: "rollback_to_block" as const,
+		};
 		await api.previewRevertAction("n", { ...target, idempotencyKey: "selective-key" });
 		await api.previewRevertAction("n", {
 			...target,
@@ -311,9 +321,10 @@ describe("narrators API", () => {
 		const plan = { planId: "p", planHash: "h", action: target.action };
 		await api.applyRevertPlan("n", plan);
 		await api.applyRevertPlan("n", { ...plan, acceptSnapshotRestore: true });
-		expect(calls[0]?.body).toEqual({ ...target, idempotencyKey: "selective-key" });
+		const planned = { action: target.action, blockIds: [target.blockId] };
+		expect(calls[0]?.body).toEqual({ ...planned, idempotencyKey: "selective-key" });
 		expect(calls[1]?.body).toEqual({
-			...target,
+			...planned,
 			idempotencyKey: "snapshot-key",
 			recoveryMode: "snapshot",
 		});

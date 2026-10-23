@@ -54,7 +54,7 @@ describe("block targets", () => {
 			blockIndex: 1,
 			blockId: "bR",
 		});
-		expect(blockTargetOf(list, "st1", 2).blockId).toBe("bT");
+		expect(blockTargetOf(list, "st1", 2)?.blockId).toBe("bT");
 		expect(inputBlockIdOf(list, "in1")).toBe("bIn");
 		expect(inputBlockIdOf(list, "st1")).toBeUndefined();
 	});
@@ -69,9 +69,9 @@ describe("block targets", () => {
 			[{ type: "text", text: "hi" }],
 		) as TreeMessage;
 		const list = { messageOf: (id: string) => (id === "u1" ? row : undefined) };
-		expect(blockTargetOf(list, "u1", 0)).toEqual({ messageId: "u1", blockIndex: 0 });
+		expect(blockTargetOf(list, "u1", 0)).toBeNull();
 		expect(inputBlockIdOf(list, "u1")).toBeUndefined();
-		expect(blockTargetOf(listOfPage(), "st1", 9)).toEqual({ messageId: "st1", blockIndex: 9 });
-		expect(blockTargetOf(null, "st1", 0)).toEqual({ messageId: "st1", blockIndex: 0 });
+		expect(blockTargetOf(listOfPage(), "st1", 9)).toBeNull();
+		expect(blockTargetOf(null, "st1", 0)).toBeNull();
 	});
 });

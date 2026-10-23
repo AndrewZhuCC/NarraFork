@@ -39,40 +39,28 @@ describe("block-addressed actions", () => {
 			Object.defineProperty(g, "localStorage", { value: originalLocalStorage, configurable: true });
 	});
 
-	test("an element without a named block keeps the index routes", async () => {
-		await api.deleteMessageBlock("n1", { messageId: "st1", blockIndex: 2 });
-		await api.rollbackToBlock("n1", { messageId: "st1", blockIndex: 2 }, { skipRevert: true });
-		await api.deleteMessageBlocks("n1", [
-			{ messageId: "st1", blockIndex: 0, blockId: "bR" },
-			{ messageId: "st1", blockIndex: 2 },
-		]);
+	test("a block action without the block's id is refused before any request", async () => {
+		await expect(
+			api.previewRevertAction("n1", {
+				action: "delete_tool_block",
+				messageId: "st1",
+				blockIndex: 2,
+				idempotencyKey: "key-1",
+			}),
+		).rejects.toThrow("needs the block's id");
+		expect(requests).toEqual([]);
+	});
+
+	test("a message-wide preview keeps the message route", async () => {
 		await api.previewRevertAction("n1", {
-			action: "delete_tool_block",
+			action: "edit_and_regenerate",
 			messageId: "st1",
-			blockIndex: 2,
 			idempotencyKey: "key-1",
 		});
 		expect(requests.map(({ url, body }) => [url, body])).toEqual([
-			["/api/narrators/n1/messages/st1/blocks/2?skipRevert=1", undefined],
-			["/api/narrators/n1/rollback/st1", { blockIndex: 2, skipRevert: true }],
-			[
-				"/api/narrators/n1/messages/batch-blocks",
-				{
-					blocks: [
-						{ messageId: "st1", blockIndex: 0 },
-						{ messageId: "st1", blockIndex: 2 },
-					],
-					skipRevert: true,
-				},
-			],
 			[
 				"/api/narrators/n1/revert-action-preview",
-				{
-					action: "delete_tool_block",
-					messageId: "st1",
-					blockIndex: 2,
-					idempotencyKey: "key-1",
-				},
+				{ action: "edit_and_regenerate", messageId: "st1", idempotencyKey: "key-1" },
 			],
 		]);
 	});

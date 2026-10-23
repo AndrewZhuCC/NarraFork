@@ -119,7 +119,7 @@ beforeEach(() => {
 			current: {
 				detachFromBottom: mock(() => {}),
 				refreshStructure: mock(() => {}),
-				messageOf: () => undefined,
+				messageOf: (id: string) => namedRow(id),
 			},
 		},
 		navigate: mock(async () => {}),
@@ -219,6 +219,26 @@ function deferredRange() {
 	return { promise, resolve, reject };
 }
 
+/** A loaded message whose every element is its own block the server named `<id>/b<index>`. */
+function namedRow(id: string): NarratorMsg {
+	return {
+		id,
+		role: "assistant",
+		blocks: Array.from({ length: 8 }, (_, index) => ({
+			id: `${id}/b${index}`,
+			kind: "output",
+			subtype: null,
+			phase: "done",
+			revision: 0,
+			wireId: null,
+			attemptId: null,
+			hasOriginal: false,
+			named: true,
+			elements: [{ type: "text", text: "" }],
+		})),
+	} as unknown as NarratorMsg;
+}
+
 describe("selection resolver publication", () => {
 	test("five idle publications add zero parent or memoized context-consumer renders", async () => {
 		await render();
@@ -300,7 +320,7 @@ describe("selection resolver publication", () => {
 		await act(async () => handler());
 		if (action === "delete") {
 			expect(deleteBlocks).toHaveBeenCalledWith("narrator-a", [
-				{ messageId: "latest-message", blockIndex: 2 },
+				{ messageId: "latest-message", blockIndex: 2, blockId: "latest-message/b2" },
 			]);
 		} else if (action === "fork") {
 			expect(forkMessages).toHaveBeenCalledWith("narrator-a", ["latest-message"]);
@@ -400,7 +420,7 @@ describe("batch-delete rollback feedback", () => {
 		} else {
 			deleteBlocks.mockResolvedValue({ ok: true, deleted: 0, failed: 0, revertResult: result });
 		}
-		const resources = ["messages", "file-tree-status", "tool-calls", "edit-regenerate-preview"];
+		const resources = ["messages", "file-tree-status", "tool-calls"];
 		for (const resource of resources)
 			queryClient.setQueryData(["narrators", "narrator-a", resource], {});
 		await render();

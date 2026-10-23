@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
+import { blockIdAt } from "../../tests/block-ids";
 import { testEnvironment } from "../../tests/preload";
 import { app } from "../app";
 import { db } from "../db";
@@ -666,16 +667,14 @@ describe("narrator-scoped per-file recovery consumers", () => {
 				},
 			],
 		};
-		spyOn(narratorService, "deleteMessageBlocks").mockRejectedValue(
-			new SnapshotRevertError(result),
-		);
-		const response = await app.request(`/api/narrators/${narratorId}/messages/batch-blocks`, {
+		spyOn(narratorService, "deleteBlocks").mockRejectedValue(new SnapshotRevertError(result));
+		const response = await app.request(`/api/narrators/${narratorId}/blocks`, {
 			method: "DELETE",
 			headers: {
 				authorization: `Bearer ${await createToken(userId, "user")}`,
 				"content-type": "application/json",
 			},
-			body: JSON.stringify({ blocks: [{ messageId, blockIndex: 0 }], skipRevert: true }),
+			body: JSON.stringify({ blockIds: [await blockIdAt(messageId, 0)], skipRevert: true }),
 		});
 		expect(response.status).toBe(409);
 		expect(await response.json()).toMatchObject({ code: "SNAPSHOT_REVERT_FAILED", ...result });

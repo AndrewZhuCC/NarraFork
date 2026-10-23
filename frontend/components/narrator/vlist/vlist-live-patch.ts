@@ -222,12 +222,10 @@ function hasActiveReflectionSuggestion(suggestions: unknown): boolean {
 /**
  * Merge `fields` into EVERY loaded occurrence of `toolUseId` (row + enriched
  * block). Used for the plain tool lifecycle (`tool_started` / `tool_completed` /
- * permission decisions / background-task terminals), mirroring the chunked
- * path's `mergeFieldsByIndex`.
+ * permission decisions / background-task terminals).
  *
- * All-occurrence semantics match the chunked path: a duplicate provider
- * toolUseId collapses to one `tool-<id>` vlist row anyway, so writing every
- * occurrence cannot make two rows disagree.
+ * A duplicate provider toolUseId collapses to one `tool-<id>` vlist row anyway,
+ * so writing every occurrence cannot make two rows disagree.
  */
 /** Navigation seeds only the newest attempt; consumed receipts may enrich an exact finished attempt. */
 export function patchSendDeliveryTargets(
@@ -504,8 +502,7 @@ function sameModelInheritance(
  * Attach the child narrator id / model to a parent card WITHOUT recording a tool
  * call. `subagent_started` announces which narrator a card now owns before that
  * child has run anything, so synthesizing a header here would invent a phantom
- * "recent call" row. Mirrors the chunked path's `updateSubagentActivityInCache`
- * identity-only update.
+ * "recent call" row: an identity-only update.
  */
 export function patchSubagentIdentity(
 	messages: readonly TreeMessage[],
