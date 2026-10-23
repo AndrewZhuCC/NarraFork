@@ -237,7 +237,7 @@ describe("reasoning translation output boundary", () => {
 				expect(ctx.pendingReasoningTranslations?.size).toBe(1);
 				const event =
 					boundary === "stream_text"
-						? { type: "stream_text" as const, text: "Answer" }
+						? { type: "stream_text" as const, blockId: "text", text: "Answer" }
 						: boundary === "tool_use_chunk"
 							? {
 									type: "tool_use_chunk" as const,
@@ -303,7 +303,7 @@ describe("reasoning translation output boundary", () => {
 				ctx,
 			);
 			expect(ctx.pendingReasoningTranslations.size).toBe(0);
-			await processEvent({ type: "stream_text", text: "new answer" }, ctx);
+			await processEvent({ type: "stream_text", blockId: "text-6", text: "new answer" }, ctx);
 			expect(ctx.reasoningTranslations?.size ?? 0).toBe(0);
 		});
 	}
@@ -911,7 +911,10 @@ describe("assistant file-reference provenance", () => {
 			...makeSubagentContext(),
 			getFileReferenceContext: () => ({ deviceId: "ChildDevice", cwd: "/child" }),
 		};
-		await processEvent({ type: "stream_text", text: "src/a.ts", outputIndex: 0 }, ctx);
+		await processEvent(
+			{ type: "stream_text", blockId: "b0", text: "src/a.ts", outputIndex: 0 },
+			ctx,
+		);
 		expect(getStreamingSnapshot(ctx.narratorId)?.streamingBlocks[0]).toMatchObject({
 			type: "text",
 			fileReferenceContext: { deviceId: "ChildDevice", cwd: "/child" },
@@ -945,9 +948,15 @@ describe("assistant file-reference provenance", () => {
 			},
 		};
 		try {
-			await processEvent({ type: "stream_text", text: "[file]", outputIndex: 0 }, ctx);
+			await processEvent(
+				{ type: "stream_text", blockId: "b0", text: "[file]", outputIndex: 0 },
+				ctx,
+			);
 			source = { deviceId: "DeviceB", cwd: "/other" };
-			await processEvent({ type: "stream_text", text: "(src/a.ts#L2)", outputIndex: 0 }, ctx);
+			await processEvent(
+				{ type: "stream_text", blockId: "b0", text: "(src/a.ts#L2)", outputIndex: 0 },
+				ctx,
+			);
 			expect(reads).toBe(1);
 			expect(getStreamingSnapshot(id)?.streamingBlocks[0]).toMatchObject({
 				fileReferenceContext: { deviceId: "DeviceA", cwd: "/repo" },
@@ -961,14 +970,15 @@ describe("assistant file-reference provenance", () => {
 			await processEvent(
 				{
 					type: "block_complete",
-					block: { type: "text", text: "[file](src/a.ts#L2)", outputIndex: 0 },
+					block: { type: "text", id: "b0", text: "[file](src/a.ts#L2)", outputIndex: 0 },
 				},
 				ctx,
 			);
 			const savedId = partialId;
-			await processEvent({ type: "stream_text", text: "next", outputIndex: 0 }, ctx);
+			// The provider reuses output index 0 for a new element: it reads its own device.
+			await processEvent({ type: "stream_text", blockId: "b1", text: "next", outputIndex: 0 }, ctx);
 			await processEvent(
-				{ type: "block_complete", block: { type: "text", text: "next", outputIndex: 0 } },
+				{ type: "block_complete", block: { type: "text", id: "b1", text: "next", outputIndex: 0 } },
 				ctx,
 			);
 			await processEvent(
@@ -992,7 +1002,7 @@ describe("assistant file-reference provenance", () => {
 		}
 	});
 
-	test("a combined provider text block never borrows its last device for earlier text", async () => {
+	test("a text block without an element id never borrows a streamed element's device", async () => {
 		const id = "file-context-mixed";
 		const createdAt = new Date().toISOString();
 		await db.insert(narrators).values({ id, createdAt, updatedAt: createdAt });
@@ -1010,9 +1020,15 @@ describe("assistant file-reference provenance", () => {
 			getFileReferenceContext: () => ({ deviceId, cwd: "/repo" }),
 		};
 		try {
-			await processEvent({ type: "stream_text", text: "first ", outputIndex: 0 }, ctx);
+			await processEvent(
+				{ type: "stream_text", blockId: "b0", text: "first ", outputIndex: 0 },
+				ctx,
+			);
 			deviceId = "B";
-			await processEvent({ type: "stream_text", text: "second", outputIndex: 1 }, ctx);
+			await processEvent(
+				{ type: "stream_text", blockId: "b1", text: "second", outputIndex: 1 },
+				ctx,
+			);
 			await processEvent(
 				{ type: "block_complete", block: { type: "text", text: "first second", outputIndex: 1 } },
 				ctx,
@@ -1384,7 +1400,10 @@ describe("完成工具输入传递", () => {
 		sseEmitter.on("event", (event) => sseEvents.push(event));
 		const ctx = makeMainContext(sseEmitter);
 
-		await processEvent({ type: "stream_text", text: "保留的 partial 文本", outputIndex: 0 }, ctx);
+		await processEvent(
+			{ type: "stream_text", blockId: "text-7", text: "保留的 partial 文本", outputIndex: 0 },
+			ctx,
+		);
 		await processEvent(
 			{
 				type: "tool_call",
@@ -1492,7 +1511,10 @@ describe("完成工具输入传递", () => {
 		const sseEvents: unknown[] = [];
 		sseEmitter.on("event", (event) => sseEvents.push(event));
 		const ctx = makeMainContext(sseEmitter);
-		await processEvent({ type: "stream_text", text: "still here", outputIndex: 0 }, ctx);
+		await processEvent(
+			{ type: "stream_text", blockId: "text-8", text: "still here", outputIndex: 0 },
+			ctx,
+		);
 		await processEvent(
 			{
 				type: "image_generation",
@@ -1534,7 +1556,7 @@ describe("完成工具输入传递", () => {
 	test("子代理 retry 只清自身生图快照，父快照保持不变", async () => {
 		const parentCtx = makeMainContext();
 		await processEvent(
-			{ type: "stream_text", text: "parent live text", outputIndex: 0 },
+			{ type: "stream_text", blockId: "text-9", text: "parent live text", outputIndex: 0 },
 			parentCtx,
 		);
 
