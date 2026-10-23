@@ -53,6 +53,7 @@ import {
 	parseCatalog,
 	parseDeparseOutput,
 	psqlProxyCallback,
+	replacesConstraintsOnly,
 	type Snapshot,
 } from "./pg-baseline-model";
 import { physicalColumnOrderFromSql } from "./pg-baseline-sql-order";
@@ -101,6 +102,15 @@ const RETIRED_CONSTRAINTS: [table: string, constraint: string][] = [
 	["volume_snapshot_applications", "volume_snapshot_applications_chapter_id_chapters_id_fk"],
 	["volume_snapshots", "volume_snapshots_source_chapter_id_chapters_id_fk"],
 ];
+
+/** The SQL of the newest migration that does more than replace constraints. */
+async function newestCreatingMigration(entries: JournalEntry[]): Promise<string> {
+	for (const entry of [...entries].reverse()) {
+		const sql = await readFile(`${MIGRATIONS_FOLDER}/${entry.tag}.sql`, "utf8");
+		if (!replacesConstraintsOnly(sql)) return sql;
+	}
+	throw new Error("every PostgreSQL migration only replaces constraints");
+}
 
 async function loadJournal(): Promise<{
 	entries: JournalEntry[];
@@ -257,9 +267,10 @@ describe("PostgreSQL baseline", () => {
 				// database would silently do nothing and the ledger would be the only guard.
 				// Never committed: a migration that opens with a DROP would otherwise succeed at
 				// that statement before failing, and the catalog read below would see the damage.
-				const rawReplay = await exec(
-					`BEGIN;\n${await readFile(`${MIGRATIONS_FOLDER}/${entries.at(-1)?.tag}.sql`, "utf8")}\n;ROLLBACK;`,
-				);
+				// The newest migration that creates something is replayed: one that only
+				// replaces constraints re-runs cleanly by construction.
+				const probed = await newestCreatingMigration(entries);
+				const rawReplay = await exec(`BEGIN;\n${probed}\n;ROLLBACK;`);
 				if (rawReplay.code === 0) {
 					problems.push("re-applying the migration SQL succeeded; it is not creating anything");
 				}
