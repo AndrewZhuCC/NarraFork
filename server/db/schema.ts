@@ -1382,6 +1382,12 @@ export const narratorMessages = sqliteTable(
 		 * column holds the complete projection (or is the body, for `body_format = 1`).
 		 */
 		bodyRowsOnly: integer("body_rows_only").notNull().default(0),
+		/**
+		 * Hash of the `content_json` text the block rows were last synced from; null when
+		 * unknown. A queued sync whose column still hashes to it re-derives only the ledger
+		 * columns of the tool blocks whose attempt moved (narrator-block-sync.ts).
+		 */
+		blocksContentHash: text("blocks_content_hash"),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
@@ -1693,6 +1699,12 @@ export const narratorBlocks = sqliteTable(
 		providerMeta: text("provider_meta", { mode: "json" }),
 		/** An output block's body before its first edit. */
 		originalPayload: text("original_payload", { mode: "json" }),
+		/**
+		 * A tool block's adopted ledger attempt as of its last sync (`<tool call id>:<model
+		 * revision>`), null without one: the sync re-derives the ledger columns (model chars,
+		 * assets, binding, search text) only of the tool blocks whose attempt moved.
+		 */
+		ledgerRevision: text("ledger_revision"),
 	},
 	(table) => [
 		uniqueIndex("idx_blocks_message_ordinal").on(table.messageId, table.ordinal),
@@ -1772,6 +1784,21 @@ export const narratorBlockSyncQueue = sqliteTable("narrator_block_sync_queue", {
 	messageId: text("message_id")
 		.primaryKey()
 		.references(() => narratorMessages.id, { onDelete: "cascade" }),
+});
+
+// === narrator_block_index_queue ===
+/**
+ * Sealed blocks whose search index text is owed (narrator-block-index.ts). The sync queues a
+ * block whose body or adopted ledger attempt changed instead of tokenizing its text in the
+ * writer's transaction; a background job computes the text off the main thread and writes it
+ * in short transactions. `version` moves on every re-queue, so text computed from an older
+ * read is never written over a newer change.
+ */
+export const narratorBlockIndexQueue = sqliteTable("narrator_block_index_queue", {
+	blockId: text("block_id")
+		.primaryKey()
+		.references(() => narratorBlocks.id, { onDelete: "cascade" }),
+	version: integer("version").notNull().default(0),
 });
 
 // === narrator_text_snapshots (§7.7) ===

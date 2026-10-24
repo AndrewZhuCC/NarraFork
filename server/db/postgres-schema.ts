@@ -743,6 +743,7 @@ export const narratorMessages = pgTable(
 		bodyBytes: integer("body_bytes").notNull().default(0),
 		stateRevision: integer("state_revision").notNull().default(0),
 		bodyRowsOnly: integer("body_rows_only").notNull().default(0),
+		blocksContentHash: text("blocks_content_hash"),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
@@ -932,6 +933,7 @@ export const narratorBlocks = pgTable(
 		state: jsonText("state"),
 		providerMeta: jsonText("provider_meta"),
 		originalPayload: jsonText("original_payload"),
+		ledgerRevision: text("ledger_revision"),
 	},
 	(table) => [
 		uniqueIndex("idx_blocks_message_ordinal").on(table.messageId, table.ordinal),
@@ -1000,6 +1002,14 @@ export const narratorBlockSyncQueue = pgTable("narrator_block_sync_queue", {
 		.primaryKey()
 		.notNull()
 		.references((): PgColumn => narratorMessages.id, { onDelete: "cascade" }),
+});
+
+export const narratorBlockIndexQueue = pgTable("narrator_block_index_queue", {
+	blockId: text("block_id")
+		.primaryKey()
+		.notNull()
+		.references((): PgColumn => narratorBlocks.id, { onDelete: "cascade" }),
+	version: integer("version").notNull().default(0),
 });
 
 export const narratorTextSnapshots = pgTable("narrator_text_snapshots", {
@@ -3879,8 +3889,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 125,
-  "columnCount": 1671,
+  "tableCount": 126,
+  "columnCount": 1675,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -8150,6 +8160,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "defaultExpression": "0"
         },
         {
+          "property": "blocksContentHash",
+          "name": "blocks_content_hash",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "createdAt",
           "name": "created_at",
           "kind": "text",
@@ -9331,6 +9350,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "notNull": false,
           "primary": false,
           "unique": false
+        },
+        {
+          "property": "ledgerRevision",
+          "name": "ledger_revision",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
         }
       ],
       "indexes": [
@@ -9523,6 +9551,45 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "constraintName": "narrator_block_sync_queue_message_id_narrator_messages_id_fk"
           },
           "emitAsTableConstraint": false
+        }
+      ],
+      "indexes": [],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "narratorBlockIndexQueue",
+      "name": "narrator_block_index_queue",
+      "columns": [
+        {
+          "property": "blockId",
+          "name": "block_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false,
+          "references": {
+            "table": "narratorBlocks",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "narrator_block_index_queue_block_id_narrator_blocks_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "version",
+          "name": "version",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
         }
       ],
       "indexes": [],
