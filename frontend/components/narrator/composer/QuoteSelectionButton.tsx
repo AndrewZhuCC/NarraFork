@@ -1,12 +1,20 @@
 import { Z } from "@frontend/lib/z-index";
-import { IconArrowBarToRight, IconFileText, IconQuote, IconX } from "@tabler/icons-react";
-import { useLayoutEffect, useRef, useState } from "react";
+import { Loader } from "@mantine/core";
+import {
+	IconArrowBarToRight,
+	IconArrowUp,
+	IconMessageQuestion,
+	IconQuote,
+	IconX,
+} from "@tabler/icons-react";
+import { type FormEvent, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import classes from "./QuoteSelectionButton.module.css";
 import {
 	type QuoteButtonBox,
 	type QuoteButtonPlacement,
+	type QuoteButtonSelection,
 	quoteButtonPosition,
 } from "./quote-button-position";
 import { NARRATOR_PANEL_SELECTOR } from "./quote-selection";
@@ -21,29 +29,40 @@ export interface QuoteSelectionButtonProps {
 	onDismiss(candidate: QuoteCandidate): void;
 	showShortcut?: boolean;
 	disabled?: boolean;
+	/** Offers 顺便提问; absent where the selection cannot fork (no source message, no session). */
+	onAskStart?: (candidate: QuoteCandidate) => void;
+	/**
+	 * Controlled ask mode: the toolbar becomes a question input for this candidate.
+	 * Escape/outside press cancels back to the live selection's actions; ✕ dismisses both.
+	 */
+	asking?: boolean;
+	askBusy?: boolean;
+	onAskSubmit?: (question: string) => void;
+	onAskCancel?: () => void;
 }
 
 function box(rect: DOMRect): QuoteButtonBox {
 	return { top: rect.top, left: rect.left, right: rect.right, bottom: rect.bottom };
 }
 
-function selectionEnd(candidate: QuoteCandidate): QuoteButtonBox | null {
+function selectionGeometry(candidate: QuoteCandidate): QuoteButtonSelection | null {
 	if (candidate.kind !== "text" || !candidate.range) return null;
 	const rects = [...candidate.range.getClientRects()].filter(
 		(rect) => rect.width > 0 || rect.height > 0,
 	);
-	const rect = candidate.backward ? rects[0] : rects.at(-1);
-	if (!rect) return null;
-	// A backward selection ends at its first rect's left edge.
-	return candidate.backward ? { ...box(rect), right: rect.left } : box(rect);
+	const backward = !!candidate.backward;
+	const end = backward ? rects[0] : rects.at(-1);
+	if (!end) return null;
+	return { union: box(candidate.range.getBoundingClientRect()), end: box(end), backward };
 }
 
 /**
- * Floating "quote selection" action. It is portalled and fixed-positioned so selecting
- * text never resizes the composer (which would move the text under the pointer).
+ * Floating selection toolbar: 引用 (and 顺便提问 where the session can fork). It is
+ * portalled and fixed-positioned so selecting text never resizes the composer (which
+ * would move the text under the pointer), and it sits outside the selected lines.
  *
  * The iOS/Android selection menus cannot be extended or reliably suppressed from a web
- * page, so on touch the button sits on the composer's top edge instead of next to the
+ * page, so on touch the toolbar sits on the composer's top edge instead of next to the
  * selection, where the platform menu (above) and the selection handles (below) live.
  */
 export function QuoteSelectionButton({
@@ -54,10 +73,17 @@ export function QuoteSelectionButton({
 	onDismiss,
 	showShortcut = true,
 	disabled = false,
+	onAskStart,
+	asking = false,
+	askBusy = false,
+	onAskSubmit,
+	onAskCancel,
 }: QuoteSelectionButtonProps) {
 	const { t } = useTranslation("narrator");
 	const ref = useRef<HTMLDivElement>(null);
+	const inputRef = useRef<HTMLInputElement>(null);
 	const [position, setPosition] = useState<{ top: number; left: number } | null>(null);
+	const [question, setQuestion] = useState("");
 
 	useLayoutEffect(() => {
 		const element = ref.current;
@@ -68,7 +94,7 @@ export function QuoteSelectionButton({
 		}
 		const update = () => {
 			const composer = anchor.getBoundingClientRect();
-			// A hidden pane (e.g. inactive tab) has no box; neither does its button.
+			// A hidden pane (e.g. inactive tab) has no box; neither does its toolbar.
 			if (composer.width === 0 && composer.height === 0) {
 				setPosition(null);
 				return;
@@ -77,7 +103,7 @@ export function QuoteSelectionButton({
 			const panel = anchor.closest(NARRATOR_PANEL_SELECTOR)?.getBoundingClientRect();
 			const next = quoteButtonPosition({
 				placement,
-				selection: selectionEnd(candidate),
+				selection: selectionGeometry(candidate),
 				bounds: panel
 					? box(panel)
 					: { top: 0, left: 0, right: viewport.width, bottom: viewport.height },
@@ -117,62 +143,124 @@ export function QuoteSelectionButton({
 		};
 	}, [candidate, anchor, placement]);
 
+	useEffect(() => {
+		if (!asking) {
+			setQuestion("");
+			return;
+		}
+		inputRef.current?.focus({ preventScroll: true });
+		const doc = anchor?.ownerDocument;
+		if (!doc || askBusy) return;
+		// Pressing anywhere else abandons the question, like any other popover.
+		const outside = (event: PointerEvent) => {
+			if (!ref.current?.contains(event.target as Node)) onAskCancel?.();
+		};
+		doc.addEventListener("pointerdown", outside, true);
+		return () => doc.removeEventListener("pointerdown", outside, true);
+	}, [asking, askBusy, anchor, onAskCancel]);
+
 	if (!candidate || !anchor) return null;
-	const unavailable = candidate.kind === "file" && !candidate.reference;
-	const label = candidate.kind === "text" ? candidate.quote.label : candidate.label;
-	const Icon = candidate.kind === "text" ? IconQuote : IconFileText;
 	const keyboardShortcut = showShortcut && candidate.kind === "text";
+	const submit = (event: FormEvent) => {
+		event.preventDefault();
+		if (!askBusy) onAskSubmit?.(question.trim());
+	};
 	return createPortal(
-		// biome-ignore lint/a11y/useSemanticElements: a fieldset would add form semantics to a toolbar.
 		<div
 			ref={ref}
 			className={classes.root}
 			data-quote-candidate
 			data-placement={placement}
-			role="group"
-			aria-label={t("quote.add", { defaultValue: "Quote selection" })}
+			data-mode={asking ? "ask" : "actions"}
+			role="toolbar"
+			aria-label={t("quote.add", { defaultValue: "Quote" })}
 			style={{
 				zIndex: Z.popover,
 				top: position?.top ?? 0,
 				left: position?.left ?? 0,
 				visibility: position ? undefined : "hidden",
 			}}
-			// Keep the source selection (and focus) alive while the button is pressed.
-			onPointerDown={(event) => event.preventDefault()}
+			// Keep the source selection (and focus) alive while a toolbar button is pressed.
+			onPointerDown={(event) => {
+				if (event.target !== inputRef.current) event.preventDefault();
+			}}
 		>
-			<button
-				type="button"
-				className={classes.accept}
-				aria-label={t("quote.add", { defaultValue: "Quote selection" })}
-				aria-keyshortcuts={keyboardShortcut ? "Tab" : undefined}
-				disabled={disabled || unavailable}
-				title={
-					unavailable
-						? t("quote.fileUnsaved", { defaultValue: "Save the file before quoting" })
-						: candidate.kind === "text"
-							? candidate.quote.text
-							: label
-				}
-				onClick={() => onAccept(candidate)}
-			>
-				{keyboardShortcut ? (
-					<kbd
-						className={classes.shortcut}
-						aria-label={t("quote.tabKey")}
-						title={t("quote.tabKey")}
+			{asking ? (
+				<form className={classes.askForm} onSubmit={submit}>
+					<IconMessageQuestion size={14} aria-hidden="true" className={classes.askIcon} />
+					<input
+						ref={inputRef}
+						className={classes.askInput}
+						value={question}
+						disabled={askBusy}
+						placeholder={t("quote.askPlaceholder")}
+						aria-label={t("contextMenu_askInPassing")}
+						onChange={(event) => setQuestion(event.currentTarget.value)}
+						onKeyDown={(event) => {
+							if (event.key !== "Escape" || event.nativeEvent.isComposing) return;
+							event.preventDefault();
+							event.stopPropagation();
+							if (!askBusy) onAskCancel?.();
+						}}
+					/>
+					<button
+						type="submit"
+						className={classes.iconAction}
+						aria-label={t("askInPassing_confirm")}
+						title={t("askInPassing_confirm")}
+						disabled={askBusy}
+						data-quote-ask-submit
 					>
-						<IconArrowBarToRight size={12} aria-hidden="true" />
-						<span>Tab</span>
-					</kbd>
-				) : null}
-				<Icon size={14} aria-hidden="true" data-quote-action />
-				<span className={classes.label}>{label}</span>
-			</button>
+						{askBusy ? <Loader size={12} /> : <IconArrowUp size={14} />}
+					</button>
+				</form>
+			) : (
+				<>
+					<button
+						type="button"
+						className={classes.action}
+						aria-keyshortcuts={keyboardShortcut ? "Tab" : undefined}
+						disabled={disabled}
+						title={candidate.kind === "text" ? candidate.quote.text : candidate.label}
+						onClick={() => onAccept(candidate)}
+						data-quote-accept
+					>
+						{keyboardShortcut ? (
+							<kbd
+								className={classes.shortcut}
+								aria-label={t("quote.tabKey")}
+								title={t("quote.tabKey")}
+							>
+								<IconArrowBarToRight size={12} aria-hidden="true" />
+								<span>Tab</span>
+							</kbd>
+						) : null}
+						<IconQuote size={14} aria-hidden="true" data-quote-action />
+						<span>{t("quote.add", { defaultValue: "Quote" })}</span>
+					</button>
+					{onAskStart ? (
+						<button
+							type="button"
+							className={classes.action}
+							onClick={() => onAskStart(candidate)}
+							data-quote-ask
+						>
+							<IconMessageQuestion size={14} aria-hidden="true" />
+							<span>{t("contextMenu_askInPassing")}</span>
+						</button>
+					) : null}
+				</>
+			)}
 			<button
 				type="button"
-				className={classes.dismiss}
+				className={classes.iconAction}
 				aria-label={t("quote.dismiss", { defaultValue: "Dismiss" })}
-				onClick={() => onDismiss(candidate)}
+				disabled={askBusy}
+				onClick={() => {
+					if (asking) onAskCancel?.();
+					onDismiss(candidate);
+				}}
+				data-quote-dismiss
 			>
 				<IconX size={12} />
 			</button>

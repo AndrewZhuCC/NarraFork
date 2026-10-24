@@ -21,6 +21,8 @@ export type QuoteCandidate =
 			range?: Range;
 			/** Focus precedes anchor: the selection "end" the user moved is its start. */
 			backward?: boolean;
+			/** Message the selection starts in, the fork point for 顺便提问. */
+			messageId?: string;
 	  }
 	| {
 			kind: "file";
@@ -199,8 +201,14 @@ export function useQuoteCandidate({
 				!!selection.focusNode &&
 				(range.startContainer !== selection.anchorNode ||
 					range.startOffset !== selection.anchorOffset);
+			const start = range.startContainer;
+			const messageId =
+				(start.nodeType === 1 ? (start as Element) : start.parentElement)
+					?.closest("[data-message-id]")
+					?.getAttribute("data-message-id")
+					?.trim() || undefined;
 			setShowShortcut(!touchInputRef.current);
-			setCandidate({ kind: "text", key, quote, range, backward });
+			setCandidate({ kind: "text", key, quote, range, backward, messageId });
 		};
 		const schedule = () => {
 			clearTimeout(timer);

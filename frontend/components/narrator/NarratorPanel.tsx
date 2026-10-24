@@ -159,6 +159,7 @@ import {
 	normalizeDangerReflectionLevel,
 	normalizeDangerReflectionOverride,
 } from "./interaction/reflection-types";
+import { useAskSelectionInPassing } from "./interaction/use-ask-selection-in-passing";
 import { useComposerAttachments } from "./interaction/use-composer-attachments";
 import { useComposerFileIngest } from "./interaction/use-composer-file-ingest";
 import { useInternalFileViewer } from "./interaction/use-internal-file-viewer";
@@ -1833,6 +1834,7 @@ function NarratorPanelBody({
 		navigateToNarrator: (id: string) =>
 			navigate({ to: "/narrators/$narratorId", params: { narratorId: id } }),
 	});
+	const askSelectionInPassing = useAskSelectionInPassing(narratorId);
 
 	// Slash-command handlers for /fork and /compact, mirroring the manual
 	// controls exactly: fork from the latest real message (its right-click fork
@@ -3672,6 +3674,7 @@ function NarratorPanelBody({
 							reflectionSettingsDisabled,
 						}}
 						composerRowProps={{
+							onAskSelection: askSelectionInPassing,
 							fileInputRef,
 							composerRef,
 							sendingRef,
