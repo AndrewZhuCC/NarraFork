@@ -402,6 +402,8 @@
 			"merged": "{{count}} 段内容"
 		},
 		"add": "引用",
+		"askPlaceholder": "就选中内容提问，直接回车即可",
+		"askDefault": "解释一下这段内容。",
 		"addHint": "引用选中内容（Tab）",
 		"tabKey": "Tab 键",
 		"dismiss": "忽略",

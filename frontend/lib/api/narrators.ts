@@ -2146,6 +2146,8 @@ export const narratorsApi = {
 		opts: {
 			question: string;
 			pendingMessageId: string;
+			/** Selected excerpt; the fork receives it as a quote block ahead of the question. */
+			quote?: { label: string; text: string; anchor?: string };
 		},
 	) =>
 		request<ApiEntity & { message?: unknown }>(`/narrators/${narratorId}/ask-in-passing`, {

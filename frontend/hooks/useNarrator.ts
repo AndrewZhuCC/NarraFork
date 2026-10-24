@@ -581,11 +581,13 @@ export function useAskInPassing() {
 			narratorId,
 			question,
 			pendingMessageId,
+			quote,
 		}: {
 			narratorId: string;
 			question: string;
 			pendingMessageId: string;
-		}) => api.askInPassing(narratorId, { question, pendingMessageId }),
+			quote?: { label: string; text: string; anchor?: string };
+		}) => api.askInPassing(narratorId, { question, pendingMessageId, quote }),
 		// Only the narrator LISTS need refreshing (a new standalone narrator now
 		// exists). Invalidating the whole `["narrators"]` prefix also dropped every
 		// open session's messages/tool-calls/preview caches — including the panel the

@@ -1037,6 +1037,84 @@ test("a live selected message is quoted once with Tab, not Alt+Q or modified Tab
 	}
 });
 
+async function openAsk(page: Page) {
+	await selectQuotableSource(page);
+	await page.click("[data-quote-ask]");
+	await page.waitForSelector('[data-quote-candidate][data-mode="ask"] input', { visible: true });
+	expect(await page.evaluate(() => document.activeElement?.tagName)).toBe("INPUT");
+}
+const askedQuote = {
+	label: "Select this source text to quote without changing the message…",
+	text: "Select this source text to quote without changing the message layout.",
+	anchor: "m:message-source",
+};
+
+test("顺便提问 from a selection forks at the source message with the excerpt quoted", async () => {
+	const page = await open();
+	try {
+		await openAsk(page);
+		// Focus left the message list; the toolbar keeps the question's selection.
+		await settle(page);
+		expect(await page.$('[data-quote-candidate][data-mode="ask"]')).not.toBeNull();
+		await page.keyboard.type("Why does this matter?");
+		await page.keyboard.press("Enter");
+		await page.waitForSelector("[data-quote-candidate]", { hidden: true });
+		const state = await snapshot(page);
+		expect(state.asked).toEqual([
+			{
+				sourceMessageId: "message-source",
+				quote: expect.objectContaining({ text: askedQuote.text, anchor: askedQuote.anchor }),
+				question: "Why does this matter?",
+			},
+		]);
+		// Asking never quotes into the main composer.
+		expect(nodeCount(state.document, "quote")).toBe(0);
+	} finally {
+		await close(page);
+	}
+});
+
+test("an empty 顺便提问 asks about the excerpt directly; Escape and failures keep the composer", async () => {
+	const page = await open();
+	try {
+		await openAsk(page);
+		await page.keyboard.press("Enter");
+		await page.waitForSelector("[data-quote-candidate]", { hidden: true });
+		expect((await snapshot(page)).asked.map((input) => input.question)).toEqual([
+			"Explain this excerpt.",
+		]);
+
+		await openAsk(page);
+		await page.keyboard.type("never sent");
+		// Escape steps back to the still-live selection's actions; ✕ dismisses them.
+		await page.keyboard.press("Escape");
+		await page.waitForSelector('[data-quote-candidate][data-mode="actions"]', { visible: true });
+		await page.click("[data-quote-dismiss]");
+		await page.waitForSelector("[data-quote-candidate]", { hidden: true });
+		expect((await snapshot(page)).asked).toHaveLength(1);
+		// A dismissed selection is offered again only once it changed: let the clear settle.
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.clearSelection());
+		await Bun.sleep(250);
+
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.failAsk("boom"));
+		await openAsk(page);
+		await page.keyboard.type("fails");
+		await page.keyboard.press("Enter");
+		await settle(page);
+		// The question survives a failed request for a retry.
+		expect(
+			await page.$eval(
+				'[data-quote-candidate][data-mode="ask"] input',
+				(input) => (input as HTMLInputElement).value,
+			),
+		).toBe("fails");
+		expect((await snapshot(page)).asked).toHaveLength(2);
+	} finally {
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.failAsk(null));
+		await close(page);
+	}
+}, 15_000);
+
 test("normal input Tab is not captured by a stale message quote candidate", async () => {
 	const page = await open();
 	try {
@@ -1084,7 +1162,7 @@ test("touch and pen selections hide shortcut hints; mouse on the same touch-capa
 			placement: "composer",
 			gapToComposer: 6,
 			rightAligned: true,
-			height: 36,
+			height: 38,
 		});
 		await page.mouse.click(source.x, source.y);
 		await selectQuotableSource(page);
@@ -1986,7 +2064,8 @@ for (const width of [1440, 390]) {
 						fullPage: true,
 					});
 				const button = await measure("[data-quote-candidate]");
-				expect(button.height).toBe(28);
+				expect(button.height).toBe(30);
+				expect(button.label).toBe("Quote");
 				expect(button.left).toBeGreaterThanOrEqual(0);
 				expect(button.right).toBeLessThanOrEqual(width);
 				expect(Math.abs(button.keyOffset)).toBeLessThanOrEqual(1);
@@ -2002,7 +2081,6 @@ for (const width of [1440, 390]) {
 					});
 				expect(await page.$("[data-quote-candidate]")).toBeNull();
 				const chip = await measure('[data-composer-atom="quote"]');
-				expect(chip.label).toBe(button.label);
 				expect(chip.icon).toBe(button.icon);
 			} finally {
 				await close(page);

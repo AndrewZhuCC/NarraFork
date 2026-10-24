@@ -402,6 +402,8 @@
 			"merged": "{{count}} blocks"
 		},
 		"add": "Quote",
+		"askPlaceholder": "Ask about the selection — Enter asks right away",
+		"askDefault": "Explain this excerpt.",
 		"addHint": "Quote selection (Tab)",
 		"tabKey": "Tab key",
 		"dismiss": "Dismiss",

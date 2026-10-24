@@ -35,6 +35,7 @@ import { shouldFallbackPanelState } from "../../../lib/narrator-panel-state";
 import { Z } from "../../../lib/z-index";
 import { useImageViewer } from "../../common/image-viewer-context";
 import { useNarratorDockContext } from "../dock/NarratorDockContext";
+import type { AskSelectionInput } from "../interaction/use-ask-selection-in-passing";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
 import { ComposerTextAttachmentPreview } from "./ComposerTextAttachmentPreview";
@@ -207,6 +208,8 @@ export interface NarratorComposerProps {
 	 * row below) instead of collapsing to one line while short.
 	 */
 	adaptive?: boolean;
+	/** 顺便提问 from a message-list selection; absent hides the action. */
+	onAskSelection?: (input: AskSelectionInput) => Promise<void>;
 }
 
 /**
@@ -249,6 +252,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			sending = false,
 			draft,
 			adaptive = true,
+			onAskSelection,
 		},
 		ref,
 	) {
@@ -1516,6 +1520,46 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		);
 		acceptQuoteRef.current = acceptQuote;
 
+		// 顺便提问 freezes the candidate: typing the question moves focus out of the
+		// message list, which clears the live selection the toolbar was offered for.
+		const [askCandidate, setAskCandidate] = useState<Extract<
+			QuoteCandidate,
+			{ kind: "text" }
+		> | null>(null);
+		const [askBusy, setAskBusy] = useState(false);
+		const startAsk = useCallback((candidate: QuoteCandidate) => {
+			if (candidate.kind === "text" && candidate.messageId) setAskCandidate(candidate);
+		}, []);
+		// Focusing the question already collapsed the source selection; reselecting the
+		// same text offers the toolbar again.
+		const cancelAsk = useCallback(() => setAskCandidate(null), []);
+		const submitAsk = useCallback(
+			async (question: string) => {
+				const candidate = askCandidate;
+				if (!candidate?.messageId || !onAskSelection) return;
+				setAskBusy(true);
+				try {
+					await onAskSelection({
+						sourceMessageId: candidate.messageId,
+						quote: candidate.quote,
+						question: question || t("quote.askDefault"),
+					});
+					setAskCandidate(null);
+					candidate.range?.startContainer.ownerDocument?.getSelection()?.removeAllRanges();
+				} catch (error) {
+					notifications.show({
+						message: error instanceof Error ? error.message : String(error),
+						color: "red",
+						autoClose: 5000,
+					});
+				} finally {
+					setAskBusy(false);
+				}
+			},
+			[askCandidate, onAskSelection, t],
+		);
+		const toolbarCandidate = askCandidate ?? quoteCandidate.candidate;
+
 		useEffect(() => {
 			if (appendInputRef) {
 				appendInputRef.current = appendText;
@@ -1731,13 +1775,25 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				aria-label={fullscreenOpened ? t("fullscreenComposerTitle") : undefined}
 			>
 				<QuoteSelectionButton
-					candidate={quoteCandidate.candidate}
+					candidate={toolbarCandidate}
 					anchor={editorElement?.closest<HTMLElement>("[data-inline-composer]") ?? null}
 					placement={quoteCandidate.showShortcut ? "selection" : "composer"}
 					showShortcut={quoteCandidate.showShortcut}
 					disabled={sending || hasUnconfirmedLegacyAttachments()}
 					onAccept={acceptQuote}
 					onDismiss={quoteCandidate.hide}
+					onAskStart={
+						onAskSelection &&
+						!draft &&
+						toolbarCandidate?.kind === "text" &&
+						toolbarCandidate.messageId
+							? startAsk
+							: undefined
+					}
+					asking={!!askCandidate}
+					askBusy={askBusy}
+					onAskSubmit={submitAsk}
+					onAskCancel={cancelAsk}
 				/>
 				<QuoteDetailModal
 					quote={quoteDetail}

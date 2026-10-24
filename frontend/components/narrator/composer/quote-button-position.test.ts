@@ -1,62 +1,109 @@
 import { describe, expect, test } from "bun:test";
-import { type QuoteButtonLayout, quoteButtonPosition } from "./quote-button-position";
+import {
+	type QuoteButtonBox,
+	type QuoteButtonLayout,
+	quoteButtonPosition,
+} from "./quote-button-position";
 
+const line = (top: number, left: number, right: number): QuoteButtonBox => ({
+	top,
+	left,
+	right,
+	bottom: top + 20,
+});
+
+// Three selected lines, 200..260, ending mid-line at x=300.
+const forward = {
+	union: { top: 200, left: 40, right: 900, bottom: 260 },
+	end: line(240, 40, 300),
+	backward: false,
+};
 const base: QuoteButtonLayout = {
 	placement: "selection",
-	selection: { top: 200, left: 100, right: 300, bottom: 220 },
+	selection: forward,
 	bounds: { top: 50, left: 0, right: 1000, bottom: 700 },
 	composer: { top: 600, left: 20, right: 980, bottom: 680 },
 	viewport: { width: 1000, height: 800 },
 	size: { width: 120, height: 28 },
 };
 
+function overlaps(position: { top: number } | null, from: number, to: number): boolean {
+	return !!position && position.top < to && position.top + 28 > from;
+}
+
 describe("quoteButtonPosition", () => {
-	test("sits above the selection end, centred on it", () => {
-		expect(quoteButtonPosition(base)).toEqual({ top: 166, left: 240 });
+	test("forward: below the last selected line, centred on the selection end", () => {
+		const position = quoteButtonPosition(base);
+		expect(position).toEqual({ top: 266, left: 240 });
+		expect(overlaps(position, 200, 260)).toBe(false);
 	});
 
-	test("flips below when there is no room above", () => {
+	test("backward: above the first selected line, at the selection start", () => {
 		expect(
-			quoteButtonPosition({ ...base, selection: { top: 60, left: 100, right: 300, bottom: 80 } }),
-		).toEqual({ top: 86, left: 240 });
+			quoteButtonPosition({
+				...base,
+				selection: { ...forward, end: line(200, 400, 900), backward: true },
+			}),
+		).toEqual({ top: 166, left: 340 });
 	});
 
-	test("never overlaps the composer: clamps into the space between the panel top and it", () => {
-		const position = quoteButtonPosition({
+	test("flips to the other side when the preferred side has no room", () => {
+		const nearComposer = quoteButtonPosition({
 			...base,
-			bounds: { ...base.bounds, top: 560 },
-			selection: { top: 570, left: 100, right: 300, bottom: 590 },
+			selection: {
+				union: { top: 520, left: 40, right: 900, bottom: 580 },
+				end: line(560, 40, 300),
+				backward: false,
+			},
 		});
-		expect(position).toEqual({ top: 560, left: 240 });
+		expect(nearComposer).toEqual({ top: 486, left: 240 });
+		const nearTop = quoteButtonPosition({
+			...base,
+			selection: {
+				union: { top: 60, left: 40, right: 900, bottom: 120 },
+				end: line(60, 400, 900),
+				backward: true,
+			},
+		});
+		expect(nearTop).toEqual({ top: 126, left: 340 });
 	});
 
-	test("hides once the selection end scrolls out of the visible message area", () => {
+	test("a selection taller than the view is covered only at the edge near its moved end", () => {
+		const tall = { top: 0, left: 40, right: 900, bottom: 900 };
 		expect(
-			quoteButtonPosition({ ...base, selection: { top: 10, left: 0, right: 10, bottom: 40 } }),
-		).toBeNull();
+			quoteButtonPosition({
+				...base,
+				selection: { union: tall, end: line(880, 40, 300), backward: false },
+			})?.top,
+		).toBe(572);
 		expect(
-			quoteButtonPosition({ ...base, selection: { top: 610, left: 0, right: 10, bottom: 630 } }),
-		).toBeNull();
+			quoteButtonPosition({
+				...base,
+				selection: { union: tall, end: line(0, 400, 900), backward: true },
+			})?.top,
+		).toBe(50);
+	});
+
+	test("hides once the selection scrolls out of the visible message area", () => {
+		for (const union of [
+			{ top: 0, left: 0, right: 10, bottom: 40 },
+			{ top: 610, left: 0, right: 10, bottom: 630 },
+		])
+			expect(
+				quoteButtonPosition({ ...base, selection: { union, end: union, backward: false } }),
+			).toBeNull();
 	});
 
 	test("stays inside the panel and viewport horizontally", () => {
-		expect(
-			quoteButtonPosition({ ...base, selection: { top: 200, left: 0, right: 10, bottom: 220 } })
-				?.left,
-		).toBe(4);
-		expect(
+		const at = (end: QuoteButtonBox, bounds = base.bounds) =>
 			quoteButtonPosition({
 				...base,
-				selection: { top: 200, left: 900, right: 995, bottom: 220 },
-			})?.left,
-		).toBe(876);
-		expect(
-			quoteButtonPosition({
-				...base,
-				bounds: { ...base.bounds, left: 500, right: 800 },
-				selection: { top: 200, left: 500, right: 510, bottom: 220 },
-			})?.left,
-		).toBe(500);
+				bounds,
+				selection: { ...forward, end },
+			})?.left;
+		expect(at(line(240, 0, 10))).toBe(4);
+		expect(at(line(240, 900, 995))).toBe(876);
+		expect(at(line(240, 500, 510), { ...base.bounds, left: 500, right: 800 })).toBe(500);
 	});
 
 	test("touch placement right-aligns on the composer's top edge", () => {

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import { resolve } from "node:path";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
-import type { ComposerDocument } from "@shared/composer-document";
+import { type ComposerDocument, composerQuoteBlock } from "@shared/composer-document";
 import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 import {
 	type FileReference,
@@ -5308,7 +5308,7 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 	const parsed = askInPassingSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 
-	const { question, pendingMessageId } = parsed.data;
+	const { question, pendingMessageId, quote } = parsed.data;
 
 	// Verify the pending message exists, belongs to this narrator, and is still pending
 	const pendingMsg = fillBody(
@@ -5355,7 +5355,10 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 	// and left createdBy empty, so the question rendered without its author.
 	const locale = await getUserLanguage(userId);
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
-	await sendMessage(newNarrator.id, question, [], locale, replyInUserLanguage, null, userId);
+	// A selection-started question carries its excerpt as the composer's quote block,
+	// so the fork sees the context and its bubble renders the quote chip.
+	const sentText = quote ? `${composerQuoteBlock(quote)}${question}` : question;
+	await sendMessage(newNarrator.id, sentText, [], locale, replyInUserLanguage, null, userId);
 
 	// Update the pending message to resolved
 	const resolvedContentJson = [
