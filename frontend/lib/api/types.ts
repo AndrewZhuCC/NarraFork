@@ -292,6 +292,8 @@ export interface SearchRequest {
 	/** Search all of history even for a query of only short terms. */
 	fullHistory?: boolean;
 	cursor?: string;
+	/** 1-based page of a single section, in place of `cursor`. */
+	page?: number;
 	limit?: number;
 }
 
