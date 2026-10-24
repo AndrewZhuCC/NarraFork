@@ -531,7 +531,21 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/narrator-panel-state.ts": ["json1"],
 	"server/services/narrator-persistence.ts": ["handle", "rowid", "indexHint"],
 	// Block storage is SQLite-only in P1 (PG envelopes stay legacy-format).
-	"server/services/narrator-block-sync.ts": ["handle", "sqliteCatalog", "insertOr", "rowid"],
+	// The broken-call flag of a tool result is read in SQL so the result itself is not.
+	"server/services/narrator-block-sync.ts": [
+		"handle",
+		"sqliteCatalog",
+		"insertOr",
+		"rowid",
+		"json1",
+	],
+	// The block index job is SQLite-only like block storage: worker reads, rowid writes.
+	"server/services/narrator-block-index.ts": [
+		"handle",
+		"connectionModule",
+		"sqliteCatalog",
+		"rowid",
+	],
 	"server/services/narrator-epochs.ts": ["handle", "json1"],
 	// The block backfill is SQLite-only like block storage: rowid cursor, worker reads.
 	"server/services/narrator-block-backfill.ts": [
