@@ -1777,7 +1777,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				<QuoteSelectionButton
 					candidate={toolbarCandidate}
 					anchor={editorElement?.closest<HTMLElement>("[data-inline-composer]") ?? null}
-					placement={quoteCandidate.showShortcut ? "selection" : "composer"}
+					placement={quoteCandidate.showShortcut ? "selection" : "touch"}
 					showShortcut={quoteCandidate.showShortcut}
 					disabled={sending || hasUnconfirmedLegacyAttachments()}
 					onAccept={acceptQuote}

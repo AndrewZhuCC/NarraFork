@@ -1120,6 +1120,8 @@ const SYSTEM_TEXT_SUBTYPES = new Set([
 	"system_injection",
 ]);
 /** Extra recognized system block types beyond the simple/text sets. */
+/** One ellipsized line is all the resolved card shows; more is wasted payload. */
+const ASK_IN_PASSING_QUOTE_CHARS = 200;
 const SYSTEM_OTHER_TYPES = new Set(["knowledge_hint", "ask_in_passing", "subagent_recovery"]);
 /**
  * Block types that make a role=user message render as a SYSTEM card rather than a
@@ -3282,10 +3284,20 @@ function adaptSystemBlock(
 			typeof block.question === "string" && block.question.length > 0
 				? block.question
 				: (block.text ?? "");
+		// A selection-started question records its excerpt; the card shows it on one line.
+		const quote = block.quote as { text?: unknown } | undefined;
+		const quoteText =
+			!pending && typeof quote?.text === "string"
+				? quote.text.replace(/\s+/gu, " ").trim().slice(0, ASK_IN_PASSING_QUOTE_CHARS)
+				: "";
 		return {
 			kind: "ask-in-passing",
 			key: `${idBase}-aip`,
-			data: { kind: pending ? "pending" : "resolved", question },
+			data: {
+				kind: pending ? "pending" : "resolved",
+				question,
+				...(quoteText ? { quoteText } : {}),
+			},
 		};
 	}
 	if (blockType === "subagent_recovery") {

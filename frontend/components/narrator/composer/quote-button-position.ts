@@ -6,10 +6,10 @@ export interface QuoteButtonBox {
 }
 
 /**
- * `selection`: beside the selection (mouse). `composer`: on the composer's top edge (touch),
- * away from the platform selection menu and handles that iOS/Android draw around the selection.
+ * `selection`: beside the selection (mouse). `touch`: below the selection, clear of the
+ * selection handles; the platform menu iOS/Android draw sits above it and cannot be moved.
  */
-export type QuoteButtonPlacement = "selection" | "composer";
+export type QuoteButtonPlacement = "selection" | "touch";
 
 export interface QuoteButtonSelection {
 	/** Bounding box of every selected line. */
@@ -32,6 +32,8 @@ export interface QuoteButtonLayout {
 }
 
 export const QUOTE_BUTTON_GAP = 6;
+/** Below the last line: room for the Android teardrop / iOS knob selection handles. */
+export const QUOTE_TOUCH_HANDLE_CLEARANCE = 30;
 const EDGE_MARGIN = 4;
 
 function clamp(value: number, min: number, max: number): number {
@@ -41,28 +43,44 @@ function clamp(value: number, min: number, max: number): number {
 /**
  * Fixed-position top/left for the floating quote toolbar, or null when it must stay hidden.
  *
- * With a selection it goes outside the selected lines: below the last line for a forward
- * selection, above the first for a backward one (where the pointer ended), flipping when
- * that side has no room. Only a selection taller than the visible area gets covered, and
- * then only at the visible edge nearest the moved end.
+ * Mouse: outside the selected lines, below the last line for a forward selection, above
+ * the first for a backward one (where the pointer ended), flipping when that side has no
+ * room. Only a selection taller than the visible area gets covered, and then only at the
+ * visible edge nearest the moved end.
+ *
+ * Touch: always below the selection past its handles, since the platform menu owns the
+ * space above it; with no room there, on the composer's top edge instead.
  */
 export function quoteButtonPosition(
 	layout: QuoteButtonLayout,
 ): { top: number; left: number } | null {
 	const { selection, bounds, composer, viewport, size } = layout;
 	const maxLeft = Math.max(EDGE_MARGIN, viewport.width - size.width - EDGE_MARGIN);
-	if (layout.placement === "composer" || !selection) {
-		if (composer.right <= composer.left) return null;
-		return {
-			top: Math.max(EDGE_MARGIN, composer.top - QUOTE_BUTTON_GAP - size.height),
-			left: clamp(composer.right - size.width, EDGE_MARGIN, maxLeft),
-		};
-	}
+	const composerEdge = () =>
+		composer.right <= composer.left
+			? null
+			: {
+					top: Math.max(EDGE_MARGIN, composer.top - QUOTE_BUTTON_GAP - size.height),
+					left: clamp(composer.right - size.width, EDGE_MARGIN, maxLeft),
+				};
+	if (!selection) return composerEdge();
 	const { union, end, backward } = selection;
 	const top = Math.max(bounds.top, EDGE_MARGIN);
 	const bottom = Math.min(bounds.bottom, composer.top, viewport.height);
 	// The selection scrolled out of the visible message area.
 	if (union.bottom <= top || union.top >= bottom || bottom - top < size.height) return null;
+	const minLeft = Math.max(EDGE_MARGIN, bounds.left);
+	const horizontal = (x: number) =>
+		clamp(
+			x - size.width / 2,
+			minLeft,
+			Math.max(minLeft, Math.min(maxLeft, bounds.right - size.width)),
+		);
+	if (layout.placement === "touch") {
+		const below = Math.max(top, union.bottom + QUOTE_TOUCH_HANDLE_CLEARANCE);
+		if (below + size.height > bottom) return composerEdge();
+		return { top: below, left: horizontal(backward ? end.left : end.right) };
+	}
 	const below = union.bottom + QUOTE_BUTTON_GAP;
 	const above = union.top - QUOTE_BUTTON_GAP - size.height;
 	const fitsBelow = below + size.height <= bottom;
@@ -78,14 +96,5 @@ export function quoteButtonPosition(
 			: fitsAbove
 				? above
 				: bottom - size.height;
-	const minLeft = Math.max(EDGE_MARGIN, bounds.left);
-	const x = backward ? end.left : end.right;
-	return {
-		top: y,
-		left: clamp(
-			x - size.width / 2,
-			minLeft,
-			Math.max(minLeft, Math.min(maxLeft, bounds.right - size.width)),
-		),
-	};
+	return { top: y, left: horizontal(backward ? end.left : end.right) };
 }

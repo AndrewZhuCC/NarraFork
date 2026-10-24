@@ -949,16 +949,17 @@ function nodeCount(doc: ComposerDocument | undefined, type: string) {
 			.length ?? 0
 	);
 }
-/** Where the floating quote button sits, relative to the composer shell. */
+/** Where the floating quote toolbar sits, relative to the selection and composer. */
 function quoteButtonLayout(page: Page) {
 	return page.$eval("[data-quote-candidate]", (node) => {
 		const rect = node.getBoundingClientRect();
 		const composer = document.querySelector("[data-inline-composer]")?.getBoundingClientRect();
-		if (!composer) throw new Error("Missing composer");
+		const selection = window.getSelection()?.getRangeAt(0).getBoundingClientRect();
+		if (!composer || !selection) throw new Error("Missing composer or selection");
 		return {
 			placement: node.getAttribute("data-placement"),
-			gapToComposer: Math.round(composer.top - rect.bottom),
-			rightAligned: Math.abs(composer.right - rect.right) <= 1,
+			gapBelowSelection: Math.round(rect.top - selection.bottom),
+			aboveComposer: rect.bottom <= composer.top,
 			height: rect.height,
 		};
 	});
@@ -1053,12 +1054,21 @@ test("顺便提问 from a selection forks at the source message with the excerpt
 	const page = await open();
 	try {
 		await openAsk(page);
-		// Focus left the message list; the toolbar keeps the question's selection.
+		// Focus left the message list; the toolbar keeps the question's selection and
+		// paints it in place, since the native highlight went with the focus.
 		await settle(page);
 		expect(await page.$('[data-quote-candidate][data-mode="ask"]')).not.toBeNull();
+		const askedHighlight = () =>
+			page.evaluate(() => {
+				const highlight = CSS.highlights.get("nf-ask-selection");
+				const [range] = highlight ? [...highlight] : [];
+				return range instanceof Range ? range.toString() : null;
+			});
+		expect(await askedHighlight()).toBe(askedQuote.text);
 		await page.keyboard.type("Why does this matter?");
 		await page.keyboard.press("Enter");
 		await page.waitForSelector("[data-quote-candidate]", { hidden: true });
+		expect(await askedHighlight()).toBeNull();
 		const state = await snapshot(page);
 		expect(state.asked).toEqual([
 			{
@@ -1157,11 +1167,11 @@ test("touch and pen selections hide shortcut hints; mouse on the same touch-capa
 		expect(
 			await page.$eval("[data-quote-candidate]", (element) => element.getAttribute("aria-label")),
 		).not.toContain("Tab");
-		// Away from the platform selection menu and handles: on the composer's top edge.
+		// Below the selection, past its handles; the platform menu owns the space above.
 		expect(await quoteButtonLayout(page)).toEqual({
-			placement: "composer",
-			gapToComposer: 6,
-			rightAligned: true,
+			placement: "touch",
+			gapBelowSelection: 30,
+			aboveComposer: true,
 			height: 38,
 		});
 		await page.mouse.click(source.x, source.y);

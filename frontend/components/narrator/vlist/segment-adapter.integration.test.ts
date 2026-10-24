@@ -414,6 +414,34 @@ describe("adapter × real segmentMessages", () => {
 		expect((resolved[0]?.data as { kind?: string }).kind).toBe("resolved");
 	});
 
+	it("ask_in_passing: a resolved selection question carries its excerpt as one line", () => {
+		const mk = (block: Record<string, unknown>) =>
+			adaptSegments(
+				segmentMessages([
+					rowWithElements(
+						{
+							id: "aip-quote",
+							narratorId: "n1",
+							parentToolUseId: null,
+							role: "system",
+							contentText: null,
+							toolCalls: [],
+							createdAt: "2026-01-01T00:00:00Z",
+						},
+						[{ type: "ask_in_passing", question: "Why?", ...block }],
+					) as unknown as NarratorMsg,
+				]) as unknown as AdapterSegment[],
+				CTX,
+			)[0]?.data as { quoteText?: string };
+		const quote = { label: "Assistant", text: "first line\n\n  second   line" };
+		expect(mk({ status: "resolved", quote }).quoteText).toBe("first line second line");
+		expect(
+			mk({ status: "resolved", quote: { label: "A", text: "x".repeat(500) } }).quoteText,
+		).toHaveLength(200);
+		expect(mk({ status: "resolved" })).not.toHaveProperty("quoteText");
+		expect(mk({ status: "pending", quote })).not.toHaveProperty("quoteText");
+	});
+
 	it("subagent card carries height-relevant fields (recentCallCount, isTerminal) + render-only status glyph", () => {
 		const agentMsg = rowWithElements(
 			{

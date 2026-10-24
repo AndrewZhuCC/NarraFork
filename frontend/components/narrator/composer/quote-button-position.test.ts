@@ -106,11 +106,30 @@ describe("quoteButtonPosition", () => {
 		expect(at(line(240, 500, 510), { ...base.bounds, left: 500, right: 800 })).toBe(500);
 	});
 
-	test("touch placement right-aligns on the composer's top edge", () => {
-		expect(quoteButtonPosition({ ...base, placement: "composer" })).toEqual({
-			top: 566,
-			left: 860,
-		});
+	test("touch: below the selection past its handles, both directions", () => {
+		const touch = { ...base, placement: "touch" as const };
+		expect(quoteButtonPosition(touch)).toEqual({ top: 290, left: 240 });
+		// The platform menu owns the space above, so a backward selection still goes below.
+		expect(
+			quoteButtonPosition({
+				...touch,
+				selection: { ...forward, end: line(200, 400, 900), backward: true },
+			}),
+		).toEqual({ top: 290, left: 340 });
+	});
+
+	test("touch: no room below the handles → the composer's top edge", () => {
+		expect(
+			quoteButtonPosition({
+				...base,
+				placement: "touch",
+				selection: {
+					union: { top: 520, left: 40, right: 900, bottom: 560 },
+					end: line(540, 40, 300),
+					backward: false,
+				},
+			}),
+		).toEqual({ top: 566, left: 860 });
 	});
 
 	test("falls back to the composer edge without a selection rect, hides without a composer", () => {
@@ -118,7 +137,7 @@ describe("quoteButtonPosition", () => {
 		expect(
 			quoteButtonPosition({
 				...base,
-				placement: "composer",
+				selection: null,
 				composer: { top: 0, left: 0, right: 0, bottom: 0 },
 			}),
 		).toBeNull();

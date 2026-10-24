@@ -5367,6 +5367,8 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 			status: "resolved",
 			sourceMessageId: sourceMessageId ?? null,
 			question,
+			// Lets the card show what was asked about, not only the question.
+			...(quote ? { quote } : {}),
 			targetNarratorId: newNarrator.id,
 			createdAt: new Date().toISOString(),
 		},

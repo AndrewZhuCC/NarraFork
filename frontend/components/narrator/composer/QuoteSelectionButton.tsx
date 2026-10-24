@@ -41,6 +41,31 @@ export interface QuoteSelectionButtonProps {
 	onAskCancel?: () => void;
 }
 
+const ASK_HIGHLIGHT = "nf-ask-selection";
+
+type HighlightWindow = Window & {
+	CSS?: { highlights?: { set(name: string, value: unknown): void; delete(name: string): void } };
+	Highlight?: new (...ranges: Range[]) => unknown;
+};
+
+/**
+ * Typing the question moves focus out of the message list, which drops the native
+ * selection highlight; paint the excerpt with a CSS custom highlight instead.
+ */
+function highlightAskedRange(doc: Document, range: Range): (() => void) | undefined {
+	const view = doc.defaultView as HighlightWindow | null;
+	const highlights = view?.CSS?.highlights;
+	if (!highlights || !view?.Highlight) return undefined;
+	if (!doc.getElementById(`${ASK_HIGHLIGHT}-style`)) {
+		const style = doc.createElement("style");
+		style.id = `${ASK_HIGHLIGHT}-style`;
+		style.textContent = `::highlight(${ASK_HIGHLIGHT}){background-color:var(--mantine-primary-color-light);color:inherit}`;
+		doc.head.append(style);
+	}
+	highlights.set(ASK_HIGHLIGHT, new view.Highlight(range));
+	return () => highlights.delete(ASK_HIGHLIGHT);
+}
+
 function box(rect: DOMRect): QuoteButtonBox {
 	return { top: rect.top, left: rect.left, right: rect.right, bottom: rect.bottom };
 }
@@ -62,8 +87,8 @@ function selectionGeometry(candidate: QuoteCandidate): QuoteButtonSelection | nu
  * would move the text under the pointer), and it sits outside the selected lines.
  *
  * The iOS/Android selection menus cannot be extended or reliably suppressed from a web
- * page, so on touch the toolbar sits on the composer's top edge instead of next to the
- * selection, where the platform menu (above) and the selection handles (below) live.
+ * page and own the space above the selection, so on touch the toolbar goes below it,
+ * past the selection handles (see quoteButtonPosition).
  */
 export function QuoteSelectionButton({
 	candidate,
@@ -142,6 +167,13 @@ export function QuoteSelectionButton({
 			visual?.removeEventListener("scroll", schedule);
 		};
 	}, [candidate, anchor, placement]);
+
+	const askedRange = asking && candidate?.kind === "text" ? candidate.range : undefined;
+	useEffect(() => {
+		const doc = anchor?.ownerDocument;
+		if (!askedRange || !doc) return;
+		return highlightAskedRange(doc, askedRange);
+	}, [askedRange, anchor]);
 
 	useEffect(() => {
 		if (!asking) {

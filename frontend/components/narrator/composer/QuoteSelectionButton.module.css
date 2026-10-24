@@ -26,8 +26,8 @@
 	width: min(340px, calc(100vw - 8px));
 }
 
-/* Finger-sized targets; the composer edge has room for them. */
-.root[data-placement="composer"] {
+/* Finger-sized targets on touch. */
+.root[data-placement="touch"] {
 	height: 38px;
 	font-size: var(--mantine-font-size-sm);
 }
@@ -55,11 +55,11 @@
 	color: var(--mantine-color-dimmed);
 }
 
-.root[data-placement="composer"] .action {
+.root[data-placement="touch"] .action {
 	padding: 0 10px;
 }
 
-.root[data-placement="composer"] .iconAction {
+.root[data-placement="touch"] .iconAction {
 	width: 32px;
 }
 
@@ -131,7 +131,7 @@
 	-webkit-user-select: text;
 }
 
-.root:not([data-placement="composer"]) .askInput {
+.root:not([data-placement="touch"]) .askInput {
 	font-size: var(--mantine-font-size-sm);
 }
 
