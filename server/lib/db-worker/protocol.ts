@@ -23,6 +23,7 @@ export const DB_WORKER_PROBE_READY_TIMEOUT_MS = 1_500;
 
 import type {
 	BlockBackfillSliceParams,
+	BlockIndexQueueSliceParams,
 	BlockProjectionSliceParams,
 	BlockReindexSliceParams,
 	BlockVerifySliceParams,
@@ -45,6 +46,7 @@ export type DbReadTaskName =
 	| "blockBackfillSlice"
 	| "blockVerifySlice"
 	| "blockReindexSlice"
+	| "blockIndexQueueSlice"
 	| "blockProjectionSlice";
 
 /** Shared read-query budgets; importing these must never bootstrap a database. */
@@ -248,6 +250,7 @@ export type DbReadTaskParams =
 	| BlockBackfillSliceParams
 	| BlockVerifySliceParams
 	| BlockReindexSliceParams
+	| BlockIndexQueueSliceParams
 	| BlockProjectionSliceParams
 	| StorageScanContextParams
 	| StorageScanTablesParams

@@ -19,7 +19,7 @@
 import { splitEnvelope } from "@shared/narrator-blocks/storage";
 import type { EnvelopeRole } from "@shared/narrator-blocks/types";
 import * as database from "../db";
-import { syncEnvelopeNow } from "./narrator-block-sync";
+import { syncQueuedEnvelopeNow } from "./narrator-block-sync";
 
 /** One block as protocol v2 sends it. */
 export interface BlockDTO {
@@ -63,7 +63,7 @@ const ID_BATCH = 500;
 
 /** Rebuild a queued envelope's rows (in a transaction of its own, or the caller's). */
 function syncQueued(messageId: string): void {
-	syncEnvelopeNow(messageId);
+	syncQueuedEnvelopeNow(messageId);
 }
 
 /**

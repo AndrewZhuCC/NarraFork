@@ -27,6 +27,7 @@ import {
 } from "../../services/storage-scan-queries";
 import {
 	runBlockBackfillSlice,
+	runBlockIndexQueueSlice,
 	runBlockProjectionSlice,
 	runBlockReindexSlice,
 	runBlockVerifySlice,
@@ -214,35 +215,37 @@ self.onmessage = async (event: MessageEvent<DbWorkerInbound>) => {
 						? runBlockVerifySlice(getConnection(message.dbPath), params)
 						: params.kind === "blockReindexSlice"
 							? runBlockReindexSlice(getConnection(message.dbPath), params)
-							: params.kind === "blockProjectionSlice"
-								? runBlockProjectionSlice(getConnection(message.dbPath), params)
-								: params.kind === "displayPageMessages"
-									? runDisplayPageQuery(getConnection(message.dbPath), params)
-									: params.kind === "selectRows"
-										? runSelectRows(getConnection(message.dbPath), params)
-										: params.kind === "storageScanContext"
-											? runStorageScanContext(message.dbPath)
-											: params.kind === "storageScanSerial"
-												? runStorageScanSerial(
-														message.dbPath,
-														message.requestId,
-														params.mainBytes,
-														controller.signal,
-													)
-												: params.kind === "storageScanCleanupSummaries"
-													? runStorageScanCleanupSummaries(message.dbPath, params)
-													: params.kind === "storageScanSessionPreview"
-														? runStorageScanSessionPreview(
-																message.dbPath,
-																params,
-																controller.signal,
-															)
-														: runStorageScanTables(
-																message.dbPath,
-																message.requestId,
-																params,
-																controller.signal,
-															);
+							: params.kind === "blockIndexQueueSlice"
+								? runBlockIndexQueueSlice(getConnection(message.dbPath), params)
+								: params.kind === "blockProjectionSlice"
+									? runBlockProjectionSlice(getConnection(message.dbPath), params)
+									: params.kind === "displayPageMessages"
+										? runDisplayPageQuery(getConnection(message.dbPath), params)
+										: params.kind === "selectRows"
+											? runSelectRows(getConnection(message.dbPath), params)
+											: params.kind === "storageScanContext"
+												? runStorageScanContext(message.dbPath)
+												: params.kind === "storageScanSerial"
+													? runStorageScanSerial(
+															message.dbPath,
+															message.requestId,
+															params.mainBytes,
+															controller.signal,
+														)
+													: params.kind === "storageScanCleanupSummaries"
+														? runStorageScanCleanupSummaries(message.dbPath, params)
+														: params.kind === "storageScanSessionPreview"
+															? runStorageScanSessionPreview(
+																	message.dbPath,
+																	params,
+																	controller.signal,
+																)
+															: runStorageScanTables(
+																	message.dbPath,
+																	message.requestId,
+																	params,
+																	controller.signal,
+																);
 		post({
 			type: "result",
 			requestId: message.requestId,
