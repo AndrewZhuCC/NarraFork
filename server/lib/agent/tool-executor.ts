@@ -1269,6 +1269,7 @@ export async function executeTool(
 			narratorId: config.narratorId,
 			cwd: config.cwd,
 			signal: config.signal,
+			guidanceSignal: config.guidanceSignal,
 			provider: config.provider,
 			model: config.model,
 			pipelineUnusedToolCallThreshold: config.pipelineUnusedToolCallThreshold,

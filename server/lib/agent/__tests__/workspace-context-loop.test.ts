@@ -218,7 +218,7 @@ describe("workspace switch pass barrier", () => {
 		expect(writes).toEqual([]);
 		expect(
 			events.filter((event) => event.type === "tool_result" && event.toolName === "Write"),
-		).toMatchObject([{ isError: true, metadata: { skippedForSoftStop: true } }]);
+		).toMatchObject([{ isError: true, metadata: { skippedForPassEnd: true } }]);
 		invalidated = false;
 		scenario = "write";
 		const next = config(current);
@@ -269,7 +269,7 @@ describe("workspace switch pass barrier", () => {
 		).toEqual([]);
 		expect(
 			events.filter((event) => event.type === "tool_result" && event.toolName === "Write"),
-		).toMatchObject([{ isError: true, metadata: { skippedForSoftStop: true } }]);
+		).toMatchObject([{ isError: true, metadata: { skippedForPassEnd: true } }]);
 		expect(current.revision).toBe(1);
 		expect(writes).toEqual([]);
 		expect(
