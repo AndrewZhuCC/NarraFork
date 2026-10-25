@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, opendir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CI_RELEASE_TARGETS } from "./lib/ci-release-types";
@@ -168,6 +168,157 @@ export function validateConfig(text: string): void {
 	);
 }
 
+export function selectTarget(
+	entries: ReturnType<typeof selectAssets>,
+	target: string | undefined,
+	ci: boolean,
+) {
+	if (!target) {
+		check(!ci, "CI requires an explicit target");
+		return entries;
+	}
+	const selected = entries.filter((entry) => entry.target.target === target);
+	check(selected.length === 1, "Invalid target");
+	return selected;
+}
+
+export interface BinaryReceipt {
+	repository: string;
+	releaseId: number;
+	version: string;
+	commit: string;
+	target: string;
+	complete: boolean;
+	files: {
+		name: string;
+		assetId: number;
+		size: number;
+		sha256: string;
+		remote: string;
+		status: string;
+	}[];
+}
+/** Normalize rather than forwarding arbitrary artifact JSON into the public aggregate receipt. */
+export function aggregateReceipts(values: unknown[], version: string): BinaryReceipt {
+	versionPath(version);
+	check(values.length === CI_RELEASE_TARGETS.length, "Exactly eight target receipts required");
+	const seen = new Set<string>();
+	const assetIds = new Set<number>();
+	let aggregate: BinaryReceipt | undefined;
+	for (const value of values) {
+		const receipt = value as BinaryReceipt;
+		const target = CI_RELEASE_TARGETS.find((entry) => entry.target === receipt?.target);
+		check(
+			target &&
+				!seen.has(target.target) &&
+				receipt.complete === true &&
+				receipt.repository === REPOSITORY &&
+				receipt.version === version &&
+				Number.isSafeInteger(receipt.releaseId) &&
+				receipt.releaseId > 0 &&
+				typeof receipt.commit === "string" &&
+				/^[a-f0-9]{40}(?![\s\S])/.test(receipt.commit) &&
+				Array.isArray(receipt.files) &&
+				receipt.files.length === 1,
+			"Invalid target receipt",
+		);
+		seen.add(target.target);
+		if (!aggregate)
+			aggregate = {
+				repository: REPOSITORY,
+				releaseId: receipt.releaseId,
+				version,
+				commit: receipt.commit,
+				target: "all",
+				complete: true,
+				files: [],
+			};
+		check(
+			receipt.releaseId === aggregate.releaseId && receipt.commit === aggregate.commit,
+			"Mixed Release identity",
+		);
+		const file = receipt.files[0];
+		const name = `narrafork-${version}-${target.suffix}`;
+		check(
+			file &&
+				file.name === name &&
+				file.remote === remotePath(version, name) &&
+				Number.isSafeInteger(file.assetId) &&
+				file.assetId > 0 &&
+				!assetIds.has(file.assetId) &&
+				Number.isSafeInteger(file.size) &&
+				file.size > 0 &&
+				file.size <= GIB &&
+				typeof file.sha256 === "string" &&
+				/^[a-f0-9]{64}(?![\s\S])/.test(file.sha256) &&
+				["uploaded", "reused"].includes(file.status),
+			"Invalid receipt binary",
+		);
+		assetIds.add(file.assetId);
+		aggregate.files.push({
+			name,
+			assetId: file.assetId,
+			size: file.size,
+			sha256: file.sha256,
+			remote: file.remote,
+			status: file.status,
+		});
+	}
+	check(
+		aggregate &&
+			seen.size === 8 &&
+			aggregate.files.reduce((sum, file) => sum + file.size, 0) <= 8 * GIB,
+		"Incomplete aggregate",
+	);
+	aggregate.files.sort((left, right) => left.name.localeCompare(right.name));
+	return aggregate;
+}
+
+async function aggregateDirectory(directory: string, version: string) {
+	check((await lstat(directory)).isDirectory(), "Invalid receipt directory");
+	const receipts: unknown[] = [];
+	for await (const entry of await opendir(directory)) {
+		check(
+			receipts.length < 8 && entry.isDirectory() && !entry.isSymbolicLink(),
+			"Unexpected receipt artifact",
+		);
+		remotePath(version, entry.name);
+		const artifact = join(directory, entry.name);
+		let count = 0;
+		for await (const file of await opendir(artifact)) {
+			check(
+				++count === 1 &&
+					file.isFile() &&
+					!file.isSymbolicLink() &&
+					file.name === "github-binaries-123-receipt.json",
+				"Unexpected receipt file",
+			);
+			const path = join(artifact, file.name);
+			const info = await lstat(path);
+			check(info.isFile() && info.size > 0 && info.size <= 16384, "Oversized receipt");
+			const text = await Bun.file(path).slice(0, 16385).text();
+			check(Buffer.byteLength(text) <= 16384, "Receipt grew beyond limit");
+			receipts.push(JSON.parse(text));
+		}
+		check(count === 1, "Missing artifact receipt");
+	}
+	const receipt = aggregateReceipts(receipts, version);
+	await writeFile(
+		".ci-release/github-binaries-123-receipt.json",
+		`${JSON.stringify(receipt, null, 2)}\n`,
+		{ mode: 0o600, flag: "wx" },
+	);
+	phase("aggregate-complete targets=8");
+}
+
+export function childTimeoutMs(command: string[]): number {
+	if (command[0] !== "rclone") return 15 * 60_000;
+	const minutes: Record<string, number> = { copyto: 325, cat: 25, lsjson: 2 };
+	const timeout = minutes[command[1]];
+	check(Object.hasOwn(minutes, command[1]) && timeout, "Unsupported rclone operation");
+	return timeout * 60_000;
+}
+
 const RCLONE_STAT_FIELDS = [
 	"bytes",
 	"speed",
@@ -274,7 +425,7 @@ export async function runChild(
 	signal: AbortSignal,
 	consume?: (chunk: Uint8Array) => Promise<void>,
 ): Promise<{ code: number; stdout: string }> {
-	const childSignal = AbortSignal.any([signal, AbortSignal.timeout(15 * 60_000)]);
+	const childSignal = AbortSignal.any([signal, AbortSignal.timeout(childTimeoutMs(command))]);
 	childSignal.throwIfAborted();
 	const child = Bun.spawn(command, {
 		stdout: "pipe",
@@ -355,10 +506,8 @@ export async function ensureRemote(
 		"30s",
 		"--timeout",
 		"2m",
-		"--max-duration",
-		"14m",
 		"--stats",
-		"30s",
+		"120s",
 		"--stats-log-level",
 		"NOTICE",
 		"--use-json-log",
@@ -368,7 +517,11 @@ export async function ensureRemote(
 		"HARD",
 	];
 	phase(`remote-stat file=${destination[2]}`);
-	const listed = await run(["rclone", "lsjson", remote, "--stat", ...base], 65536, signal);
+	const listed = await run(
+		["rclone", "lsjson", remote, "--stat", "--max-duration", "90s", ...base],
+		65536,
+		signal,
+	);
 	phase(`remote-stat-result file=${destination[2]} code=${listed.code}`);
 	// rclone uses 3/4 exclusively for missing directory/file. All other failures fail closed.
 	check([0, 3, 4].includes(listed.code), "Remote existence check failed");
@@ -379,7 +532,7 @@ export async function ensureRemote(
 	} else {
 		phase(`upload file=${destination[2]} bytes=${expected.size}`);
 		const copied = await run(
-			["rclone", "copyto", local, remote, "--immutable", ...base],
+			["rclone", "copyto", local, remote, "--immutable", "--max-duration", "320m", ...base],
 			65536,
 			signal,
 		);
@@ -390,7 +543,7 @@ export async function ensureRemote(
 	const hash = createHash("sha256");
 	let size = 0;
 	const result = await run(
-		["rclone", "cat", remote, ...base],
+		["rclone", "cat", remote, "--max-duration", "24m", ...base],
 		expected.size,
 		signal,
 		async (chunk) => {
@@ -404,10 +557,22 @@ export async function ensureRemote(
 	return exists ? "reused" : "uploaded";
 }
 async function main() {
-	const signal = AbortSignal.timeout(60 * 60_000);
+	const signal = AbortSignal.timeout(350 * 60_000);
 	let staging: string | undefined;
 	try {
 		const version = versionPath(process.env.VERSION ?? "0.9.8");
+		if (process.env.AGGREGATE_RECEIPTS_DIR) {
+			await aggregateDirectory(process.env.AGGREGATE_RECEIPTS_DIR, version);
+			return;
+		}
+		const target = process.env.TARGET;
+		// Validate before any network access; only local runs may opt into all targets.
+		check(
+			target
+				? CI_RELEASE_TARGETS.some((entry) => entry.target === target)
+				: !process.env.CI && !process.env.GITHUB_ACTIONS,
+			"CI requires a valid explicit target",
+		);
 		check(process.env.GH_TOKEN, "Missing GitHub token");
 		const configInfo = await lstat(CONFIG);
 		check(
@@ -479,7 +644,14 @@ async function main() {
 			verified.push({ ...entry, identity });
 		}
 		const files = [];
-		for (const entry of verified) {
+		const selected = selectTarget(
+			entries,
+			target,
+			Boolean(process.env.CI || process.env.GITHUB_ACTIONS),
+		);
+		for (const entry of verified.filter((item) =>
+			selected.some((choice) => choice.binary.id === item.binary.id),
+		)) {
 			const local = join(staging, entry.binary.name);
 			const writer = Bun.file(local).writer();
 			const hash = createHash("sha256");
@@ -506,14 +678,14 @@ async function main() {
 			});
 			await writeFile(
 				".ci-release/github-binaries-123-receipt.json",
-				`${JSON.stringify({ repository: REPOSITORY, releaseId: release.id, version, commit, complete: false, files }, null, 2)}\n`,
+				`${JSON.stringify({ repository: REPOSITORY, releaseId: release.id, version, commit, target: target ?? "all", complete: false, files }, null, 2)}\n`,
 				{ mode: 0o600 },
 			);
 			await rm(local);
 		}
 		await writeFile(
 			".ci-release/github-binaries-123-receipt.json",
-			`${JSON.stringify({ repository: REPOSITORY, releaseId: release.id, version, commit, complete: true, files }, null, 2)}\n`,
+			`${JSON.stringify({ repository: REPOSITORY, releaseId: release.id, version, commit, target: target ?? "all", complete: true, files }, null, 2)}\n`,
 			{ mode: 0o600 },
 		);
 	} finally {

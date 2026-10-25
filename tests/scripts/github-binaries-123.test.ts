@@ -2,6 +2,9 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import {
+	aggregateReceipts,
+	type BinaryReceipt,
+	childTimeoutMs,
 	ensureRemote,
 	type Release,
 	type Runner,
@@ -9,6 +12,7 @@ import {
 	remotePath,
 	runChild,
 	selectAssets,
+	selectTarget,
 	validateConfig,
 	validateSidecar,
 	verifyIdentity,
@@ -158,11 +162,11 @@ describe("immutable remote behavior", () => {
 		expect(fake.commands[1]).toContain("--immutable");
 		for (const command of fake.commands) {
 			for (const [flag, value] of [
-				["--stats", "30s"],
+				["--stats", "120s"],
 				["--stats-log-level", "NOTICE"],
 				["--log-level", "NOTICE"],
 				["--cutoff-mode", "HARD"],
-				["--max-duration", "14m"],
+				["--max-duration", command[1] === "copyto" ? "320m" : command[1] === "cat" ? "24m" : "90s"],
 			]) {
 				expect(command[command.indexOf(flag) + 1]).toBe(value);
 			}
@@ -196,6 +200,130 @@ describe("immutable remote behavior", () => {
 		expect(fake.commands).toHaveLength(1);
 	});
 });
+describe("matrix target receipts", () => {
+	function receipts(): BinaryReceipt[] {
+		return CI_RELEASE_TARGETS.map((target, index) => {
+			const name = `narrafork-${version}-${target.suffix}`;
+			return {
+				repository: "NarraFork/NarraFork",
+				releaseId: 42,
+				version,
+				commit,
+				target: target.target,
+				complete: true,
+				files: [
+					{
+						name,
+						assetId: index + 1,
+						...identity,
+						remote: remotePath(version, name),
+						status: "uploaded",
+					},
+				],
+			};
+		});
+	}
+	test("requires a single official target in CI and permits explicit local all", () => {
+		const entries = selectAssets(fixture(), version);
+		for (const target of CI_RELEASE_TARGETS) {
+			const selected = selectTarget(entries, target.target, true);
+			expect(selected).toHaveLength(1);
+			expect(selected[0].target.target).toBe(target.target);
+		}
+		expect(selectTarget(entries, undefined, false)).toHaveLength(8);
+		for (const target of [undefined, "", "all", "win-x64", "linux-x64\n", "../linux-x64"])
+			expect(() => selectTarget(entries, target, true)).toThrow();
+	});
+	test("operation-specific child deadlines retain bounded long uploads", () => {
+		for (const [operation, minutes] of [
+			["copyto", 325],
+			["cat", 25],
+			["lsjson", 2],
+		] as const)
+			expect(childTimeoutMs(["rclone", operation])).toBe(minutes * 60_000);
+		expect(childTimeoutMs(["gh", "api"])).toBe(15 * 60_000);
+		for (const operation of ["copy", "sync", "constructor", "toString", ""])
+			expect(() => childTimeoutMs(["rclone", operation])).toThrow();
+	});
+	test("aggregates exactly eight complete target identities without forwarding unknown fields", () => {
+		const input = receipts().reverse();
+		Object.assign(input[0], { secret: "PRIVATE-CREDENTIAL" });
+		Object.assign(input[0].files[0], { secret: "PRIVATE-CREDENTIAL" });
+		const aggregate = aggregateReceipts(input, version);
+		expect(aggregate).toMatchObject({
+			repository: "NarraFork/NarraFork",
+			releaseId: 42,
+			version,
+			commit,
+			target: "all",
+			complete: true,
+		});
+		expect(aggregate.files).toHaveLength(8);
+		expect(new Set(aggregate.files.map((file) => file.name))).toEqual(
+			new Set(CI_RELEASE_TARGETS.map((target) => `narrafork-${version}-${target.suffix}`)),
+		);
+		expect(JSON.stringify(aggregate)).not.toContain("PRIVATE-CREDENTIAL");
+		expect(input[0].target).toBe("darwin-arm64");
+	});
+	test("rejects missing/extra/duplicate targets, incomplete receipts and mixed Release identity", () => {
+		for (const mutate of [
+			(items: BinaryReceipt[]) => {
+				items.pop();
+			},
+			(items: BinaryReceipt[]) => {
+				items.push(items[0]);
+			},
+			(items: BinaryReceipt[]) => {
+				items[1] = items[0];
+			},
+			(items: BinaryReceipt[]) => {
+				items[0].target = "all";
+			},
+			(items: BinaryReceipt[]) => {
+				items[0].complete = false;
+			},
+			(items: BinaryReceipt[]) => {
+				items[0].version = "0.9.7";
+			},
+			(items: BinaryReceipt[]) => {
+				items[0].repository = "attacker/fork";
+			},
+			(items: BinaryReceipt[]) => {
+				items[0].releaseId = 43;
+			},
+			(items: BinaryReceipt[]) => {
+				items[0].commit = "b".repeat(40);
+			},
+			(items: BinaryReceipt[]) => {
+				items[0].files.push(items[0].files[0]);
+			},
+			(items: BinaryReceipt[]) => {
+				items[0].files[0].name = "../secret";
+			},
+			(items: BinaryReceipt[]) => {
+				items[0].files[0].remote = "nf_update:v0.9.8/other";
+			},
+			(items: BinaryReceipt[]) => {
+				items[0].files[0].sha256 = "invalid";
+			},
+			(items: BinaryReceipt[]) => {
+				items[0].files[0].size = 1024 ** 3 + 1;
+			},
+			(items: BinaryReceipt[]) => {
+				items[0].files[0].assetId = items[1].files[0].assetId;
+			},
+			(items: BinaryReceipt[]) => {
+				items[0].files[0].status = "failed";
+			},
+		]) {
+			const items = receipts();
+			mutate(items);
+			expect(() => aggregateReceipts(items, version)).toThrow();
+		}
+		expect(() => aggregateReceipts(Array(8).fill(null), version)).toThrow();
+	});
+});
+
 describe("private rclone diagnostics", () => {
 	test("streams only finite nonnegative whitelisted stats, never private fields", () => {
 		const logs: string[] = [];
@@ -366,7 +494,15 @@ test("workflow is manual/default-branch/official-repository/environment guarded 
 		"github.event.repository.default_branch",
 		"environment: release",
 		"contents: read",
-		"timeout-minutes: 60",
+		"timeout-minutes: 360",
+		"fail-fast: false",
+		"max-parallel: 8",
+		`TARGET: \${{ matrix.target }}`,
+		"needs: distribute",
+		"needs.distribute.result == 'success'",
+		"merge-multiple: false",
+		"AGGREGATE_RECEIPTS_DIR: .ci-release/receipts",
+		"actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333",
 		"bun-version: 1.4.3",
 		`VERSION: \${{ inputs.version }}`,
 		"secrets.NF_RELAY_RCLONE_CONFIG",
@@ -383,6 +519,13 @@ test("workflow is manual/default-branch/official-repository/environment guarded 
 		"workflow_call:",
 	])
 		expect(workflow).not.toContain(forbidden);
-	expect(workflow.match(/uses: actions\/upload-artifact/g)).toHaveLength(1);
+	expect(workflow.match(/uses: actions\/upload-artifact/g)).toHaveLength(2);
+	for (const target of CI_RELEASE_TARGETS)
+		expect(workflow).toContain(`          - ${target.target}`);
+	expect(workflow).toContain(
+		`name: github-binaries-123-receipt-\${{ github.run_id }}-\${{ github.run_attempt }}-\${{ matrix.target }}`,
+	);
+	const script = readFileSync("scripts/distribute-github-binaries-123.ts", "utf8");
+	expect(script).toContain("AbortSignal.timeout(350 * 60_000)");
 	expect(workflow).not.toContain("run: ${{");
 });
