@@ -489,6 +489,8 @@ export type NarratorServerMessage =
 	// inline a narrower shape that had already drifted (missing imageCount/creator),
 	// so clients could not see attachments the server was in fact sending.
 	| { type: "buffer_set"; narratorId: string; messages: BufferMessageSummary[] }
+	/** Queued agent messages changed; clients refetch the bounded projection. */
+	| { type: "agent_inbox_changed"; narratorId: string }
 	| {
 			type: "buffer_consumed";
 			narratorId: string;

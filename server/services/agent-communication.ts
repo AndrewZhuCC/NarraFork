@@ -24,7 +24,12 @@ import {
 	settlePreparedAgentReply,
 	snapshotDeliveryCoordinates,
 } from "./agent-reply-waiter";
-import { enqueueInboxAgent, wakeInboxIfEligible } from "./agent-runtime/inbox";
+import {
+	blockingStopReason,
+	enqueueInboxAgent,
+	type ResumableStopReason,
+	wakeInboxIfEligible,
+} from "./agent-runtime/inbox";
 import { getExecutionOwner, getRunHold } from "./agent-runtime/ownership";
 import { getRuntimePublicationService, type PublicationRun } from "./agent-runtime/publication";
 import { controlRun, wakeHeldRun } from "./agent-runtime/run";
@@ -39,6 +44,11 @@ import {
 	assertRuntimeCanSendAwait,
 } from "./subagent-communication-policy";
 import { agentLabelFromNarrator, resolveAgentLabel, shortAgentId } from "./subagent-label";
+import {
+	applySubagentModelSwitch,
+	planSubagentModelSwitch,
+	type SubagentModelSwitchPlan,
+} from "./subagent-model-switch";
 
 const TAKEN_OVER_SUBSTATUS = "taken_over";
 const isTakenOver = (narratorId: string) => !!getRunHold(narratorId);
@@ -68,6 +78,13 @@ export interface SendSubagentInput extends ResolveTargetsInput {
 	displayMessage?: string;
 	message: string;
 	doInterrupt?: boolean;
+	/**
+	 * Explicitly restart a direct child whose last turn ended with an error. Agent
+	 * messages alone never restart such a session; this is the one-call opt-in.
+	 */
+	resume?: boolean;
+	/** Switch each direct child's model before delivery (`"parent"` follows the delegator again). */
+	model?: string;
 	shouldAwait?: boolean;
 	/** Explicit request id being answered by this Send call. */
 	replyTo?: string;
@@ -157,7 +174,13 @@ export interface SendTargetResult extends SendDeliveryTarget {
 		| "timeout"
 		| "aborted"
 		| "cancelled"
-		| "taken_over";
+		| "taken_over"
+		| "blocked";
+	/** `blocked` only: why the queued message cannot start the target by itself. */
+	blockedReason?: ResumableStopReason;
+	/** Model reference stored for the target by this Send's `model` switch. */
+	model?: string;
+	resumed?: boolean;
 	interrupted?: boolean;
 	awaited?: boolean;
 	error?: string;
@@ -1284,6 +1307,27 @@ async function resolveSendTargets(
 	return [...targets.values()];
 }
 
+function blockedSendNote(
+	label: string,
+	reason: ResumableStopReason,
+	resumeRequested: boolean,
+): string {
+	if (reason === "user_interrupt")
+		return (
+			`Sent to ${label}, but it is NOT running: the user stopped its last turn, so agent ` +
+			"messages do not restart it" +
+			(resumeRequested ? " and resume=true cannot override the user's stop" : "") +
+			". The message stays queued (visible on its page) until the user resumes it; " +
+			"do not assume it has been read."
+		);
+	return (
+		`Sent to ${label}, but it is NOT running: its last turn ended with an error, so agent ` +
+		"messages do not restart it automatically. The message stays queued (visible on its " +
+		"page) and has not been read. Send again with resume=true to restart it (optionally " +
+		"with model=... to switch its model first), or ask the user to resume it."
+	);
+}
+
 async function sendSubagentMessageDetailedWithRun(
 	input: SendSubagentInput,
 ): Promise<SendSubagentResult> {
@@ -1297,7 +1341,8 @@ async function sendSubagentMessageDetailedWithRun(
 	// Reaching a target (step 4 owns that rule) is not control: an interrupt additionally
 	// needs the target's registered controller grant for "steer".
 	const targets = await resolveSendTargets(input, scope);
-	if (input.doInterrupt) {
+	const modelRequest = input.model?.trim() ? input.model : undefined;
+	if (input.doInterrupt || input.resume || modelRequest !== undefined) {
 		for (const target of targets)
 			await authorizeAgentControl({
 				callerNarratorId: scope.caller.id,
@@ -1305,6 +1350,21 @@ async function sendSubagentMessageDetailedWithRun(
 				action: "steer",
 				userId: input.userId ?? null,
 			});
+	}
+	// Validated for every target before anything is written, like the grant above.
+	const modelPlans = new Map<string, SubagentModelSwitchPlan>();
+	if (modelRequest !== undefined) {
+		if (input.replyTo) throw new Error("model cannot be combined with replyTo");
+		for (const target of targets) {
+			if (isTakenOver(target.id))
+				throw new Error(
+					`Agent ${agentLabelFromNarrator(target, scope.teamParentId)} is taken over by the user; its model cannot be changed now.`,
+				);
+			modelPlans.set(
+				target.id,
+				await planSubagentModelSwitch(target, modelRequest, input.userId ?? null),
+			);
+		}
 	}
 	input.replyRun?.setTargetCount?.(targets.length);
 	try {
@@ -1390,6 +1450,15 @@ async function sendSubagentMessageDetailedWithRun(
 					" wait for the user again; its final result arrives after the user stops the takeover."
 				: "";
 			const interruptTarget = input.doInterrupt && !takenOver;
+			const running = fresh.status === "working" || fresh.status === "waiting";
+			const modelPlan = modelPlans.get(fresh.id);
+			let modelNote = "";
+			if (modelPlan) {
+				await applySubagentModelSwitch(fresh.id, modelPlan);
+				modelNote =
+					` Model switched to ${modelPlan.model}` +
+					(running ? " (applies from its next model request)." : ".");
+			}
 
 			if (input.shouldAwait) {
 				replyHandle = registerAgentReplyWait({
@@ -1438,7 +1507,7 @@ async function sendSubagentMessageDetailedWithRun(
 			);
 			let deliveryMessageId = delivery.recipientMessageId;
 
-			if (fresh.status === "working" || fresh.status === "waiting") {
+			if (running) {
 				const enqueued = await enqueueInboxAgent(delivery, deliveredMessage, {
 					createdBy: input.userId ?? null,
 				});
@@ -1457,7 +1526,7 @@ async function sendSubagentMessageDetailedWithRun(
 						}),
 					);
 				deliveryMessageId = delivery.recipientMessageId;
-				let interruptNote = takeoverNote;
+				let interruptNote = modelNote + takeoverNote;
 				let interrupted: boolean | undefined;
 				if (interruptTarget && !buffered.duplicate) {
 					interrupted = await controlRun(fresh.id, { kind: "stop" });
@@ -1494,6 +1563,7 @@ async function sendSubagentMessageDetailedWithRun(
 						status: "queued",
 						deliveryMessageId,
 						...stableSendCoordinates(fresh.id, deliveryMessageId, delivery),
+						...(modelPlan && { model: modelPlan.model }),
 						interrupted,
 						awaited: false,
 					});
@@ -1511,6 +1581,10 @@ async function sendSubagentMessageDetailedWithRun(
 				throw new Error(
 					`Previous delivery is ${accepted.delivery.state}; explicit retry is required`,
 				);
+			// Agent messages never restart a failed or user-stopped session by themselves;
+			// `resume` is the explicit opt-in, and only for a failure (the user's stop stands).
+			const stopped = takenOver ? null : blockingStopReason(fresh.lastStopReason);
+			const resumeRequested = input.resume === true && stopped === "error";
 			let wakeFailed = false;
 			if (accepted.delivery.state === "queued") {
 				// The ordinary wake of any idle session: a held run is woken in place, an
@@ -1519,7 +1593,11 @@ async function sendSubagentMessageDetailedWithRun(
 				try {
 					wakeFailed =
 						!wakeHeldRun(fresh.id) &&
-						!(await wakeInboxIfEligible(fresh.id, input.locale as Locale));
+						!(await wakeInboxIfEligible(
+							fresh.id,
+							input.locale as Locale,
+							resumeRequested ? { resumeStopped: ["error"] } : {},
+						));
 				} catch (error) {
 					wakeFailed = true;
 					logger.warn("Accepted mailbox input awaits eligible wake", {
@@ -1528,10 +1606,35 @@ async function sendSubagentMessageDetailedWithRun(
 					});
 				}
 			} else wakeFailed = true;
-			if (replyHandle) {
-				const deliveryNote = wakeFailed
-					? `Sent to ${label}; durable message retained for the next eligible turn.${takeoverNote} A Send reply was requested.`
-					: `Sent to ${label}; subagent started asynchronously.${takeoverNote} A Send reply was requested.`;
+			const blockedReason = wakeFailed && stopped && !resumeRequested ? stopped : undefined;
+			const outcome = blockedReason
+				? blockedSendNote(label, blockedReason, input.resume === true)
+				: wakeFailed
+					? resumeRequested
+						? `Sent to ${label}; resume was requested but it cannot start right now, so the message stays queued for its next eligible turn.`
+						: `Sent to ${label}; durable message retained for the next eligible turn.`
+					: resumeRequested
+						? `Sent to ${label}; resumed after its failed last turn and started asynchronously.`
+						: `Sent to ${label}; subagent started asynchronously.`;
+			if (replyHandle && blockedReason) {
+				const deliveryNote = outcome + modelNote;
+				replyHandle.updateSnapshot({
+					deliveryNote,
+					deliveryMessageId,
+					...snapshotDeliveryCoordinates(delivery),
+				});
+				replyHandle.fail("the target is not running, so no reply can arrive until it is resumed");
+				pendingReplies.push({
+					id: fresh.id,
+					label,
+					title: fresh.title,
+					handle: replyHandle,
+					deliveryMessageId,
+					...snapshotDeliveryCoordinates(delivery),
+					deliveryNote,
+				});
+			} else if (replyHandle) {
+				const deliveryNote = `${outcome}${modelNote}${takeoverNote} A Send reply was requested.`;
 				replyHandle.updateSnapshot({
 					deliveryNote,
 					deliveryMessageId,
@@ -1547,16 +1650,15 @@ async function sendSubagentMessageDetailedWithRun(
 					deliveryNote,
 				});
 			} else {
-				sections.push(
-					(wakeFailed
-						? `Sent to ${label}; durable message retained for the next eligible turn.`
-						: `Sent to ${label}; subagent started asynchronously.`) + takeoverNote,
-				);
+				sections.push(outcome + modelNote + takeoverNote);
 				targetResults.push({
 					id: fresh.id,
 					label,
 					title: fresh.title,
-					status: wakeFailed ? "queued" : "started",
+					status: blockedReason ? "blocked" : wakeFailed ? "queued" : "started",
+					...(blockedReason && { blockedReason }),
+					...(modelPlan && { model: modelPlan.model }),
+					...(resumeRequested && !wakeFailed && { resumed: true }),
 					deliveryMessageId,
 					...stableSendCoordinates(fresh.id, deliveryMessageId, delivery),
 					awaited: false,

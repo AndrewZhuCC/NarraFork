@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
@@ -14,8 +14,16 @@ const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 const ws = { ...(await import("../../websocket/narrator-ws")) };
-mock.module("../../websocket/narrator-ws", () => ({ ...ws, broadcastToNarrator: () => {} }));
+const broadcasts: Array<{ narratorId: string; type: string; model?: string }> = [];
+mock.module("../../websocket/narrator-ws", () => ({
+	...ws,
+	broadcastToNarrator: (narratorId: string, message: { type: string; model?: string }) => {
+		broadcasts.push({ narratorId, type: message.type, model: message.model });
+	},
+}));
 const { sendSubagentMessageDetailed } = await import("../agent-communication");
+const inbox = await import("../agent-runtime/inbox");
+const settingsModule = await import("../../lib/settings");
 const { createMailboxStore } = await import("../agent-runtime/mailbox");
 const { getExecutionOwner, setRunHold, tryClaimExecution } = await import(
 	"../agent-runtime/ownership"
@@ -46,6 +54,7 @@ const ids = [
 const time = "2026-09-09T00:00:00.000Z";
 let serial = 0;
 beforeEach(() => {
+	broadcasts.length = 0;
 	clearPendingAgentReplyWaits();
 	for (const id of ids) {
 		setRunHold(id, undefined);
@@ -419,6 +428,165 @@ test("missing or stale exact receipt never falls back to text/provider tool-use 
 		toolCallBinding: { toolCallId: request.toolCallBinding?.toolCallId ?? "missing", attempt: 2 },
 	});
 	expect(stale.targets.every((target) => target.status === "failed")).toBe(true);
+	expect(rows()).toHaveLength(0);
+});
+
+function stopTarget(reason: "error" | "user_interrupt", id = "sibling-a") {
+	db.update(narrators)
+		.set({ status: "idle", lastStopReason: reason })
+		.where(eq(narrators.id, id))
+		.run();
+}
+async function settled(condition: () => boolean) {
+	for (let i = 0; i < 100 && !condition(); i++) await Bun.sleep(5);
+	expect(condition()).toBe(true);
+}
+
+test("Send to an error-stopped child reports blocked, keeps the message and tells its page", async () => {
+	stopTarget("error");
+	const result = await sendSubagentMessageDetailed(input("parent-root", ["sibling-a"]));
+	expect(result.targets).toEqual([
+		expect.objectContaining({ id: "sibling-a", status: "blocked", blockedReason: "error" }),
+	]);
+	expect(result.output).toContain("NOT running");
+	expect(result.output).toContain("resume=true");
+	expect(result.output).not.toContain("retained for the next eligible turn");
+	expect(rows("sibling-a").map((row) => row.state)).toEqual(["queued"]);
+	await settled(() =>
+		broadcasts.some((b) => b.narratorId === "sibling-a" && b.type === "agent_inbox_changed"),
+	);
+	expect((await inbox.listPendingAgentMessages("sibling-a")).messages).toEqual([
+		expect.objectContaining({ preview: "same report", truncated: false }),
+	]);
+});
+
+test("Send await to a blocked child fails the reply wait instead of hanging", async () => {
+	stopTarget("error");
+	const result = await sendSubagentMessageDetailed({
+		...input("parent-root", ["sibling-a"]),
+		shouldAwait: true,
+		timeoutMs: 60_000,
+	});
+	expect(result.targets[0]?.status).toBe("failed");
+	expect(result.output).toContain("NOT running");
+	expect(rows("sibling-a").map((row) => row.state)).toEqual(["queued"]);
+});
+
+test("resume=true restarts an error-stopped child through the explicit override only", async () => {
+	stopTarget("error");
+	const wake = spyOn(inbox, "wakeInboxIfEligible").mockResolvedValue(true);
+	try {
+		const result = await sendSubagentMessageDetailed({
+			...input("parent-root", ["sibling-a"]),
+			resume: true,
+		});
+		expect(wake).toHaveBeenCalledWith("sibling-a", "en", { resumeStopped: ["error"] });
+		expect(result.targets[0]).toMatchObject({ status: "started", resumed: true });
+		expect(result.output).toContain("resumed after its failed last turn");
+	} finally {
+		wake.mockRestore();
+	}
+});
+
+test("resume=true cannot override a stop the user made", async () => {
+	stopTarget("user_interrupt");
+	const result = await sendSubagentMessageDetailed({
+		...input("parent-root", ["sibling-a"]),
+		resume: true,
+	});
+	expect(result.targets[0]).toMatchObject({ status: "blocked", blockedReason: "user_interrupt" });
+	expect(result.output).toContain("cannot override the user's stop");
+	expect(rows("sibling-a")).toHaveLength(1);
+});
+
+test("resume and model require control of the target: a child cannot steer its sibling", async () => {
+	stopTarget("error");
+	for (const extra of [{ resume: true }, { model: "test:other" }])
+		await expect(
+			sendSubagentMessageDetailed({ ...input("sender-child", ["sibling-a"]), ...extra }),
+		).rejects.toThrow("not a direct child");
+	expect(rows()).toHaveLength(0);
+});
+
+test("model switches a child before delivery and announces it to an idle page", async () => {
+	const visible = spyOn(settingsModule, "getSubagentVisibleModels").mockReturnValue([
+		"test:model",
+		"test:other",
+	]);
+	try {
+		const result = await sendSubagentMessageDetailed({
+			...input("parent-root", ["sibling-a"]),
+			model: "test:other",
+		});
+		expect(result.targets[0]).toMatchObject({ status: "queued", model: "test:other" });
+		expect(result.output).toContain("Model switched to test:other (applies from its next");
+		expect(db.select().from(narrators).where(eq(narrators.id, "sibling-a")).get()?.model).toBe(
+			"test:other",
+		);
+		expect(broadcasts).toContainEqual({
+			narratorId: "sibling-a",
+			type: "model_changed",
+			model: "test:other",
+		});
+		await sendSubagentMessageDetailed({ ...input("parent-root", ["sibling-a"]), model: "parent" });
+		expect(db.select().from(narrators).where(eq(narrators.id, "sibling-a")).get()?.model).toBe(
+			"__parent__",
+		);
+	} finally {
+		visible.mockRestore();
+	}
+});
+
+test("an unknown or out-of-pool model rejects the whole call before any write", async () => {
+	const visible = spyOn(settingsModule, "getSubagentVisibleModels").mockReturnValue([
+		"test:model",
+		"test:pooled",
+	]);
+	const pools = settingsModule.settings.agent.subagentAllowedModels;
+	const siblingModels = () =>
+		db
+			.select()
+			.from(narrators)
+			.all()
+			.filter((row) => row.id.startsWith("sibling"))
+			.map((row) => row.model);
+	const before = siblingModels();
+	try {
+		await expect(
+			sendSubagentMessageDetailed({
+				...input("parent-root", ["sibling-a", "sibling-b"]),
+				model: "test:missing",
+			}),
+		).rejects.toThrow("not available to subagents");
+		settingsModule.settings.agent.subagentAllowedModels = {
+			explore: [],
+			plan: [],
+			general: ["test:pooled"],
+		};
+		await expect(
+			sendSubagentMessageDetailed({
+				...input("parent-root", ["sibling-a"]),
+				model: "test:model",
+			}),
+		).rejects.toThrow('not in the allowed "general" subagent model pool');
+		expect(rows()).toHaveLength(0);
+		expect(siblingModels()).toEqual(before);
+		const allowed = await sendSubagentMessageDetailed({
+			...input("parent-root", ["sibling-a"]),
+			model: "test:pooled",
+		});
+		expect(allowed.targets[0]).toMatchObject({ status: "queued", model: "test:pooled" });
+	} finally {
+		settingsModule.settings.agent.subagentAllowedModels = pools;
+		visible.mockRestore();
+	}
+});
+
+test("model cannot change a child the user has taken over", async () => {
+	setRunHold("sibling-a", { released: false });
+	await expect(
+		sendSubagentMessageDetailed({ ...input("parent-root", ["sibling-a"]), model: "test:other" }),
+	).rejects.toThrow("taken over by the user");
 	expect(rows()).toHaveLength(0);
 });
 

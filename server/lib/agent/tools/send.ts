@@ -13,7 +13,19 @@ const USER_TARGET_DESCRIPTION =
 	"Bot only — your voice to people: the username of the person to message (the name in " +
 	"their sender marker). Delivers `message` into your chat with them, the only text of yours " +
 	"they ever see (Markdown renders, up to 32,000 characters). Use it alone: no agent " +
-	"targets, replyTo, doInterrupt or await.";
+	"targets, replyTo, doInterrupt, resume, model or await.";
+
+const RESUME_DESCRIPTION =
+	"Direct child subagents only: restart a target whose last turn ended with an error. Agent " +
+	"messages alone never restart such a subagent (Send then reports status `blocked` and the " +
+	"message stays queued); set resume=true to deliver this message and start it again. " +
+	"It cannot override a stop the user made.";
+
+const MODEL_DESCRIPTION =
+	"Direct child subagents only: switch each target's model before delivering this message " +
+	'(use "parent" to follow your own model again). Subject to the same allowed subagent model ' +
+	"pool as the Agent call; a running subagent switches at its next model request. Combine with " +
+	"resume=true to retry a subagent that failed on its previous model.";
 
 function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 	const properties: Record<string, unknown> = {
@@ -51,6 +63,12 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 		},
 	};
 
+	const policy = runtimePolicyForContext(config);
+	if (policy.capabilities.spawnAgent) {
+		properties.resume = { description: RESUME_DESCRIPTION, type: "boolean" };
+		properties.model = { description: MODEL_DESCRIPTION, type: "string" };
+	}
+
 	// Only a bot speaks to people, so only a bot is offered the person target. An
 	// unassembled config (no runtime, as with the policy ceiling) sees the full schema.
 	if (!config || config.bot) {
@@ -63,7 +81,7 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 	// The model-facing schema omits reply-wait parameters for subagents. The Zod
 	// schema remains permissive for post-resolution validation and legacy inputs;
 	// the service layer is the authoritative runtime guard.
-	if (runtimePolicyForContext(config).capabilities.sendAwait) {
+	if (policy.capabilities.sendAwait) {
 		properties.await = {
 			description:
 				"Primary-narrator-only option: request and wait for target(s) to call Send back. Subagents must omit this or set it false; it does not wait for task completion.",
@@ -134,6 +152,8 @@ export const sendTool: ToolDefinition = {
 				"Interrupt an active foreground child subagent after queuing the message. Use only " +
 					"for an urgent correction that requires stopping current work, never for status polling.",
 			),
+		resume: z.boolean().optional().describe(RESUME_DESCRIPTION),
+		model: z.string().optional().describe(MODEL_DESCRIPTION),
 		await: z
 			.boolean()
 			.optional()
@@ -160,6 +180,8 @@ export const sendTool: ToolDefinition = {
 			user?: string;
 			replyTo?: string;
 			doInterrupt?: boolean;
+			resume?: boolean;
+			model?: string;
 			await?: boolean;
 			timeout?: number;
 		};
@@ -187,6 +209,8 @@ export const sendTool: ToolDefinition = {
 				message: raw.message,
 				replyTo: raw.replyTo,
 				doInterrupt: raw.doInterrupt,
+				resume: raw.resume,
+				model: raw.model,
 				shouldAwait: raw.await,
 				timeoutMs: normalizeNumber(raw.timeout, { min: 1 }),
 				toolUseId: ctx.currentToolUseId,
@@ -272,12 +296,20 @@ async function sendToUser(
 		names?: string[];
 		replyTo?: string;
 		doInterrupt?: boolean;
+		resume?: boolean;
+		model?: string;
 		await?: boolean;
 	},
 	ctx: ToolContext,
 ): Promise<ToolResult> {
 	if (raw.id || raw.ids?.length || raw.name || raw.names?.length || raw.replyTo) {
 		return { output: "Send error: `user` cannot be combined with agent targets.", isError: true };
+	}
+	if (raw.resume || raw.model !== undefined) {
+		return {
+			output: "Send error: `user` cannot be combined with resume or model.",
+			isError: true,
+		};
 	}
 	if (raw.doInterrupt || raw.await) {
 		return {

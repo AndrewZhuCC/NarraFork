@@ -25,7 +25,8 @@ export type SendAwaitTargetStatus =
 	| "timeout"
 	| "aborted"
 	| "cancelled"
-	| "taken_over";
+	| "taken_over"
+	| "blocked";
 
 /** Coordinates are captured at Send acceptance; restoring never substitutes the current revision. */
 export interface SendAwaitDeliveryCoordinates {
