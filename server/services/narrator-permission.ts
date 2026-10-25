@@ -3178,7 +3178,7 @@ async function resolveSendAliasCandidate(
  * Resolve Send destinations for permission auto-allow rank checks.
  *
  * Parent is a first-class destination for a subagent: progress reports and
- * replyTo answers address the narrator that launched the child. Treating a
+ * answers address the narrator that launched the child. Treating a
  * primary parent as "not a valid target" made `shouldAutoAllowSendWithinScope`
  * always fail for child→parent Send, so those reports sat in `pending` until a
  * human approved them — often never, while the parent Agent/await held an

@@ -394,8 +394,7 @@ export function classifyToolUpdateExecution(tu: AgentToolUse): UpdateExecutionKi
 	}
 	if (
 		(tu.name === "Agent" && typeof tu.input.stop !== "string") ||
-		(tu.name === "Await" && tu.input.type === "agent") ||
-		(tu.name === "Send" && tu.input.await === true)
+		(tu.name === "Await" && tu.input.type === "agent")
 	) {
 		return "resumable";
 	}
