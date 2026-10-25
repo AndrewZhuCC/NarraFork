@@ -7,6 +7,9 @@ import { CI_RELEASE_TARGETS } from "./lib/ci-release-types";
 const REPOSITORY = "NarraFork/NarraFork";
 const GIB = 1024 ** 3;
 const CONFIG = ".ci-release/123-rclone.conf";
+function phase(name: string) {
+	console.log(`${new Date().toISOString()} phase=${name}`);
+}
 export interface Asset {
 	id: number;
 	name: string;
@@ -188,8 +191,13 @@ export async function runChild(
 	const chunks: Uint8Array[] = [];
 	async function drain(stream: ReadableStream<Uint8Array>, maximum: number, output: boolean) {
 		let size = 0;
+		let nextProgress = 16 * 1024 ** 2;
 		for await (const chunk of stream) {
 			size += chunk.length;
+			if (output && size >= nextProgress) {
+				phase(`stream-progress bytes=${size}`);
+				nextProgress = size + 16 * 1024 ** 2;
+			}
 			check(size <= maximum, "Child output limit");
 			if (output) {
 				if (consume) await consume(chunk);
@@ -206,6 +214,7 @@ export async function runChild(
 	} catch {
 		child.kill("SIGKILL");
 		await child.exited;
+		phase(`child-failed aborted=${childSignal.aborted} exit=${child.exitCode}`);
 		throw new Error("Bounded child operation failed");
 	} finally {
 		childSignal.removeEventListener("abort", abort);
@@ -247,7 +256,9 @@ export async function ensureRemote(
 		"--log-level",
 		"ERROR",
 	];
+	phase(`remote-stat file=${destination[2]}`);
 	const listed = await run(["rclone", "lsjson", remote, "--stat", ...base], 65536, signal);
+	phase(`remote-stat-result file=${destination[2]} code=${listed.code}`);
 	// rclone uses 3/4 exclusively for missing directory/file. All other failures fail closed.
 	check([0, 3, 4].includes(listed.code), "Remote existence check failed");
 	const exists = listed.code === 0;
@@ -255,13 +266,16 @@ export async function ensureRemote(
 		const info = JSON.parse(listed.stdout);
 		check(info.IsDir === false && info.Size === expected.size, "Remote conflict");
 	} else {
+		phase(`upload file=${destination[2]} bytes=${expected.size}`);
 		const copied = await run(
 			["rclone", "copyto", local, remote, "--immutable", ...base],
 			65536,
 			signal,
 		);
+		phase(`upload-result file=${destination[2]} code=${copied.code}`);
 		check(copied.code === 0, "Immutable upload failed");
 	}
+	phase(`readback file=${destination[2]} bytes=${expected.size}`);
 	const hash = createHash("sha256");
 	let size = 0;
 	const result = await run(
@@ -275,6 +289,7 @@ export async function ensureRemote(
 	);
 	check(result.code === 0, "Remote readback failed");
 	verifyIdentity({ size, sha256: hash.digest("hex") }, expected);
+	phase(`verified file=${destination[2]} bytes=${size}`);
 	return exists ? "reused" : "uploaded";
 }
 async function main() {
@@ -299,6 +314,7 @@ async function main() {
 			check(result.code === 0, "GitHub metadata request failed");
 			return JSON.parse(result.stdout);
 		}
+		phase(`release-metadata version=${version}`);
 		const release: Release = await api(`releases/tags/v${version}`);
 		const entries = selectAssets(release, version);
 		check(
@@ -307,6 +323,7 @@ async function main() {
 		);
 		const commit = (await api(`commits/v${version}`)).sha;
 		async function download(asset: Asset, consume: (chunk: Uint8Array) => Promise<void>) {
+			phase(`download file=${asset.name} bytes=${asset.size}`);
 			const current: Release = await api(`releases/${release.id}`);
 			selectAssets(current, version);
 			check(
@@ -332,6 +349,7 @@ async function main() {
 					await consume(chunk);
 				},
 			);
+			phase(`download-result file=${asset.name} code=${result.code} bytes=${size}`);
 			check(result.code === 0 && size === asset.size, "Asset download failed");
 		}
 		const verified = [];
@@ -375,12 +393,17 @@ async function main() {
 				remote,
 				status,
 			});
+			await writeFile(
+				".ci-release/github-binaries-123-receipt.json",
+				`${JSON.stringify({ repository: REPOSITORY, releaseId: release.id, version, commit, complete: false, files }, null, 2)}\n`,
+				{ mode: 0o600 },
+			);
 			await rm(local);
 		}
 		await writeFile(
 			".ci-release/github-binaries-123-receipt.json",
-			`${JSON.stringify({ repository: REPOSITORY, releaseId: release.id, version, commit, files }, null, 2)}\n`,
-			{ flag: "wx", mode: 0o600 },
+			`${JSON.stringify({ repository: REPOSITORY, releaseId: release.id, version, commit, complete: true, files }, null, 2)}\n`,
+			{ mode: 0o600 },
 		);
 	} finally {
 		await rm(CONFIG, { force: true });

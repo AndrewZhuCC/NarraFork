@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import {
@@ -218,6 +218,42 @@ test("bounded child output and cancellation do not expose stderr", async () => {
 	const controller = new AbortController();
 	controller.abort();
 	await expect(runChild([process.execPath, "-e", "0"], 20, controller.signal)).rejects.toThrow();
+});
+test("stage diagnostics identify the remote operation without exposing child stderr", async () => {
+	const logs: string[] = [];
+	const spy = spyOn(console, "log").mockImplementation((line) => logs.push(String(line)));
+	try {
+		await expect(
+			runChild(
+				[
+					process.execPath,
+					"-e",
+					'console.error("PRIVATE-CREDENTIAL"); console.log("x".repeat(2000))',
+				],
+				20,
+				new AbortController().signal,
+			),
+		).rejects.toThrow("Bounded child operation failed");
+		expect(logs.some((line) => line.includes("phase=child-failed"))).toBe(true);
+		expect(logs.join("\n")).not.toContain("PRIVATE-CREDENTIAL");
+		const run: Runner = async (command, _limit, _signal, consume) => {
+			if (command[1] === "lsjson")
+				return { code: 0, stdout: JSON.stringify({ IsDir: false, Size: bytes.length }) };
+			await consume?.(bytes);
+			return { code: 0, stdout: "" };
+		};
+		await ensureRemote(
+			"local",
+			remotePath(version, "binary"),
+			identity,
+			new AbortController().signal,
+			run,
+		);
+		for (const stage of ["remote-stat", "readback", "verified"])
+			expect(logs.some((line) => line.includes(`phase=${stage} file=binary`))).toBe(true);
+	} finally {
+		spy.mockRestore();
+	}
 });
 test("workflow is manual/default-branch/official-repository/environment guarded and receipt-only", () => {
 	const workflow = readFileSync(".github/workflows/github-binaries-123.yml", "utf8");
