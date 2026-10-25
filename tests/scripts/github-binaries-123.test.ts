@@ -5,6 +5,7 @@ import {
 	ensureRemote,
 	type Release,
 	type Runner,
+	rcloneDiagnostics,
 	remotePath,
 	runChild,
 	selectAssets,
@@ -155,6 +156,18 @@ describe("immutable remote behavior", () => {
 		).toBe("uploaded");
 		expect(fake.commands.map((command) => command[1])).toEqual(["lsjson", "copyto", "cat"]);
 		expect(fake.commands[1]).toContain("--immutable");
+		for (const command of fake.commands) {
+			for (const [flag, value] of [
+				["--stats", "30s"],
+				["--stats-log-level", "NOTICE"],
+				["--log-level", "NOTICE"],
+				["--cutoff-mode", "HARD"],
+				["--max-duration", "14m"],
+			]) {
+				expect(command[command.indexOf(flag) + 1]).toBe(value);
+			}
+			expect(command).toContain("--use-json-log");
+		}
 	});
 	test("same-size conflicting bytes, readback corruption, and existence failures fail closed", async () => {
 		for (const exists of [true, false]) {
@@ -183,6 +196,95 @@ describe("immutable remote behavior", () => {
 		expect(fake.commands).toHaveLength(1);
 	});
 });
+describe("private rclone diagnostics", () => {
+	test("streams only finite nonnegative whitelisted stats, never private fields", () => {
+		const logs: string[] = [];
+		const diagnostic = rcloneDiagnostics("copyto", (line) => logs.push(line));
+		const privateText =
+			"https://private-user:private-pass@webdav.123pan.cn/private-path?token=private-token";
+		const record = Buffer.from(
+			`${JSON.stringify({
+				msg: privateText,
+				object: privateText,
+				source: privateText,
+				stats: {
+					bytes: 1234,
+					speed: 50.25,
+					errors: 2,
+					checks: 3,
+					transfers: 1,
+					totalBytes: 5000,
+					totalChecks: 4,
+					totalTransfers: 8,
+					elapsedTime: 30.5,
+					eta: 60,
+					retryAfter: 5,
+					lastError: privateText,
+					transferring: [{ name: privateText, bytes: 10 }],
+					secretNumber: 123456,
+					token: privateText,
+					credentials: { pass: privateText },
+				},
+			})}\n`,
+		);
+		diagnostic.push(record.subarray(0, 11));
+		expect(logs).toHaveLength(0);
+		diagnostic.push(record.subarray(11));
+		diagnostic.push(
+			Buffer.from(
+				`${JSON.stringify({ stats: { bytes: "private-token", speed: -1, errors: null, checks: Infinity, eta: Number.MAX_SAFE_INTEGER + 1 } })}\n`,
+			),
+		);
+		diagnostic.push(Buffer.from(`raw private-pass\n${JSON.stringify({ msg: privateText })}\n`));
+		diagnostic.finish(0, false);
+		expect(logs).toEqual([
+			'rclone-stats operation=copyto {"bytes":1234,"speed":50.25,"errors":2,"checks":3,"transfers":1,"totalBytes":5000,"totalChecks":4,"totalTransfers":8,"elapsedTime":30.5,"eta":60,"retryAfter":5}',
+			"rclone-result operation=copyto code=0 category=none",
+		]);
+		for (const secret of [
+			"private-",
+			"lastError",
+			"transferring",
+			"secretNumber",
+			"credentials",
+			"webdav.123pan.cn",
+			"msg",
+			"source",
+			"object",
+		])
+			expect(logs.join("\n")).not.toContain(secret);
+	});
+	test("emits only fixed HTTP/timeout/network/error classifications per operation", () => {
+		for (const [message, category] of [
+			[
+				"HTTP/1.1 403 Forbidden https://private-user:private-pass@private-host/private-path",
+				"http httpStatus=403",
+			],
+			["private-path: context deadline exceeded", "timeout"],
+			["private-host: dial tcp: connection reset", "network"],
+			["private-token opaque failure", "other"],
+		]) {
+			const logs: string[] = [];
+			const diagnostic = rcloneDiagnostics("cat", (line) => logs.push(line));
+			diagnostic.push(Buffer.from(JSON.stringify({ level: "error", msg: message })));
+			diagnostic.finish(1, false);
+			expect(logs).toEqual([`rclone-result operation=cat code=1 category=${category}`]);
+		}
+		const logs: string[] = [];
+		const diagnostic = rcloneDiagnostics("private-path", (line) => logs.push(line));
+		diagnostic.finish(-1, true);
+		expect(logs).toEqual(["rclone-result operation=other code=-1 category=timeout"]);
+	});
+	test("rejects stderr lines over 64KiB and total stderr over 512KiB", () => {
+		const diagnostic = rcloneDiagnostics("copyto", () => {});
+		diagnostic.push(Buffer.alloc(65536, 32));
+		expect(() => diagnostic.push(Buffer.from("x"))).toThrow("Child diagnostic line limit");
+		const total = rcloneDiagnostics("copyto", () => {});
+		for (let index = 0; index < 8; index++) total.push(Buffer.from(`${" ".repeat(65535)}\n`));
+		expect(() => total.push(Buffer.from("x"))).toThrow("Child diagnostic total limit");
+	});
+});
+
 test("strict version and flat paths prevent injection/traversal; future versions work", () => {
 	for (const bad of ["v0.9.8", "0.9.8/../", "0.9.8\n", "01.2.3", "0.9.8-beta", "$(id)"])
 		expect(() => versionPath(bad)).toThrow();

@@ -168,6 +168,105 @@ export function validateConfig(text: string): void {
 	);
 }
 
+const RCLONE_STAT_FIELDS = [
+	"bytes",
+	"speed",
+	"errors",
+	"checks",
+	"transfers",
+	"totalBytes",
+	"totalChecks",
+	"totalTransfers",
+	"elapsedTime",
+	"eta",
+	"retryAfter",
+] as const;
+
+/** Never forward rclone messages, paths, URLs, headers, or arbitrary JSON properties. */
+export function rcloneDiagnostics(operation: string, log: (line: string) => void = phase) {
+	const op = ["lsjson", "copyto", "cat"].includes(operation) ? operation : "other";
+	let pending = Buffer.alloc(0);
+	let total = 0;
+	let category = "none";
+	let status: number | undefined;
+	function line(bytes: Buffer) {
+		check(bytes.length <= 65536, "Child diagnostic line limit");
+		let value: Record<string, unknown>;
+		try {
+			value = JSON.parse(bytes.toString("utf8"));
+		} catch {
+			return;
+		}
+		if (!value || typeof value !== "object" || Array.isArray(value)) return;
+		const stats = value.stats;
+		if (stats && typeof stats === "object" && !Array.isArray(stats)) {
+			const numeric: Record<string, number> = {};
+			for (const key of RCLONE_STAT_FIELDS) {
+				const number = (stats as Record<string, unknown>)[key];
+				if (
+					typeof number === "number" &&
+					Number.isFinite(number) &&
+					number >= 0 &&
+					number <= Number.MAX_SAFE_INTEGER
+				)
+					numeric[key] = number;
+			}
+			if (Object.keys(numeric).length)
+				log(`rclone-stats operation=${op} ${JSON.stringify(numeric)}`);
+		}
+		// Classify only in memory. Neither this text nor any substring of it is emitted.
+		const text = [value.msg, value.error, (stats as Record<string, unknown> | null)?.lastError]
+			.filter((item): item is string => typeof item === "string")
+			.join(" ");
+		const http =
+			/(?:HTTP(?:\/\d(?:\.\d)?)?\s*(?:status(?:\s+code)?\s*)?[:=]?\s*|status(?:\s+code)?\s*[:=]?\s*|\b)([45]\d{2})\b/i.exec(
+				text,
+			);
+		if (http) {
+			category = "http";
+			status = Number(http[1]);
+		} else if (/timeout|timed out|deadline|max duration|context canceled/i.test(text)) {
+			category = "timeout";
+			status = undefined;
+		} else if (
+			/connection|network|dial tcp|no such host|TLS|certificate|unexpected EOF|broken pipe|connection reset/i.test(
+				text,
+			)
+		) {
+			category = "network";
+			status = undefined;
+		} else if (value.level === "error" || value.level === "fatal") {
+			category = "other";
+			status = undefined;
+		}
+	}
+	return {
+		push(chunk: Uint8Array) {
+			total += chunk.length;
+			check(total <= 512 * 1024, "Child diagnostic total limit");
+			let start = 0;
+			for (let index = 0; index < chunk.length; index++) {
+				if (chunk[index] !== 10) continue;
+				check(pending.length + index - start <= 65536, "Child diagnostic line limit");
+				line(Buffer.concat([pending, chunk.subarray(start, index)]));
+				pending = Buffer.alloc(0);
+				start = index + 1;
+			}
+			check(pending.length + chunk.length - start <= 65536, "Child diagnostic line limit");
+			pending = Buffer.concat([pending, chunk.subarray(start)]);
+		},
+		finish(code: number, aborted: boolean) {
+			if (pending.length) {
+				line(pending);
+				pending = Buffer.alloc(0);
+			}
+			log(
+				`rclone-result operation=${op} code=${Number.isSafeInteger(code) ? code : -1} category=${aborted ? "timeout" : code === 0 ? "none" : category === "none" ? "other" : category}${!aborted && code !== 0 && status !== undefined ? ` httpStatus=${status}` : ""}`,
+			);
+		},
+	};
+}
+
 /** CI-only process adapter: streaming stdout, bounded diagnostics, cancellation and per-child deadline. */
 export async function runChild(
 	command: string[],
@@ -189,6 +288,7 @@ export async function runChild(
 	const abort = () => child.kill("SIGKILL");
 	childSignal.addEventListener("abort", abort, { once: true });
 	const chunks: Uint8Array[] = [];
+	const diagnostics = command[0] === "rclone" ? rcloneDiagnostics(command[1]) : undefined;
 	async function drain(stream: ReadableStream<Uint8Array>, maximum: number, output: boolean) {
 		let size = 0;
 		let nextProgress = 16 * 1024 ** 2;
@@ -202,12 +302,15 @@ export async function runChild(
 			if (output) {
 				if (consume) await consume(chunk);
 				else chunks.push(chunk);
-			}
+			} else diagnostics?.push(chunk);
 		}
 	}
 	try {
 		childSignal.throwIfAborted();
-		await Promise.all([drain(child.stdout, limit, true), drain(child.stderr, 65536, false)]);
+		await Promise.all([
+			drain(child.stdout, limit, true),
+			drain(child.stderr, diagnostics ? 512 * 1024 : 65536, false),
+		]);
 		const code = await child.exited;
 		childSignal.throwIfAborted();
 		return { code, stdout: Buffer.concat(chunks).toString("utf8") };
@@ -218,6 +321,7 @@ export async function runChild(
 		throw new Error("Bounded child operation failed");
 	} finally {
 		childSignal.removeEventListener("abort", abort);
+		diagnostics?.finish(child.exitCode ?? -1, childSignal.aborted);
 	}
 }
 export type Runner = typeof runChild;
@@ -253,8 +357,15 @@ export async function ensureRemote(
 		"2m",
 		"--max-duration",
 		"14m",
+		"--stats",
+		"30s",
+		"--stats-log-level",
+		"NOTICE",
+		"--use-json-log",
 		"--log-level",
-		"ERROR",
+		"NOTICE",
+		"--cutoff-mode",
+		"HARD",
 	];
 	phase(`remote-stat file=${destination[2]}`);
 	const listed = await run(["rclone", "lsjson", remote, "--stat", ...base], 65536, signal);
