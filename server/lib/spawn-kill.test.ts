@@ -15,6 +15,12 @@ function running(pid: number): boolean {
 	}
 }
 
+/** A process closes its pipes early in its exit, so `running` can lag safeSpawn by a moment. */
+async function exits(pid: number): Promise<boolean> {
+	for (let attempt = 0; attempt < 100 && running(pid); attempt++) await Bun.sleep(20);
+	return !running(pid);
+}
+
 describe("safeSpawn process-tree kill", () => {
 	test.if(process.platform === "linux")(
 		"abort reaches a grandchild through the shell",
@@ -38,7 +44,7 @@ describe("safeSpawn process-tree kill", () => {
 			});
 			expect(result.terminationReason).toBe("abort");
 			expect(grandchild).toBeGreaterThan(0);
-			expect(running(grandchild)).toBe(false);
+			expect(await exits(grandchild)).toBe(true);
 			expect(performance.now() - startedAt).toBeLessThan(10_000);
 		},
 	);
