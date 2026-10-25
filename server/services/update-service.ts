@@ -43,6 +43,7 @@ import { managerChildTokenEnv } from "../lib/manager-token";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
 import { createUpdateFetchContext, type UpdateFetchContext } from "../lib/net/update-fetch";
+import { replacementLaunchArgs } from "../lib/replacement-launch";
 import {
 	beginGracefulRestartSession,
 	cancelGracefulRestartSession,
@@ -1881,8 +1882,11 @@ async function drainAndSpawnPreparedUpdate(options: {
 			NARRAFORK_GRACEFUL_RESTART_MARKER_PATH: session.markerPath,
 			NARRAFORK_GRACEFUL_RESTART_MARKER_NONCE: session.markerNonce,
 		};
-		const launchArgs = process.argv.slice(2);
 		const isWindows = process.platform === "win32";
+		const launchArgs = replacementLaunchArgs(process.argv.slice(2), {
+			platform: process.platform,
+			managerManaged: process.env.NARRAFORK_MANAGER_MANAGED === "1",
+		});
 		const proc = isWindows
 			? Bun.spawn(
 					[
