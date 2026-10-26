@@ -212,10 +212,10 @@ describe("subagent file-change rendering", () => {
 		const { root, measured } = render(payload);
 		expect(root.textContent).toContain("unknown device · unknown workspace");
 		expect(root.textContent).toContain("coverage unknown");
-		expect(root.querySelector('[data-testid="subagent-file-changes-legacy"]')?.textContent).toBe(
-			"Legacy/unscoped · not per-attempt or net changes",
-		);
-		expect(root.querySelector('[data-testid="subagent-file-changes-window"]')).toBeNull();
+		const legacy = root.querySelector('[data-testid="subagent-file-changes-legacy"]');
+		expect(legacy?.textContent).toBe("· approximate");
+		expect(legacy?.getAttribute("title")).toContain("not the net change");
+		expect(legacy?.getAttribute("title")).not.toContain("Time window");
 		expectHeightParity(root, measured.fileChangesHeight);
 	});
 
@@ -250,19 +250,22 @@ describe("subagent file-change rendering", () => {
 		for (const attributionScope of ["exact_attempt", "mixed"] as const) {
 			const { root, measured } = render(changes({ attributionScope }));
 			expect(root.querySelector('[data-testid="subagent-file-changes-legacy"]')).toBeNull();
-			expect(root.querySelector('[data-testid="subagent-file-changes-window"]')).toBeNull();
 			expectHeightParity(root, measured.fileChangesHeight);
 		}
 	});
 
-	it("shows the requested scope without upgrading it to exact attempt/net evidence", () => {
-		const scope = { sourceToolUseId: "parent-call", startedAt: null, completedAt: null };
+	it("folds legacy attribution and its window into the title row's hover text", () => {
+		const startedAt = "2026-10-26T01:00:00.000Z";
+		const scope = { sourceToolUseId: "parent-call", startedAt, completedAt: null };
 		const { root, measured } = render(changes({ scope }));
-		expect(root.textContent).toContain("Legacy/unscoped");
-		expect(root.textContent).toContain("not per-attempt or net changes");
-		const window = root.querySelector('[data-testid="subagent-file-changes-window"]');
-		expect(window?.textContent).toContain("not verified attempt evidence");
-		expect(window?.getAttribute("title")).toContain(JSON.stringify(scope));
+		const legacy = root.querySelector('[data-testid="subagent-file-changes-legacy"]');
+		expect(legacy?.textContent).toBe("· approximate");
+		const title = legacy?.getAttribute("title") ?? "";
+		expect(title).toContain("not linked to this exact run");
+		expect(title).toContain(`Time window: ${new Date(startedAt).toLocaleString()} → …`);
+		// Ids are diagnostics, not reader-facing text.
+		expect(root.textContent).not.toContain("parent-call");
+		expect(title).not.toContain("parent-call");
 		expectHeightParity(root, measured.fileChangesHeight);
 	});
 
@@ -362,8 +365,7 @@ describe("subagent file-change rendering", () => {
 		);
 		const locale = language === "zh-CN" ? zh : en;
 		for (const key of [
-			"subagentFileChangesLegacy",
-			"subagentFileChangesWindow",
+			"subagentFileChangesLegacyBadge",
 			"subagentFileChangesUnknownDevice",
 			"subagentFileChangesUnknownWorkspace",
 			"subagentFileChangesUnknownCoverage",
