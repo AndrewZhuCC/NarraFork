@@ -4,14 +4,13 @@
  * Two rules are in tension here and this module is where they are reconciled:
  *
  *  - Every SQL statement must be bounded. An unbounded `findMany` on the HTTP thread is the
- *    "all requests stop responding" failure the backend rules describe, and both the project
- *    list and the chapter list used to be exactly that.
+ *    "all requests stop responding" failure the backend rules describe, and the project list
+ *    used to be exactly that.
  *  - The RESPONSES are bare JSON arrays that existing clients consume whole. `GET /api/projects`
- *    and `GET /api/chapters?projectId=` are called with no paging parameters by the dashboard,
- *    the project page, the merge modal and the scheduled-task editor. Serving them one 200-row
- *    page would silently hide the rest, and "silently" is the part that matters: the project
- *    list then reads as "you have 200 projects" and the merge modal offers a target list with
- *    chapters missing from it.
+ *    is called with no paging parameters by the dashboard, the project page and the
+ *    scheduled-task editor. Serving one 200-row page would silently hide the rest, and
+ *    "silently" is the part that matters: the project list then reads as "you have 200
+ *    projects".
  *
  * So the query stays bounded and the RESPONSE is assembled from as many bounded pages as it
  * takes, up to `maxRows`. Reaching that ceiling is reported rather than papered over: the
@@ -24,8 +23,8 @@
 import type { ReadPage, ReadPageResult } from "./project-read-adapter";
 
 /**
- * Rows one response may carry. Ten pages of `projectPage`/`chapterPage`, which is far above
- * any real project or chapter count and still a bounded amount of JSON to serialize.
+ * Rows one response may carry. Ten pages of `projectPage`, which is far above any real
+ * project count and still a bounded amount of JSON to serialize.
  */
 export const COLLECT_MAX_ROWS = 2000;
 

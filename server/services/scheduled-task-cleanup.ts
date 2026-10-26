@@ -13,6 +13,7 @@ import { AsyncMutex } from "../lib/async-mutex";
 import { NotFoundError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { buildNarratorCleanupPlan } from "./database-cleanup-utils";
+import { storedBodyBytesSql } from "./narrator-body-reads";
 import { narratorService } from "./narrator-service";
 import { isLoopRunning } from "./narrator-session";
 import { withIdleNarratorCleanupAdmission } from "./narrator-session-state";
@@ -29,7 +30,6 @@ const scanCursors = new Map<string, { policy: string; createdAt: string; id: str
 const cleanupColumns = {
 	id: narrators.id,
 	parentNarratorId: narrators.parentNarratorId,
-	chapterId: narrators.chapterId,
 	scheduledTaskId: narrators.scheduledTaskId,
 	ownerUserId: narrators.ownerUserId,
 	type: narrators.type,
@@ -247,7 +247,7 @@ export async function cleanupScheduledTaskNarrators(
 					const messages = await db
 						.select({
 							id: narratorMessages.id,
-							bytes: sql<number>`COALESCE(length(CAST(${narratorMessages.contentJson} AS BLOB)), 0)`,
+							bytes: sql<number>`COALESCE(${storedBodyBytesSql()}, 0)`,
 						})
 						.from(narratorMessages)
 						.where(inArray(narratorMessages.narratorId, ids))

@@ -1,4 +1,4 @@
-/** Git facts belong to a device/worktree, not a chapter or narrator. */
+/** Git facts belong to a device/worktree, not a narrator. */
 export type GitWorkspaceState =
 	| "ready"
 	| "not_git"
@@ -22,8 +22,6 @@ export interface GitWorkspace {
 	repositories?: Array<{ workspaceKey: string; rootPath: string; relativePath: string }>;
 	discoveryTruncated?: boolean;
 	narratorId?: string;
-	/** Present only when the actual worktree matches this chapter. */
-	chapterId?: string;
 	projectId?: string;
 }
 

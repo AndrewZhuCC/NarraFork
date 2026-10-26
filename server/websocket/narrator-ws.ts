@@ -24,19 +24,10 @@ export const MAX_NARRATOR_SUBSCRIPTIONS_PER_CONNECTION =
 import type { GitWorkspaceClientMessage } from "@shared/git-workspace-events";
 import { and, count as countFn, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
-import {
-	chapters,
-	containerInstances,
-	mergeSessions,
-	narrators,
-	narratorToolCalls,
-	projects,
-	terminals,
-} from "../db/schema";
+import { narrators, narratorToolCalls, terminals } from "../db/schema";
 import { updateAwaitTimeout } from "../lib/agent/tools/await";
 import { updateBashTimeout } from "../lib/agent/tools/bash";
 import { listSessions as listBrowserSessions } from "../lib/browser/session";
-import { CONTAINER_STATUS_PRIORITY } from "../lib/constants";
 import { eventBus } from "../lib/event-bus";
 import { hotOnce, hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
@@ -44,7 +35,6 @@ import { parseSubstatus } from "../lib/narrator-utils";
 import { nugAvailabilityPoller } from "../lib/nug-availability-poller";
 import { getUserLanguage } from "../lib/prompt-i18n";
 import { narratorWsMessageSchema } from "../lib/validators";
-import { type MergeDecision, resolveMergeDecision } from "../services/chapter-batch-merge";
 import type {
 	BlockAllSkillsResult,
 	BlockSkillResult,
@@ -81,7 +71,6 @@ import {
 } from "../services/narrator-session";
 import { addStatsSubscriber, removeStatsSubscriber } from "../services/output-stats";
 import { permissionPolicyChanges } from "../services/permission-rule-service";
-import { assertChapterProjectAccess, canReadProject } from "../services/project-acl";
 import type { PublicShareConnectionLease } from "../services/public-narrator-share-connections";
 import {
 	isPublicToolSourceAllowed,
@@ -103,6 +92,12 @@ import {
 import { handleEditorFileMessage, releaseEditorFileSubscriptions } from "./editor-file-ws";
 import { handleGitWorkspaceMessage, releaseGitWorkspaceSubscriptions } from "./git-workspace-ws";
 import { projectNarratorActivityEvent } from "./narrator-activity-projection";
+import {
+	toBlockCatchUp,
+	toBlockFrames,
+	toBlockSnapshot,
+	toolOpened,
+} from "./narrator-block-protocol";
 import {
 	createCodexQuotaOverviewWsMessage,
 	type NarratorListStateSnapshotItem,
@@ -139,15 +134,16 @@ export interface NarratorWSData {
 	 */
 	subscribedChatRooms: Set<string>;
 	userId?: string;
+	sessionId?: string;
 	sessionExp?: number;
-	sessionTokenVersion?: number;
 	username?: string;
 	avatarColor?: string | null;
 	avatarImageId?: string | null;
 	/**
-	 * Live role captured at upgrade time, for the admin short-circuit in narrator
-	 * authorization. Absent on connections whose user row could not be resolved,
-	 * which are treated as non-admin.
+	 * Live role, for the admin short-circuit in narrator authorization. Captured at
+	 * upgrade and refreshed whenever the user's authorization changes (see
+	 * `revalidateSessionSockets`). Absent on connections whose user row could not be
+	 * resolved, which are treated as non-admin.
 	 */
 	userRole?: string;
 	/**
@@ -188,11 +184,6 @@ export type NarratorClientMessage =
 			feedbackText?: string;
 			compactAfter?: boolean;
 			updatedPlan?: string;
-	  }
-	| {
-			type: "merge_decision";
-			mergeSessionId: string;
-			decision: MergeDecision;
 	  }
 	| { type: "buffer_message"; narratorId: string; text: string }
 	| { type: "cancel_buffer"; narratorId: string }
@@ -714,26 +705,47 @@ export function broadcastToNarrator(narratorId: string, message: NarratorServerM
 		});
 	}
 	if (message.type === "tool_use_chunk" && message.inputDocument) {
+		let opened: string | null | undefined;
 		for (const ws of connections) {
 			if (ws.data.publicShare && ws.data.publicShare.narratorId !== narratorId) continue;
 			if (!ws.data.subscribedNarrators.has(narratorId)) continue;
 			if (ws.data.activityOnlyNarrators?.has(narratorId)) continue;
 			if (ws.data.publicShare && !projectPublicNarratorEvent(narratorId, message)) continue;
+			if (opened === undefined) {
+				const frame = toolOpened(message as unknown as Record<string, unknown> & { type: string });
+				opened = frame ? JSON.stringify(frame) : null;
+			}
+			if (opened && !sendPayload(ws, opened)) continue;
 			if (!sendToolInputLane(ws, message)) removeConnection(ws);
 		}
 		eventBus.emit({ type: "narrator:message_broadcast", narratorId, message });
 		return;
 	}
-	const payload = JSON.stringify(message);
 	let publicMessage: NarratorServerMessage | null | undefined;
-	let publicPayload: string | undefined;
 	let activityMessage: NarratorServerMessage | null | undefined;
 	let activityPayload: string | undefined;
+	// Protocol v2 frames (§8.2), built once per broadcast for each audience that needs them.
+	let blockFrames: Array<[NarratorServerMessage, string]> | undefined;
+	let publicBlockFrames: Array<[NarratorServerMessage, string]> | undefined;
+	const inBlockProtocol = (
+		frame: NarratorServerMessage,
+	): Array<[NarratorServerMessage, string]> => {
+		try {
+			return toBlockFrames(frame).map((item) => [item, JSON.stringify(item)]);
+		} catch (error) {
+			// A broadcast never fails its emitter; the v2 client reloads what it missed.
+			logger.warn("Message protocol v2 frame failed; asking the client to reload", {
+				narratorId,
+				type: frame.type,
+				error: String(error),
+			});
+			const reload: NarratorServerMessage = { type: "full_reload", narratorId };
+			return [[reload, JSON.stringify(reload)]];
+		}
+	};
 	for (const ws of connections) {
 		if (ws.data.publicShare && ws.data.publicShare.narratorId !== narratorId) continue;
 		if (!ws.data.subscribedNarrators.has(narratorId)) continue;
-		let outgoing = message;
-		let outgoingPayload = payload;
 		if (ws.data.activityOnlyNarrators?.has(narratorId)) {
 			if (activityMessage === undefined) activityMessage = projectNarratorActivityEvent(message);
 			if (!activityMessage) continue;
@@ -745,26 +757,26 @@ export function broadcastToNarrator(narratorId: string, message: NarratorServerM
 			}
 			continue;
 		}
+		let frames: Array<[NarratorServerMessage, string]>;
 		if (ws.data.publicShare) {
 			if (publicMessage === undefined)
 				publicMessage = projectPublicNarratorEvent(narratorId, message);
 			if (!publicMessage) continue;
-			publicPayload ??= JSON.stringify(publicMessage);
-			outgoing = publicMessage;
-			outgoingPayload = publicPayload;
+			publicBlockFrames ??= inBlockProtocol(publicMessage);
+			frames = publicBlockFrames;
+		} else {
+			blockFrames ??= inBlockProtocol(message);
+			frames = blockFrames;
 		}
 		if (ws.data.catchingUpNarrators.has(narratorId)) {
 			const buffer = ws.data.catchUpBuffers.get(narratorId);
 			if (buffer) {
-				bufferRealtimeMessage(buffer, outgoing, outgoingPayload.length);
+				for (const [frame, framePayload] of frames)
+					bufferRealtimeMessage(buffer, frame, framePayload.length);
 				continue;
 			}
 		}
-		try {
-			ws.send(outgoingPayload);
-		} catch {
-			removeConnection(ws);
-		}
+		for (const [, framePayload] of frames) if (!sendPayload(ws, framePayload)) break;
 	}
 	eventBus.emit({ type: "narrator:message_broadcast", narratorId, message });
 }
@@ -786,7 +798,26 @@ function withSubscriptionRequestId<T extends Record<string, unknown>>(
 	return subscriptionRequestId ? { ...message, subscriptionRequestId } : message;
 }
 
-function safeSend(ws: NarratorWS, message: Record<string, unknown>): boolean {
+/** Send one serialized frame; a failed send drops the connection. */
+function sendPayload(ws: NarratorWS, payload: string): boolean {
+	try {
+		ws.send(payload);
+		return true;
+	} catch {
+		removeConnection(ws);
+		return false;
+	}
+}
+
+/**
+ * Send one frame to one connection, projected for a public-share reader. `inProtocol`
+ * maps the (projected) frame for a connection that negotiated message protocol v2.
+ */
+function safeSend(
+	ws: NarratorWS,
+	message: Record<string, unknown>,
+	inProtocol?: (frame: Record<string, unknown> & { type: string }) => Record<string, unknown>,
+): boolean {
 	let outgoing = message;
 	if (ws.data.publicShare) {
 		if (typeof message.type !== "string") return true;
@@ -797,6 +828,7 @@ function safeSend(ws: NarratorWS, message: Record<string, unknown>): boolean {
 		if (!projected) return true;
 		outgoing = projected;
 	}
+	if (inProtocol) outgoing = inProtocol(outgoing as Record<string, unknown> & { type: string });
 	if (outgoing.type === "tool_use_chunk" && outgoing.inputDocument)
 		return sendToolInputLane(ws, outgoing as unknown as ToolInputChunkMessage);
 	try {
@@ -931,9 +963,6 @@ async function authorizeNarratorFrame(
 	const needsWrite = NARRATOR_FRAME_WRITE_TYPES.has(msg.type);
 	const needsRead = NARRATOR_FRAME_READ_TYPES.has(msg.type);
 	const needsIndirectWrite = NARRATOR_FRAME_INDIRECT_WRITE_TYPES.has(msg.type);
-	if (msg.type === "merge_decision") {
-		return await authorizeMergeDecisionFrame(ws, msg.mergeSessionId);
-	}
 	if (!needsWrite && !needsRead && !needsIndirectWrite) return true;
 
 	const userId = ws.data.userId;
@@ -970,40 +999,6 @@ async function authorizeNarratorFrame(
 		logger.warn("Narrator WS frame authorization failed", {
 			narratorId,
 			frame: msg.type,
-			error: String(err),
-		});
-		return false;
-	}
-}
-
-/**
- * Authorize a merge decision, which is scoped to a project rather than a narrator.
- *
- * Continuing or cancelling a conflicted merge commits to (or rolls back) the target
- * chapter's worktree, so it needs write access on the owning project — the same
- * verdict the HTTP merge routes require. Like `permission_decision` the frame names
- * only a session id, and that id is visible to everyone watching the merge, so
- * without this lookup any observer could decide someone else's merge.
- */
-async function authorizeMergeDecisionFrame(
-	ws: NarratorWS,
-	mergeSessionId: string,
-): Promise<boolean> {
-	const userId = ws.data.userId;
-	if (!userId) return false;
-	const principal = { userId, isAdmin: ws.data.userRole === "admin" };
-	try {
-		const session = await db.query.mergeSessions.findFirst({
-			where: eq(mergeSessions.id, mergeSessionId),
-			columns: { targetChapterId: true },
-		});
-		if (!session?.targetChapterId) return false;
-		// Throws NotFoundError when the caller may not reach the project.
-		await assertChapterProjectAccess(session.targetChapterId, principal, "write");
-		return true;
-	} catch (err) {
-		logger.warn("Merge decision frame authorization failed", {
-			mergeSessionId,
 			error: String(err),
 		});
 		return false;
@@ -1307,6 +1302,7 @@ function sendStreamingSnapshot(ws: NarratorWS, narratorIds: string[], requestId?
 					},
 					requestId,
 				),
+				toBlockSnapshot,
 			)
 		) {
 			return;
@@ -1428,6 +1424,7 @@ async function sendCatchUpForAnchor(
 					},
 					requestId,
 				),
+				toBlockCatchUp,
 			);
 		}
 
@@ -1461,6 +1458,7 @@ async function sendCatchUpForAnchor(
 								},
 								requestId,
 							),
+							toBlockCatchUp,
 						);
 					}
 				}
@@ -1655,109 +1653,6 @@ export function broadcastToAdmins(message: Record<string, unknown>): void {
 	}
 }
 
-/**
- * Broadcast to the connections whose user may read one project.
- *
- * For the frames whose payload is narrower than "the whole deployment": container
- * build logs (a chapter's raw build output, line by line) and merge progress
- * (conflicting file paths). `broadcastToAll` walks every connection, so those were
- * shipping one project's filenames and build output to every open session — cost
- * with no reader, and a payload that contradicted the "safe for every logged-in
- * client" rule that the graph-topology bridge is documented against.
- *
- * Resolution is per distinct user rather than per connection, and the verdict is
- * cached for the duration of one broadcast, so N connections of one user cost one
- * check. Serialization happens once regardless of recipient count.
- *
- * Fails closed: a user whose check throws is skipped rather than included.
- */
-async function broadcastToProjectReaders(
-	projectId: string,
-	message: Record<string, unknown>,
-): Promise<void> {
-	const payload = JSON.stringify(message);
-	const verdicts = new Map<string, boolean>();
-	for (const [userId, userConnections] of connectionsByUserId) {
-		if (userConnections.size === 0) continue;
-		let allowed = verdicts.get(userId);
-		if (allowed === undefined) {
-			const role = [...userConnections][0]?.data.userRole;
-			try {
-				const row = await db.query.projects.findFirst({
-					where: eq(projects.id, projectId),
-					columns: { id: true, ownerUserId: true, visibility: true },
-				});
-				allowed = row ? await canReadProject(row, { userId, isAdmin: role === "admin" }) : false;
-			} catch (err) {
-				logger.warn("Project-scoped broadcast authorization failed", {
-					projectId,
-					error: String(err),
-				});
-				allowed = false;
-			}
-			verdicts.set(userId, allowed);
-		}
-		if (!allowed) continue;
-		for (const ws of userConnections) {
-			try {
-				ws.send(payload);
-			} catch {
-				removeConnection(ws);
-			}
-		}
-	}
-}
-
-/**
- * The project a chapter belongs to, for the chapter-keyed container events.
- *
- * Cached because container build logs arrive line by line: without it every line of
- * a Docker build would be one SQLite lookup on the main thread. Bounded, and keyed
- * by chapter id — a chapter never changes project, so entries cannot go stale.
- */
-const CHAPTER_PROJECT_CACHE_MAX = 256;
-const chapterProjectCache = new Map<string, string | null>();
-
-async function resolveChapterProjectId(chapterId: string): Promise<string | null> {
-	const cached = chapterProjectCache.get(chapterId);
-	if (cached !== undefined) return cached;
-	let projectId: string | null = null;
-	try {
-		const row = await db.query.chapters.findFirst({
-			where: eq(chapters.id, chapterId),
-			columns: { projectId: true },
-		});
-		projectId = row?.projectId ?? null;
-	} catch (err) {
-		logger.warn("Chapter project lookup failed for scoped broadcast", {
-			chapterId,
-			error: String(err),
-		});
-		return null;
-	}
-	if (chapterProjectCache.size >= CHAPTER_PROJECT_CACHE_MAX) {
-		const oldest = chapterProjectCache.keys().next().value;
-		if (oldest !== undefined) chapterProjectCache.delete(oldest);
-	}
-	chapterProjectCache.set(chapterId, projectId);
-	return projectId;
-}
-
-/**
- * Broadcast a chapter-scoped frame to the readers of its project.
- *
- * A chapter with no resolvable project is dropped rather than fanned out: an
- * unknown owner must not mean "everyone".
- */
-async function broadcastToChapterProjectReaders(
-	chapterId: string,
-	message: Record<string, unknown>,
-): Promise<void> {
-	const projectId = await resolveChapterProjectId(chapterId);
-	if (!projectId) return;
-	await broadcastToProjectReaders(projectId, message);
-}
-
 // === Terminal count change listener ===
 // When a terminal is created or exits, compute the new running count for its narrator
 // and broadcast to subscribers. Debounced per-narrator to avoid redundant queries
@@ -1788,35 +1683,6 @@ function debouncedTerminalCount(narratorId: string | null) {
 		setTimeout(() => {
 			pendingTerminalBroadcasts.delete(narratorId);
 			broadcastTerminalCount(narratorId).catch(() => {});
-		}, 100),
-	);
-}
-
-/**
- * When a terminal is created/exited via chapterId (without narratorId),
- * broadcast terminal_count_changed to all narrators bound to that chapter.
- */
-async function broadcastTerminalCountByChapter(chapterId: string) {
-	const chapterNarrators = await db.query.narrators.findMany({
-		where: eq(narrators.chapterId, chapterId),
-		columns: { id: true },
-	});
-	for (const n of chapterNarrators) {
-		broadcastTerminalCount(n.id);
-	}
-}
-
-const pendingChapterTerminalBroadcasts = new Map<string, ReturnType<typeof setTimeout>>();
-
-function debouncedChapterTerminalCount(chapterId: string | null) {
-	if (!chapterId) return;
-	const existing = pendingChapterTerminalBroadcasts.get(chapterId);
-	if (existing) clearTimeout(existing);
-	pendingChapterTerminalBroadcasts.set(
-		chapterId,
-		setTimeout(() => {
-			pendingChapterTerminalBroadcasts.delete(chapterId);
-			broadcastTerminalCountByChapter(chapterId).catch(() => {});
 		}, 100),
 	);
 }
@@ -1867,102 +1733,6 @@ function debouncedBrowserVisualChange(narratorId: string, sessionId: string) {
 	);
 }
 
-// === Container status change listener ===
-// When a container starts/stops/pauses/resumes, compute the aggregate status for the chapter
-// and broadcast to subscribers of the chapter's narrator. Debounced per-chapter.
-
-const pendingContainerBroadcasts = new Map<string, ReturnType<typeof setTimeout>>();
-
-async function broadcastContainerStatus(chapterId: string) {
-	// A chapter may have multiple narrators — broadcast to all of them.
-	const chapterNarrators = await db.query.narrators.findMany({
-		where: eq(narrators.chapterId, chapterId),
-		columns: { id: true },
-	});
-	if (chapterNarrators.length === 0) return;
-
-	const rows = await db
-		.select({ status: containerInstances.status })
-		.from(containerInstances)
-		.where(eq(containerInstances.chapterId, chapterId));
-
-	let bestStatus: string | null = null;
-	let bestPriority = -1;
-	for (const row of rows) {
-		const p = CONTAINER_STATUS_PRIORITY[row.status] ?? 0;
-		if (p > bestPriority) {
-			bestPriority = p;
-			bestStatus = row.status;
-		}
-	}
-
-	for (const narrator of chapterNarrators) {
-		broadcastToNarrator(narrator.id, {
-			type: "container_status_changed",
-			narratorId: narrator.id,
-			chapterId,
-			containerStatus: bestStatus,
-		});
-	}
-}
-
-function debouncedContainerStatus(chapterId: string) {
-	const existing = pendingContainerBroadcasts.get(chapterId);
-	if (existing) clearTimeout(existing);
-	pendingContainerBroadcasts.set(
-		chapterId,
-		setTimeout(() => {
-			pendingContainerBroadcasts.delete(chapterId);
-			broadcastContainerStatus(chapterId).catch(() => {});
-		}, 100),
-	);
-}
-
-/**
- * Event prefixes whose members describe a change to the project's story network
- * (nodes, edges, exploration groups, review chapters) and therefore invalidate the
- * graph for every connected client.
- */
-const GRAPH_TOPOLOGY_PREFIXES = ["chapter:", "dependency:", "exploration:", "review:"] as const;
-
-/**
- * Events inside those prefixes that must NOT be broadcast to all connections.
- *
- * This list is the price of matching by prefix. Forwarding by prefix means a new
- * lifecycle event reaches the graph without a second change here — but it also means
- * a new event's *payload* reaches every client without anyone deciding that it
- * should. `broadcastToAll` walks the whole connection set: it is not scoped by
- * project, chapter or user. So the rule for anything under these prefixes is that its
- * payload must be safe for every logged-in client to see, and must not be
- * high-frequency. Anything else belongs here.
- *
- * Current members:
- *
- *   - `chapter:files_changed` / `chapter:external_change_recorded` — fire on the
- *     worktree watcher's tick (every few seconds per active chapter) and say nothing
- *     about graph topology, so fanning them out would be steady background traffic
- *     for no redraw. Chapters that need file activity already get it narrator-scoped
- *     via `narrator:ws_broadcast` (`git_status`).
- *   - `chapter:conflict` — carries `files`, the conflicting paths of one merge. It
- *     does not change graph topology (the outcome arrives as `chapter:merged`), no
- *     client subscribes to it, and the merge UI learns about conflicts from its own
- *     HTTP response and the narrator-scoped `merge:conflict` session events. Sending
- *     one project's conflicting filenames to every open session is cost with no
- *     reader.
- *
- * `chapter:commits_updated` is deliberately absent: it changes the commit count
- * rendered on a node, and the watcher only emits it when HEAD actually moved.
- *
- * Adding an event under these prefixes? If its payload names file contents, paths,
- * diffs, prompts or anything else scoped narrower than "the whole deployment", or if
- * it can fire on a timer, add it here at the same time.
- */
-const GRAPH_TOPOLOGY_EXCLUDED: ReadonlySet<string> = new Set([
-	"chapter:files_changed",
-	"chapter:external_change_recorded",
-	"chapter:conflict",
-]);
-
 // === Event bus listeners ===
 // Guard against duplicate registration during Bun --hot reloads.
 // The eventBus singleton survives reloads (via hotSafe in event-bus.ts),
@@ -1972,12 +1742,10 @@ const GRAPH_TOPOLOGY_EXCLUDED: ReadonlySet<string> = new Set([
 if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 	eventBus.on("terminal:created", (event) => {
 		debouncedTerminalCount(event.narratorId);
-		debouncedChapterTerminalCount(event.chapterId);
 	});
 
 	eventBus.on("terminal:exited", (event) => {
 		debouncedTerminalCount(event.narratorId);
-		debouncedChapterTerminalCount(event.chapterId);
 	});
 
 	eventBus.on("browser:session_created", (event) => {
@@ -1994,47 +1762,6 @@ if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 
 	eventBus.on("browser:session_visual_change", (event) => {
 		debouncedBrowserVisualChange(event.narratorId, event.sessionId);
-	});
-
-	eventBus.on("container:started", (event) => {
-		debouncedContainerStatus(event.chapterId);
-		broadcastToAll({ type: "container:started", chapterId: event.chapterId });
-	});
-
-	eventBus.on("container:stopped", (event) => {
-		debouncedContainerStatus(event.chapterId);
-		broadcastToAll({ type: "container:stopped", chapterId: event.chapterId });
-	});
-
-	eventBus.on("container:paused", (event) => {
-		debouncedContainerStatus(event.chapterId);
-		broadcastToAll({ type: "container:paused", chapterId: event.chapterId });
-	});
-
-	eventBus.on("container:resumed", (event) => {
-		debouncedContainerStatus(event.chapterId);
-		broadcastToAll({ type: "container:resumed", chapterId: event.chapterId });
-	});
-
-	eventBus.on("container:starting", (event) => {
-		broadcastToAll({ type: "container:starting", chapterId: event.chapterId });
-	});
-
-	// Raw build/start output of one chapter's container, line by line. The only
-	// container frame carrying content rather than an id, and the densest: a Docker
-	// build emits hundreds of lines. Scoped to the project's readers so one team's
-	// build output does not stream to every open session in the deployment.
-	eventBus.on("container:log", (event) => {
-		void broadcastToChapterProjectReaders(event.chapterId, {
-			type: "container:log",
-			chapterId: event.chapterId,
-			line: event.line,
-			phase: event.phase,
-		});
-	});
-
-	eventBus.on("container:error", (event) => {
-		broadcastToAll({ type: "container:error", chapterId: event.chapterId, error: event.error });
 	});
 
 	// === Narrator WS broadcast (peripheral services emit this to decouple) ===
@@ -2059,44 +1786,6 @@ if (hotOnce("narrafork.narratorWs.listenersRegistered")) {
 			pluginId: event.pluginId,
 			providerInstanceId: event.providerInstanceId,
 		});
-	});
-
-	// === Batch merge progress broadcast ===
-	// Scoped to the project's readers rather than fanned out: `merge:conflict` carries
-	// `conflictFiles`, the conflicting paths of one project's merge, and the rest name
-	// its chapters. Every `merge:*` event carries `projectId`, so the scope is already
-	// in the payload — an event that ever omits it is dropped rather than broadcast,
-	// which is the fail-closed direction.
-	eventBus.onAny((event) => {
-		if (!event.type.startsWith("merge:")) return;
-		const projectId = (event as { projectId?: string }).projectId;
-		if (!projectId) {
-			logger.warn("Dropped merge event with no projectId", { type: event.type });
-			return;
-		}
-		void broadcastToProjectReaders(projectId, event as unknown as Record<string, unknown>);
-	});
-
-	// === Story-network graph topology broadcast ===
-	// The graph is project-global state, not narrator-scoped: a fork, merge, or
-	// dormancy performed by one client must invalidate every other client's view.
-	// Without this bridge the graph only refreshed on its 60 s fallback poll even
-	// though the events were already being emitted.
-	//
-	// Forwarded by prefix rather than by an explicit type list so the next
-	// lifecycle event someone emits reaches the frontend without a second change
-	// here — an allowlist is what let these nine events go unnoticed to begin
-	// with. The trade is that a new event's payload also ships by default, so
-	// `GRAPH_TOPOLOGY_EXCLUDED` carries the ones that must not: read its note before
-	// adding an event under these prefixes.
-	//
-	// What survives the filter is ids and small scalars, and clients treat the frame
-	// as an invalidation signal: they refetch the bounded graph snapshot over
-	// authenticated HTTP rather than trusting what arrived over WS.
-	eventBus.onAny((event) => {
-		if (!GRAPH_TOPOLOGY_PREFIXES.some((prefix) => event.type.startsWith(prefix))) return;
-		if (GRAPH_TOPOLOGY_EXCLUDED.has(event.type)) return;
-		broadcastToAll(event as unknown as Record<string, unknown>);
 	});
 
 	// === Codex quota overview broadcast ===
@@ -2188,7 +1877,7 @@ export const handleNarratorWS = {
 		// Frames that act on one narrator are authorized here, once, instead of in each
 		// case. Queueing or editing buffered input is indistinguishable from sending a
 		// message, so it needs write access; presence announces "I am looking at this",
-		// so read is enough. Decision frames (`permission_decision`, `merge_decision`)
+		// so read is enough. Decision frames (`permission_decision`)
 		// name only a request/session id, so their owner is resolved first — see
 		// `authorizeNarratorFrame`. `subscribe` authorizes itself (it takes a list, and
 		// reports per-id denials), and `sync_check` is covered transitively because it
@@ -2260,9 +1949,7 @@ export const handleNarratorWS = {
 					await sendStatusSnapshot(ws, allowedIds);
 					sendRuntimeSnapshot(ws, allowedIds, requestId);
 				}
-				if (kind === "messages") {
-					sendStreamingSnapshot(ws, allowedIds, requestId);
-				}
+				if (kind === "messages") sendStreamingSnapshot(ws, allowedIds, requestId);
 
 				if (messageNarratorId && msg.version != null) {
 					// The version belongs to the REST snapshot used by THIS subscription,
@@ -2345,20 +2032,6 @@ export const handleNarratorWS = {
 						});
 					});
 
-				break;
-			}
-			case "merge_decision": {
-				resolveMergeDecision(msg.mergeSessionId, msg.decision).catch((err) => {
-					logger.error("Failed to resolve merge decision", { error: String(err) });
-					safeSend(ws, {
-						type: "error",
-						message: `Failed to resolve merge decision: ${String(err)}`,
-					});
-				});
-				logger.debug("Merge decision received via WS", {
-					mergeSessionId: msg.mergeSessionId,
-					decision: msg.decision,
-				});
 				break;
 			}
 			case "buffer_message": {

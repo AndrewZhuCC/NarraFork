@@ -3,6 +3,7 @@ import { existsSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSy
 import { resolve } from "node:path";
 import { safeSpawn } from "../server/lib/spawn";
 import {
+	appendModelHistoryReinstall,
 	assertResourceMigrationValidated,
 	finalizeResourceMigration,
 	type ResourceMigrationSnapshot,
@@ -17,7 +18,7 @@ import {
 	appendGeneratedModelHistoryTriggers,
 	generatedModelHistoryTriggerSuffix,
 	MODEL_HISTORY_REVISION_CONTRACT,
-	renderModelHistoryRevisionSql,
+	modelHistoryRendererFingerprint,
 } from "./lib/generated-model-history-triggers";
 import { acquireSqliteGenerationLock } from "./lib/sqlite-generation-lock";
 
@@ -138,7 +139,7 @@ async function generateLocked(
 	const schemaDigest = digest(readBounded(schemaPath, 1024 * 1024));
 	const modelHistoryTriggers = {
 		contract: MODEL_HISTORY_REVISION_CONTRACT,
-		sqlDigest: digest(renderModelHistoryRevisionSql("sqlite")),
+		sqlDigest: digest(modelHistoryRendererFingerprint("sqlite")),
 	};
 	const contextStatsMigration = {
 		contract: CONTEXT_STATS_MIGRATION_CONTRACT,
@@ -308,7 +309,11 @@ async function generateLocked(
 		? splitGeneratedContextStatsMigration(original, contextSuffix)
 		: original;
 	const finalizedSchema = (options.finalize ?? finalizeResourceMigration)(
-		appendGeneratedModelHistoryTriggers(schemaSql, triggerSuffix),
+		appendModelHistoryReinstall(
+			appendGeneratedModelHistoryTriggers(schemaSql, triggerSuffix),
+			before,
+			after,
+		),
 		before,
 		after,
 	);

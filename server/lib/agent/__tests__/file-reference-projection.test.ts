@@ -233,7 +233,7 @@ describe("provider-independent file material", () => {
 		}
 	});
 
-	test("only the exact tail input omits its history snapshot, keeping original text/images", () => {
+	test("the current input is expanded in history like every other row", () => {
 		const image = { type: "image", imageId: "kept", uploadNarratorId: "owner" };
 		const tail = row(
 			[image, snapshot(), { type: "text", text: "inspect" }],
@@ -245,64 +245,19 @@ describe("provider-independent file material", () => {
 			role: "sys",
 		};
 		const display: DbMessage = { ...row([]), role: "disp" };
-		const child: DbMessage = { ...row([snapshot()]), parentToolUseId: "child" };
-		const messages = [older, tail, sys, display, child];
+		const messages = [older, tail, sys, display];
 		const saved = structuredClone(messages);
-		const currentInput = projectFileReferenceText(tail.contentText ?? "", [snapshot()]);
-		const projected = projectFileReferencesForModel(messages, { currentInput });
+		const projected = projectFileReferencesForModel(messages);
 		expect(projected[0].contentText).toContain("10 | first");
-		expect(projected[1].contentText).toBe(tail.contentText);
-		expect(projected[1].contentJson).toEqual([image, { type: "text", text: "inspect" }]);
+		expect(projected[1].contentText).toBe(projected[0].contentText);
+		expect(projected[1].contentJson).toEqual(projected[0].contentJson);
+		expect(getFileReferenceSnapshots(projected[1].contentJson)).toEqual([]);
 		expect(projected[2]).toBe(sys);
 		expect(projected[3]).toBe(display);
 		expect(messages).toEqual(saved);
 	});
 
-	test("full exact equality is required; substrings, extra sys and whitespace do not match", () => {
-		const message = row([snapshot()]);
-		const full = projectFileReferenceText("inspect", [snapshot()]);
-		for (const currentInput of [
-			"inspect",
-			`${full} `,
-			` ${full}`,
-			`reminder\n\n${full}`,
-			`${full}\nmore`,
-		]) {
-			expect(projectFileReferencesForModel([message], { currentInput })[0].contentText).toBe(full);
-		}
-	});
-
-	test("cannot cross a trailing assistant even if an older user exactly matches", () => {
-		const user = row([snapshot()]);
-		const assistant: DbMessage = { ...row([{ type: "text", text: "reply" }]), role: "assistant" };
-		const sys: DbMessage = { ...row([]), role: "sys" };
-		const child: DbMessage = { ...user, parentToolUseId: "child" };
-		const currentInput = projectFileReferenceText("inspect", [snapshot()]);
-		const projected = projectFileReferencesForModel([user, assistant, sys, child], {
-			currentInput,
-		});
-		expect(projected[0].contentText).toBe(currentInput);
-		expect(projected[1]).toBe(assistant);
-	});
-
-	test("a different tail user cannot cause an older exact match to be omitted", () => {
-		const older = row([snapshot()]);
-		const tail = { ...row([snapshot("different")], "another request"), id: "different-user" };
-		const currentInput = projectFileReferenceText("inspect", [snapshot()]);
-		const projected = projectFileReferencesForModel([older, tail], { currentInput });
-		expect(projected[0].contentText).toBe(currentInput);
-		expect(projected[1].contentText).toContain("10 | first");
-	});
-
-	test("summary/default projection still expands every row after an exact-tail call", () => {
-		const user = row([snapshot()]);
-		const currentInput = projectFileReferenceText("inspect", [snapshot()]);
-		projectFileReferencesForModel([user], { currentInput });
-		expect(projectFileReferencesForModel([user])[0].contentText).toBe(currentInput);
-		expect(projectFileReferencesForModel([user], {})[0].contentText).toBe(currentInput);
-	});
-
-	test("snapshot-only and text-block-fallback inputs use the same canonical comparison", () => {
+	test("snapshot-only and text-block-fallback inputs expand the same way", () => {
 		const only = row([snapshot()], "");
 		const fallback: DbMessage = {
 			...row([snapshot(), { type: "text", text: "from blocks" }]),
@@ -312,11 +267,10 @@ describe("provider-independent file material", () => {
 			[only, ""],
 			[fallback, "from blocks"],
 		] as const) {
-			const currentInput = projectFileReferenceText(original, [snapshot()]);
-			const [projected] = projectFileReferencesForModel([message], { currentInput });
+			const [projected] = projectFileReferencesForModel([message]);
 			expect(getFileReferenceSnapshots(projected.contentJson)).toEqual([]);
-			expect(projected.contentText).toBe(message.contentText);
-			expect(currentInput).toContain("10 | first");
+			expect(projected.contentText).toBe(projectFileReferenceText(original, [snapshot()]));
+			expect(projected.contentText).toContain("10 | first");
 		}
 	});
 

@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
+import { historyStrings } from "../../../tests/fixtures/model-input";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narratorMessageRefs, narrators, narratorToolCalls } from "../../db/schema";
 import { buildLegacyAttachedFilesHint } from "../../lib/attached-files";
@@ -243,9 +244,8 @@ for (const provider of ["anthropic", "responses", "gemini"] as const) {
 				expect(JSON.stringify(arguments_)).not.toContain(
 					questionReply.annotations["Which rollout should we use?"],
 				);
-				const results = nativeQuestionResults(
-					placement === "trailing" ? prepared.trailingToolResults : prepared.history,
-				);
+				// Results ride in the history, trailing ones included.
+				const results = nativeQuestionResults(prepared.history);
 				expect(results).toHaveLength(1);
 				expect(JSON.stringify(results)).toContain(HUMAN_QUESTION_CANARY);
 				if (placement === "user-event") {
@@ -365,7 +365,7 @@ for (const provider of ["anthropic", "responses", "gemini"] as const) {
 				narratorId,
 			});
 			expect(nativeToolArguments(prepared.history)).toEqual([questionInput]);
-			expect(JSON.stringify(nativeQuestionResults(prepared.trailingToolResults))).toContain(
+			expect(JSON.stringify(nativeQuestionResults(prepared.history))).toContain(
 				HUMAN_QUESTION_CANARY,
 			);
 			expect(prepared.sourceMessages[0].id).toBe(saved.id);
@@ -400,7 +400,6 @@ for (const provider of ["anthropic", "responses", "gemini"] as const) {
 		});
 		expect(nativeToolArguments(prepared.history)).toEqual([]);
 		expect(JSON.stringify(prepared.history)).not.toContain(HUMAN_QUESTION_CANARY);
-		expect(prepared.trailingToolResults).toEqual([]);
 		expect(source).toEqual(before);
 	});
 }
@@ -413,29 +412,14 @@ function injectionMessage(id: string, role: "sys" | "user", text: string) {
 }
 
 for (const entry of [
-	{
-		label: "Anthropic relay",
-		model: "claude-sonnet-4",
-		provider: "history-relay",
-		liftsTail: true,
-	},
-	{
-		label: "Anthropic official",
-		model: "claude-sonnet-4",
-		provider: "history-official",
-		liftsTail: false,
-	},
-	{ label: "Responses", model: "gpt-5", provider: "question-responses", liftsTail: false },
-	{ label: "Completions", model: "gpt-5", provider: "question-completions", liftsTail: false },
-	{ label: "Gemini", model: "gemini-2.5-pro", provider: "question-gemini", liftsTail: false },
-	{
-		label: "Gemini interactions",
-		model: "gemini-2.5-pro",
-		provider: "question-interactions",
-		liftsTail: false,
-	},
+	{ label: "Anthropic relay", model: "claude-sonnet-4", provider: "history-relay" },
+	{ label: "Anthropic official", model: "claude-sonnet-4", provider: "history-official" },
+	{ label: "Responses", model: "gpt-5", provider: "question-responses" },
+	{ label: "Completions", model: "gpt-5", provider: "question-completions" },
+	{ label: "Gemini", model: "gemini-2.5-pro", provider: "question-gemini" },
+	{ label: "Gemini interactions", model: "gemini-2.5-pro", provider: "question-interactions" },
 ]) {
-	test(`${entry.label} reports native source IDs retained in history, not its extracted tail`, async () => {
+	test(`${entry.label} reports native source IDs retained in history, the tail included`, async () => {
 		const source = [
 			message("u", "user", "earlier"),
 			injectionMessage("historical-notice", "sys", "same-notice-body"),
@@ -449,14 +433,12 @@ for (const entry of [
 		];
 		const before = structuredClone(source);
 		const prepared = await buildRuntimeHistory({ ...options(), ...entry, sourceMessages: source });
-		expect(prepared.replayedInjectionMessageIds).toEqual(
-			entry.liftsTail ? ["u", "historical-notice"] : ["u", "historical-notice", "tail-notice"],
-		);
+		expect(prepared.replayedInjectionMessageIds).toEqual(["u", "historical-notice", "tail-notice"]);
 		const historyText = JSON.stringify(prepared.history);
-		expect(historyText.split("same-notice-body").length - 1).toBe(entry.liftsTail ? 1 : 2);
+		expect(historyText.split("same-notice-body").length - 1).toBe(2);
 		expect(historyText).not.toContain("hidden-child-body");
 		expect(historyText).not.toContain("display-only-body");
-		if (entry.liftsTail) expect(prepared.currentText).toContain("same-notice-body");
+		expect(prepared.currentText).toBe("");
 		expect(source).toEqual(before);
 	});
 
@@ -477,21 +459,17 @@ for (const entry of [
 					injectionMessage("buffered-knowledge-hint", "sys", "buffered-knowledge-body"),
 				],
 			});
-			expect(prepared.replayedInjectionMessageIds).toEqual(
-				entry.liftsTail ? [] : ["buffered-user", "buffered-knowledge-hint"],
-			);
+			expect(prepared.replayedInjectionMessageIds).toEqual([
+				"buffered-user",
+				"buffered-knowledge-hint",
+			]);
 			const historyText = JSON.stringify(prepared.history);
-			if (entry.liftsTail) {
-				expect(historyText).not.toContain("buffered-plain-body");
-				expect(prepared.currentText).toContain("buffered-knowledge-body");
-			} else {
-				expect(historyText).toContain("buffered-plain-body");
-				expect(historyText).toContain("buffered-knowledge-body");
-			}
+			expect(historyText).toContain("buffered-plain-body");
+			expect(historyText).toContain("buffered-knowledge-body");
 		});
 	}
 
-	test(`${entry.label} never reports a native current-user row as replayed history`, async () => {
+	test(`${entry.label} reports the native current-user row its history carries`, async () => {
 		const prepared = await buildRuntimeHistory({
 			...options(),
 			...entry,
@@ -500,11 +478,11 @@ for (const entry of [
 				injectionMessage("current-user-notice", "user", "current-native-body"),
 			],
 		});
-		expect(prepared.replayedInjectionMessageIds).toEqual([]);
-		expect(JSON.stringify(prepared.history)).not.toContain("current-native-body");
+		expect(prepared.replayedInjectionMessageIds).toEqual(["current-user-notice"]);
+		expect(JSON.stringify(prepared.history)).toContain("current-native-body");
 	});
 
-	test(`${entry.label} handles an empty extracted sys tail without guessing from trailing text`, async () => {
+	test(`${entry.label} skips an empty sys tail without dropping the input before it`, async () => {
 		const prepared = await buildRuntimeHistory({
 			...options(),
 			...entry,
@@ -514,12 +492,8 @@ for (const entry of [
 				injectionMessage("empty-sys-tail", "sys", ""),
 			],
 		});
-		expect(prepared.replayedInjectionMessageIds).toEqual(
-			entry.liftsTail ? [] : ["user-before-empty-tail"],
-		);
-		const historyText = JSON.stringify(prepared.history);
-		if (entry.liftsTail) expect(historyText).not.toContain("before-empty-tail-body");
-		else expect(historyText).toContain("before-empty-tail-body");
+		expect(prepared.replayedInjectionMessageIds).toEqual(["user-before-empty-tail"]);
+		expect(JSON.stringify(prepared.history)).toContain("before-empty-tail-body");
 	});
 }
 
@@ -538,20 +512,11 @@ test.each([
 			message("s", "sys", "fresh injection"),
 		],
 	});
-	if (official) {
-		expect(prepared.trailingUserText).toBeUndefined();
-		expect(prepared.history).toEqual(
-			expect.arrayContaining([
-				expect.objectContaining({
-					role: "system",
-					content: '<sender kind="system" />\nfresh injection',
-				}),
-			]),
-		);
-	} else {
-		expect(prepared.trailingUserText).toContain("fresh injection");
-		expect(prepared.currentText).toContain("fresh injection");
-	}
+	expect(prepared.currentText).toBe("");
+	const last = prepared.history.at(-1) as { role: string; content: unknown };
+	// Official endpoints take runtime context as a system message; compatible ones as user input.
+	expect(last.role).toBe(official ? "system" : "user");
+	expect(JSON.stringify(last.content)).toContain('<sender kind=\\"system\\" />\\nfresh injection');
 });
 
 test.each([
@@ -589,7 +554,8 @@ test.each([
 	expect(prepared.sourceMessages).toContain(receipt);
 	expect(prepared.modelMessages.map((row) => row.id)).toEqual(["parent-tool"]);
 	expect(JSON.stringify(prepared.history)).not.toContain("private snapshot preview");
-	expect(JSON.stringify(prepared.trailingToolResults)).toContain("parent result survives");
+	expect(JSON.stringify(prepared.history)).toContain("parent result survives");
+	expect(prepared.endsWithToolResults).toBe(true);
 });
 
 test("child placement is projected while complete tools and reasoning metadata are retained", async () => {
@@ -619,20 +585,22 @@ test("child placement is projected while complete tools and reasoning metadata a
 	expect(child.modelMessages[0].narratorId).toBe("primary");
 	expect(child.modelMessages[0].toolCalls).toEqual(source[0].toolCalls);
 	expect(child.modelMessages[0].contentJson).toEqual(source[0].contentJson);
-	expect(child.trailingToolResults).toHaveLength(1);
-	expect(JSON.stringify(child.trailingToolResults)).toContain("large output");
+	expect(child.endsWithToolResults).toBe(true);
+	expect(JSON.stringify(child.history)).toContain("large output");
 	expect(JSON.stringify(child.history)).toContain("reasoned");
 	const primary = await buildRuntimeHistory({ ...options(), sourceMessages: source });
 	expect(primary.history).toEqual([]);
 });
 
-test("empty prompt recovers the popped user but pure tool results never invent continuation", async () => {
+test("empty prompt keeps the accepted user in history and tool results never invent continuation", async () => {
 	const recovered = await buildRuntimeHistory({
 		...options(),
 		sourceMessages: [message("u", "user", "actual accepted text")],
 	});
-	expect(recovered.currentText).toBe('<sender kind="human" />\nactual accepted text');
-	expect(recovered.history).toEqual([]);
+	expect(recovered.currentText).toBe("");
+	expect(recovered.currentInputText).toBe('<sender kind="human" />\nactual accepted text');
+	expect(recovered.currentInputPersisted).toBe(true);
+	expect(JSON.stringify(recovered.history)).toContain("actual accepted text");
 	const tool = message("tool", "assistant", "");
 	tool.contentJson = [{ type: "tool_use", id: "call", name: "Read", input: { path: "x" } }];
 	tool.toolCalls = [
@@ -645,9 +613,10 @@ test("empty prompt recovers the popped user but pure tool results never invent c
 		},
 	];
 	const replay = await buildRuntimeHistory({ ...options(), sourceMessages: [tool] });
-	expect(replay.isPureToolResultReplay).toBe(true);
+	expect(replay.endsWithToolResults).toBe(true);
 	expect(replay.currentText).toBe("");
-	expect(replay.trailingToolResults).toHaveLength(1);
+	expect(replay.currentInputText).toBe("");
+	expect(JSON.stringify(replay.history)).toContain("result");
 });
 
 test("current text stays distinct from extracted sys and source attachment metadata survives", async () => {
@@ -661,9 +630,10 @@ test("current text stays distinct from extracted sys and source attachment metad
 		sourceMessages: source,
 		currentInput: "new principal input",
 	});
-	expect(prepared.currentText).toBe(
-		'<sender kind="system" />\npending notice\n\n<sender kind="system" />\nnew principal input',
-	);
+	// The pending notice is a persisted row in history; only the new input is current text.
+	expect(prepared.currentText).toBe('<sender kind="system" />\nnew principal input');
+	expect(prepared.currentInputPersisted).toBe(false);
+	expect(JSON.stringify(prepared.history)).toContain("pending notice");
 	expect(prepared.sourceMessages).toBe(source);
 });
 
@@ -685,13 +655,15 @@ test("snapshot-only accepted input recovers frozen attachment bytes without reso
 	];
 	const before = JSON.stringify(source);
 	const prepared = await buildRuntimeHistory({ ...options(), sourceMessages: [source] });
-	expect(prepared.currentText).toContain("const accepted = 42;");
-	expect(prepared.currentText).toContain("offline-device");
+	expect(prepared.currentText).toBe("");
+	expect(prepared.currentInputText).toContain("const accepted = 42;");
+	const history = JSON.stringify(prepared.history);
+	expect(history).toContain("const accepted = 42;");
+	expect(history).toContain("offline-device");
 	expect(JSON.stringify(source)).toBe(before);
-	expect(prepared.history).toEqual([]);
 });
 
-test("real loader plus currentRevision adoption retain exact history identity and current-input guard", async () => {
+test("real loader plus currentRevision adoption retain exact history identity", async () => {
 	const owner = tryClaimExecution("primary", "run");
 	if (!owner) throw new Error("Missing owner");
 	const store = createMailboxStore(db);
@@ -725,14 +697,15 @@ test("real loader plus currentRevision adoption retain exact history identity an
 		contentJson: [{ type: "text", text: "edited current" }],
 	});
 	const first = await buildRuntimeHistory(options());
-	expect(first.currentText).toBe('<sender kind="human" />\nedited current');
+	expect(first.currentText).toBe("");
+	expect(first.currentInputText).toBe('<sender kind="human" />\nedited current');
+	expect(historyStrings(first.history)).toContain('<sender kind="human" />\nedited current');
 	expect(store.getByDelivery(row.deliveryId as string)?.currentAdoptedAt).toBeNull();
-	consumeAgentMessageHistory([...first.history], first.currentText);
-	consumeAgentMessageHistory(first.history, "other replacement input");
+	// A copy is not the built history's identity and adopts nothing.
+	consumeAgentMessageHistory([...first.history]);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	expect(store.getByDelivery(row.deliveryId as string)?.currentAdoptedAt).toBeNull();
-	const accepted = await buildRuntimeHistory(options());
-	consumeAgentMessageHistory(accepted.history, accepted.currentText);
+	consumeAgentMessageHistory(first.history);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	expect(store.getByDelivery(row.deliveryId as string)).toMatchObject({
 		currentAdoptedRevision: 2,
@@ -744,7 +717,7 @@ test("real loader plus currentRevision adoption retain exact history identity an
 	).toBeInstanceOf(Date);
 });
 
-test("grouped extracted sys receipts require the exact projected packet before adoption", async () => {
+test("grouped sys receipts are adopted with the history that carries their packet", async () => {
 	const owner = tryClaimExecution("primary", "run");
 	if (!owner) throw new Error("Missing owner");
 	const store = createMailboxStore(db);
@@ -786,26 +759,32 @@ test("grouped extracted sys receipts require the exact projected packet before a
 		},
 	);
 	const prepared = await buildRuntimeHistory(options());
-	expect(prepared.currentText).toContain('<sender kind="agent" id="agent-a" name="A" />\none');
-	expect(prepared.currentText).toContain('<sender kind="agent" id="agent-b" name="B" />\ntwo');
-	consumeAgentMessageHistory(prepared.history, "unrelated replacement input");
-	await new Promise((resolve) => setTimeout(resolve, 0));
+	expect(prepared.currentText).toBe("");
+	const packet = historyStrings(prepared.history);
+	expect(packet).toContain('<sender kind="agent" id="agent-a" name="A" />\none');
+	expect(packet).toContain('<sender kind="agent" id="agent-b" name="B" />\ntwo');
 	expect(store.getByDelivery(row.deliveryId as string)?.adoptedAt).toBeNull();
-	const accepted = await buildRuntimeHistory(options());
-	consumeAgentMessageHistory(accepted.history, accepted.currentText);
+	consumeAgentMessageHistory(prepared.history);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	expect(store.getByDelivery(row.deliveryId as string)?.adoptedAt).not.toBeNull();
 });
 
 test("an already prepared initial packet is not attributed or extracted twice", async () => {
 	const source = message("sys", "sys", "prepared context");
-	const first = await buildRuntimeHistory({ ...options(), sourceMessages: [source] });
+	const first = await buildRuntimeHistory({
+		...options(),
+		sourceMessages: [source],
+		currentInput: "prepared context",
+	});
+	expect(first.currentInputPersisted).toBe(true);
 	const resumed = await buildRuntimeHistory({
 		...options(),
 		sourceMessages: [source],
-		currentInput: first.currentText,
+		currentInput: first.currentInputText,
 	});
-	expect(resumed.currentInputText).toBe(first.currentText);
+	expect(resumed.currentInputPersisted).toBe(true);
+	expect(resumed.currentText).toBe("");
+	expect(resumed.currentInputText).toBe(first.currentInputText);
 	expect(resumed.currentInputText.match(/<sender /g)).toHaveLength(1);
 });
 
@@ -881,8 +860,9 @@ test.each([
 		expect(history).toContain(mode === "relay" || mode === "official" ? '"type":"image"' : "image");
 		expect(readdirSync(join(cwd, ".narrafork", "attached"))).toHaveLength(1);
 		const recovered = await buildRuntimeHistory({ ...runtimeOptions, sourceMessages: [user] });
-		// Relay builders pop the final user row; locators must survive that recovery.
-		if (mode === "relay") expect(recovered.currentText).toContain('image: "logo.png"');
+		// Recovered with no prompt, the accepted row keeps its locators in history.
+		expect(recovered.currentInputText).toContain('image: "logo.png"');
+		expect(historyStrings(recovered.history)).toContain('image: "logo.png"');
 		const child = await buildRuntimeHistory({
 			...runtimeOptions,
 			ownTurnPlacement: "origin",

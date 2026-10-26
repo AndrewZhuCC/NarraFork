@@ -14,8 +14,6 @@ export type PluginViewSurface =
 	| "workspace"
 	| "director"
 	| "focus"
-	/** A chapter node's embedded dock; part of the `focus` family (one narrator). */
-	| "graph"
 	| "settings"
 	| "provider-settings";
 
@@ -135,7 +133,7 @@ export interface PluginUiContext {
 		active: boolean;
 		visible: boolean;
 	};
-	narrator?: { id: string; chapterId?: string | null; projectId?: string | null };
+	narrator?: { id: string; projectId?: string | null };
 	project?: { id: string };
 	workspace?: {
 		id: string;

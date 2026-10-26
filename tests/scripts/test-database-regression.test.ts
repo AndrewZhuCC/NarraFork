@@ -516,9 +516,7 @@ describe("batch definitions", () => {
 			"server/routes/__tests__/fs-download.test.ts",
 			"server/routes/__tests__/trait-layers.test.ts",
 			"server/routes/__tests__/project-membership.test.ts",
-			"server/routes/__tests__/projects-delete-fallback.test.ts",
 			"tests/server/routes/narrators-file-references.test.ts",
-			"server/services/worktree-watcher-poll.test.ts",
 		]) {
 			expect(BATCH_ACCEPTANCE1).toContain(anchor);
 		}

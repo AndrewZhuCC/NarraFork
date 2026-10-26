@@ -17,7 +17,6 @@ export const RECENT_TABS_LIST_EVENT_TYPES = [
 	"presence_update",
 	"terminal_count_changed",
 	"background_task_count_changed",
-	"container_status_changed",
 	"draft_changed",
 	"goals_set",
 	"list_state_snapshot",
@@ -71,12 +70,6 @@ function dispatchListStateItem(
 			activeBackgroundTaskCount: state.activeBackgroundTaskCount,
 			activeBackgroundWorkCount: state.activeBackgroundWorkCount as number | undefined,
 			activeBackgroundServiceCount: state.activeBackgroundServiceCount as number | undefined,
-		});
-	}
-	if ("containerStatus" in state) {
-		onUpdate(narratorId, {
-			type: "containerStatus",
-			containerStatus: state.containerStatus as NarratorListWSEvent["containerStatus"],
 		});
 	}
 	if (typeof state.hasDraft === "boolean") {
@@ -176,11 +169,6 @@ export function useRecentTabsWS(
 						activeBackgroundTaskCount: data.activeBackgroundTaskCount as number,
 						activeBackgroundWorkCount: data.activeBackgroundWorkCount as number | undefined,
 						activeBackgroundServiceCount: data.activeBackgroundServiceCount as number | undefined,
-					});
-				} else if (data.type === "container_status_changed") {
-					onUpdateRef.current(narratorId, {
-						type: "containerStatus",
-						containerStatus: data.containerStatus as NarratorListWSEvent["containerStatus"],
 					});
 				} else if (data.type === "draft_changed") {
 					onUpdateRef.current(narratorId, { type: "draft", hasDraft: !!data.hasDraft });

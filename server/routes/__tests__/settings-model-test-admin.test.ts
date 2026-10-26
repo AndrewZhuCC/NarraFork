@@ -5,8 +5,9 @@ import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { AUTO_LAN_HOST } from "../../../shared/server-host";
+import { updateSettingsKey } from "../../../shared/update-settings";
 import { AppError } from "../../lib/errors";
-import { invalidateUserCache } from "../../middleware/auth";
+import { settingsUpdateLock } from "../../lib/settings/write-lock";
 import type { AuthSessionStore } from "../../services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 
@@ -42,8 +43,6 @@ setAuthStores({ session: sessionStoreSeam, mfa: authMfaStore });
 
 afterAll(() => {
 	setAuthStores(undefined);
-	invalidateUserCache(ADMIN_ACTOR_ID);
-	invalidateUserCache(NON_ADMIN_ACTOR_ID);
 	if (previousHome === undefined) delete process.env.NARRAFORK_HOME;
 	else process.env.NARRAFORK_HOME = previousHome;
 	rmSync(testHome, { recursive: true, force: true });
@@ -702,6 +701,102 @@ describe("settings conditional admin guards", () => {
 			expect(settings.customApiProviders?.[0]?.prefix).toBe("new-prefix");
 		} finally {
 			await db.delete(narrators).where(eq(narrators.id, narratorId));
+			saveSettings(original);
+		}
+	});
+});
+
+describe("conditional update source settings", () => {
+	test("an expected source is checked after acquiring the settings write lock", async () => {
+		const original = structuredClone(settings);
+		const initialUpdate = original.update;
+		if (!initialUpdate) throw new Error("Missing default update settings");
+		const gate = Promise.withResolvers<void>();
+		let blocker: Promise<unknown> | undefined;
+		try {
+			saveSettings({ ...original, update: { ...initialUpdate, source: "github" } });
+			const app = appForRole("admin");
+			const checked = await (await app.request("http://localhost/settings")).json();
+			const expectedUpdateSettingsKey = updateSettingsKey(checked.update);
+			const concurrent = {
+				...initialUpdate,
+				source: "update-server" as const,
+				serverUrl: "https://private.example",
+			};
+			blocker = settingsUpdateLock.acquire("settings", async () => {
+				saveSettings({ ...settings, update: concurrent });
+				await gate.promise;
+			});
+			const pending = app.request("http://localhost/settings", {
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					expectedUpdateSettingsKey,
+					update: { source: "update-server", serverUrl: "https://narrafork-update.b.domexie.cn" },
+				}),
+			});
+			gate.resolve();
+			await blocker;
+			const response = await pending;
+			expect(response.status).toBe(409);
+			expect((await response.json()).code).toBe("UPDATE_SOURCE_CHANGED");
+			expect(settings.update).toEqual(concurrent);
+		} finally {
+			gate.resolve();
+			await blocker;
+			saveSettings(original);
+		}
+	});
+
+	test("a matching conditional patch preserves other preferences without persisting its precondition", async () => {
+		const original = structuredClone(settings);
+		const initialUpdate = original.update;
+		if (!initialUpdate) throw new Error("Missing default update settings");
+		try {
+			saveSettings({
+				...original,
+				update: {
+					...initialUpdate,
+					source: "github",
+					channel: "beta",
+					autoDownload: true,
+					proxy: { mode: "direct" },
+				},
+			});
+			const before = structuredClone(settings.update);
+			if (!before) throw new Error("Missing saved update settings");
+			const response = await appForRole("admin").request("http://localhost/settings", {
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					expectedUpdateSettingsKey: updateSettingsKey(before),
+					update: { source: "update-server", serverUrl: "https://narrafork-update.b.domexie.cn" },
+				}),
+			});
+			expect(response.status).toBe(200);
+			expect(settings.update).toEqual({
+				...before,
+				source: "update-server",
+				serverUrl: "https://narrafork-update.b.domexie.cn",
+			});
+			expect(settings).not.toHaveProperty("expectedUpdateSettingsKey");
+			expect(await response.json()).not.toHaveProperty("expectedUpdateSettingsKey");
+		} finally {
+			saveSettings(original);
+		}
+	});
+
+	test("an ordinary patch without a precondition remains supported", async () => {
+		const original = structuredClone(settings);
+		try {
+			const response = await appForRole("admin").request("http://localhost/settings", {
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ update: { channel: "beta" } }),
+			});
+			expect(response.status).toBe(200);
+			expect(settings.update?.channel).toBe("beta");
+		} finally {
 			saveSettings(original);
 		}
 	});

@@ -170,9 +170,9 @@ async function seedFixture(owner: HttpFixtureLifetime) {
 			})
 			.run();
 	});
-	token = await createToken(userId, "user");
-	otherToken = await createToken(otherId, "user");
-	settings.chapters.treeSnapshotsEnabled = false;
+	token = await createToken(userId);
+	otherToken = await createToken(otherId);
+	settings.workspace.treeSnapshotsEnabled = false;
 	runtime = await getDefaultLocalFileChangeRuntime();
 	owner.runtime = runtime;
 	const verifyNamespace = runtime.verifyNamespace;
@@ -953,6 +953,67 @@ describe("action-bound HTTP preview and real local execution", () => {
 		expect(messageVersion()).toBe((version ?? 0) + 1);
 		expect(events.some((event) => event.message.type === "full_reload")).toBe(true);
 		expect(events.every((event) => event.committed)).toBe(true);
+	});
+	test("delete_tool_block selects every execution attempt of a re-run call", async () => {
+		const path = join(workspace, "rerun.txt");
+		await writeFile(path, "R0\n");
+		const first = await write(path, "R1\n");
+		// The same call run again: a second ledger row of the first tool_use that also wrote,
+		// and no tool_use element of its own. (Its file journal is bound to the attempt it ran
+		// as, so the row keeps that attempt number.)
+		const again = await write(path, "R2\n", first.messageId);
+		db.update(schema.narratorToolCalls)
+			.set({ toolUseId: first.toolUseId })
+			.where(eq(schema.narratorToolCalls.id, again.toolCallId))
+			.run();
+		const content = messageRow(first.messageId)?.contentJson as Array<{ id?: string }>;
+		db.update(schema.narratorMessages)
+			.set({ contentJson: content.filter((element) => element.id !== again.toolUseId) })
+			.where(eq(schema.narratorMessages.id, first.messageId))
+			.run();
+		const plan = await actionPrepared("delete_tool_block", first.messageId, {
+			blockIndex: first.blockIndex,
+		});
+		expect((await originalManifest(plan.manifestDigests.selector)).request.selector).toEqual({
+			kind: "tool_calls",
+			toolCallIds: [first.toolCallId, again.toolCallId].sort(),
+		});
+		await committed(plan, "delete_tool_block");
+		expect(await readFile(path, "utf8")).toBe("R0\n");
+		expect(
+			db
+				.select({ id: schema.narratorToolCalls.id })
+				.from(schema.narratorToolCalls)
+				.where(eq(schema.narratorToolCalls.toolUseId, first.toolUseId))
+				.all(),
+		).toEqual([]);
+	});
+	test("delete_tool_block refuses a call whose id another call of the message shares", async () => {
+		const path = join(workspace, "twin.txt");
+		await writeFile(path, "T0\n");
+		const first = await write(path, "T1\n");
+		const twin = await write(path, "T2\n", first.messageId);
+		db.update(schema.narratorToolCalls)
+			.set({ toolUseId: first.toolUseId })
+			.where(eq(schema.narratorToolCalls.id, twin.toolCallId))
+			.run();
+		const content = messageRow(first.messageId)?.contentJson as Array<{ id?: string }>;
+		db.update(schema.narratorMessages)
+			.set({
+				contentJson: content.map((element) =>
+					element.id === twin.toolUseId ? { ...element, id: first.toolUseId } : element,
+				),
+			})
+			.where(eq(schema.narratorMessages.id, first.messageId))
+			.run();
+		const before = history();
+		const body = await actionUnavailable(
+			await actionPreview("delete_tool_block", first.messageId, { blockIndex: first.blockIndex }),
+			"delete_tool_block",
+		);
+		expect(body.unavailable).toBe("incomplete_coverage");
+		expect(await readFile(path, "utf8")).toBe("T2\n");
+		expect(history()).toBe(before);
 	});
 	test("assistant rollback uses exact after_block and removes the entire later window", async () => {
 		const path = join(workspace, "window.txt");
@@ -2354,15 +2415,6 @@ describe("real requireAuth and conjunctive ACL", () => {
 		for (const endpoint of [`revert-plans/${plan.id}`, `revert-plans/${plan.id}/files`])
 			expect((await http(endpoint, "GET", undefined, otherToken)).status).toBe(404);
 		expect(history()).toBe(before);
-	});
-	test("existing JWT with a changed database role fails even through the session cache", async () => {
-		await fixture();
-		await http("revert-plans", "POST", request({ unexpected: true }));
-		db.update(schema.users).set({ role: "admin" }).where(eq(schema.users.id, userId)).run();
-		restorers.push(() => {
-			db.update(schema.users).set({ role: "user" }).where(eq(schema.users.id, userId)).run();
-		});
-		await refused(await prepare(), "REVERT_PREVIEW_AUTHENTICATION_CHANGED");
 	});
 	test("project gate cannot be bypassed by owning the narrator", async () => {
 		await fixture();

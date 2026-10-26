@@ -19,7 +19,7 @@
 
 import { eq } from "drizzle-orm";
 import { db } from "../../db";
-import { chapters, knowledgeCollections, knowledgeEntries, narrators } from "../../db/schema";
+import { knowledgeCollections, knowledgeEntries, narrators } from "../../db/schema";
 import { resolveNarratorProjectId } from "../narrator-project";
 
 /**
@@ -32,7 +32,6 @@ import { resolveNarratorProjectId } from "../narrator-project";
 export const ACL_SCOPE_TYPES = [
 	"global",
 	"project",
-	"chapter",
 	"narrator",
 	"knowledge_collection",
 	"knowledge_entry",
@@ -58,8 +57,7 @@ export function scopeKey(scope: AclScope): string {
  * Chains can be shorter than their static shape suggests, because several links
  * are nullable in the schema:
  *
- *   narrator             → chapter? → project? → global
- *   chapter              → project  → global
+ *   narrator             → project? → global
  *   knowledge_entry      → knowledge_collection → project? → global
  *   knowledge_collection → project? → global
  *   project              → global
@@ -69,7 +67,7 @@ export function scopeKey(scope: AclScope): string {
  * applies" — NOT "unrestricted", and NOT "denied". The resource's own ACL is
  * unaffected either way.
  *
- * A dangling reference (a narrator pointing at a deleted chapter) also terminates
+ * A dangling reference (a narrator pointing at a deleted project) also terminates
  * the chain rather than throwing: it is a broken link, not a verdict, and the
  * resource's own check still runs.
  */
@@ -92,28 +90,15 @@ export async function resolveAncestorChain(scope: AclScope): Promise<AclScope[]>
 		case "project":
 			return [GLOBAL_SCOPE];
 
-		case "chapter": {
-			if (!scope.id) return [GLOBAL_SCOPE];
-			const chapter = await db.query.chapters.findFirst({
-				where: eq(chapters.id, scope.id),
-				columns: { projectId: true },
-			});
-			return chapter?.projectId
-				? [{ type: "project", id: chapter.projectId }, GLOBAL_SCOPE]
-				: [GLOBAL_SCOPE];
-		}
-
 		case "narrator": {
 			if (!scope.id) return [GLOBAL_SCOPE];
 			const narrator = await db.query.narrators.findFirst({
 				where: eq(narrators.id, scope.id),
-				columns: { chapterId: true, contextProjectId: true },
+				columns: { id: true, contextProjectId: true },
 			});
 			if (!narrator) return [GLOBAL_SCOPE];
 			const chain: AclScope[] = [];
-			if (narrator.chapterId) chain.push({ type: "chapter", id: narrator.chapterId });
-			// Single source of truth for "which project" — see narrator-project.ts for
-			// why the chapter wins over contextProjectId.
+			// Single source of truth for "which project" — see narrator-project.ts.
 			const projectId = await resolveNarratorProjectId(narrator);
 			if (projectId) chain.push({ type: "project", id: projectId });
 			chain.push(GLOBAL_SCOPE);

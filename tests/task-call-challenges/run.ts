@@ -2,9 +2,10 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { z } from "zod/v4";
-import type { AgentToolUse, ProviderAdapter } from "../../server/lib/agent/provider";
+import type { AgentToolUse } from "../../server/lib/agent/provider";
 import type { ResolvedToolDefinition } from "../../server/lib/agent/types";
 import { artifactReference } from "./artifacts";
+import type { BenchAdapter } from "./client";
 import {
 	CODE_DESCRIPTION,
 	CONTRACT_VERSION,
@@ -14,7 +15,7 @@ import {
 	renderApiGuide,
 } from "./contract";
 import { redactExperimentError } from "./error-redaction";
-import { challenges, type EvalOutcome, GRADER_VERSION, type MockState } from "./fixtures";
+import { challenges, GRADER_VERSION } from "./fixtures";
 import { assertPodmanReady, executeEval, IMAGE, type SandboxOutcome } from "./isolate";
 import { type BenchProfile, defaultProfile } from "./profiles";
 
@@ -270,7 +271,7 @@ async function makeAdapter(fullModel: string) {
 		protocol: meta.channelType,
 		proxy: config.proxy,
 		modelHash: getNugCachedModelHash(config.id) ?? "none",
-	}) as unknown as ProviderAdapter;
+	});
 	return { adapter, channelType: meta.channelType, model: fullModel };
 }
 
@@ -313,7 +314,7 @@ async function makeCapture(profile: BenchProfile) {
 	})();
 }
 
-async function oneResponse(adapter: ProviderAdapter, params: any, profile: BenchProfile) {
+async function oneResponse(adapter: BenchAdapter, params: any, profile: BenchProfile) {
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(new Error("request deadline")), LIMITS.requestMs);
 	const capture = await makeCapture(profile);
@@ -428,7 +429,7 @@ export async function runEpisode(
 	challengeId: string,
 	profile: BenchProfile = defaultProfile(evalTool.rawJsonSchema ?? {}),
 	adapterOverride?: {
-		adapter: ProviderAdapter;
+		adapter: BenchAdapter;
 		channelType: string;
 		/** Offline tests provide a fixed-code evaluator; real model runs always use Podman. */
 		evaluate?: typeof executeEval;
@@ -491,19 +492,9 @@ export async function runEpisode(
 			evals: [],
 		};
 		turns.push(record);
-		if (turn === 0) adapter.pushUserTurn(history, prompt, model, []);
-		else if (pending.length) adapter.pushUserTurn(history, "", model, pending);
-		adapter.pushAssistantTurn(
-			history,
-			response.text,
-			response.calls,
-			response.reasoning,
-			undefined,
-			response.messageId,
-			undefined,
-			response.textOutputIndex,
-			response.redacted,
-		);
+		if (turn === 0) adapter.appendUserTurn(history, prompt, []);
+		else if (pending.length) adapter.appendUserTurn(history, "", pending);
+		adapter.appendAssistantTurn(history);
 		pending = [];
 		finalText = response.text;
 		if (!response.calls.length) {
@@ -556,15 +547,7 @@ export async function runEpisode(
 				interfaceViolation: outcome.interfaceViolation,
 				gradeAfterEval: grade,
 			});
-			pending.push(
-				adapter.formatToolResult(
-					call.toolUseId,
-					JSON.stringify(feedback),
-					!outcome.ok,
-					undefined,
-					call.name,
-				),
-			);
+			pending.push(adapter.toolResult(call.toolUseId, JSON.stringify(feedback), !outcome.ok));
 			if (outcome.ok && outcome.delivery) {
 				// The stop decision depends only on the trusted delivery envelope, never grade.
 				deliveryAccepted = true;

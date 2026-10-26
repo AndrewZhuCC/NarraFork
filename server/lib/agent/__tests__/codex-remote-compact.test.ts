@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { CodexProvider } from "../codex-provider";
+import { buildAdapterHistory } from "../history-build";
+import { LoopTranscript } from "../loop-transcript";
 import {
 	clipMessagesBeforeUnpairedToolCalls,
 	findUnpairedCodexFunctionCallIds,
@@ -738,13 +740,18 @@ describe("Codex retained user originals", () => {
 			message("u1", "user", "keep this exact requirement"),
 			message("s1", "sys", "system reminder, not a user original"),
 			message("a1", "assistant", "assistant answer"),
-			message("u2", "user", "not sent: trailing user"),
+			message("u2", "user", "current user is included in complete history"),
 		]);
 		expect(result.retainedUsers).toEqual([
 			{
 				id: "u1",
 				narratorId: "owner",
 				contentJson: [{ type: "text", text: "keep this exact requirement" }],
+			},
+			{
+				id: "u2",
+				narratorId: "owner",
+				contentJson: [{ type: "text", text: "current user is included in complete history" }],
 			},
 		]);
 		expect(result.items).toEqual([
@@ -950,4 +957,38 @@ describe("prepareCodexCompactInput", () => {
 			{ type: "compaction_trigger" },
 		]);
 	});
+});
+
+test("remote checkpoint survives transcript projection after a subsequent assistant step", async () => {
+	const provider = new OpenAIProvider({
+		id: "relay", name: "Relay", prefix: "relay", apiKey: "sk-test",
+		baseUrl: "https://example.invalid/v1", defaultModel: "gpt-6-luna",
+		apiMode: "codex", codexRemoteCompact: true,
+	});
+	const checkpoint = { type: "compaction", id: "cmp_preserved", encrypted_content: "checkpoint" };
+	const marker: DbMessage = {
+		id: "compact-boundary", role: "system", contentText: null, parentToolUseId: null,
+		messageUuid: null,
+		contentJson: [{
+			type: "compact", status: "compacted", summary: "remote checkpoint",
+			remoteCompact: {
+				provider: "codex", version: 1, items: [checkpoint], model: "gpt-6-luna",
+				completedAt: "2026-10-25T00:00:00.000Z",
+			},
+		}],
+	};
+	const user: DbMessage = {
+		...marker, id: "next-user", role: "user", contentText: "next user turn",
+		contentJson: [{ type: "text", text: "next user turn" }],
+	};
+	const transcript = new LoopTranscript([marker, user]);
+	const project = () => buildAdapterHistory(
+		provider, transcript.withInput(""),
+		{ provider: "relay", model: "gpt-6-luna" }, { narratorId: "compact-replay" },
+	);
+	expect((await project()).history[0]).toEqual(checkpoint);
+	transcript.appendStep([{ type: "text", text: "subsequent answer" }]);
+	const rebuilt = await project();
+	expect(rebuilt.history[0]).toEqual(checkpoint);
+	expect(JSON.stringify(rebuilt.history)).toContain("subsequent answer");
 });

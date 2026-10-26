@@ -14,9 +14,8 @@
  *   - The chat toolbar *opens / closes / toggles* tool panels via the dockview
  *     api, without owning it.
  *
- * Everything is optional: outside a provider (workspace page, narraflow graph
- * embed) the publish hooks are no-ops and NarratorPanel keeps its legacy
- * prop-callback behaviour.
+ * Everything is optional: outside a provider (workspace page) the publish hooks
+ * are no-ops and NarratorPanel keeps its legacy prop-callback behaviour.
  */
 
 import type { FileReference, FileReferenceEditorSelection } from "@shared/file-reference";
@@ -86,33 +85,20 @@ interface NarratorDockBridges {
 
 export interface NarratorDockContextValue {
 	narratorId: string;
-	chapterId: string | null | undefined;
 
 	/**
 	 * The surrounding host already displays this narrator's title, so the chat panel
 	 * must not render its own title row (nor its edit / generate actions).
 	 *
-	 * Set by a chapter node's embedded dock: the node header shows the title and owns
-	 * those two actions, and the panel's copy was being squeezed to zero width by its
-	 * own tool buttons.
+	 * Optional so the hand-built context values (workspace shards) keep their current
+	 * behaviour by simply not setting it — none of them has an outer header to show
+	 * the title.
 	 *
-	 * Optional so the hand-built context values (detached canvas panels, workspace
-	 * shards) keep their current behaviour by simply not setting it — none of them has
-	 * an outer header to show the title.
-	 *
-	 * Deliberately NOT derived from `pluginSurface === "graph"`: that flag identifies
-	 * the host for PLUGINS, and using it to decide chat chrome would silently drop the
-	 * title the moment a surface name is reused or renamed.
+	 * Deliberately NOT derived from `pluginSurface`: that flag identifies the host for
+	 * PLUGINS, and using it to decide chat chrome would silently drop the title the
+	 * moment a surface name is reused or renamed.
 	 */
 	hostOwnsTitle?: boolean;
-
-	/**
-	 * Chapter fork-from-message handler supplied by the page (route owns the
-	 * mutation + notifications). Consumed by the chat panel; null when the
-	 * narrator has no chapter. Panel params can't carry functions, so this is
-	 * threaded through context rather than params.
-	 */
-	onForkFromMessage: ((messageId: string) => void) | null;
 
 	/**
 	 * Message id to scroll to + highlight on open (from search-result / deep-link
@@ -233,8 +219,6 @@ export const NarratorDockContext = createContext<NarratorDockContextValue | null
 /** Provider that owns the shared state for one narrator dockview surface. */
 export function NarratorDockProvider({
 	narratorId,
-	chapterId,
-	onForkFromMessage = null,
 	highlightMessageId,
 	onBack = null,
 	onMinimize = null,
@@ -243,8 +227,6 @@ export function NarratorDockProvider({
 	children,
 }: {
 	narratorId: string;
-	chapterId?: string | null;
-	onForkFromMessage?: ((messageId: string) => void) | null;
 	highlightMessageId?: string;
 	onBack?: (() => void) | null;
 	onMinimize?: (() => void) | null;
@@ -252,9 +234,7 @@ export function NarratorDockProvider({
 	hostOwnsTitle?: boolean;
 	/**
 	 * Which host surface plugins should see. Defaults to `"focus"` (the narrator
-	 * page). A chapter node's embedded dock passes `"graph"`: the coordination
-	 * model is identical — one surface, one narrator — but plugins get to tell the
-	 * two apart, since a node's viewport is far smaller than a full page.
+	 * page).
 	 */
 	pluginSurface?: PluginUiHostSurface;
 	children: React.ReactNode;
@@ -278,11 +258,6 @@ export function NarratorDockProvider({
 		submitToNarrator: null,
 		addFileReference: null,
 	});
-
-	// Keep chapterId in a ref so openToolPanel always uses the latest without
-	// churning callback identity.
-	const chapterIdRef = useRef<string | null | undefined>(chapterId);
-	chapterIdRef.current = chapterId;
 
 	const refreshOpenToolTypes = useCallback(() => {
 		const api = apiRef.current;
@@ -326,7 +301,6 @@ export function NarratorDockProvider({
 			const params: NarratorDockPanelParams = {
 				panelType: type,
 				narratorId,
-				chapterId: chapterIdRef.current,
 			};
 			const placement = resolveToolPlacement({
 				hasSecondaryGroup: !!existingTool?.group,
@@ -649,11 +623,10 @@ export function NarratorDockProvider({
 		bridgesRef.current.addFileReference?.(reference);
 	}, []);
 
-	// These callback props (onForkFromMessage, onBack, onMinimize) MUST keep stable
-	// references across parent renders. The sole call site in
-	// routes/narrators/$narratorId.tsx wraps each with useCallback, ensuring the
-	// context value below only rebuilds when truly necessary (narratorId/chapterId
-	// change, or local state changes). If a new call site is added without
+	// These callback props (onBack, onMinimize) MUST keep stable references across
+	// parent renders. The sole call site in routes/narrators/$narratorId.tsx wraps
+	// each with useCallback, ensuring the context value below only rebuilds when
+	// truly necessary (narratorId change, or local state changes). If a new call site is added without
 	// useCallback, the entire context will re-create on every parent render.
 	// Publishing details/file/browser state must not replace the chat/terminal
 	// bridges. Their consumers register in effects; changing these identities
@@ -709,9 +682,7 @@ export function NarratorDockProvider({
 	const value = useMemo<NarratorDockContextValue>(() => {
 		return {
 			narratorId,
-			chapterId,
 			hostOwnsTitle,
-			onForkFromMessage,
 			highlightMessageId,
 			onBack,
 			onMinimize,
@@ -737,9 +708,7 @@ export function NarratorDockProvider({
 	}, [
 		bridgeCallbacks,
 		narratorId,
-		chapterId,
 		hostOwnsTitle,
-		onForkFromMessage,
 		highlightMessageId,
 		onBack,
 		onMinimize,
@@ -759,8 +728,8 @@ export function NarratorDockProvider({
 	]);
 
 	const pluginHostContext = useMemo(
-		() => ({ surface: pluginSurface, narratorId, chapterId }),
-		[pluginSurface, narratorId, chapterId],
+		() => ({ surface: pluginSurface, narratorId }),
+		[pluginSurface, narratorId],
 	);
 	return (
 		<PluginUiSurfaceProvider hostContext={pluginHostContext}>

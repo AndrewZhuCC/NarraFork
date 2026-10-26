@@ -1,3 +1,4 @@
+import { type ChatRoomKind, isConversationRoomKind } from "@shared/chat-room-kinds";
 import {
 	type InfiniteData,
 	useInfiniteQuery,
@@ -43,6 +44,7 @@ export const chatKeys = {
 	rooms: () => ["chat", "rooms"] as const,
 	unread: () => ["chat", "unread"] as const,
 	narratorRoom: (narratorId: string) => ["chat", "narrator-room", narratorId] as const,
+	botRoom: (narratorId: string) => ["chat", "bot-room", narratorId] as const,
 	messages: (roomId: string) => ["chat", "messages", roomId] as const,
 };
 
@@ -86,6 +88,22 @@ export function useNarratorChatRoom(narratorId: string | undefined, enabled = tr
 		enabled: enabled && !!narratorId,
 		gcTime: CHAT_GC_TIME_MS,
 		staleTime: Number.POSITIVE_INFINITY,
+	});
+}
+
+/**
+ * Resolve (lazily creating) the current user's conversation with a bot.
+ *
+ * Not `Infinity` like the discussion room: `canPost` follows the bot's write audience,
+ * which its owner can change, so a remount re-asks after the summary window.
+ */
+export function useBotChatRoom(narratorId: string | undefined, enabled = true) {
+	return useQuery({
+		queryKey: chatKeys.botRoom(narratorId ?? ""),
+		queryFn: () => api.getBotChatRoom(narratorId as string),
+		enabled: enabled && !!narratorId,
+		gcTime: CHAT_GC_TIME_MS,
+		staleTime: CHAT_SUMMARY_STALE_TIME_MS,
 	});
 }
 
@@ -348,12 +366,13 @@ const CHAT_UNREAD_PROBE_LIMIT = 100;
  * or the nav badge and the room list will disagree:
  *
  *  - `byRoom` omits rooms at zero, so a read deletes the key rather than storing 0.
- *  - `dmTotal` counts unmuted DM rooms ONLY. A narrator room's badge belongs on
- *    that narrator's toolbar, so it lives in `byRoom` but not in the total.
+ *  - `dmTotal` counts unmuted CONVERSATION rooms only — DMs and bot rooms
+ *    (`isConversationRoomKind`). A narrator room's badge belongs on that narrator's
+ *    toolbar, so it lives in `byRoom` but not in the total.
  *
  * `dmTotal` is adjusted by this room's delta rather than re-summed: `byRoom` also
  * holds narrator rooms, and nothing here can tell which of the OTHER entries
- * those are (the rooms list only contains DMs).
+ * those are (the rooms list only contains conversations).
  *
  * Returns `null` when the patch cannot be trusted — unknown room kind, or a
  * count sitting at the probe ceiling — and the caller refetches instead.
@@ -362,7 +381,7 @@ export function applyChatUnreadToSummary(
 	summary: ChatUnreadSummary | undefined,
 	roomId: string,
 	unread: number,
-	kind: "dm" | "narrator" | undefined,
+	kind: ChatRoomKind | undefined,
 	muted = false,
 ): ChatUnreadSummary | null {
 	if (!summary) return null;
@@ -373,7 +392,7 @@ export function applyChatUnreadToSummary(
 	if (unread > 0 && !muted) byRoom[roomId] = unread;
 	else delete byRoom[roomId];
 
-	if (kind !== "dm") return { ...summary, byRoom };
+	if (!isConversationRoomKind(kind)) return { ...summary, byRoom };
 
 	// Either endpoint of the delta being capped makes the arithmetic meaningless.
 	if (previous >= CHAT_UNREAD_PROBE_LIMIT || unread >= CHAT_UNREAD_PROBE_LIMIT) return null;
@@ -416,22 +435,23 @@ export function applyChatReadToRooms(
 type QueryClient = ReturnType<typeof useQueryClient>;
 
 /**
- * Find a room's cached summary, from either cache that can hold one.
+ * Find a room's cached summary, from any cache that can hold one.
  *
- * `/chat/rooms` returns DM rooms ONLY (`listDmRooms`), so a narrator room is
- * never in that list — its summary lives under `chatKeys.narratorRoom` instead.
- * Consulting both is what lets a narrator panel patch rather than fall back to
- * invalidating on every frame.
+ * `/chat/rooms` returns conversations ONLY (`listConversationRooms`), so a narrator
+ * room is never in that list — its summary lives under `chatKeys.narratorRoom`
+ * instead. A bot room IS in the list, but a bot's page resolves it on its own
+ * (`chatKeys.botRoom`) without ever loading the list. Consulting all three is what
+ * lets an open panel patch rather than fall back to invalidating on every frame.
  */
 function cachedRoomSummary(qc: QueryClient, roomId: string): ChatRoomSummary | undefined {
 	const fromList = qc
 		.getQueryData<ChatRoomSummary[]>(chatKeys.rooms())
 		?.find((room) => room.id === roomId);
 	if (fromList) return fromList;
-	for (const [, data] of qc.getQueriesData<ChatRoomSummary>({
-		queryKey: ["chat", "narrator-room"],
-	})) {
-		if (data?.id === roomId) return data;
+	for (const prefix of ["narrator-room", "bot-room"]) {
+		for (const [, data] of qc.getQueriesData<ChatRoomSummary>({ queryKey: ["chat", prefix] })) {
+			if (data?.id === roomId) return data;
+		}
 	}
 	return undefined;
 }

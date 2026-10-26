@@ -1,5 +1,4 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { invalidateUserCache } from "@server/middleware/auth";
 import {
 	createUsageHistoryRoutes,
 	type UsageHistoryRouteService,
@@ -68,14 +67,12 @@ beforeEach(() => {
 		}),
 	};
 	setAuthStores({ session: store, mfa: authMfaStore });
-	for (const id of SEEN_ACTOR_IDS) invalidateUserCache(id);
 	listUsageHistoryCursor.mockClear();
 	listUsageHistory.mockClear();
 });
 
 afterEach(() => {
 	setAuthStores(undefined);
-	for (const id of SEEN_ACTOR_IDS) invalidateUserCache(id);
 });
 
 function encodeRawCursor(createdAt: string): string {

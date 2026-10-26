@@ -263,10 +263,7 @@ export function AuthenticatedLayout() {
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
 	const previewLoginRedirect = useRouterState({
 		select: ({ location }) =>
-			location.pathname.startsWith("/git/narrators/") ||
-			location.pathname.startsWith("/git/chapters/")
-				? location.href
-				: undefined,
+			location.pathname.startsWith("/git/narrators/") ? location.href : undefined,
 	});
 	const appShellScrollKey = useAppShellHistoryEntryKey();
 	const appShellReady =

@@ -7,6 +7,7 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import type { FileReference } from "@shared/file-reference";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { type AdapterSegment, adaptSegment } from "@shared/pretext-layout/segment-adapter";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
@@ -31,16 +32,18 @@ beforeAll(() => {
 function renderUser(text: string, reference?: FileReference): Element {
 	const seg: AdapterSegment = {
 		kind: "message",
-		msg: {
-			id: "u-inline",
-			role: "user",
-			narratorId: "nar_1",
-			contentJson: [
+		msg: rowWithElements(
+			{
+				id: "u-inline",
+				role: "user",
+				narratorId: "nar_1",
+			},
+			[
 				{ type: "image", imageId: "img_1", filename: "shot.png", width: 40, height: 20 } as never,
 				...(reference ? [{ type: "file_reference", reference } as never] : []),
 				{ type: "text", text },
 			],
-		},
+		),
 	};
 	const spec = adaptSegment(seg, { lod: 5, labels: {} })[0];
 	if (!spec) throw new Error("no spec produced");

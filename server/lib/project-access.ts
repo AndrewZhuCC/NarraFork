@@ -9,14 +9,13 @@
 
 import type { Context } from "hono";
 import {
-	assertChapterProjectAccess,
 	assertProjectAccess,
 	loadProjectForAccess,
 	type ProjectAccessNeed,
 	type ProjectAclRow,
 	type ProjectPrincipal,
 } from "../services/project-acl";
-import type { JwtPayload } from "./auth";
+import type { SessionPayload } from "./auth";
 
 /**
  * The requesting principal, taken from the verified session/OAuth payload.
@@ -27,7 +26,7 @@ import type { JwtPayload } from "./auth";
  * that hides the real problem.
  */
 export function projectPrincipalOf(c: Context): ProjectPrincipal {
-	const user = c.get("user") as JwtPayload | undefined;
+	const user = c.get("user") as SessionPayload | undefined;
 	if (!user?.sub) return { userId: "", isAdmin: false };
 	return { userId: user.sub, isAdmin: user.role === "admin" };
 }
@@ -37,7 +36,7 @@ export function projectPrincipalOf(c: Context): ProjectPrincipal {
  *
  * Throws NotFoundError both when it does not exist and when it is not theirs, so a
  * caller cannot probe for ids. Use `"read"` for inspection, `"write"` for anything
- * that changes the repository or its chapters, and `"manage"` for membership,
+ * that changes the project, and `"manage"` for membership,
  * visibility, ownership and deletion.
  */
 export async function requireProjectAccess(c: Context, projectId: string, need: ProjectAccessNeed) {
@@ -51,16 +50,4 @@ export async function requireAccessToProjectRow(
 	need: ProjectAccessNeed,
 ): Promise<void> {
 	await assertProjectAccess(row, projectPrincipalOf(c), need);
-}
-
-/**
- * Authorize by way of a chapter: chapters have no ACL of their own and inherit the
- * project verdict wholesale.
- */
-export async function requireChapterAccess(
-	c: Context,
-	chapterId: string,
-	need: ProjectAccessNeed,
-): Promise<{ projectId: string }> {
-	return await assertChapterProjectAccess(chapterId, projectPrincipalOf(c), need);
 }

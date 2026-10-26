@@ -15,6 +15,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
+import { modelInputText, rowsAsHistory } from "../../../tests/fixtures/model-input";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
 	backgroundTasks,
@@ -51,14 +52,11 @@ const { emptyRevertResult, SnapshotRevertError } = await import("../snapshot-rev
 
 const provider: ProviderAdapter = {
 	formatTools: () => [],
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: rowsAsHistory,
 	injectSystemPrompt: () => {},
 	chat() {
 		throw new Error("Resume test must never call a model");
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -201,11 +199,11 @@ function message(
 
 /**
  * Script the model boundary only: the real orchestrator runs (holds, boundaries,
- * placement); each pass records its current input and returns a reply.
+ * placement); each pass records what it gives the model and returns a reply.
  */
 function scriptPasses() {
 	return spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
-		passes.push(options.userText);
+		passes.push(modelInputText(options));
 		const step = script.shift();
 		const outcome = step ? await step() : { finalText: "done" };
 		if (!outcome.hasError)
@@ -563,20 +561,6 @@ describe("a held run (user takeover) is continued in place", () => {
 		expect(owner).toBeDefined();
 		expect(logicalRunId).toBeTruthy();
 		const starts = spyOn(runModule, "startNarratorRun");
-		// Like the official builders: a trailing run of `sys` rows becomes the current input.
-		spyOn(provider, "buildHistory").mockImplementation(async (messages) => {
-			let tail = messages.length;
-			while (tail > 0 && messages[tail - 1].role === "sys") tail--;
-			const trailing = messages
-				.slice(tail)
-				.map((row) => row.contentText ?? "")
-				.join("\n\n");
-			return {
-				history: [],
-				trailingToolResults: [],
-				...(trailing ? { trailingUserText: trailing } : {}),
-			};
-		});
 		// The parent's Send: a receipted tool call of the parent session.
 		const text = "parent says: also check the edge case";
 		sendCall();
@@ -621,7 +605,7 @@ describe("a held run (user takeover) is continued in place", () => {
 		const signals: AbortSignal[] = [];
 		const secondGate = Promise.withResolvers<void>();
 		const spy = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
-			passes.push(options.userText);
+			passes.push(modelInputText(options));
 			if (options.config.signal) signals.push(options.config.signal);
 			if (passes.length === 2) await secondGate.promise;
 			const finalText = passes.length === 1 ? "turn one" : "turn two";

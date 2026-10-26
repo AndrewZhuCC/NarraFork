@@ -117,9 +117,8 @@ async function runPolicyScenario(
 		// path installs it, so the suite does the same.
 		await ensurePgFts(client.sql);
 
-		// Seed: project → chapter → narrator → two messages.
+		// Seed: project → narrator → two messages.
 		const projectId = generateId();
-		const chapterId = generateId();
 		const narratorId = generateId();
 		const keptMessageId = generateId();
 		const replacedMessageId = generateId();
@@ -131,20 +130,9 @@ async function runPolicyScenario(
 			createdAt: NOW,
 			updatedAt: NOW,
 		});
-		await pgDb.insert(pgSchema.chapters).values({
-			id: chapterId,
-			projectId,
-			title: "policy chapter",
-			branch: "chapter/policy",
-			baseBranch: "main",
-			status: "active",
-			role: "branch",
-			createdAt: NOW,
-			updatedAt: NOW,
-		});
 		await pgDb.insert(pgSchema.narrators).values({
 			id: narratorId,
-			chapterId,
+			contextProjectId: projectId,
 			title: "original title",
 			createdAt: NOW,
 			updatedAt: NOW,

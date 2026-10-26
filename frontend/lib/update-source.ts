@@ -5,43 +5,18 @@ import {
 	type UpdateSourceIdentity,
 } from "@shared/update-identity";
 
-export type UpdateSource = "github" | "update-server";
-
-export interface UpdateSourceSettings {
-	source?: UpdateSource;
-	githubRepository?: string;
-	serverUrl?: string;
-	product?: string;
-	channel?: "stable" | "beta";
-}
+import {
+	normalizeUpdateServerUrl as normalizeServerUrl,
+	type UpdateSource,
+	type UpdateSourceSettings,
+} from "@shared/update-settings";
 
 export { BUILD_GITHUB_REPOSITORY as DEFAULT_GITHUB_REPOSITORY } from "@shared/build-repository";
-
-const LEGACY_UPDATE_SERVER_URL = "https://narrafork-update.b.domexie.cn";
-
-function normalizeServerUrl(value?: string): string {
-	const url = value?.trim() || LEGACY_UPDATE_SERVER_URL;
-	try {
-		const parsed = new URL(url);
-		parsed.pathname = parsed.pathname.replace(/\/+$/, "");
-		return parsed.toString().replace(/\/+$/, "");
-	} catch {
-		return url.replace(/\/+$/, "");
-	}
-}
-
-/** Fingerprint the saved configuration actually used by the active source. */
-export function updateSettingsKey(update?: UpdateSourceSettings): string {
-	const source = update?.source ?? "github";
-	return JSON.stringify([
-		source,
-		update?.channel ?? "stable",
-		(update?.githubRepository ?? DEFAULT_GITHUB_REPOSITORY).trim().toLowerCase(),
-		...(source === "github"
-			? []
-			: [normalizeServerUrl(update?.serverUrl), update?.product ?? "narrafork"]),
-	]);
-}
+export {
+	type UpdateSource,
+	type UpdateSourceSettings,
+	updateSettingsKey,
+} from "@shared/update-settings";
 
 export function settingsSourceIdentity(
 	update: UpdateSourceSettings | undefined,

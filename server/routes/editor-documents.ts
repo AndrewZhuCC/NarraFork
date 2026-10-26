@@ -5,7 +5,7 @@ import { type Context, Hono } from "hono";
 import type { z } from "zod";
 import { EDITOR_METADATA_MAX_BYTES } from "../../shared/editor-document";
 import { db } from "../db";
-import { chapters, projects, users } from "../db/schema";
+import { projects, users } from "../db/schema";
 import { AppError, NotFoundError, zodValidationError } from "../lib/errors";
 import { checkWriteBoundary, describeWriteRefusal } from "../lib/fs-write-boundary";
 import { requireNarratorAccess } from "../lib/narrator-access";
@@ -45,7 +45,10 @@ import {
 	authorizeEditorReferenceTarget,
 } from "../services/file-reference-service";
 import { loadNarratorForAccess } from "../services/narrator-acl";
-import { resolveNarratorSessionCwd } from "../services/narrator-cwd";
+import {
+	isFormerChapterSessionWithoutDirectory,
+	resolveNarratorSessionCwd,
+} from "../services/narrator-cwd";
 
 /** Bounded raw metadata reading also covers chunked requests with no Content-Length. */
 export async function readEditorMetadata<T>(request: Request, schema: z.ZodType<T>): Promise<T> {
@@ -106,7 +109,7 @@ export function editorActorForSubject(
 			auth?.type === "session" &&
 			(auth.user.sub !== subject.userId ||
 				auth.user.exp <= Date.now() / 1000 ||
-				(auth.user.sv ?? 0) !== user.tokenVersion)
+				(auth.user.tokenVersion ?? 0) !== user.tokenVersion)
 		)
 			throw new AppError("Editor authorization expired", 403, "EDITOR_IDENTITY_CHANGED");
 		if (auth?.type === "oauth") {
@@ -163,7 +166,6 @@ export function editorActorForSubject(
 					narrator.workspaceRevision,
 					narrator.workspaceContext?.contextKey,
 					narrator.defaultDeviceId,
-					narrator.chapterId,
 				]);
 				const root = await backend.editorRootIdentity(operationSignal);
 				if (need === "write" && !backend.supportsEditorDurableWrite)
@@ -238,16 +240,13 @@ export function editorActorForSubject(
 					422,
 					"EDITOR_REMOTE_UNSUPPORTED",
 				);
-			// cwd is an optional override: chapter narrators normally inherit their worktree.
-			// Resolve it on every request so moving/dormant worktrees invalidate old bindings.
-			const chapter = narrator.chapterId
-				? await db.query.chapters.findFirst({
-						where: eq(chapters.id, narrator.chapterId),
-						columns: { projectId: true, worktreePath: true },
-					})
-				: undefined;
-			if (narrator.chapterId && !chapter) throw new NotFoundError("Chapter", narrator.chapterId);
-			const projectId = chapter?.projectId ?? narrator.contextProjectId ?? null;
+			if (isFormerChapterSessionWithoutDirectory(narrator))
+				throw new AppError(
+					"This legacy workspace has no directory. Choose a working directory to continue.",
+					409,
+					"WORKSPACE_DIRECTORY_REQUIRED",
+				);
+			const projectId = narrator.contextProjectId ?? null;
 			const project = projectId
 				? await db.query.projects.findFirst({
 						where: eq(projects.id, projectId),
@@ -255,12 +254,7 @@ export function editorActorForSubject(
 					})
 				: undefined;
 			if (projectId && !project) throw new NotFoundError("Project", projectId);
-			const cwd = resolveNarratorSessionCwd(
-				narrator.cwd,
-				chapter?.worktreePath,
-				project?.gitPath,
-				getHome(),
-			);
+			const cwd = resolveNarratorSessionCwd(narrator.cwd, project?.gitPath, getHome());
 			const lexicalPath = resolve(cwd, input.path);
 			try {
 				await rejectEditorSymlinks(lexicalPath);
@@ -298,8 +292,6 @@ export function editorActorForSubject(
 					narrator.workspaceRevision,
 					narrator.workspaceContext?.contextKey,
 					narrator.defaultDeviceId,
-					narrator.chapterId,
-					chapter?.worktreePath,
 				]),
 				workspaceIdentity: JSON.stringify([canonicalRoot, String(root.dev), String(root.ino)]),
 				pathFlavor: process.platform === "win32" ? ("windows" as const) : ("posix" as const),

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
 import { normalizeApiRequestDiagnostics } from "@shared/agent-protocol/error-diagnostics";
+import { encodeToolOutput, type ToolOutputImageRef } from "@shared/agent-protocol/tool-output";
 import type { ContextUsageSnapshot } from "@shared/context-usage";
 import type { FileReferenceContext } from "@shared/file-reference";
 import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-document";
@@ -10,15 +11,9 @@ import {
 	type SubagentToolInputSummary,
 } from "@shared/subagent-tool-summary";
 import type { ToolProgressPayload } from "@shared/tool-progress";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "../db";
-import {
-	apiRequests,
-	narratorMessageRefs,
-	narratorMessages,
-	narrators,
-	narratorToolCalls,
-} from "../db/schema";
+import { apiRequests, narratorMessageRefs, narratorMessages, narrators } from "../db/schema";
 import type { AgentEvent } from "../lib/agent";
 import { summaryGenerate } from "../lib/agent";
 import {
@@ -31,7 +26,7 @@ import {
 	finishApiRequest,
 	startApiRequest,
 } from "../lib/api-request-tracker";
-import { measureMessageCharacters, queueContextCharacterRefresh } from "../lib/context-characters";
+import { queueContextCharacterRefresh } from "../lib/context-characters";
 import { boundedContextSnapshot } from "../lib/context-usage-snapshot";
 import { updateCustomApiQuotaByPrefix } from "../lib/custom-api-quota-cache";
 import { withDbRetry } from "../lib/db-resilience";
@@ -46,10 +41,12 @@ import {
 	resolveTranslationModelOverride,
 	settings,
 } from "../lib/settings";
+import { saveUploadedImage } from "../lib/uploads";
 import { buildUsageDataFromSnapshot, updateMessageUsage } from "../lib/usage-tracking";
 import { dualBroadcastToNarrator } from "../websocket/narrator-dual-broadcast";
 import { broadcastToNarrator, type NarratorServerMessage } from "../websocket/narrator-ws";
 import { FileReferenceContextTracker } from "./file-reference-context";
+import { bodyColumns, fillBody } from "./narrator-body-reads";
 import { storeNarratorContextUsage } from "./narrator-context-composition";
 import { completeAssistantOutput } from "./narrator-output-recovery";
 import { bumpNarratorMessageVersion, narratorPersistence } from "./narrator-persistence";
@@ -60,6 +57,8 @@ import {
 	truncateJson,
 	truncateToolIO,
 } from "./narrator-service";
+import { narratorStore } from "./narrator-store";
+import { recordTurnStep, recordTurnToolCall } from "./narrator-turns";
 import { recordOutputChunk } from "./output-stats";
 import { toolInputStreamSource } from "./tool-input-stream-source";
 
@@ -184,6 +183,49 @@ function boundedWriteInput(input: Record<string, unknown>, update?: TextDocument
 }
 
 /**
+ * The stored output of a tool result: text plus metadata, the broken marker and the
+ * images the tool returned. Images are saved as uploads of this narrator and stored by
+ * reference, so a rebuilt request can send them again; one that cannot be saved is
+ * logged and left out while the text is kept.
+ */
+export async function toolResultLedgerOutput(
+	narratorId: string,
+	event: Extract<AgentEvent, { type: "tool_result" }>,
+): Promise<unknown> {
+	const images: ToolOutputImageRef[] = [];
+	for (const [index, image] of (event.images ?? []).entries()) {
+		try {
+			const saved = await saveUploadedImage(
+				narratorId,
+				new File(
+					[Buffer.from(image.base64, "base64")],
+					`${event.toolUseId}-${index}.${image.format}`,
+					{
+						type: `image/${image.format}`,
+					},
+				),
+			);
+			images.push({
+				imageId: saved.imageId,
+				mediaType: saved.mediaType,
+				uploadNarratorId: saved.uploadNarratorId ?? narratorId,
+			});
+		} catch (error) {
+			logger.warn("Failed to save a tool result image; its text is kept", {
+				narratorId,
+				toolUseId: event.toolUseId,
+				error: String(error),
+			});
+		}
+	}
+	return encodeToolOutput(event.output, {
+		metadata: event.metadata,
+		broken: !!event.brokenInputOverride,
+		images,
+	});
+}
+
+/**
  * Finish an already-started tool after its loop has drained/aborted. This intentionally
  * takes no EventHandlerContext: a newer turn may own the streaming snapshot and hooks.
  * Only the original execution receipt can update history; never recover it by provider id.
@@ -196,13 +238,14 @@ export async function persistDetachedToolResult(
 	if (!binding) {
 		throw new CriticalEventPersistenceError("Detached tool result has no execution receipt");
 	}
+	const output = await toolResultLedgerOutput(narratorId, event);
 	// The generator is already gone, so a transient lock cannot rely on its normal
 	// tool_result retry path. Retry asynchronously and retain the same CAS authority.
 	const affected = await withDbRetry(
 		() =>
-			narratorPersistence.updateToolCallResult(event.toolUseId, {
+			narratorStore.settleTool(event.toolUseId, {
 				expectedBinding: { ...binding, narratorId },
-				output: event.metadata ? { _text: event.output, _metadata: event.metadata } : event.output,
+				output,
 				input: event.brokenInputOverride ?? event.updatedInput ?? event.input,
 				status: event.isError ? "fail" : "success",
 				errorMessage: event.isError ? event.output : undefined,
@@ -217,10 +260,13 @@ export async function persistDetachedToolResult(
 
 	// Refresh persisted history, not tool_completed (which mutates live streaming
 	// state by toolUseId). Project the current row so a newer attempt remains visible.
-	const message = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, affected.messageId),
-		with: { toolCalls: true },
-	});
+	const message = fillBody(
+		await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, affected.messageId),
+			...bodyColumns(),
+			with: { toolCalls: true },
+		}),
+	);
 	const ref = await db.query.narratorMessageRefs.findFirst({
 		where: and(
 			eq(narratorMessageRefs.narratorId, narratorId),
@@ -306,6 +352,10 @@ export interface EventHandlerContext {
 	>;
 	/** Avoid translating the same checkpoint concurrently while metadata catches up. */
 	reasoningTranslations?: Set<string>;
+	/** Latest checkpoints wait for real output; reasoning-only retries never translate. */
+	pendingReasoningTranslations?: Map<string, { messageId: string; block: PersistedReasoningBlock }>;
+	/** A reasoning block is dispatched at most once per provider attempt. */
+	dispatchedReasoningTranslations?: Set<string>;
 	/** Retry publication after a checkpoint write succeeded but its announce failed. */
 	unpublishedContentBlockIds?: Set<string>;
 	getTtftMs?: () => number | undefined;
@@ -361,6 +411,11 @@ export interface EventHandlerContext {
 	 * of how blocks are stored.
 	 */
 	attemptBlockBaselines?: Map<string, number>;
+	/**
+	 * The provider request whose stream is being written (§3.6): the blocks it creates
+	 * carry it, and `attempt_discarded` drops exactly those.
+	 */
+	currentAttemptId?: string;
 	/** API requests inserted during this turn and awaiting assistant-message binding */
 	pendingApiRequestIds?: string[];
 	/** Exact persisted tool-call row ids prepared for EnterPlanMode in this turn. */
@@ -500,7 +555,9 @@ export class CriticalEventPersistenceError extends Error {
 export interface EventHooks {
 	/** Title tracking after assistant_message */
 	onTitleCheck?: (savedId: string) => Promise<{ titleUpdate?: boolean } | null>;
-	/** Prepare EnterPlanMode after its assistant message is persisted, without committing state. */
+	/** Runs after an assistant message is finalized, persisted and broadcast. */
+	onAssistantMessageFinalized?: () => Promise<void>;
+	/** Prepare EnterPlanMode once its tool call row is persisted, without committing state. */
 	onPrepareEnterPlanMode?: (
 		toolCallId: string,
 		toolUseId: string,
@@ -664,17 +721,26 @@ function getOrCreateSnapshot(narratorId: string): StreamingSnapshot {
 	return snap;
 }
 
+/** Write one item of the open step, stamped with the provider request writing it. */
+function writeAttemptItem(
+	ctx: EventHandlerContext,
+	messageId: string,
+	block: Parameters<typeof narratorStore.writeStepItem>[2],
+) {
+	return narratorStore.writeStepItem(messageId, ctx.narratorId, block, {
+		attemptId: ctx.currentAttemptId,
+	});
+}
+
 async function persistContentCheckpoint(
 	ctx: EventHandlerContext,
 	messageId: string,
-	block: Extract<
-		Parameters<typeof narratorService.appendBlockToMessage>[2],
-		{ type: "text" | "reasoning" }
-	>,
+	block: Extract<Parameters<typeof narratorStore.writeStepItem>[2], { type: "text" | "reasoning" }>,
 ): Promise<void> {
 	try {
-		await narratorService.appendBlockToMessage(messageId, ctx.narratorId, block, {
+		await narratorStore.writeStepItem(messageId, ctx.narratorId, block, {
 			republishUnchanged: !!block.id && ctx.unpublishedContentBlockIds?.has(block.id),
+			attemptId: ctx.currentAttemptId,
 		});
 		if (block.id) ctx.unpublishedContentBlockIds?.delete(block.id);
 	} catch (error) {
@@ -690,14 +756,8 @@ async function persistContentCheckpoint(
 function appendRawStreamText(
 	previous: { text: string; textOffset?: number } | undefined,
 	text: string,
-	textOffset?: number,
-): { text: string; textOffset?: number } {
-	if (textOffset == null) {
-		return {
-			text: (previous?.text ?? "") + text,
-			...(previous?.textOffset != null ? { textOffset: previous.textOffset } : {}),
-		};
-	}
+	textOffset: number,
+): { text: string; textOffset: number } {
 	const previousStart = previous?.textOffset ?? 0;
 	const previousEnd = previousStart + (previous?.text.length ?? 0);
 	if (!previous || textOffset > previousEnd || textOffset < previousStart) {
@@ -881,7 +941,7 @@ function noteSubagentOutputText(
 	ctx: EventHandlerContext,
 	blockKey: string,
 	text: string,
-	textOffset?: number,
+	textOffset: number,
 ): void {
 	if (!ctx.parentToolUseId || !text) return;
 	const key = ctx.narratorId;
@@ -900,22 +960,18 @@ function noteSubagentOutputText(
 	// replayed/overlapping prefix (a resume) must not double-count.
 	const previous = counter.blocks.get(blockKey);
 	let span: { start: number; length: number };
-	if (textOffset == null) {
-		span = { start: previous?.start ?? 0, length: (previous?.length ?? 0) + text.length };
+	const previousEnd = (previous?.start ?? 0) + (previous?.length ?? 0);
+	if (!previous || textOffset > previousEnd || textOffset < previous.start) {
+		// A gap/missing prefix cannot be invented — the delta becomes the span.
+		span = { start: textOffset, length: text.length };
 	} else {
-		const previousEnd = (previous?.start ?? 0) + (previous?.length ?? 0);
-		if (!previous || textOffset > previousEnd || textOffset < previous.start) {
-			// A gap/missing prefix cannot be invented — the delta becomes the span.
-			span = { start: textOffset, length: text.length };
-		} else {
-			// Merge, never shrink: a replay fully INSIDE the span adds nothing (the
-			// max keeps the old end), one extending past it grows by exactly the
-			// non-overlapping tail — the length-only form of appendRawStreamText.
-			span = {
-				start: previous.start,
-				length: Math.max(previousEnd, textOffset + text.length) - previous.start,
-			};
-		}
+		// Merge, never shrink: a replay fully INSIDE the span adds nothing (the
+		// max keeps the old end), one extending past it grows by exactly the
+		// non-overlapping tail — the length-only form of appendRawStreamText.
+		span = {
+			start: previous.start,
+			length: Math.max(previousEnd, textOffset + text.length) - previous.start,
+		};
 	}
 	counter.blocks.set(blockKey, span);
 	let total = 0;
@@ -1177,10 +1233,12 @@ function reorderPersistedToolUseBlocks(
 /** Block count of a partial assistant message, or 0 when there is no partial row yet. */
 async function countPersistedBlocks(partialMessageId: string | undefined): Promise<number> {
 	if (!partialMessageId) return 0;
-	const row = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, partialMessageId),
-		columns: { contentJson: true },
-	});
+	const row = fillBody(
+		await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, partialMessageId),
+			...bodyColumns({ id: true, contentJson: true }),
+		}),
+	);
 	return Array.isArray(row?.contentJson) ? row.contentJson.length : 0;
 }
 
@@ -1264,90 +1322,23 @@ async function discardAttemptPersistedBlocks(
 	if (!partialId) return;
 
 	try {
-		const message = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, partialId),
-			columns: { contentJson: true },
-		});
-		const blocks = Array.isArray(message?.contentJson)
-			? (message.contentJson as Array<Record<string, unknown>>)
-			: [];
-		if (blocks.length <= baseline) return;
-
-		// An in-flight partial may have been forked. Keep execution/approval identity
-		// on the real owner while isolating sibling snapshots before any mutation.
-		partialId = await narratorPersistence.copyOnWriteMessage(narratorId, partialId, undefined, {
-			preserveExecutionOwner: true,
-		});
-		ctx.setPartialMessageId(partialId);
-		const discarded = blocks.slice(baseline);
-		const discardedToolUseIds = discarded.flatMap((block) =>
-			block.type === "tool_use" && typeof block.id === "string" ? [block.id] : [],
-		);
-
-		// Which of those tool calls never ran — only these may be removed.
-		const executedToolUseIds = new Set<string>();
-		if (discardedToolUseIds.length > 0) {
-			const rows = await db.query.narratorToolCalls.findMany({
-				where: and(
-					eq(narratorToolCalls.messageId, partialId),
-					inArray(narratorToolCalls.toolUseId, discardedToolUseIds),
-				),
-				columns: { id: true, toolUseId: true, status: true },
-			});
-			const removableRowIds: string[] = [];
-			for (const row of rows) {
-				if (row.status === "initializing" || row.status === "pending") {
-					removableRowIds.push(row.id);
-				} else {
-					executedToolUseIds.add(row.toolUseId);
-				}
-			}
-			if (removableRowIds.length > 0) {
-				await db.delete(narratorToolCalls).where(inArray(narratorToolCalls.id, removableRowIds));
-				for (const toolUseId of discardedToolUseIds) {
-					if (!executedToolUseIds.has(toolUseId)) ctx.toolCallIdsMap?.delete(toolUseId);
-				}
-			}
-		}
-
-		// Keep the blocks of tools that actually executed, drop the rest. Order is
-		// preserved by filtering the whole array rather than concatenating the survivors
-		// after the baseline slice: `appendBlockToMessage` maintains blocks in
-		// `outputIndex` order, and `reorderPersistedToolUseBlocks` (run at
-		// `assistant_message`) reads tool positions, so both rely on that invariant.
-		const isRetainedBlock = (block: Record<string, unknown>, index: number): boolean =>
-			index < baseline ||
-			(block.type === "tool_use" &&
-				typeof block.id === "string" &&
-				executedToolUseIds.has(block.id));
-		const nextBlocks = blocks.filter(isRetainedBlock);
-		const retainedFromAttempt = nextBlocks.length - baseline;
-		const contentText = nextBlocks
-			.flatMap((block) =>
-				block.type === "text" && typeof block.text === "string" ? [block.text] : [],
-			)
-			.join("\n");
-
-		// A fork can acquire a ref after the earlier tool-isolation COW returned.
-		// Recheck membership and truncate atomically, never in a separate UPDATE.
-		partialId = await narratorPersistence.copyOnWriteMessage(
+		const discarded = await narratorStore.discardAttempt(
 			narratorId,
 			partialId,
-			{
-				contentJson: nextBlocks,
-				contentText: contentText || null,
-				contextCharsJson: measureMessageCharacters("assistant", nextBlocks, contentText),
-			},
-			{ preserveExecutionOwner: true },
+			baseline,
+			requestId,
 		);
+		if (!discarded) return;
+		partialId = discarded.messageId;
 		ctx.setPartialMessageId(partialId);
+		for (const toolUseId of discarded.removedToolUseIds) ctx.toolCallIdsMap?.delete(toolUseId);
 
 		logger.info("Discarded persisted blocks of a replayed attempt", {
 			narratorId,
 			partialId,
 			baseline,
-			discardedBlocks: discarded.length - retainedFromAttempt,
-			retainedExecutedToolCalls: retainedFromAttempt,
+			discardedBlocks: discarded.discardedBlocks,
+			retainedExecutedToolCalls: discarded.retainedExecutedCalls,
 		});
 
 		// `streaming_reset` above only drops LIVE streaming blocks. Blocks that already
@@ -1358,10 +1349,13 @@ async function discardAttemptPersistedBlocks(
 		// message mutation) so an attached client and a reconnecting one agree.
 		await bumpNarratorMessageVersion(narratorId);
 		queueContextCharacterRefresh(narratorId, partialId);
-		const updated = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, partialId),
-			with: { toolCalls: true },
-		});
+		const updated = fillBody(
+			await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, partialId),
+				...bodyColumns(),
+				with: { toolCalls: true },
+			}),
+		);
 		if (updated) {
 			const ref = await db.query.narratorMessageRefs.findFirst({
 				where: and(
@@ -1532,10 +1526,12 @@ function translateReasoningBlock(
 
 	(async () => {
 		try {
-			const before = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, messageId),
-				columns: { contentJson: true },
-			});
+			const before = fillBody(
+				await db.query.narratorMessages.findFirst({
+					where: eq(narratorMessages.id, messageId),
+					...bodyColumns({ id: true, contentJson: true }),
+				}),
+			);
 			const beforeBlocks = Array.isArray(before?.contentJson) ? before.contentJson : [];
 			const beforeIndex = findReasoningBlockIndex(beforeBlocks, { ...locator, reasoningText });
 			const beforeBlock = beforeBlocks[beforeIndex] as PersistedReasoningBlock | undefined;
@@ -1555,10 +1551,12 @@ function translateReasoningBlock(
 
 			// Find the exact reasoning block in the message.
 			// Prefer loop identity; provider coordinates/text are legacy-only fallbacks.
-			const msg = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, messageId),
-				columns: { contentJson: true },
-			});
+			const msg = fillBody(
+				await db.query.narratorMessages.findFirst({
+					where: eq(narratorMessages.id, messageId),
+					...bodyColumns({ id: true, contentJson: true }),
+				}),
+			);
 			if (!msg) return;
 			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
 			const targetIdx = findReasoningBlockIndex(blocks, {
@@ -1585,10 +1583,13 @@ function translateReasoningBlock(
 			if (!patched) return;
 
 			// Broadcast updated message so frontend picks up the translation
-			const fullMessage = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, messageId),
-				with: { toolCalls: true },
-			});
+			const fullMessage = fillBody(
+				await db.query.narratorMessages.findFirst({
+					...bodyColumns(),
+					where: eq(narratorMessages.id, messageId),
+					with: { toolCalls: true },
+				}),
+			);
 			if (fullMessage) {
 				const ref = await db.query.narratorMessageRefs.findFirst({
 					where: and(
@@ -1633,25 +1634,46 @@ export async function processEvent(
 ): Promise<{ titleUpdate?: boolean } | null> {
 	const { narratorId, broadcastTargetId } = ctx;
 
+	if (
+		event.type === "attempt_discarded" ||
+		event.type === "stream_reset" ||
+		event.type === "api_request_start"
+	) {
+		ctx.pendingReasoningTranslations?.clear();
+		ctx.dispatchedReasoningTranslations?.clear();
+	} else if (
+		(event.type === "stream_text" && event.text.trim().length > 0) ||
+		event.type === "tool_call" ||
+		event.type === "tool_use_chunk" ||
+		(event.type === "block_complete" &&
+			((event.block.type === "text" && event.block.text.trim().length > 0) ||
+				event.block.type === "tool_use"))
+	) {
+		// Drain synchronously before starting asynchronous translations. Further tokens,
+		// tool argument chunks and completion events must not dispatch the same block.
+		ctx.dispatchedReasoningTranslations ??= new Set();
+		for (const [key, { messageId, block }] of ctx.pendingReasoningTranslations ?? []) {
+			ctx.dispatchedReasoningTranslations.add(key);
+			if (settings.agent.translateReasoning && block.text) {
+				translateReasoningBlock(messageId, narratorId, broadcastTargetId, block.text, ctx, block);
+			}
+		}
+		ctx.pendingReasoningTranslations?.clear();
+	}
+
 	switch (event.type) {
 		case "stream_text": {
 			ctx.fileReferenceContexts ??= new FileReferenceContextTracker();
+			const textBlockId = event.blockId;
 			const fileReferenceContext = ctx.fileReferenceContexts.capture(
-				event.outputIndex,
+				textBlockId,
 				ctx.getFileReferenceContext,
-				event.blockId,
 			);
-			const textBlockId = event.blockId ?? ctx.fileReferenceContexts.blockId(event.outputIndex);
 			const snap = getOrCreateSnapshot(ctx.parentToolUseId ? narratorId : broadcastTargetId);
 			const existing = snap.streamingBlocks.find((b) => b.type === "text" && b.id === textBlockId);
-			const base = event.blockId ? ctx.committedContentSnapshots?.get(event.blockId) : undefined;
+			const base = ctx.committedContentSnapshots?.get(textBlockId);
 			const latestRevision = existing?.type === "text" ? existing.revision : base?.revision;
-			if (
-				event.blockRevision != null &&
-				latestRevision != null &&
-				event.blockRevision <= latestRevision
-			)
-				return null;
+			if (latestRevision != null && event.blockRevision <= latestRevision) return null;
 			// Clear "reasoning" substatus when text starts (reasoning phase ended)
 			if (ctx.removeSubstatus && ctx.getSubstatus?.().has("reasoning")) {
 				ctx.removeSubstatus("reasoning").catch(() => {});
@@ -1667,12 +1689,7 @@ export async function processEvent(
 			// Track AI output character rate
 			recordOutputChunk(event.text.length);
 			// A subagent's reply length is the parent card's live progress signal.
-			noteSubagentOutputText(
-				ctx,
-				textBlockId ?? `output:${event.outputIndex ?? 0}`,
-				event.text,
-				event.blockTextOffset,
-			);
+			noteSubagentOutputText(ctx, textBlockId, event.text, event.blockTextOffset);
 
 			// Text snapshots belong to the actual author (also on a subagent's own
 			// page), never to a different narrator sharing the parent's subscription.
@@ -1683,7 +1700,7 @@ export async function processEvent(
 			);
 			if (existing?.type === "text") {
 				Object.assign(existing, rawText);
-				if (event.blockRevision != null) existing.revision = event.blockRevision;
+				existing.revision = event.blockRevision;
 			} else {
 				snap.streamingBlocks.splice(
 					findOrderedSnapshotInsertIndex(snap.streamingBlocks, event.outputIndex),
@@ -1691,7 +1708,7 @@ export async function processEvent(
 					{
 						type: "text",
 						id: textBlockId,
-						...(event.blockRevision != null ? { revision: event.blockRevision } : {}),
+						revision: event.blockRevision,
 						...rawText,
 						outputIndex: event.outputIndex,
 						fileReferenceContext,
@@ -1705,8 +1722,8 @@ export async function processEvent(
 					type: "text_delta",
 					text: event.text,
 					id: textBlockId,
-					...(event.blockRevision != null ? { revision: event.blockRevision } : {}),
-					...(event.blockTextOffset != null ? { textOffset: event.blockTextOffset } : {}),
+					revision: event.blockRevision,
+					textOffset: event.blockTextOffset,
 				},
 				fileReferenceContext,
 				...(event.outputIndex != null ? { outputIndex: event.outputIndex } : {}),
@@ -1729,8 +1746,8 @@ export async function processEvent(
 						type: "text_delta",
 						text: event.text,
 						id: textBlockId,
-						...(event.blockRevision != null ? { revision: event.blockRevision } : {}),
-						...(event.blockTextOffset != null ? { textOffset: event.blockTextOffset } : {}),
+						revision: event.blockRevision,
+						textOffset: event.blockTextOffset,
 					},
 					fileReferenceContext,
 					...(event.outputIndex != null ? { outputIndex: event.outputIndex } : {}),
@@ -1930,27 +1947,11 @@ export async function processEvent(
 		case "block_complete": {
 			const { block } = event;
 			const snapshotNarratorId = ctx.parentToolUseId ? narratorId : broadcastTargetId;
-			const textBlockId =
-				block.type === "text"
-					? (block.id ?? ctx.fileReferenceContexts?.blockId(block.outputIndex))
-					: undefined;
-			const mixedTextSources =
-				block.type === "text" && !block.id && ctx.fileReferenceContexts?.hasDifferentContexts();
-			let fileReferenceContext =
-				block.type === "text"
-					? (ctx.fileReferenceContexts?.peek(block.outputIndex, block.id) ?? null)
-					: null;
-			if (mixedTextSources && block.type === "text") {
-				// The loop can combine multiple output items into one block_complete.
-				// Unless this is provably the exact lane, a mixed-device body has no
-				// single trustworthy base. Keep the text; only disable inferred links.
-				const streamed = streamingSnapshots
-					.get(ctx.parentToolUseId ? narratorId : broadcastTargetId)
-					?.streamingBlocks.find(
-						(candidate) => candidate.type === "text" && candidate.id === textBlockId,
-					);
-				if (streamed?.type !== "text" || streamed.text !== block.text) fileReferenceContext = null;
-			}
+			const textBlockId = block.type === "text" ? block.id : undefined;
+			// The element's own context; a text block without an element id names no
+			// device to resolve its links against, so it gets none.
+			const fileReferenceContext =
+				block.type === "text" ? (ctx.fileReferenceContexts?.peek(block.id) ?? null) : null;
 
 			// Capture the exact live object, but keep it visible until BOTH persistence
 			// and publication finish. A later delta may advance it while we await I/O.
@@ -2005,7 +2006,7 @@ export async function processEvent(
 			// Ensure a partial message exists for incremental persistence
 			if (!ctx.getPartialMessageId()) {
 				const tokenUsage = ctx.getTokenUsage();
-				const partial = await narratorService.createPartialAssistantMessage(narratorId, {
+				const partial = await narratorStore.openStep(narratorId, {
 					uuid: randomUUID(),
 					session_id: ctx.conversationId,
 					parent_tool_use_id: ctx.parentToolUseId,
@@ -2074,13 +2075,6 @@ export async function processEvent(
 					...(block.citations ? { citations: block.citations } : {}),
 				});
 				retireCompletedSnapshot();
-				if (
-					!block.id &&
-					ctx.fileReferenceContexts?.blockId(block.outputIndex) === textBlockId &&
-					(!completedSnapshot || !snap?.streamingBlocks.includes(completedSnapshot))
-				) {
-					ctx.fileReferenceContexts?.complete(block.outputIndex);
-				}
 			} else if (block.type === "reasoning") {
 				await persistContentCheckpoint(ctx, partialId, {
 					type: "reasoning",
@@ -2093,23 +2087,30 @@ export async function processEvent(
 					outputIndex: block.outputIndex,
 				});
 				retireCompletedSnapshot();
-				// Fire-and-forget reasoning translation
+				// Summary segments share a block ID and can repeatedly checkpoint a growing
+				// prefix. Only retain the latest version until real output begins.
 				if (settings.agent.translateReasoning && block.text) {
-					translateReasoningBlock(partialId, narratorId, broadcastTargetId, block.text, ctx, {
-						id: block.id,
-						providerMetadata: block.providerMetadata,
-						outputIndex: block.outputIndex,
-					});
+					const key = JSON.stringify([
+						partialId,
+						block.id ??
+							getReasoningItemId(block.providerMetadata) ??
+							block.outputIndex ??
+							block.text,
+					]);
+					if (!ctx.dispatchedReasoningTranslations?.has(key)) {
+						ctx.pendingReasoningTranslations ??= new Map();
+						ctx.pendingReasoningTranslations.set(key, { messageId: partialId, block });
+					}
 				}
 			} else if (block.type === "redacted_thinking") {
-				await narratorService.appendBlockToMessage(partialId, narratorId, {
+				await writeAttemptItem(ctx, partialId, {
 					type: "redacted_thinking",
 					data: block.data,
 					outputIndex: block.outputIndex,
 					signatureSource: block.signatureSource,
 				});
 			} else if (block.type === "tool_use") {
-				const toolCallId = await narratorService.appendBlockToMessage(partialId, narratorId, {
+				const toolCallId = await writeAttemptItem(ctx, partialId, {
 					type: "tool_use",
 					id: block.toolUseId,
 					name: block.name,
@@ -2134,12 +2135,21 @@ export async function processEvent(
 				ctx.toolCallIdsMap.set(block.toolUseId, toolCallId);
 				ctx.toolExecutionReceipts ??= new Map();
 				ctx.toolExecutionReceipts.set(block.toolUseId, { messageId: partialId, binding });
+				// Prepare plan-mode state at the call's own persistence, before the loop can
+				// start it: tools run as soon as their input is complete, not after the
+				// response ends, and the plan file path must already be in the tool context.
+				if (block.name === "EnterPlanMode" && hooks?.onPrepareEnterPlanMode) {
+					ctx.preparedPlanModeToolCalls ??= new Map();
+					ctx.preparedPlanModeToolCalls.set(block.toolUseId, toolCallId);
+					await hooks.onPrepareEnterPlanMode(toolCallId, block.toolUseId, block.input);
+				}
 				event.onToolPersisted?.(binding);
+				recordTurnToolCall(narratorId);
 				if (block.name === "Write" && typeof block.input.content === "string") {
 					await handoffWriteInput(ctx, block.toolUseId, block.input.content, partialId, binding);
 				}
 			} else if (block.type === "web_search") {
-				await narratorService.appendBlockToMessage(partialId, narratorId, {
+				await writeAttemptItem(ctx, partialId, {
 					type: "web_search",
 					id: block.id,
 					query: block.query,
@@ -2173,7 +2183,7 @@ export async function processEvent(
 						});
 					}
 				}
-				await narratorService.appendBlockToMessage(partialId, narratorId, {
+				await writeAttemptItem(ctx, partialId, {
 					type: "image_generation",
 					id: block.id,
 					revisedPrompt: block.revisedPrompt,
@@ -2271,14 +2281,11 @@ export async function processEvent(
 				// Partial message was already created incrementally via block_complete —
 				// just update final metadata (messageUuid + token usage).
 				savedId = partialId;
-				const updates: Record<string, unknown> = {};
-				if (event.messageId) updates.messageUuid = event.messageId;
-				if (event.credentialId) updates.credentialId = event.credentialId;
-				if (turnUsage) updates.turnUsageJson = turnUsage;
-
-				if (Object.keys(updates).length > 0) {
-					await db.update(narratorMessages).set(updates).where(eq(narratorMessages.id, savedId));
-				}
+				await narratorStore.sealStepMeta(savedId, {
+					messageUuid: event.messageId || undefined,
+					credentialId: event.credentialId || undefined,
+					turnUsageJson: turnUsage,
+				});
 				const usageData = buildUsageDataFromSnapshot(tokenUsage);
 				if (usageData && ctx.provider && ctx.model) {
 					await updateMessageUsage(savedId, usageData, ctx.provider, ctx.model);
@@ -2308,7 +2315,7 @@ export async function processEvent(
 				}
 
 				const usageData = buildUsageDataFromSnapshot(tokenUsage);
-				const saved = await narratorService.persistAssistantMessage(narratorId, {
+				const saved = await narratorStore.appendStep(narratorId, {
 					uuid: event.messageId ?? randomUUID(),
 					session_id: ctx.conversationId,
 					parent_tool_use_id: ctx.parentToolUseId,
@@ -2342,11 +2349,7 @@ export async function processEvent(
 						: undefined,
 				});
 				savedId = saved.id;
-				if (turnUsage)
-					await db
-						.update(narratorMessages)
-						.set({ turnUsageJson: turnUsage })
-						.where(eq(narratorMessages.id, savedId));
+				await narratorStore.sealStepMeta(savedId, { turnUsageJson: turnUsage });
 				if (usageData && ctx.provider && ctx.model) {
 					await updateMessageUsage(savedId, usageData, ctx.provider, ctx.model);
 				}
@@ -2360,10 +2363,13 @@ export async function processEvent(
 			}
 
 			// Load full message with tool calls for broadcast and exact EnterPlanMode row identity.
-			let fullMessage = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, savedId),
-				with: { toolCalls: true },
-			});
+			let fullMessage = fillBody(
+				await db.query.narratorMessages.findFirst({
+					where: eq(narratorMessages.id, savedId),
+					...bodyColumns(),
+					with: { toolCalls: true },
+				}),
+			);
 
 			// Tool blocks may have been appended by block_complete in stop/completion order.
 			// The final event's toolUses is already in stable model/start order, so reconcile
@@ -2374,18 +2380,12 @@ export async function processEvent(
 					event.toolUses,
 				);
 				if (reorderedContent) {
-					await db
-						.update(narratorMessages)
-						.set({
-							contentJson: reorderedContent,
-							contextCharsJson: measureMessageCharacters(
-								"assistant",
-								reorderedContent,
-								fullMessage.contentText,
-							),
-						})
-						.where(eq(narratorMessages.id, savedId));
-					queueContextCharacterRefresh(narratorId, savedId);
+					await narratorStore.orderStepCalls(
+						narratorId,
+						savedId,
+						reorderedContent,
+						fullMessage.contentText,
+					);
 					fullMessage = { ...fullMessage, contentJson: reorderedContent };
 				}
 			}
@@ -2413,6 +2413,13 @@ export async function processEvent(
 							tu.toolUseId,
 							rows[0].id,
 						);
+						// A call bound only now never passed block_complete, so it cannot have
+						// started (execution needs the binding) nor been prepared there.
+						if (tu.name === "EnterPlanMode" && hooks?.onPrepareEnterPlanMode) {
+							ctx.preparedPlanModeToolCalls ??= new Map();
+							ctx.preparedPlanModeToolCalls.set(tu.toolUseId, binding.toolCallId);
+							await hooks.onPrepareEnterPlanMode(binding.toolCallId, tu.toolUseId, tu.input);
+						}
 					}
 					ctx.toolCallIdsMap.set(tu.toolUseId, binding.toolCallId);
 					ctx.toolExecutionReceipts.set(tu.toolUseId, { messageId: savedId, binding });
@@ -2420,29 +2427,6 @@ export async function processEvent(
 					if (tu.name === "Write" && typeof tu.input.content === "string") {
 						await handoffWriteInput(ctx, tu.toolUseId, tu.input.content, savedId, binding);
 					}
-				}
-			}
-
-			if (
-				hooks?.onPrepareEnterPlanMode &&
-				event.toolUses.some((toolUse) => toolUse.name === "EnterPlanMode")
-			) {
-				if (!fullMessage) {
-					throw new Error(
-						`Cannot prepare EnterPlanMode: persisted message ${savedId} was not found.`,
-					);
-				}
-				for (const tu of event.toolUses) {
-					if (tu.name !== "EnterPlanMode") continue;
-					const toolCall = fullMessage.toolCalls.find((tc) => tc.toolUseId === tu.toolUseId);
-					if (!toolCall?.id) {
-						throw new Error(
-							`Cannot prepare EnterPlanMode without an exact tool-call row for ${tu.toolUseId}.`,
-						);
-					}
-					ctx.preparedPlanModeToolCalls ??= new Map();
-					ctx.preparedPlanModeToolCalls.set(tu.toolUseId, toolCall.id);
-					await hooks.onPrepareEnterPlanMode(toolCall.id, tu.toolUseId, tu.input);
 				}
 			}
 
@@ -2499,6 +2483,11 @@ export async function processEvent(
 			const savedMsg = fullMessage ?? { id: savedId };
 			ctx.sseEmitter?.emit("event", { type: "assistant_message", data: savedMsg });
 
+			// Effects deferred until the response is persisted whole (plan approval restart).
+			if (hooks?.onAssistantMessageFinalized) {
+				await hooks.onAssistantMessageFinalized();
+			}
+
 			// Main narrator: title tracking
 			if (hooks?.onTitleCheck) {
 				return hooks.onTitleCheck(savedId);
@@ -2537,9 +2526,7 @@ export async function processEvent(
 					"Prepared plan state belongs to another tool attempt",
 				);
 			}
-			const persistedOutput = event.metadata
-				? { _text: event.output, _metadata: event.metadata }
-				: event.output;
+			const persistedOutput = await toolResultLedgerOutput(narratorId, event);
 			const isSuccessfulEnterPlanMode = event.toolName === "EnterPlanMode" && !event.isError;
 			if (isSuccessfulEnterPlanMode && ctx.committedPlanModeToolUseIds?.has(event.toolUseId)) {
 				return null;
@@ -2563,7 +2550,7 @@ export async function processEvent(
 					: "Refusing successful EnterPlanMode without prepared persisted state.";
 				try {
 					if (resultToolCallId)
-						await narratorService.updateToolCallResult(
+						await narratorStore.settleTool(
 							event.toolUseId,
 							{ output: message, status: "fail", errorMessage: message },
 							undefined,
@@ -2640,7 +2627,7 @@ export async function processEvent(
 					);
 					const message = failure.message;
 					try {
-						await narratorService.updateToolCallResult(
+						await narratorStore.settleTool(
 							event.toolUseId,
 							{ output: message, status: "fail", errorMessage: message },
 							undefined,
@@ -2666,9 +2653,12 @@ export async function processEvent(
 				}
 			}
 
+			// A broken call stores its sanitized input; a permission redirect (e.g. the
+			// plan-mode file path) the input actually used. Either rides with the result.
+			const settledInput = event.brokenInputOverride ?? event.updatedInput;
 			if (!shouldCommitEnterPlanModeAtomically && resultToolCallId) {
 				try {
-					await narratorService.updateToolCallResult(
+					await narratorStore.settleTool(
 						event.toolUseId,
 						{
 							output: persistedOutput,
@@ -2678,28 +2668,11 @@ export async function processEvent(
 							permissionStartedAt: event.permissionStartedAt,
 							executionStartedAt: event.executionStartedAt,
 							completedAt: event.completedAt,
+							input: settledInput,
 						},
 						undefined,
 						resultToolCallId,
 					);
-					// Broken tool call: overwrite the persisted inputJson with a sanitized
-					// version (large content fields replaced with a short placeholder).
-					if (event.brokenInputOverride) {
-						await narratorService.overwriteToolCallInput(
-							event.toolUseId,
-							event.brokenInputOverride,
-							resultToolCallId,
-						);
-					}
-					// Permission-level input redirect (e.g. plan-mode file path):
-					// update the persisted inputJson to reflect the actual path used.
-					else if (event.updatedInput) {
-						await narratorService.overwriteToolCallInput(
-							event.toolUseId,
-							event.updatedInput,
-							resultToolCallId,
-						);
-					}
 					toolResultPersisted = true;
 				} catch (err) {
 					logger.error("Failed to persist tool result", {
@@ -2709,35 +2682,21 @@ export async function processEvent(
 					});
 					// Retry once — transient DB lock / busy errors are common with SQLite
 					try {
-						await narratorService.updateToolCallResult(
+						await narratorStore.settleTool(
 							event.toolUseId,
 							{
-								output: event.metadata
-									? { _text: event.output, _metadata: event.metadata }
-									: event.output,
+								output: persistedOutput,
 								status,
 								errorMessage: event.isError ? event.output : undefined,
 								durationMs: event.durationMs,
 								permissionStartedAt: event.permissionStartedAt,
 								executionStartedAt: event.executionStartedAt,
 								completedAt: event.completedAt,
+								input: settledInput,
 							},
 							undefined,
 							resultToolCallId,
 						);
-						if (event.brokenInputOverride) {
-							await narratorService.overwriteToolCallInput(
-								event.toolUseId,
-								event.brokenInputOverride,
-								resultToolCallId,
-							);
-						} else if (event.updatedInput) {
-							await narratorService.overwriteToolCallInput(
-								event.toolUseId,
-								event.updatedInput,
-								resultToolCallId,
-							);
-						}
 						toolResultPersisted = true;
 					} catch (retryErr) {
 						logger.error("CRITICAL: tool_result persist failed after retry", {
@@ -3016,25 +2975,16 @@ export async function processEvent(
 		}
 
 		case "stream_reasoning": {
-			// Provider itemId is replay metadata, not the attempt-scoped display ID.
-			// Keep its legacy fallback only when the producer has no loop identity.
-			const reasoningId = event.blockId ?? event.providerMetadata?.openai?.itemId;
+			// The loop's attempt-scoped element id; a provider itemId is replay metadata only.
+			const reasoningId = event.blockId;
 			const reasoningOutputIndex = event.outputIndex;
 			const snap = getOrCreateSnapshot(ctx.parentToolUseId ? narratorId : broadcastTargetId);
-			const existing = snap.streamingBlocks.find((b) => {
-				if (b.type !== "reasoning") return false;
-				if (reasoningId) return b.id === reasoningId;
-				if (reasoningOutputIndex != null) return b.outputIndex === reasoningOutputIndex;
-				return !b.id && b.outputIndex == null;
-			});
-			const base = event.blockId ? ctx.committedContentSnapshots?.get(event.blockId) : undefined;
+			const existing = snap.streamingBlocks.find(
+				(b) => b.type === "reasoning" && b.id === reasoningId,
+			);
+			const base = ctx.committedContentSnapshots?.get(reasoningId);
 			const latestRevision = existing?.type === "reasoning" ? existing.revision : base?.revision;
-			if (
-				event.blockRevision != null &&
-				latestRevision != null &&
-				event.blockRevision <= latestRevision
-			)
-				return null;
+			if (latestRevision != null && event.blockRevision <= latestRevision) return null;
 			// Add "reasoning" substatus on first reasoning chunk
 			if (ctx.addSubstatus && ctx.getSubstatus && !ctx.getSubstatus().has("reasoning")) {
 				ctx.addSubstatus("reasoning").catch(() => {});
@@ -3058,7 +3008,7 @@ export async function processEvent(
 			);
 			if (existing?.type === "reasoning") {
 				Object.assign(existing, rawText);
-				if (event.blockRevision != null) existing.revision = event.blockRevision;
+				existing.revision = event.blockRevision;
 			} else {
 				snap.streamingBlocks.splice(
 					findOrderedSnapshotInsertIndex(snap.streamingBlocks, reasoningOutputIndex),
@@ -3067,7 +3017,7 @@ export async function processEvent(
 						type: "reasoning",
 						...rawText,
 						...(reasoningId ? { id: reasoningId } : {}),
-						...(event.blockRevision != null ? { revision: event.blockRevision } : {}),
+						revision: event.blockRevision,
 						...(reasoningOutputIndex != null ? { outputIndex: reasoningOutputIndex } : {}),
 					},
 				);
@@ -3079,8 +3029,8 @@ export async function processEvent(
 					type: "reasoning_delta",
 					text: event.text,
 					...(reasoningId ? { id: reasoningId } : {}),
-					...(event.blockRevision != null ? { revision: event.blockRevision } : {}),
-					...(event.blockTextOffset != null ? { textOffset: event.blockTextOffset } : {}),
+					revision: event.blockRevision,
+					textOffset: event.blockTextOffset,
 					...(reasoningOutputIndex != null ? { outputIndex: reasoningOutputIndex } : {}),
 				},
 			};
@@ -3102,8 +3052,8 @@ export async function processEvent(
 						type: "reasoning_delta",
 						text: event.text,
 						...(reasoningId ? { id: reasoningId } : {}),
-						...(event.blockRevision != null ? { revision: event.blockRevision } : {}),
-						...(event.blockTextOffset != null ? { textOffset: event.blockTextOffset } : {}),
+						revision: event.blockRevision,
+						textOffset: event.blockTextOffset,
 						...(reasoningOutputIndex != null ? { outputIndex: reasoningOutputIndex } : {}),
 					},
 				},
@@ -3459,6 +3409,7 @@ export async function processEvent(
 		}
 
 		case "api_request_start": {
+			ctx.currentAttemptId = event.requestId;
 			// Counters and frozen classifications never carry across attempts.
 			ctx.setTokenUsage(undefined);
 			// This context is runtime state; durable checkpoints must use the same
@@ -3542,6 +3493,7 @@ export async function processEvent(
 			if (requestInfo) {
 				ctx.apiRequestsMap?.delete(event.requestId);
 				ctx.accountRequestTokenUsage?.(event.usage);
+				recordTurnStep(narratorId, ctx.model, event.usage);
 			}
 			const snapshot = boundedContextSnapshot(event.contextSnapshot);
 			if (snapshot) {

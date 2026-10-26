@@ -8,31 +8,59 @@ import {
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { api } from "../lib/api";
-import type { SearchSortMode } from "../lib/search-utils";
-import { useSearch } from "./useSearch";
+import { api, type SearchRequest } from "../lib/api";
+import {
+	SEARCH_OVERVIEW_LIMIT,
+	SEARCH_PAGE_LIMIT,
+	useSearchOverview,
+	useSearchSection,
+	useSessionHits,
+} from "./useSearch";
 
 let root: Root;
 let client: QueryClient;
-let searchSpy: ReturnType<typeof spyOn<typeof api, "search">>;
-let result: ReturnType<typeof useSearch>;
+let sectionsSpy: ReturnType<typeof spyOn<typeof api, "searchSections">>;
+let hitsSpy: ReturnType<typeof spyOn<typeof api, "searchSessionHits">>;
+let overview: ReturnType<typeof useSearchOverview>;
+let section: ReturnType<typeof useSearchSection>;
+let hits: ReturnType<typeof useSessionHits>;
 const originals = new Map<string, PropertyDescriptor | undefined>();
-const entities = "chapters,messages,narrators,knowledge";
 const notificationTimers = new Map<ReturnType<typeof setTimeout>, () => void>();
 
-function Probe({ query, sort }: { query: string; sort?: SearchSortMode }) {
-	result = useSearch(query, entities, sort);
+const emptyPage = { items: [], total: 0, totalIsLowerBound: false, nextCursor: null };
+
+function Probe({
+	request,
+	expanded,
+	page,
+}: {
+	request: SearchRequest;
+	expanded: boolean;
+	page: number;
+}) {
+	overview = useSearchOverview(request);
+	section = useSearchSection(request, "sessions", page, true);
+	hits = useSessionHits("n1", request, expanded);
 	return null;
 }
 
-async function render(query: string, sort?: SearchSortMode) {
+async function render(request: SearchRequest, expanded = false, page = 1) {
 	await act(async () => {
 		root.render(
 			<QueryClientProvider client={client}>
-				<Probe query={query} sort={sort} />
+				<Probe request={request} expanded={expanded} page={page} />
 			</QueryClientProvider>,
 		);
 	});
+}
+
+/** Let resolved queries deliver their results, until `done` holds (or a short deadline). */
+async function settle(done: () => boolean = () => false) {
+	for (let i = 0; i < 20 && !done(); i++) {
+		await act(async () => {
+			await Bun.sleep(5);
+		});
+	}
 }
 
 beforeEach(() => {
@@ -55,7 +83,19 @@ beforeEach(() => {
 		notificationTimers.set(timer, callback);
 	});
 	client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-	searchSpy = spyOn(api, "search").mockResolvedValue({ results: [] });
+	sectionsSpy = spyOn(api, "searchSections").mockImplementation(async (request, sections) => ({
+		sections: Object.fromEntries(
+			sections.map((name) => [
+				name,
+				{
+					...emptyPage,
+					total: 45,
+					nextCursor: request.cursor || request.page ? null : `${name}-page-2`,
+				},
+			]),
+		),
+	}));
+	hitsSpy = spyOn(api, "searchSessionHits").mockResolvedValue({ hits: [], nextCursor: null });
 	root = createRoot(document.body.appendChild(document.createElement("div")));
 });
 
@@ -79,7 +119,8 @@ afterEach(async () => {
 		for (const timer of notificationTimers.keys()) clearTimeout(timer);
 		notificationTimers.clear();
 		notifyManager.setScheduler(defaultScheduler);
-		searchSpy.mockRestore();
+		sectionsSpy.mockRestore();
+		hitsSpy.mockRestore();
 		for (const [key, descriptor] of originals) {
 			if (descriptor) Object.defineProperty(globalThis, key, descriptor);
 			else Reflect.deleteProperty(globalThis, key);
@@ -88,62 +129,61 @@ afterEach(async () => {
 	}
 });
 
-for (const query of ["中", "中文", "a", "ab"]) {
-	test(`automatically searches trimmed short query ${query}`, async () => {
-		await render(`  ${query}  `);
-		expect(searchSpy).toHaveBeenCalledWith(query, entities, "relevance", expect.any(AbortSignal));
-		expect(result.isShortQuery).toBe(true);
-	});
-}
-
-test("ignores whitespace-only input and debounces short terms for 300ms", async () => {
-	await render("  ");
-	expect(searchSpy).not.toHaveBeenCalled();
-	await render("中");
-	await render("中文");
-	expect(searchSpy).not.toHaveBeenCalled();
-	await act(async () => {
-		await Bun.sleep(350);
-	});
-	expect(searchSpy).toHaveBeenCalledTimes(1);
-	expect(searchSpy).toHaveBeenCalledWith("中文", entities, "relevance", expect.any(AbortSignal));
+test("does not search for a blank query", async () => {
+	await render({ q: "   " }, true);
+	expect(sectionsSpy).not.toHaveBeenCalled();
+	expect(hitsSpy).not.toHaveBeenCalled();
 });
 
-test("forwards sorting and separates cached candidates by sort", async () => {
-	await render("query", "relevance");
-	await render("query", "time");
-	expect(searchSpy).toHaveBeenCalledWith("query", entities, "time", expect.any(AbortSignal));
-	for (const sort of ["title", "type"] as const) {
-		await render("query", sort);
-		expect(searchSpy).toHaveBeenLastCalledWith(
-			"query",
-			entities,
-			"relevance",
-			expect.any(AbortSignal),
-		);
-	}
+test("loads every section's first page for the overview, and one section's pages", async () => {
+	await render({ q: "  kestrel  ", sort: "time" });
+	await settle();
+	expect(sectionsSpy).toHaveBeenCalledWith(
+		{ q: "kestrel", sort: "time", limit: SEARCH_OVERVIEW_LIMIT },
+		["sessions", "knowledge"],
+		expect.any(AbortSignal),
+	);
+	expect(sectionsSpy).toHaveBeenCalledWith(
+		{ q: "kestrel", sort: "time", page: 1, limit: SEARCH_PAGE_LIMIT },
+		["sessions"],
+		expect.any(AbortSignal),
+	);
+	expect(overview.data?.sections.sessions?.nextCursor).toBe("sessions-page-2");
+
+	// Jumping to a page asks for it directly, keeping the shown page until it arrives.
+	await render({ q: "kestrel", sort: "time" }, false, 3);
+	expect(section.data?.total).toBe(45);
+	await settle(() => section.isPlaceholderData === false);
+	expect(sectionsSpy).toHaveBeenLastCalledWith(
+		{ q: "kestrel", sort: "time", page: 3, limit: SEARCH_PAGE_LIMIT },
+		["sessions"],
+		expect.any(AbortSignal),
+	);
+	expect(section.isPlaceholderData).toBe(false);
+});
+
+test("caches each filter combination separately", async () => {
+	await render({ q: "kestrel" });
+	await render({ q: "kestrel", include: ["subagents"], projectId: "p1" });
+	await settle();
 	const keys = client
 		.getQueryCache()
 		.getAll()
-		.map((query) => query.queryKey);
-	expect(keys).toEqual(
-		["relevance", "time", "title", "type"].map((sort) => ["search", "query", entities, sort]),
-	);
-	await render("query", "time");
-	expect(searchSpy).toHaveBeenCalledTimes(4);
+		.filter((query) => query.queryKey[1] === "overview")
+		.map((query) => query.queryKey[2]);
+	expect(keys).toEqual(["q=kestrel", "q=kestrel&include=subagents&projectId=p1"]);
 });
 
-test("changing sort aborts the previous pending search request", async () => {
-	const signals: AbortSignal[] = [];
-	searchSpy.mockImplementation(async (_query, _entities, _sort, signal) => {
-		if (signal) signals.push(signal);
-		return new Promise(() => {});
-	});
-	await render("PR", "time");
-	expect(signals).toHaveLength(1);
-	expect(signals[0].aborted).toBe(false);
-	await render("PR", "relevance");
-	expect(signals).toHaveLength(2);
-	expect(signals[0].aborted).toBe(true);
-	expect(signals[1].aborted).toBe(false);
+test("reads a session's further hits only once its card is expanded", async () => {
+	await render({ q: "kestrel" });
+	await settle();
+	expect(hitsSpy).not.toHaveBeenCalled();
+	await render({ q: "kestrel" }, true);
+	await settle();
+	expect(hitsSpy).toHaveBeenCalledWith(
+		"n1",
+		{ q: "kestrel", cursor: undefined, limit: 20 },
+		expect.any(AbortSignal),
+	);
+	expect(hits.data?.pages).toEqual([{ hits: [], nextCursor: null }]);
 });

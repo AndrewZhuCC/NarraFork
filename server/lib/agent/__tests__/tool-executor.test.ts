@@ -36,8 +36,9 @@ import {
 	waitForOrdinaryToolDrain,
 	waitForUpdateCheckpointFence,
 } from "../../../services/update-coordinator";
-import { getToolMessage, getToolMessageWithParams } from "../../i18n";
+import { getToolMessage } from "../../i18n";
 import { settings } from "../../settings";
+import { sideCarBodyWithText } from "../../sidecar-templates";
 import type { ExecutionBackend } from "../execution/backend";
 import { posixPathSemantics } from "../execution/path-semantics";
 import { setRemoteBackendResolver } from "../execution/registry";
@@ -344,9 +345,11 @@ describe("broken tool input attribution", () => {
 		expect(placeholder).not.toContain("过长");
 		expect(placeholder).not.toContain("truncated");
 		expect(placeholder).not.toContain("截断");
-		const reminder = getToolMessageWithParams("brokenToolCallReminder", locale, {
-			toolNames: "Write",
-		});
+		const reminder = sideCarBodyWithText(
+			"broken_call",
+			{ kind: "notice", params: { toolNames: "Write" } },
+			locale,
+		).content;
 		expect(reminder).toContain(locale === "en" ? "does not establish" : "无法认定");
 		expect(reminder).toContain(locale === "en" ? "valid JSON" : "有效的 JSON");
 	});

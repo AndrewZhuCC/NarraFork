@@ -10,6 +10,8 @@ import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { selectTokenDanceProtocol } from "@shared/tokendance";
 import { getCodexManager } from "../codex-manager";
 import { resolveCommandCodeToken } from "../commandcode-manager";
+import { peekCommandCodeModels } from "../commandcode-models";
+import { COMMAND_CODE_PREFIX } from "../commandcode-protocol";
 import { AppError, ValidationError } from "../errors";
 import { getEffectiveModelProfile, resolveEffectiveModelCard } from "../model-catalog";
 import { isNugCachedModelAvailable, resolveNugModelMeta } from "../nug-model-cache";
@@ -615,6 +617,19 @@ export function resolveEffectiveModel(
 }
 
 /**
+ * Command Code 的模型来自上游目录（`GET /provider/v1/models`），这里只读它已有的缓存：
+ * `peekCommandCodeModels` 立刻返回（命中、过期旧值或空），并在需要时补一次去重的后台拉取，
+ * 所以这条同步路径不会被上游延迟拖住。未启用或没有凭据时没有模型。
+ */
+function listCommandCodeModelValues(): string[] {
+	const config = s().commandCode;
+	if (config?.disabled) return [];
+	return peekCommandCodeModels(config?.apiKey, config?.baseUrl).models.map(
+		(model) => `${COMMAND_CODE_PREFIX}:${model}`,
+	);
+}
+
+/**
  * Get all available model values (provider:id format), excluding hidden models
  * and models from disabled providers.
  */
@@ -627,6 +642,9 @@ export function getVisibleModels(): string[] {
 	const nug = nugModelLister?.() ?? [];
 	const gemini = geminiModelLister?.() ?? [];
 	const grok = grokModelLister?.() ?? [];
+
+	const commandCode = listCommandCodeModelValues();
+
 	const custom = (s().agent.customModels ?? []).map((m) => {
 		const value = m.value ?? "";
 		return value.includes(":") ? value : `${m.provider ?? "openai"}:${value}`;
@@ -642,7 +660,11 @@ export function getVisibleModels(): string[] {
 		...codex,
 		...nug,
 		...gemini,
+
 		...grok,
+
+		...commandCode,
+
 		...custom,
 		...extra,
 	]) {
@@ -720,9 +742,11 @@ export function usesStatefulModel(prefix?: string, model?: string): boolean {
 	if (prefix === "tokendance" && getTokenDanceRuntimeConfig()) {
 		const rawModel = model?.startsWith("tokendance:") ? model.slice("tokendance:".length) : model;
 		const catalog = getTokenDanceCatalogModels().find((m) => m.id === rawModel);
-		return (
-			!!catalog && selectTokenDanceProtocol(catalog.supported_protocols) === "openai-responses"
-		);
+		if (!catalog) return false;
+		const protocol =
+			resolveModelProtocol("tokendance", model) ??
+			selectTokenDanceProtocol(catalog.supported_protocols);
+		return protocol === "openai-responses";
 	}
 	if (usesStatefulApi(prefix)) return true;
 	if (usesCodexModel(prefix, model)) return true;

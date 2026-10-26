@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
 import { CodexProvider, isCodexProviderExpected101WebSocketFailure } from "../codex-provider";
 import {
 	CODEX_IMAGE_GENERATION_PARTIAL_IMAGES,
 	OpenAIProvider,
 	supportsCodexImageGeneration,
 } from "../openai-provider";
+import type { DbMessage } from "../provider";
 
 describe("CodexProvider Responses WebSocket handling", () => {
 	test("HTTP credential delegation preserves the parent tool snapshot", async () => {
@@ -267,15 +269,54 @@ describe("CodexProvider Responses WebSocket handling", () => {
 		expect(toolsJson).toContain('"type":"image_generation"');
 	});
 
-	test("buildResponsesWebSocketRequest emits tool result images as input_image items", () => {
+	test("buildResponsesWebSocketRequest emits tool result images as input_image items", async () => {
 		const provider = new CodexProvider({ useWebSocket: true });
-		const toolResult = provider.formatToolResult("call_img", "Screenshot ready", false, [
+		// Codex builds its history with an OpenAI provider in codex mode (it needs a live
+		// credential to pick one); the result images ride in the history it returns.
+		const rows: DbMessage[] = [
 			{
-				format: "png",
-				base64:
-					"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+				id: "u1",
+				role: "user",
+				contentJson: [{ type: "text", text: "take a screenshot" }],
+				contentText: "take a screenshot",
+				parentToolUseId: null,
+				messageUuid: null,
 			},
-		]);
+			{
+				id: "a1",
+				role: "assistant",
+				contentJson: [{ type: "tool_use", id: "call_img", name: "Screenshot", input: {} }],
+				contentText: null,
+				parentToolUseId: null,
+				messageUuid: null,
+				toolCalls: [
+					{
+						toolUseId: "call_img",
+						toolName: "Screenshot",
+						inputJson: {},
+						status: "success",
+						outputJson: encodeToolOutput("Screenshot ready", {
+							images: [
+								{
+									imageId: "img-1",
+									mediaType: "image/png",
+									data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+								},
+							],
+						}),
+					},
+				],
+			},
+		];
+		const { history } = await new OpenAIProvider({
+			id: "codex",
+			name: "Codex",
+			prefix: "codex",
+			apiKey: "",
+			baseUrl: "https://chatgpt.com/backend-api/codex",
+			defaultModel: "gpt-5.5",
+			apiMode: "codex",
+		}).buildHistory(rows, "gpt-5.5");
 
 		const request = (
 			provider as unknown as {
@@ -297,8 +338,8 @@ describe("CodexProvider Responses WebSocket handling", () => {
 			}
 		).buildResponsesWebSocketRequest({
 			model: "openai:gpt-5.5",
-			history: [],
-			toolResults: [toolResult],
+			history,
+			toolResults: [],
 			content: "",
 			images: undefined,
 			conversationId: "conv-1",

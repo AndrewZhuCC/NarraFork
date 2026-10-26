@@ -20,7 +20,7 @@ import { parseModelId, settings } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
 import { extractOpenAIUsage } from "../usage-tracking";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
-import { convertHistoryToResponsesApi } from "./openai-provider";
+import { convertHistoryToResponsesApi, OpenAIProvider } from "./openai-provider";
 import type {
 	ChatParams,
 	DbMessage,
@@ -141,12 +141,12 @@ export class GrokProvider implements ProviderAdapter {
 		}));
 	}
 
-	async buildHistory(
-		dbMessages: DbMessage[],
-		_model: string,
-		_narratorId?: string,
-	): Promise<{ history: unknown[]; trailingToolResults: unknown[] }> {
-		return this.buildGrokHistory(dbMessages);
+	async buildHistory(dbMessages: DbMessage[], model: string, narratorId?: string) {
+		return new OpenAIProvider({ ...this.config, apiKey: this.config.apiKey ?? "", apiMode: "responses" }).buildHistory(
+			dbMessages,
+			model,
+			narratorId,
+		);
 	}
 
 	injectSystemPrompt(
@@ -453,40 +453,6 @@ export class GrokProvider implements ProviderAdapter {
 	}
 
 	// === Internal methods ===
-
-	private buildGrokHistory(dbMessages: DbMessage[]): {
-		history: GrokResponsesMessage[];
-		trailingToolResults: GrokToolResult[];
-	} {
-		const topLevel = dbMessages.filter(
-			(m) =>
-				!m.parentToolUseId && (m.role === "user" || m.role === "assistant" || m.role === "sys"),
-		);
-
-		if (topLevel.length > 0 && topLevel[topLevel.length - 1].role === "user") {
-			topLevel.pop();
-		}
-
-		const history: GrokResponsesMessage[] = [];
-		let pendingToolResults: GrokToolResult[] = [];
-
-		for (const msg of topLevel) {
-			if (msg.role === "assistant") {
-				history.push(...this.assistantToResponsesMessage(msg));
-				pendingToolResults = [];
-			} else if (msg.role === "user") {
-				history.push({
-					role: "user",
-					content: this.messageText(msg) || "[user message]",
-				});
-				pendingToolResults = [];
-			} else if (msg.role === "sys") {
-				history.push({ role: "developer", content: this.messageText(msg) });
-			}
-		}
-
-		return { history, trailingToolResults: pendingToolResults };
-	}
 
 	private assistantToResponsesMessage(msg: DbMessage): GrokResponsesMessage[] {
 		const text = this.messageText(msg);

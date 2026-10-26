@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
+import { modelInputText } from "../../../tests/fixtures/model-input";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
 	narratorBufferedMessages,
@@ -59,24 +60,19 @@ const { enqueueInboxAgent } = await import("../agent-runtime/inbox");
 const MODEL = "orchestratorfixture:model";
 const adapter: ProviderAdapter = {
 	formatTools: () => [],
+	// Every row is one entry, and a step's settled results follow it, as real builders do.
 	buildHistory: async (messages) => ({
-		history: messages.map((message) => ({ role: message.role, content: message.contentJson })),
-		trailingToolResults: messages.flatMap((message) =>
-			(message.toolCalls ?? [])
+		history: messages.flatMap((message) => [
+			{ role: message.role, content: message.contentJson },
+			...(message.toolCalls ?? [])
 				.filter((tool) => tool.status === "success")
-				.map((tool) => ({
-					toolUseId: tool.toolUseId,
-					output: tool.outputJson,
-				})),
-		),
+				.map((tool) => ({ toolUseId: tool.toolUseId, output: tool.outputJson })),
+		]),
 	}),
 	injectSystemPrompt: () => {},
 	chat() {
 		throw new Error("Contract must not contact a model");
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => {
 		throw new Error("Contract must not generate titles");
 	},
@@ -271,6 +267,11 @@ describe("round token totals at the Stop hook", () => {
 			]);
 			await h.run();
 			expect(stopTotals).toEqual([exit === "workspace" ? 2315 : 2300]);
+			if (exit === "workspace") {
+				// The workspace notice is a persisted row the next pass reads from history.
+				expect(h.calls[1]?.userText).toBe("");
+				expect(modelInputText(h.calls[1])).toContain("Working directory changed.");
+			}
 		});
 	}
 
@@ -310,7 +311,7 @@ describe("Bash Git command detection for status refresh", () => {
 });
 
 describe("tool Git status refresh", () => {
-	test("invalidates at the write boundary and shares cached status in the trailing chapter broadcast", async () => {
+	test("invalidates at the write boundary and shares cached status in the trailing broadcast", async () => {
 		const statusCache = await import("../git-status-cache");
 		const { gitService } = await import("../git-service");
 		const ws = await import("../../websocket/narrator-ws");
@@ -333,19 +334,15 @@ describe("tool Git status refresh", () => {
 		spyOn(gitService, "getStatusSummary").mockImplementation((path, options) =>
 			coordinateGitStatusQuery(getLocalGitStatusQueryKey(path), query, options),
 		);
-		const ahead = spyOn(gitService, "getCommitsAhead").mockResolvedValue({
-			count: 2,
-			baseBranch: "main",
-		});
 		const invalidate = spyOn(statusCache, "invalidateStatus");
 		const cachedRead = spyOn(statusCache, "getStatusSummaryCached");
 		const broadcast = spyOn(ws, "broadcastToNarrator").mockImplementation(() => {});
 		let verified = false;
 		const h = fixture(profiles[0], [
 			async (options) => {
-				h.session._chapterId = "git-track-chapter";
-				h.session._worktreePath = repo;
-				h.session._baseBranch = "main";
+				// A local session working in a Git repository tracks its cwd.
+				h.session.cwd = repo;
+				h.session._isInGitRepo = true;
 				const scheduled: Array<() => void> = [];
 				const timer = spyOn(globalThis, "setTimeout").mockImplementation(((
 					callback: () => void,
@@ -376,15 +373,13 @@ describe("tool Git status refresh", () => {
 				expect(invalidate).toHaveBeenCalledTimes(2);
 				expect(query).toHaveBeenCalledTimes(1);
 				expect(cachedRead).toHaveBeenCalledWith(repo);
-				expect(ahead).toHaveBeenCalledWith(repo, "main");
 				expect(
 					broadcast.mock.calls.some(
 						([, message]) =>
 							message.type === "git_status" &&
 							message.toolUseId === "write-2" &&
-							message.chapterId === "git-track-chapter" &&
-							message.commitsAhead === 2 &&
-							message.baseBranch === "main" &&
+							message.narratorId === h.session.narratorId &&
+							message.status.headSha === "fixture-head" &&
 							!("files" in message.status),
 					),
 				).toBe(true);
@@ -568,15 +563,13 @@ describe("real shared orchestrator profile contract", () => {
 					async (options) => {
 						expect(options.config.getWorkTurnId?.()).toBe(id);
 						expect(existsSync(spillPath)).toBe(false);
-						if (references) expect(options.userText).toContain(snapshot.snapshotText);
+						if (references) expect(modelInputText(options)).toContain(snapshot.snapshotText);
 						if (official) {
-							// Official provider: the snapshot is the current input exactly once,
-							// never a second copy in history; the trailing sys row is kept.
-							expect(options.userText.split(snapshot.snapshotText).length).toBe(2);
-							const history = JSON.stringify(options.history);
-							expect(history).not.toContain(snapshot.snapshotText);
+							// Official provider: the snapshot reaches the model exactly once, in the
+							// persisted input row; the trailing sys row is kept.
+							expect(modelInputText(options).split(snapshot.snapshotText).length).toBe(2);
 							// Official semantics: the trailing sys row stays a system message in history.
-							expect(options.history).toEqual(
+							expect(options.history.built).toEqual(
 								expect.arrayContaining([
 									expect.objectContaining({
 										role: "system",
@@ -975,9 +968,12 @@ describe("real shared orchestrator profile contract", () => {
 			expect(
 				db.select().from(narratorMessages).where(eq(narratorMessages.role, "user")).all(),
 			).toEqual([]);
-			expect(h.calls[1].trailingToolResults).toEqual([
-				{ toolUseId: "read-replay", output: "persisted replay output" },
-			]);
+			// The replayed request is the history, which ends with the persisted result.
+			expect(h.calls[1].startedWithToolResults).toBe(true);
+			expect(h.calls[1].history.built?.at(-1)).toEqual({
+				toolUseId: "read-replay",
+				output: "persisted replay output",
+			});
 		});
 
 		test(`${profile.kind}: plan approval feedback preserves the existing work-turn callback`, async () => {
@@ -1103,7 +1099,7 @@ describe("real shared orchestrator profile contract", () => {
 					expect(options.config.userId).toBe(scenario.recipient);
 					expect(options.config.getWorkTurnId?.()).toBe(acceptedId);
 					expect(reflectionConfig?.getWorkTurnId?.()).toBe(acceptedId);
-					expect(options.userText).toContain(feedback);
+					expect(modelInputText(options)).toContain(feedback);
 					order.push("feedback-before-next-tool");
 					const message = db
 						.select()
@@ -1252,7 +1248,13 @@ describe("real shared orchestrator profile contract", () => {
 		const h = fixture(profiles[1], [
 			async (options) => {
 				await processEvent(
-					{ type: "stream_text", text: "child output" },
+					{
+						type: "stream_text",
+						blockRevision: 1,
+						blockTextOffset: 0,
+						blockId: "text-2",
+						text: "child output",
+					},
 					options.eventContext,
 					options.hooks,
 				);
@@ -1347,7 +1349,7 @@ describe("real shared orchestrator profile contract", () => {
 				h.runControl.wake?.("input");
 				expect((await run).hasError).toBe(false);
 				expect(h.calls).toHaveLength(2);
-				expect(h.calls[1].userText).toContain("manual resume");
+				expect(modelInputText(h.calls[1])).toContain("manual resume");
 				expect(getExecutionOwner(h.session.narratorId)).toBe(h.owner);
 			} finally {
 				await endRun(h, run);
@@ -1381,7 +1383,7 @@ describe("real shared orchestrator profile contract", () => {
 				const result = await run;
 				expect(result.hasError).toBe(false);
 				expect(h.calls).toHaveLength(2);
-				expect(h.calls[1].userText).toContain("after stop");
+				expect(modelInputText(h.calls[1])).toContain("after stop");
 			} finally {
 				await endRun(h, run);
 			}
@@ -1419,7 +1421,7 @@ describe("real shared orchestrator profile contract", () => {
 				setRunHold(fixtureRun.session.narratorId, { released: true });
 				fixtureRun.runControl.wake?.("input");
 				expect((await run).hasError).toBe(false);
-				expect(fixtureRun.calls.at(-1)?.userText).toContain("after backoff stop");
+				expect(modelInputText(fixtureRun.calls.at(-1))).toContain("after backoff stop");
 			} finally {
 				await endRun(fixtureRun, run);
 			}
@@ -1455,7 +1457,7 @@ describe("real shared orchestrator profile contract", () => {
 					return { ...finished, completedNaturally: false, hadToolUses: true };
 				},
 				async (options) => {
-					expect(options.userText).toContain("urgent input");
+					expect(modelInputText(options)).toContain("urgent input");
 					// Each pass gets a fresh urgent channel.
 					expect(options.config.urgentGuidanceSignal?.aborted).toBe(false);
 					return finished;
@@ -1563,11 +1565,14 @@ for (const profile of profiles) {
 				throw new Error("Real keyword lookup did not persist a knowledge hit");
 			const projected = projectMessageSenderText(knowledge, knowledge.contentText);
 			expect(projected).toStartWith('<sender kind="system" />\n');
-			expect(h.calls[0].userText).toStartWith(
-				'<sender kind="human" id="principal-a" name="principal-a" />\n',
+			// The request and its knowledge hit are both persisted rows the history carries.
+			expect(h.calls[0].userText).toBe("");
+			const input = modelInputText(h.calls[0]);
+			expect(input).toContain(
+				`<sender kind="human" id="principal-a" name="principal-a" />\n${request}`,
 			);
-			expect(h.calls[0].userText).toContain(`\n\n${projected}`);
-			expect(h.calls[0].userText.match(/<sender kind="system"/g)).toHaveLength(1);
+			expect(input).toContain(projected);
+			expect(input.match(/<sender kind="system"/g)).toHaveLength(1);
 			expect(knowledge.contentText).not.toContain("<sender ");
 			const rebuilt = await buildRuntimeHistory({
 				narratorId: h.session.narratorId,
@@ -1575,7 +1580,8 @@ for (const profile of profiles) {
 				provider: "orchestratorfixture",
 				sourceMessages: rawMessages,
 			});
-			expect(JSON.stringify(rebuilt.history)).toContain(JSON.stringify(projected).slice(1, -1));
+			// Live and rebuilt requests carry the same bytes.
+			expect(rebuilt.history).toEqual(h.calls[0].history.built ?? []);
 			expect(h.session._currentUserId).toBe("principal-a");
 		} finally {
 			settings.knowledge.injectMode = previousMode;

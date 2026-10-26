@@ -4,7 +4,7 @@ import { isValidCron } from "../cron";
 import { permissionModeSchema } from "../permission-modes";
 import { localeSchema } from "./common";
 
-const runContextEnum = z.enum(["standalone", "chapter"]);
+const runContextEnum = z.enum(["standalone", "project"]);
 const narratorModeEnum = z.enum(["new", "reuse"]);
 
 export const scheduledTaskCleanupPolicySchema = z.discriminatedUnion("mode", [
@@ -26,7 +26,6 @@ const baseFields = {
 	runContext: runContextEnum.optional(),
 	cwd: z.string().max(4096).optional().nullable(),
 	projectId: z.string().max(100).optional().nullable(),
-	chapterId: z.string().max(100).optional().nullable(),
 	narratorMode: narratorModeEnum.optional(),
 	cleanupPolicy: scheduledTaskCleanupPolicySchema.optional(),
 	enabled: z.boolean().optional(),
@@ -42,9 +41,9 @@ export const createScheduledTaskSchema = z
 		message: "Invalid cron expression",
 		path: ["cronExpr"],
 	})
-	// chapter runContext requires both projectId and chapterId; standalone ignores them.
-	.refine((d) => d.runContext !== "chapter" || (!!d.projectId && !!d.chapterId), {
-		message: "chapter runContext requires projectId and chapterId",
+	// project runContext requires projectId; standalone ignores it.
+	.refine((d) => d.runContext !== "project" || !!d.projectId, {
+		message: "project runContext requires projectId",
 	});
 
 export const updateScheduledTaskSchema = z
@@ -56,8 +55,8 @@ export const updateScheduledTaskSchema = z
 		message: "Invalid cron expression",
 		path: ["cronExpr"],
 	})
-	.refine((d) => d.runContext !== "chapter" || (!!d.projectId && !!d.chapterId), {
-		message: "chapter runContext requires projectId and chapterId",
+	.refine((d) => d.runContext !== "project" || !!d.projectId, {
+		message: "project runContext requires projectId",
 	});
 
 export const toggleScheduledTaskSchema = z.object({

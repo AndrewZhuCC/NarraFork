@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { ImageViewerContext } from "@frontend/components/common/image-viewer-context";
 import { ApiError, api } from "@frontend/lib/api";
-import { resetSessionStoreForTest } from "@frontend/lib/session-store";
+import { flush, resetSessionStoreForTest, writeSession } from "@frontend/lib/session-store";
 import { MantineProvider } from "@mantine/core";
 import {
 	type ComposerDocument,
@@ -26,7 +26,11 @@ import {
 	type NarratorComposerHandle,
 	type NarratorRemoteDraft,
 } from "./NarratorComposer";
-import { persistNarratorInputDraft, readNarratorInputDraft } from "./narrator-draft-storage";
+import {
+	getNarratorDraftStorageId,
+	persistNarratorInputDraft,
+	readNarratorInputDraft,
+} from "./narrator-draft-storage";
 
 const reference: FileReference = {
 	id: "occurrence",
@@ -59,7 +63,6 @@ let documentAssetsChange = mock((_ids: readonly string[]) => {});
 let getSpy: ReturnType<typeof spyOn<typeof api, "getNarratorDraft">>;
 let panelSpy: ReturnType<typeof spyOn<typeof api, "getNarratorPanelState">>;
 let updateSpy: ReturnType<typeof spyOn<typeof api, "updateNarratorDraft">>;
-let restoreSpy: ReturnType<typeof spyOn<typeof api, "restoreNarratorDraftPrevious">>;
 let mockServerRevision = 1;
 const previousGlobals = new Map<string, PropertyDescriptor | undefined>();
 
@@ -175,6 +178,8 @@ beforeEach(async () => {
 					attachments: narratorEn.attachments,
 					draftReplacedByRemote: "replaced by remote",
 					draftRestorePrevious: "restore original",
+					draftStaleLocalSetAside: "stale local set aside",
+					draftUseStaleLocal: "use stale local",
 					draftDismissReplace: "dismiss",
 				},
 			},
@@ -207,9 +212,6 @@ beforeEach(async () => {
 			hasDraft: !!text || !!fileReferences?.length || !!composerDocument?.assets.length,
 		}),
 	);
-	restoreSpy = spyOn(api, "restoreNarratorDraftPrevious").mockRejectedValue(
-		new Error("no undo slot"),
-	);
 	host = document.createElement("div");
 	document.body.append(host);
 	root = createRoot(host);
@@ -236,7 +238,6 @@ afterEach(async () => {
 	getSpy.mockRestore();
 	panelSpy.mockRestore();
 	updateSpy.mockRestore();
-	restoreSpy.mockRestore();
 	resetSessionStoreForTest();
 	for (const [key, descriptor] of previousGlobals) {
 		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
@@ -289,6 +290,14 @@ async function activateAttachment(name: string) {
 	const event = new Event("click", { bubbles: true });
 	Object.defineProperty(event, "detail", { value: 0 });
 	await act(async () => button?.dispatchEvent(event));
+}
+
+async function clickButton(label: string) {
+	const button = [...host.querySelectorAll("button")].find(
+		(candidate) => candidate.textContent === label,
+	);
+	expect(button).toBeDefined();
+	await act(async () => button?.click());
 }
 
 describe("composer local text attachment previews", () => {
@@ -432,7 +441,7 @@ describe("composer revision-only initial reconciliation", () => {
 	}
 
 	for (const edit of ["text", "references", "clear"] as const) {
-		test(`a real ${edit} edit during metadata loading remains dirty across switching`, async () => {
+		test(`a real ${edit} edit left unsynced yields to a newer remote and is offered back`, async () => {
 			const pending = deferred<Awaited<ReturnType<typeof api.getNarratorPanelState>>>();
 			panelSpy.mockReturnValueOnce(pending.promise);
 			const state = { text: "acknowledged", fileReferences: [reference] };
@@ -453,10 +462,29 @@ describe("composer revision-only initial reconciliation", () => {
 			getSpy.mockResolvedValue({ ...initial, hasDraft: true, text: "remote newer", revision: 8 });
 			testNarratorId = "n1";
 			await render();
+			// Revision 8 was written elsewhere after these edits: pushing them would replace it.
+			expect(handle.current?.getText()).toBe("remote newer");
+			expect(handle.current?.getFileReferences()).toEqual([]);
+			expect(readNarratorInputDraft("u1", "n1")).toMatchObject({
+				text: "remote newer",
+				syncedRevision: 8,
+			});
+			expect(updateSpy).not.toHaveBeenCalled();
+			expect(host.textContent).not.toContain("replaced by remote");
+			if (edit === "clear") {
+				// An empty stale copy has nothing worth offering back.
+				expect(host.textContent).not.toContain("stale local set aside");
+				return;
+			}
+			expect(host.textContent).toContain("stale local set aside");
+			await clickButton("use stale local");
 			expect(handle.current?.getText()).toBe(edited.text);
 			expect(handle.current?.getFileReferences()).toEqual(edited.fileReferences ?? []);
-			expect(readNarratorInputDraft("u1", "n1").unsynced).toBe(true);
-			expect(host.textContent).not.toContain("replaced by remote");
+			expect(host.textContent).not.toContain("stale local set aside");
+			await act(async () => {
+				await new Promise((resolve) => setTimeout(resolve, 820));
+			});
+			expect(updateSpy.mock.calls.at(-1)?.[1]).toBe(edited.text);
 		});
 	}
 
@@ -532,16 +560,14 @@ describe("composer revision-only initial reconciliation", () => {
 					sourceId: "other",
 				}),
 			);
-			if (localKind === "unsynced clear") {
-				expect(handle.current?.isTextEmpty()).toBe(true);
-				expect(host.textContent).not.toContain("replaced by remote");
-				expect(readNarratorInputDraft("u1", "n1").unsynced).toBe(true);
-			} else {
-				expect(handle.current?.getText()).toBe("new WS");
-				expect(handle.current?.getFileReferences()).toEqual([reference]);
-				expect(host.textContent).not.toContain("replaced by remote");
-				expect(readNarratorInputDraft("u1", "n1").syncedRevision).toBe(2);
-			}
+			// A stale unsynced clear must not wipe the newer remote draft.
+			expect(handle.current?.getText()).toBe("new WS");
+			expect(handle.current?.getFileReferences()).toEqual([reference]);
+			expect(readNarratorInputDraft("u1", "n1").syncedRevision).toBe(2);
+			expect(host.textContent).not.toContain("stale local set aside");
+			// Only replacing shown content earns the restore offer.
+			if (localKind === "acknowledged") expect(host.textContent).toContain("replaced by remote");
+			else expect(host.textContent).not.toContain("replaced by remote");
 			await act(async () =>
 				pending.resolve({
 					permissions: [],
@@ -550,7 +576,7 @@ describe("composer revision-only initial reconciliation", () => {
 					hasMore: { permissions: false, buffer: false },
 				}),
 			);
-			expect(handle.current?.getText()).toBe(localKind === "unsynced clear" ? "" : "new WS");
+			expect(handle.current?.getText()).toBe("new WS");
 			expect(getSpy).not.toHaveBeenCalled();
 		});
 	}
@@ -608,7 +634,7 @@ describe("composer revision-only initial reconciliation", () => {
 		expect(readNarratorInputDraft("u1", "n1").unsynced).toBe(true);
 	});
 
-	test("a newer server body cannot drop unsynced stored references", async () => {
+	test("a newer server body sets unsynced stored edits aside instead of pushing them", async () => {
 		persistNarratorInputDraft("u1", "n1", "dirty", 1, null, [reference], {
 			text: "old",
 			fileReferences: [],
@@ -622,8 +648,32 @@ describe("composer revision-only initial reconciliation", () => {
 		});
 		await render();
 		expect(host.textContent).not.toContain("replaced by remote");
+		expect(host.textContent).toContain("stale local set aside");
+		expect(handle.current?.getText()).toBe("other");
+		expect(handle.current?.getFileReferences()).toEqual([{ ...reference, deviceId: "other" }]);
+		await act(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 820));
+		});
+		expect(updateSpy).not.toHaveBeenCalled();
+		await clickButton("use stale local");
 		expect(handle.current?.getText()).toBe("dirty");
 		expect(handle.current?.getFileReferences()).toEqual([reference]);
+		await act(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 820));
+		});
+		expect(updateSpy.mock.calls.at(-1)?.[1]).toBe("dirty");
+	});
+
+	test("version-1 local text without a base survives an empty server", async () => {
+		writeSession(
+			"narrator-draft",
+			getNarratorDraftStorageId("u1", "n1"),
+			JSON.stringify({ version: 1, text: "legacy local", serverUpdatedAt: null }),
+		);
+		flush();
+		await render();
+		expect(handle.current?.getText()).toBe("legacy local");
+		expect(host.textContent).not.toContain("stale local set aside");
 	});
 
 	test("a late body cannot erase text and reference edits made while it loaded", async () => {
@@ -998,7 +1048,7 @@ describe("composer rich document contract", () => {
 		expect(handle.current?.getDocument()).toEqual(doc);
 		expect(nodeKinds()).toEqual(["text", "quote", "attachment", "fileReference", "text"]);
 	});
-	test("layout-only remote edits are ignored while local edits are unsynced", async () => {
+	test("a newer layout-only remote edit sets older unsynced local edits aside", async () => {
 		await render();
 		const doc = richDocument();
 		const input = composerDocumentText(doc);
@@ -1024,8 +1074,10 @@ describe("composer rich document contract", () => {
 				sourceId: "other",
 			}),
 		);
+		expect(handle.current?.getDocument()).toEqual(moved);
+		expect(host.textContent).toContain("stale local set aside");
+		await clickButton("use stale local");
 		expect(handle.current?.getDocument()).toEqual(doc);
-		expect(host.textContent).not.toContain("replaced by remote");
 	});
 	test.each([
 		"local edit",
@@ -1102,9 +1154,8 @@ describe("composer rich document contract", () => {
 		expect(handle.current?.getDocument()).toBeUndefined();
 		expect(handle.current?.hasMissingAssets()).toBe(false);
 		expect(host.textContent).not.toContain("draftLoadFailed");
-		// A remote clear of real content earns the undo offer; a content swap syncs silently.
-		if (change === "clear") expect(host.textContent).toContain("replaced by remote");
-		else expect(host.textContent).not.toContain("replaced by remote");
+		// Replacing real content, by a clear or by other text, earns the restore offer.
+		expect(host.textContent).toContain("replaced by remote");
 		expect(readNarratorInputDraft("u1", "n1")).toMatchObject({ text, syncedRevision: 4 });
 		expect(readNarratorInputDraft("u1", "n1").composerDocument).toBeUndefined();
 		expect(readNarratorInputDraft("u1", "n1").unsynced).toBeUndefined();
@@ -1568,7 +1619,7 @@ describe("composer atomic reference contract", () => {
 		expect(readNarratorInputDraft("u1", "n1").text).toBe(`${original.text}\nnew`);
 	});
 
-	test("metadata-only input is sendable and a different remote does not overwrite it", async () => {
+	test("metadata-only input is sendable and a newer remote sets it aside", async () => {
 		await render();
 		await act(async () => handle.current?.restoreInput("", [reference]));
 		expect(handle.current?.isTextEmpty()).toBe(false);
@@ -1587,7 +1638,9 @@ describe("composer atomic reference contract", () => {
 			sourceId: "another-editor",
 		};
 		await act(async () => handle.current?.handleDraftChanged(remote));
-		expect(host.textContent).not.toContain("replaced by remote");
+		expect(handle.current?.getFileReferences()[0].deviceId).toBe("local");
+		expect(host.textContent).toContain("stale local set aside");
+		await clickButton("use stale local");
 		expect(handle.current?.getFileReferences()[0].deviceId).toBe("RemoteABC");
 	});
 	test("synced remote clear removes text and refs while a same-source echo preserves new local refs", async () => {
@@ -1622,7 +1675,7 @@ describe("composer atomic reference contract", () => {
 		);
 		expect(handle.current?.getFileReferences()[0].id).toBe("newer-local");
 	});
-	test("a remote clear of real content offers the undo slot and restore swaps it back", async () => {
+	test("a remote clear of real content offers it back and restoring saves it again", async () => {
 		getSpy.mockResolvedValue({
 			...initial,
 			hasDraft: true,
@@ -1637,24 +1690,16 @@ describe("composer atomic reference contract", () => {
 		);
 		expect(handle.current?.isTextEmpty()).toBe(true);
 		expect(host.textContent).toContain("replaced by remote");
-		restoreSpy.mockResolvedValue({
-			...initial,
-			ok: true,
-			hasDraft: true,
-			text: "original",
-			fileReferences: [reference],
-			revision: 3,
-		});
-		const restoreButton = [...host.querySelectorAll("button")].find(
-			(button) => button.textContent === "restore original",
-		);
-		await act(async () => restoreButton?.click());
-		expect(restoreSpy).toHaveBeenCalledTimes(1);
+		await clickButton("restore original");
 		expect(handle.current?.getText()).toBe("original");
 		expect(handle.current?.getFileReferences()).toEqual([reference]);
 		expect(host.textContent).not.toContain("replaced by remote");
+		await act(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 820));
+		});
+		expect(updateSpy.mock.calls.at(-1)?.[1]).toBe("original");
 	});
-	test("a remote write that keeps content silent-syncs without the undo offer", async () => {
+	test("a remote write that swaps content also offers the replaced version back", async () => {
 		getSpy.mockResolvedValue({ ...initial, hasDraft: true, text: "original" });
 		await render();
 		await act(async () =>
@@ -1667,6 +1712,23 @@ describe("composer atomic reference contract", () => {
 			}),
 		);
 		expect(handle.current?.getText()).toBe("edited elsewhere");
+		expect(host.textContent).toContain("replaced by remote");
+		await clickButton("restore original");
+		expect(handle.current?.getText()).toBe("original");
+	});
+	test("a remote write identical to the shown draft stays silent", async () => {
+		getSpy.mockResolvedValue({ ...initial, hasDraft: true, text: "original" });
+		await render();
+		await act(async () =>
+			handle.current?.handleDraftChanged({
+				...initial,
+				hasDraft: true,
+				text: "original",
+				revision: 2,
+				sourceId: "other",
+			}),
+		);
+		expect(handle.current?.getText()).toBe("original");
 		expect(host.textContent).not.toContain("replaced by remote");
 	});
 	test("editing after a remote clear dismisses the undo offer", async () => {
@@ -1679,7 +1741,7 @@ describe("composer atomic reference contract", () => {
 		await act(async () => handle.current?.setText("fresh typing"));
 		expect(host.textContent).not.toContain("replaced by remote");
 	});
-	test("a later non-empty remote write supersedes the undo offer", async () => {
+	test("a later remote write keeps offering the version this composer showed", async () => {
 		getSpy.mockResolvedValue({ ...initial, hasDraft: true, text: "original" });
 		await render();
 		await act(async () =>
@@ -1696,7 +1758,9 @@ describe("composer atomic reference contract", () => {
 			}),
 		);
 		expect(handle.current?.getText()).toBe("fresh content");
-		expect(host.textContent).not.toContain("replaced by remote");
+		expect(host.textContent).toContain("replaced by remote");
+		await clickButton("restore original");
+		expect(handle.current?.getText()).toBe("original");
 	});
 	test("newer reconnect metadata pulls the missed body and follows it when clean", async () => {
 		await render();
@@ -1715,7 +1779,7 @@ describe("composer atomic reference contract", () => {
 		);
 		expect(getSpy).toHaveBeenCalledTimes(1);
 	});
-	test("newer reconnect metadata never overwrites unsynced local typing", async () => {
+	test("newer reconnect metadata sets older unsynced local typing aside", async () => {
 		await render();
 		await act(async () => handle.current?.setText("typed while offline"));
 		getSpy.mockClear();
@@ -1724,7 +1788,9 @@ describe("composer atomic reference contract", () => {
 			handle.current?.handleDraftMeta({ hasDraft: true, revision: 5, updatedAt: "t5" }),
 		);
 		expect(getSpy).toHaveBeenCalledTimes(1);
+		expect(handle.current?.getText()).toBe("from elsewhere");
+		expect(host.textContent).toContain("stale local set aside");
+		await clickButton("use stale local");
 		expect(handle.current?.getText()).toBe("typed while offline");
-		expect(host.textContent).not.toContain("replaced by remote");
 	});
 });

@@ -146,7 +146,16 @@ describe("ScheduledTask argument validation", () => {
 		expect(result.output).toContain("Mars/Olympus");
 	});
 
-	test("chapter runContext names the specific missing id", async () => {
+	test("project runContext names the specific missing id", async () => {
+		const result = await run({
+			action: "create",
+			task: { name: "In project", cronExpr: "0 9 * * *", prompt: "hi", runContext: "project" },
+		});
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("projectId");
+	});
+
+	test("the removed chapter runContext is refused", async () => {
 		const result = await run({
 			action: "create",
 			task: {
@@ -158,8 +167,8 @@ describe("ScheduledTask argument validation", () => {
 			},
 		});
 		expect(result.isError).toBe(true);
-		expect(result.output).toContain("chapterId");
-		expect(result.output).not.toContain("projectId and");
+		expect(result.output).toContain("Invalid ScheduledTask arguments");
+		expect(result.output).toContain("runContext");
 	});
 
 	test("update with no fields is refused instead of writing an empty patch", async () => {

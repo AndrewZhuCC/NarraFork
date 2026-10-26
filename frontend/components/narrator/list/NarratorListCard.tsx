@@ -3,6 +3,7 @@ import {
 	IconArchive,
 	IconArchiveOff,
 	IconBox,
+	IconRobot,
 	IconServer,
 	IconSubtask,
 	IconTerminal2,
@@ -53,15 +54,6 @@ export interface NarratorListViewer {
 	avatarImageId: string | null;
 }
 
-export interface NarratorListChapter {
-	id: string;
-	title: string;
-	projectId: string;
-	projectName: string | null;
-	status: string;
-	role: string;
-}
-
 export interface NarratorListItem {
 	id: string;
 	title?: string | null;
@@ -72,6 +64,8 @@ export interface NarratorListItem {
 	messageCount?: number | null;
 	/** Custom avatar image id; absent → the identicon derived from the narrator id. */
 	avatarImageId?: string | null;
+	/** Public trait tags; only `bot` is read here (it changes what opening the card shows). */
+	traits?: string[] | null;
 	createdAt: string;
 	lastMessageAt?: string | null;
 	activeTerminalCount?: number | null;
@@ -80,7 +74,6 @@ export interface NarratorListItem {
 	activeBackgroundServiceCount?: number | null;
 	containerCount?: number | null;
 	runningContainerCount?: number | null;
-	chapter?: NarratorListChapter | null;
 	viewers?: NarratorListViewer[] | null;
 }
 
@@ -169,6 +162,17 @@ function NarratorBadges({
 	const runningContainers = narrator.runningContainerCount ?? 0;
 	return (
 		<>
+			{narrator.traits?.includes("bot") && (
+				<Badge
+					size="xs"
+					variant="light"
+					color="grape"
+					leftSection={<IconRobot size={10} />}
+					style={mobile ? { flexShrink: 0 } : undefined}
+				>
+					{t("botBadge")}
+				</Badge>
+			)}
 			{activeTerminals > 0 && (
 				<Badge
 					size="xs"
@@ -221,13 +225,8 @@ function NarratorBadges({
 
 function ProjectCwdLine({ narrator }: { narrator: NarratorListItem }) {
 	const { t } = useTranslation("narrators");
-	const chapter = narrator.chapter;
-	if (!chapter?.projectName && !narrator.cwd) return null;
+	if (!narrator.cwd) return null;
 	const parts = [
-		chapter?.projectName &&
-			t("projectLabel", {
-				name: clampNarratorListText(chapter.projectName, MAX_NARRATOR_LIST_META_CHARS),
-			}),
 		narrator.cwd &&
 			t("cwdLabel", {
 				path: clampNarratorListText(narrator.cwd, MAX_NARRATOR_LIST_META_CHARS),

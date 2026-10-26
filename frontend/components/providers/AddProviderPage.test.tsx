@@ -6,7 +6,8 @@ import type { Root } from "react-dom/client";
 import { ApiError } from "../../lib/api";
 import settingsEn from "../../locales/en/settings.json";
 import settingsZhCn from "../../locales/zh-CN/settings.json";
-import { TokenDanceAddContext } from "./provider-add-context";
+import { defaultLocalImportSelection } from "./LocalProviderImport";
+import { ProviderImportContext, TokenDanceAddContext } from "./provider-add-context";
 import type { AddProviderDraft } from "./provider-add-draft";
 import { PROVIDER_PRESETS } from "./provider-presets";
 
@@ -72,7 +73,7 @@ installDom();
 const { createRoot } = await import("react-dom/client");
 const { MantineProvider } = await import("@mantine/core");
 const { I18nextProvider } = await import("react-i18next");
-const { AddProviderPage } = await import("./AddProviderPage");
+const { AddProviderPage, defaultAddProviderPresetId } = await import("./AddProviderPage");
 const i18n = createInstance();
 await i18n.init({
 	lng: "en",
@@ -214,7 +215,8 @@ describe("AddProviderPage interactions", () => {
 		],
 		[new Error("secret request body"), "loginStartClientFailed"],
 	] as const) {
-		for (const language of ["en", "zh-CN"] as const) {
+		// TokenDance is only offered in the Chinese UI.
+		for (const language of ["zh-CN"] as const) {
 			test(`TokenDance start failure is actionable and redacted (${language}, ${key}, ${error instanceof ApiError ? error.status : "client"})`, async () => {
 				await act(async () => {
 					await i18n.changeLanguage(language);
@@ -302,13 +304,13 @@ describe("AddProviderPage interactions", () => {
 		expect(button("addProviderContinue").disabled).toBe(false);
 	});
 
-	test("popular shows the seven requested providers in order and search spans the full catalog", async () => {
+	test("popular shows the requested providers in order and search spans the full catalog", async () => {
 		const ids = () =>
 			[...container.querySelectorAll("button[data-provider-preset]")].map((node) =>
 				node.getAttribute("data-provider-preset"),
 			);
+		// English UI: TokenDance is hidden everywhere, including search and "all".
 		expect(ids()).toEqual([
-			"tokendance",
 			"deepseek",
 			"zhipu",
 			"moonshot",
@@ -318,12 +320,25 @@ describe("AddProviderPage interactions", () => {
 			"anthropic",
 		]);
 		await click(button("addProviderCategoryAll"));
-		expect(ids().length).toBe(PROVIDER_PRESETS.length);
+		expect(ids().length).toBe(PROVIDER_PRESETS.length - 1);
+		expect(ids()).not.toContain("tokendance");
 		await click(button("addProviderCategoryPopular"));
 		await type("addProviderSearch", "Groq");
 		expect(ids()).toEqual(["groq"]);
+		await type("addProviderSearch", "TokenDance");
+		expect(ids()).toEqual([]);
 		await type("addProviderSearch", "");
-		expect(ids().length).toBe(8);
+		expect(ids().length).toBe(7);
+	});
+
+	test("Chinese UI lists TokenDance first with its tagline", async () => {
+		await act(async () => {
+			await i18n.changeLanguage("zh-CN");
+		});
+		const card = container.querySelector('button[data-provider-preset="tokendance"]');
+		expect(card).not.toBeNull();
+		expect(container.querySelector("button[data-provider-preset]")).toBe(card);
+		expect(card?.textContent).toContain("便捷使用正规国模");
 	});
 
 	test("Chinese defaults the four configurable platforms to China without overriding manual choices", async () => {
@@ -579,5 +594,111 @@ describe("AddProviderPage interactions", () => {
 		expect(field("addProviderApiKey").value).toBe("entered-key");
 		expect(field("providerPrefix").value).toBe("");
 		expect(added).toEqual([]);
+	});
+});
+
+describe("import from this machine", () => {
+	async function renderWithImport(
+		sources: Array<{
+			source: "claude" | "codex" | "opencode" | "deepseek-harness";
+			found: boolean;
+		}>,
+		detecting = false,
+	) {
+		await act(async () => {
+			root?.render(
+				<I18nextProvider i18n={i18n}>
+					<MantineProvider env="test">
+						<ProviderImportContext
+							value={{
+								importProvider: async () => ({ refreshFailed: false }),
+								detectedSources: detecting ? undefined : sources,
+								detecting,
+							}}
+						>
+							<AddProviderPage onClose={() => closeCount++} onAdd={addHandler} />
+						</ProviderImportContext>
+					</MantineProvider>
+				</I18nextProvider>,
+			);
+		});
+	}
+	const importOption = () => container.querySelector("button[data-local-import-option]");
+	const selectedPreset = () =>
+		container
+			.querySelector("button[data-provider-preset][data-selected]")
+			?.getAttribute("data-provider-preset") ?? null;
+
+	test("without the import context there is no import entry and DeepSeek is preselected (English)", () => {
+		expect(importOption()).toBeNull();
+		expect(selectedPreset()).toBe("deepseek");
+		expect(field("addProviderBaseUrl").value).toBe("https://api.deepseek.com/v1");
+	});
+
+	test("detected configs add the entry above the catalog and select it by default", async () => {
+		root?.unmount();
+		root = createRoot(container);
+		await renderWithImport([
+			{ source: "claude", found: false },
+			{ source: "codex", found: true },
+			{ source: "opencode", found: false },
+			{ source: "deepseek-harness", found: true },
+		]);
+		const option = importOption();
+		expect(option?.getAttribute("aria-pressed")).toBe("true");
+		expect(option?.textContent).toContain("Codex");
+		expect(option?.textContent).toContain("DeepSeek Harness");
+		expect(selectedPreset()).toBeNull();
+		// The right pane holds the import controls; nothing is read before authorizing.
+		expect(button("localImport.authorize")).toBeTruthy();
+		expect(container.querySelector("[data-local-import-candidate]")).toBeNull();
+		// Picking a preset leaves import; picking import again returns to it.
+		await click(preset("OpenAI"));
+		expect(importOption()?.getAttribute("aria-pressed")).toBe("false");
+		expect(() => button("localImport.authorize")).toThrow();
+		await click(importOption() as Element);
+		expect(button("localImport.authorize")).toBeTruthy();
+	});
+
+	test("no detected config hides the entry; waits for detection before defaulting", async () => {
+		root?.unmount();
+		root = createRoot(container);
+		await renderWithImport([], true);
+		expect(selectedPreset()).toBeNull();
+		await renderWithImport([
+			{ source: "claude", found: false },
+			{ source: "codex", found: false },
+		]);
+		expect(importOption()).toBeNull();
+		expect(selectedPreset()).toBe("deepseek");
+	});
+
+	test("Chinese UI without importable configs preselects TokenDance", async () => {
+		root?.unmount();
+		root = createRoot(container);
+		await act(async () => {
+			await i18n.changeLanguage("zh-CN");
+		});
+		await renderWithImport([{ source: "codex", found: false }]);
+		expect(selectedPreset()).toBe("tokendance");
+		expect(defaultAddProviderPresetId("zh-CN")).toBe("tokendance");
+		expect(defaultAddProviderPresetId("en")).toBe("deepseek");
+	});
+
+	test("default selection skips providers without a key or already configured", () => {
+		const base = {
+			source: "codex" as const,
+			name: "x",
+			protocol: "openai-responses" as const,
+			baseUrl: "https://example.com/v1",
+			apiKeyPreview: "",
+			configPath: "/x",
+		};
+		const selection = defaultLocalImportSelection([
+			{ ...base, id: "a", hasKey: true, alreadyConfigured: false },
+			{ ...base, id: "b", hasKey: true, alreadyConfigured: true },
+			{ ...base, id: "c", hasKey: false, alreadyConfigured: false },
+		]);
+		expect([...selection]).toEqual(["a"]);
 	});
 });

@@ -399,24 +399,14 @@ test.each([
 		},
 	];
 	const abortedHistory: unknown[] = [];
-	trackAgentMessageHistory(
-		"recipient",
-		abortedHistory,
-		candidates,
-		kind === "task_notice" ? input.text : undefined,
-	);
+	trackAgentMessageHistory("recipient", abortedHistory, candidates);
 	expect(store.getByDelivery(row.deliveryId as string)?.adoptedAt).toBeNull();
-	consumeAgentMessageHistory(abortedHistory, "unrelated replacement input");
+	consumeAgentMessageHistory(abortedHistory);
 	await Promise.resolve();
 	expect(store.getByDelivery(row.deliveryId as string)?.adoptedAt).toBeNull();
 	const coldHistory: unknown[] = [];
-	trackAgentMessageHistory(
-		"recipient",
-		coldHistory,
-		candidates,
-		kind === "task_notice" ? input.text : undefined,
-	);
-	consumeAgentMessageHistory(coldHistory, input.text);
+	trackAgentMessageHistory("recipient", coldHistory, candidates);
+	consumeAgentMessageHistory(coldHistory);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	expect(store.getByDelivery(row.deliveryId as string)?.adoptedAt).toBeString();
 	await markMailboxDeliveryConsumed({
@@ -505,7 +495,7 @@ test.each([
 		contentText: "edited third",
 		contentJson: [{ type: "text", text: "edited third" }],
 	});
-	consumeAgentMessageHistory(history2, "edited second");
+	consumeAgentMessageHistory(history2);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	expect(store.getByDelivery(row.deliveryId as string)).toMatchObject({
 		currentRevision: 3,
@@ -521,7 +511,7 @@ test.each([
 			contentJson: [{ type: "text", text: "edited third" }],
 		},
 	]);
-	consumeAgentMessageHistory(history3, "edited third");
+	consumeAgentMessageHistory(history3);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	expect(store.getByDelivery(row.deliveryId as string)).toMatchObject({
 		contentRevision: 1,
@@ -560,7 +550,7 @@ test("edited revision cannot be adopted through a fork COW or after recipient de
 			contentJson: [{ type: "text", text: "edited" }],
 		},
 	]);
-	consumeAgentMessageHistory(forkHistory, "edited");
+	consumeAgentMessageHistory(forkHistory);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	expect(store.getByDelivery(row.deliveryId as string)?.currentAdoptedAt).toBeNull();
 	const recipientHistory: unknown[] = [];
@@ -573,7 +563,7 @@ test("edited revision cannot be adopted through a fork COW or after recipient de
 		},
 	]);
 	await messageService.deleteMessage("recipient", message.id, { skipRevert: true });
-	consumeAgentMessageHistory(recipientHistory, "edited");
+	consumeAgentMessageHistory(recipientHistory);
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	expect(store.getByDelivery(row.deliveryId as string)).toMatchObject({
 		receiptDisposition: "recipient_deleted",
@@ -714,7 +704,7 @@ test("fork COW cannot acknowledge another recipient even with the same envelope"
 	trackAgentMessageHistory("fork", history, [
 		{ id: current, narratorId: "fork", role: "user", contentJson: content?.contentJson },
 	]);
-	consumeAgentMessageHistory(history, "original");
+	consumeAgentMessageHistory(history);
 	await markAgentMessageConsumed({
 		...delivery(row),
 		recipientNarratorId: "fork",

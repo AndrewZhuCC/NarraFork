@@ -84,7 +84,7 @@ import { AppError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { isSecretPlatformPath } from "../lib/fs-secret-paths";
 import { logger } from "../lib/logger";
-import { isPlanModeTrait, isSubagentVariant } from "../lib/narrator-utils";
+import { isBotNarrator, isPlanModeTrait, isSubagentVariant } from "../lib/narrator-utils";
 import {
 	type DeviceAccessPolicy,
 	intersectOAuthClientPolicies,
@@ -464,16 +464,6 @@ function formatBlacklistReason(dir: DirectoryBlacklistRule, matchedPath: string)
 	return `Blacklisted by ${src}-level rule: "${dir.path}" (${level}), matched path: ${matchedPath}`;
 }
 
-function getChapterGitPermissionIssues(bashAnalysis?: BashAnalysis): string[] {
-	return [...(bashAnalysis?.gitBranchViolations ?? []), ...(bashAnalysis?.gitBranchWarnings ?? [])];
-}
-
-function resolveChapterGitIssueDecision(effectiveMode: string): "allow" | "deny" | "ask" {
-	if (effectiveMode === "bypassPermissions") return "allow";
-	if (effectiveMode === "dontAsk" || effectiveMode === "readOnly") return "deny";
-	return "ask";
-}
-
 function isSpecTasksPath(value: unknown): boolean {
 	if (!specVfsService.isSpecUri(value)) return false;
 	try {
@@ -766,7 +756,6 @@ export function resolvePermissionDecision(
 		permMode,
 		cwd,
 		bashAnalysis,
-		isChapter = false,
 		planFileId,
 		planFilePath: designatedPlanFilePath,
 		relaxedPlan = false,
@@ -967,9 +956,21 @@ export function resolvePermissionDecision(
 		return "allow";
 	}
 
-	const chapterGitIssues = isChapter ? getChapterGitPermissionIssues(bashAnalysis) : [];
-	if (isBashToolName(toolName) && chapterGitIssues.length > 0) {
-		return resolveChapterGitIssueDecision(effectiveMode);
+	// Review-tier `.git` writes sit above allowlists, acceptEdits and bypassPermissions so
+	// none of them can auto-allow. Under bypassPermissions handlePermission routes this
+	// "ask" to danger reflection when it is enabled.
+	const gitReviewReason = resolveGitInternalReviewReason(
+		toolName,
+		input,
+		cwd,
+		bashAnalysis,
+		context,
+		executionBackend,
+		executionTarget,
+	);
+	if (gitReviewReason) {
+		if (meta) meta.gitInternalReviewReason = gitReviewReason;
+		return effectiveMode === "readOnly" || effectiveMode === "dontAsk" ? "deny" : "ask";
 	}
 
 	// Showing existing files is read-only; an allowlist must never let create
@@ -1341,6 +1342,8 @@ export interface PermissionDecisionMeta {
 	commandBlacklistReason?: string;
 	commandBlacklistDenyPrompt?: string;
 	planModeSoftDeny?: boolean;
+	/** Set when the call writes `.git` internals that need a review (see classifyGitInternalPath). */
+	gitInternalReviewReason?: string;
 }
 
 /**
@@ -1420,7 +1423,6 @@ export interface PermissionDecisionOpts {
 	permMode: string;
 	cwd: string;
 	bashAnalysis?: BashAnalysis;
-	isChapter?: boolean;
 	planFileId?: string;
 	/**
 	 * Resolved relative path of the designated plan file. Supplied by the caller
@@ -1543,7 +1545,7 @@ function areUnsafeCommandsWhitelistedForDanger(
  * Tools whose extracted path input is a write target (including worktree destinations).
  *
  * Membership is SECURITY-RELEVANT in two places, and in both an omission fails open:
- * the `.git` write ban below, and the OAuth read-only device policy. A file-modifying
+ * the `.git` write tiers below, and the OAuth read-only device policy. A file-modifying
  * tool missing from this set gets neither check and is silently allowed through.
  */
 const WRITE_TOOLS = new Set([
@@ -1560,8 +1562,124 @@ function executionPathOS(backend?: ExecutionBackend): string {
 	return backend?.platform?.os ?? (process.platform === "win32" ? "windows" : "posix");
 }
 
-function isGitInternalPath(absPath: string, os: string): boolean {
-	return normalizePathForOS(absPath, os).split("/").includes(".git");
+// ── `.git` internals: three write tiers ─────────────────
+//
+// forbidden — git executes or trusts the content (hooks, config, object storage, gitdir
+//   redirects): hard deny in every mode, bypassPermissions included.
+// review    — git's own state (refs, index, HEAD, unknown files, a rebase todo that may run
+//   `exec` lines): never auto-allowed by allowlists or acceptEdits. It is a human prompt, or
+//   danger reflection under bypassPermissions when reflection is enabled.
+// editable  — files git hands to $EDITOR in ordinary workflows: an ordinary file write.
+
+type GitInternalPathTier = "forbidden" | "review" | "editable";
+
+/** Tools that write text into an existing path; any other write tool targeting `.git` is denied. */
+const GIT_CONTENT_WRITE_TOOLS = new Set(["Write", "Edit", "NotebookEdit", "StructSed"]);
+const GIT_FORBIDDEN_DIRS = new Set(["hooks", "objects"]);
+const GIT_FORBIDDEN_FILES = new Set(["config", "config.worktree", "commondir", "gitdir"]);
+const GIT_EDITABLE_FILES = new Set([
+	"commit_editmsg",
+	"merge_msg",
+	"squash_msg",
+	"tag_editmsg",
+	"notes_editmsg",
+	"edit_description",
+	"rebase-merge/message",
+	"info/exclude",
+]);
+/** Todo lists whose `exec`/`x` lines git runs as shell commands on `--continue`. */
+const GIT_TODO_FILES = new Set(["rebase-merge/git-rebase-todo", "sequencer/todo"]);
+const GIT_TODO_EXEC_LINE = /^\s*(?:x|exec)(?:\s|$)/im;
+
+/**
+ * Segments below the first `.git` segment (lowercased), or null outside `.git`. Windows
+ * ignores trailing dots/spaces and `:stream` suffixes, so `config.` and `config::$DATA` are
+ * still `config` there.
+ */
+function gitInternalSegments(absPath: string, os: string): string[] | null {
+	const windows = os === "win32" || os === "windows";
+	const segments = normalizePathForOS(absPath, os)
+		.split("/")
+		.map((segment) => {
+			const lower = segment.toLowerCase();
+			return windows ? lower.replace(/:.*$/, "").replace(/[. ]+$/, "") : lower;
+		});
+	const index = segments.indexOf(".git");
+	return index < 0 ? null : segments.slice(index + 1);
+}
+
+/**
+ * Only a full-content Write is provably free of `exec` lines: an Edit or shell edit can
+ * splice one together from text already in the file.
+ */
+function isInertGitTodoWrite(toolName: string, input: Record<string, unknown>): boolean {
+	return (
+		toolName === "Write" &&
+		typeof input.content === "string" &&
+		!GIT_TODO_EXEC_LINE.test(input.content)
+	);
+}
+
+function classifyGitInternalPath(
+	absPath: string,
+	os: string,
+	toolName: string,
+	input: Record<string, unknown>,
+): GitInternalPathTier | null {
+	const rel = gitInternalSegments(absPath, os);
+	if (!rel) return null;
+	// The `.git` entry itself (directory, or a linked worktree's gitfile).
+	if (rel.length === 0) return "forbidden";
+	// A linked worktree's admin dir (.git/worktrees/<name>/) mirrors the main layout.
+	const local = rel[0] === "worktrees" && rel.length > 2 ? rel.slice(2) : rel;
+	// Ref names are user-chosen (a branch may be called `hooks`); refs stay reviewable.
+	if (local[0] !== "refs" && local[0] !== "logs") {
+		if (local.some((segment) => GIT_FORBIDDEN_DIRS.has(segment))) return "forbidden";
+		if (GIT_FORBIDDEN_FILES.has(local[local.length - 1])) return "forbidden";
+	}
+	const key = local.join("/");
+	if (GIT_EDITABLE_FILES.has(key)) return "editable";
+	if (GIT_TODO_FILES.has(key)) return isInertGitTodoWrite(toolName, input) ? "editable" : "review";
+	return "review";
+}
+
+/**
+ * Review-tier `.git` write targets of this call, as a reason string, or null. Forbidden
+ * targets are handled by resolveProtectedPathDeny before this runs.
+ */
+function resolveGitInternalReviewReason(
+	toolName: string,
+	input: Record<string, unknown>,
+	cwd: string,
+	bashAnalysis?: BashAnalysis,
+	executionContext?: ExecutionTargetContext | null,
+	executionBackend?: ExecutionBackend,
+	executionTarget?: Readonly<ToolExecutionTarget>,
+): string | null {
+	const targetOS = executionPathOS(executionContext?.backend ?? executionBackend);
+	if (GIT_CONTENT_WRITE_TOOLS.has(toolName)) {
+		if (isReadOnlyCall(toolName, input)) return null;
+		const filePath = extractToolPaths(toolName, input)[0] ?? "";
+		if (!filePath) return null;
+		const absPath = resolveProtectedTargetPath(
+			filePath,
+			cwd,
+			executionContext,
+			executionBackend,
+			executionTarget,
+		);
+		return classifyGitInternalPath(absPath, targetOS, toolName, input) === "review"
+			? `Write to .git internal file requires review: ${absPath}`
+			: null;
+	}
+	if (isBashToolName(toolName) && bashAnalysis?.hasWriteOperation) {
+		const paths = bashAnalysis.filePaths.filter(
+			(path) => classifyGitInternalPath(path, targetOS, toolName, input) === "review",
+		);
+		if (paths.length > 0)
+			return `Shell write operation targeting .git internals requires review: ${paths.join(", ")}`;
+	}
+	return null;
 }
 
 function resolveProtectedTargetPath(
@@ -1703,8 +1821,9 @@ function resolveProtectedPathDeny(
 			executionBackend,
 			executionTarget,
 		);
-		if (isGitInternalPath(absPath, targetOS)) {
-			return `Write to .git directory is forbidden: ${absPath}`;
+		const gitTier = classifyGitInternalPath(absPath, targetOS, toolName, input);
+		if (gitTier === "forbidden" || (gitTier && !GIT_CONTENT_WRITE_TOOLS.has(toolName))) {
+			return `Write to protected .git internals is forbidden: ${absPath}`;
 		}
 		// Only the host configuration is trusted to enable security switches. Reads and
 		// trusted settings APIs remain available; another device's same path is unrelated.
@@ -1734,8 +1853,8 @@ function resolveProtectedPathDeny(
 	if (isBashToolName(toolName) && bashAnalysis) {
 		if (bashAnalysis.hasWriteOperation) {
 			for (const p of bashAnalysis.filePaths) {
-				if (isGitInternalPath(p, targetOS)) {
-					return `Shell write operation targeting .git directory is forbidden: ${p}`;
+				if (classifyGitInternalPath(p, targetOS, toolName, input) === "forbidden") {
+					return `Shell write operation targeting protected .git internals is forbidden: ${p}`;
 				}
 			}
 		}
@@ -1762,8 +1881,8 @@ function resolveProtectedPathDeny(
 				for (const arg of cmd.tokens.slice(1)) {
 					if (arg.startsWith("-")) continue;
 					const absArg = targetPaths.resolve(targetCwd, arg);
-					if (isGitInternalPath(absArg, targetOS)) {
-						return `Destructive operation on .git directory is forbidden: ${cmdName} ${absArg}`;
+					if (classifyGitInternalPath(absArg, targetOS, toolName, input) === "forbidden") {
+						return `Destructive operation on protected .git internals is forbidden: ${cmdName} ${absArg}`;
 					}
 					const structural = isStructuralPath(absArg, projectGitPath);
 					if (structural) {
@@ -2585,7 +2704,6 @@ function classifyShellDanger(
 		bashAnalysis,
 		commandWhitelist,
 	);
-	const chapterGitIssues = getChapterGitPermissionIssues(bashAnalysis);
 	for (const cmd of bashAnalysis.commands) {
 		const [name, ...args] = cmd.tokens;
 		if (name === "git") {
@@ -2649,20 +2767,6 @@ function classifyShellDanger(
 				);
 			}
 		}
-	}
-	if (chapterGitIssues.length > 0) {
-		return danger(
-			"Git command changes chapter branch/worktree state.",
-			[
-				"The command can switch, create, delete, rewrite, or otherwise move branch/worktree state outside the normal chapter workflow.",
-				"NarraFork may lose track of which chapter owns the resulting git state.",
-			],
-			[
-				"Prefer NarraFork chapter/fork/merge operations for branch and worktree changes.",
-				"If this git operation is intentional, confirm the exact target branch or worktree first.",
-			],
-			chapterGitIssues.map((issue) => `Chapter git issue: ${issue}`),
-		);
 	}
 	if (bashAnalysis.hasEnvInjection) {
 		return danger(
@@ -2745,7 +2849,7 @@ function classifyShellDanger(
 		return danger(
 			"Shell command accesses paths outside the current working directory.",
 			[
-				"The command may read or modify files outside this chapter/worktree boundary.",
+				"The command may read or modify files outside this worktree boundary.",
 				"Those files may not be covered by NarraFork snapshots or git recovery.",
 			],
 			[
@@ -2760,6 +2864,55 @@ function classifyShellDanger(
 }
 
 export function classifyDanger(
+	toolName: string,
+	input: Record<string, unknown>,
+	cwd: string,
+	bashAnalysis?: BashAnalysis,
+	whitelistDirs: WhitelistDir[] = [],
+	commandWhitelist: CommandWhitelistEntry[] = [],
+	skipReadOnlyConfirmations = false,
+	compiledPolicy?: CompiledExecutionPolicy,
+	executionContext?: ExecutionTargetContext | null,
+): DangerInfo | null {
+	const base = classifyToolDanger(
+		toolName,
+		input,
+		cwd,
+		bashAnalysis,
+		whitelistDirs,
+		commandWhitelist,
+		skipReadOnlyConfirmations,
+		compiledPolicy,
+		executionContext,
+	);
+	const gitReviewReason = resolveGitInternalReviewReason(
+		toolName,
+		input,
+		cwd,
+		bashAnalysis,
+		executionContext,
+	);
+	if (!gitReviewReason) return base;
+	// "high" so every enabled reflection level reflects; a critical base risk keeps its rank.
+	const severity = base?.severity === "critical" ? "critical" : "high";
+	return danger(
+		base?.severity === "critical" ? base.summary : `${toolName} writes git internal state.`,
+		[
+			"Hand-edited refs, index or HEAD can detach or lose commits without a git safety check.",
+			"A rebase/sequencer todo may contain exec lines that run shell commands on --continue.",
+			...(base?.consequences ?? []),
+		],
+		[
+			"Use the corresponding git command (update-ref, rebase --edit-todo, reset) instead.",
+			"For a rebase todo, write the full file with Write and no exec lines.",
+			...(base?.saferAlternatives ?? []),
+		],
+		[gitReviewReason, ...(base?.details ?? [])],
+		severity,
+	);
+}
+
+function classifyToolDanger(
 	toolName: string,
 	input: Record<string, unknown>,
 	cwd: string,
@@ -2926,7 +3079,7 @@ export function classifyDanger(
 		return danger(
 			`${toolName} targets paths outside the current working directory.`,
 			[
-				"The operation crosses the chapter/worktree boundary.",
+				"The operation crosses the worktree boundary.",
 				"External files may not be covered by project git history or NarraFork snapshots.",
 			],
 			[
@@ -3148,6 +3301,10 @@ export async function shouldAutoAllowSendWithinScope(
 ): Promise<boolean> {
 	try {
 		if (!caller) return false;
+		// A bot's message to a person is its only voice; asking approval for every reply
+		// would make it mute. Delivery re-reads the bot trait, so a non-bot never gets here
+		// to a successful send.
+		if (input.user !== undefined) return isBotNarrator(caller.traits);
 		const root = teamRootOf({ ...caller, id: narratorId });
 		const callerIsSubagent = root !== narratorId;
 		const teamParentId = callerIsSubagent ? root : null;
@@ -4461,7 +4618,6 @@ function finalPermissionSnapshot(check: FinalToolPermissionCheck) {
 	const narrator = db
 		.select({
 			id: narrators.id,
-			chapterId: narrators.chapterId,
 			contextProjectId: narrators.contextProjectId,
 			parentNarratorId: narrators.parentNarratorId,
 			type: narrators.type,
@@ -4701,7 +4857,6 @@ export async function recheckFinalToolExecutionPermission(
 			check.input.command,
 			cwd,
 			resolvePermissionShellType(context?.backend),
-			!!before.narrator.chapterId,
 			context?.paths ?? localPathSemantics,
 		);
 		if (context) analysis = await canonicalizeShellAnalysisPaths(analysis, context, check.signal);
@@ -4843,7 +4998,6 @@ export async function recheckFinalToolExecutionPermission(
 					permMode: mode,
 					cwd,
 					bashAnalysis: analysis,
-					isChapter: !!before.narrator.chapterId,
 					compiledPolicy: policy,
 					executionContext: context,
 					projectGitPath: policy.projectGitPath ?? undefined,
@@ -5014,7 +5168,6 @@ export async function handlePermission(
 		where: eq(narrators.id, narratorId),
 		columns: {
 			permissionMode: true,
-			chapterId: true,
 			relaxedPlan: true,
 			previousPermissionMode: true,
 			planFileId: true,
@@ -5032,7 +5185,6 @@ export async function handlePermission(
 		? false
 		: resolveEffectiveRelaxedPlan(permMode, narrator?.relaxedPlan);
 	const isPlanMode = runtimeConstraint ? false : isPlanModeTrait(narrator?.traits);
-	const isChapter = !!narrator?.chapterId;
 
 	if (toolName === "RequestPermissionRule") {
 		if (runtimeConstraint || reviewReadOnlyBash || !binding || !executionContext) {
@@ -5092,7 +5244,6 @@ export async function handlePermission(
 				input.command,
 				shellCwd,
 				shellType,
-				isChapter,
 				executionContext?.paths ?? localPathSemantics,
 			);
 			if (executionContext) {
@@ -5371,7 +5522,6 @@ export async function handlePermission(
 					permMode: decisionPermMode,
 					cwd,
 					bashAnalysis,
-					isChapter,
 					planFileId,
 					planFilePath: designatedPlanFilePath,
 					planMode: isPlanMode,
@@ -5626,9 +5776,13 @@ export async function handlePermission(
 	// there is nobody to ask, so reflection is its review path rather than a denial.
 	const oauthDangerReflectionCandidate =
 		oauthReflectsInsteadOfDenying && (decision === "allow" || decision === "ask");
+	// Review-tier `.git` writes ask even under bypassPermissions; reflection answers that
+	// review when enabled, otherwise it falls through to the human prompt.
+	const bypassReviewCandidate =
+		decision === "allow" || (decision === "ask" && !!permMeta.gitInternalReviewReason);
 	if (
 		(oauthDangerReflectionCandidate ||
-			(!runtimeConstraint && decision === "allow" && effectiveMode === "bypassPermissions")) &&
+			(!runtimeConstraint && bypassReviewCandidate && effectiveMode === "bypassPermissions")) &&
 		dangerReflectionLevel !== "off"
 	) {
 		const danger =
@@ -5698,12 +5852,10 @@ export async function handlePermission(
 	// Plan mode soft deny → ask the user once before falling back to auto-deny.
 	let promotedPlanSoftDeny = false;
 	if (decision === "deny") {
-		const hasChapterGitIssues = isChapter && getChapterGitPermissionIssues(bashAnalysis).length > 0;
 		const isPlanModeSoftDeny =
 			isPlanMode &&
 			!isRelaxedPlan &&
 			!permMeta.commandBlacklistReason &&
-			!hasChapterGitIssues &&
 			(permMeta.planModeSoftDeny || !permMeta.blacklistReason);
 		if (isPlanModeSoftDeny && !planModeAskedOnce.has(narratorId)) {
 			planModeAskedOnce.add(narratorId);
@@ -5791,7 +5943,6 @@ export async function handlePermission(
 				.where(and(eq(narratorToolCalls.id, permissionToolCallId)));
 			return { behavior: "deny", message: denyMsg };
 		}
-		const chapterGitIssues = isChapter ? getChapterGitPermissionIssues(bashAnalysis) : [];
 		const isReadToolPathDenied =
 			(permMode === "readOnly" || isPlanMode) &&
 			(READ_ONLY_TOOLS.includes(toolName) ||
@@ -5801,23 +5952,18 @@ export async function handlePermission(
 					bashAnalysis.nonWhitelisted.length === 0 &&
 					!bashAnalysis.dangerousPatterns.length &&
 					!bashAnalysis.hasEnvInjection));
-		const denyMsg =
-			chapterGitIssues.length > 0
-				? `DENIED: Chapter mode restricts git branch/worktree operations. Issues: ${chapterGitIssues.join("; ")}. Use NarraFork chapter operations or request explicit permission in an interactive mode.`
-				: isReadToolPathDenied
-					? getToolMessage("permissionDeniedPathOutsideScope", locale)
-					: isPlanMode
-						? getToolMessage("permissionDeniedPlanMode", locale)
-						: permMode === "readOnly"
-							? getToolMessage("permissionDeniedReadOnly", locale)
-							: getToolMessage("permissionDeniedNonInteractive", locale);
-		const decisionReason = chapterGitIssues.length > 0 ? chapterGitIssues.join("; ") : undefined;
+		const denyMsg = isReadToolPathDenied
+			? getToolMessage("permissionDeniedPathOutsideScope", locale)
+			: isPlanMode
+				? getToolMessage("permissionDeniedPlanMode", locale)
+				: permMode === "readOnly"
+					? getToolMessage("permissionDeniedReadOnly", locale)
+					: getToolMessage("permissionDeniedNonInteractive", locale);
 		logger.debug("Permission auto-denied", {
 			narratorId,
 			toolName,
 			toolUseId,
 			permMode,
-			...(decisionReason ? { reason: decisionReason } : {}),
 		});
 		await db
 			.update(narratorToolCalls)
@@ -5826,7 +5972,6 @@ export async function handlePermission(
 				errorMessage: denyMsg,
 				permissionDecidedBy: "auto",
 				permissionDecidedAt: new Date().toISOString(),
-				...(decisionReason ? { permissionDecisionReason: decisionReason } : {}),
 			})
 			.where(and(eq(narratorToolCalls.id, permissionToolCallId)));
 		return {
@@ -5869,25 +6014,16 @@ export async function handlePermission(
 		}
 		decisionReason = parts.join("; ");
 	}
-	if (isChapter && bashAnalysis) {
-		const chapterGitParts: string[] = [];
-		if (bashAnalysis.gitBranchViolations.length > 0) {
-			chapterGitParts.push(`Chapter git issues: ${bashAnalysis.gitBranchViolations.join("; ")}`);
-		}
-		if (bashAnalysis.gitBranchWarnings.length > 0) {
-			chapterGitParts.push(`Chapter git warnings: ${bashAnalysis.gitBranchWarnings.join("; ")}`);
-		}
-		if (chapterGitParts.length > 0) {
-			const chapterGitMsg = chapterGitParts.join("; ");
-			decisionReason = decisionReason ? `${decisionReason}; ${chapterGitMsg}` : chapterGitMsg;
-		}
-	}
-
 	if (toolName === "Agent" && typeof input.workdir === "string" && input.workdir) {
 		const resolvedWorkdir = resolvePath(cwd, input.workdir);
 		decisionReason = `Subagent requests custom working directory: ${resolvedWorkdir} (parent cwd: ${cwd})`;
 	}
 
+	if (permMeta.gitInternalReviewReason) {
+		decisionReason = decisionReason
+			? `${permMeta.gitInternalReviewReason}; ${decisionReason}`
+			: permMeta.gitInternalReviewReason;
+	}
 	if (promotedPlanSoftDeny) {
 		decisionReason = getToolMessage("planModeSoftDenyAskReason", locale);
 	}

@@ -86,11 +86,11 @@ describe("narrator navigation", () => {
 			tab("pinned", { pinned: true }),
 			tab("ws", { type: "workspace" }),
 			tab("child", { workspaceId: "ws" }),
-			tab("bound", { type: "chapter", narratorId: "bound-narrator" }),
+			tab("bound-narrator", { type: "subagent" }),
 			tab("bound-narrator"),
-			tab("chapter-without-narrator", { type: "chapter" }),
 		]);
-		expect(targets.map((item) => item.id)).toEqual(["pinned", "child", "bound"]);
+		expect(targets.map((item) => item.id)).toEqual(["pinned", "child", "bound-narrator"]);
+		expect(targets[2]?.type).toBe("subagent");
 	});
 	test("a number cancels pending previous/next navigation", async () => {
 		unregister = registerRecentTabKeyboardSource(() => [tab("a"), tab("b"), tab("c")]);

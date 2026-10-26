@@ -12,8 +12,7 @@ import { SetupAssistantAuthorizationModal } from "./settings/SetupAssistantAutho
  * Non-blocking banner shown when the backend reports git is not installed.
  *
  * It used to be a full-screen overlay, which overstated the problem: the backend
- * only gates the routes that actually run git (project creation, chapter
- * lifecycle, merges, the git panel). Standalone narrators, provider setup and
+ * only gates the routes that actually run git (project creation, the git panel). Standalone narrators, provider setup and
  * every settings page work fine without it — and a Setup Assistant narrator is
  * the thing best equipped to install git on an arbitrary machine. So this
  * informs and offers actions instead of locking the user out.

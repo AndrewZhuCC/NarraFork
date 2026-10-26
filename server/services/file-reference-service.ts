@@ -932,7 +932,7 @@ const productionDependencies: FileReferenceDependencies = {
 			acl,
 			{ getHome },
 			{ getSessionDevices },
-			{ resolveNarratorSessionCwd },
+			{ isFormerChapterSessionWithoutDirectory, resolveNarratorSessionCwd },
 			{ resolveOAuthNarratorRuntimePolicy },
 		] = await Promise.all([
 			import("../db"),
@@ -961,14 +961,13 @@ const productionDependencies: FileReferenceDependencies = {
 		});
 		if (!user || !row) throw new NotFoundError("Narrator", narratorId);
 		await acl.assertNarratorAccess(row, { userId, isAdmin: user.role === "admin" }, need);
-		const chapter = row.chapterId
-			? await db.query.chapters.findFirst({
-					where: eq(schema.chapters.id, row.chapterId),
-					columns: { projectId: true, worktreePath: true },
-				})
-			: undefined;
-		if (row.chapterId && !chapter) throw new NotFoundError("Chapter", row.chapterId);
-		const projectId = chapter?.projectId ?? row.contextProjectId;
+		if (isFormerChapterSessionWithoutDirectory(row))
+			throw new AppError(
+				"This legacy workspace has no directory. Choose a working directory to continue.",
+				409,
+				"WORKSPACE_DIRECTORY_REQUIRED",
+			);
+		const projectId = row.contextProjectId;
 		const project = projectId
 			? await db.query.projects.findFirst({
 					where: eq(schema.projects.id, projectId),
@@ -985,7 +984,7 @@ const productionDependencies: FileReferenceDependencies = {
 		return {
 			narratorId,
 			userId,
-			cwd: resolveNarratorSessionCwd(row.cwd, chapter?.worktreePath, project?.gitPath, getHome()),
+			cwd: resolveNarratorSessionCwd(row.cwd, project?.gitPath, getHome()),
 			defaultDeviceId: row.defaultDeviceId ?? "local",
 			devices: await getSessionDevices(projectId, userId),
 			permissionMode: strictPlan ? "readOnly" : permissionMode,

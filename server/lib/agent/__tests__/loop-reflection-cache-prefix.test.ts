@@ -3,18 +3,19 @@
  * conversation's cacheable prefix byte-for-byte.
  *
  * Prompt caching is an exact prefix match, so the reflection request has to start
- * with the same system prompt bytes as the parent turn it interrupts. The parent
- * `agentLoop` already injected the system prompt into the history array it hands
- * down, so the nested loop must NOT inject it a second time: a duplicate lands at
- * the very front of the request and shifts every following byte, forcing the whole
- * (often 100k+ token) prefix to be re-billed at full price instead of a cache read.
+ * with the same bytes as the parent request it interrupts. The reflection receives the
+ * rows the parent's request was projected from and projects them with the same adapter,
+ * tools and system prompt, so the prefix is identical by construction; its prompt is
+ * the input that follows it. A duplicated system prompt would land at the very front
+ * and shift every following byte, re-billing the whole (often 100k+ token) prefix.
  */
 
 import { afterAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { z } from "zod/v4";
 import { CacheDropDetector } from "../../cache-drop-dump-store";
 import { settings } from "../../settings";
-import type { ProviderAdapter } from "../provider";
+import type { DbMessage, ProviderAdapter } from "../provider";
+import { markSenderProjected } from "../sender-projection";
 import { toolRegistry } from "../tool-registry";
 import { dangerCancelTool, dangerConfirmTool } from "../tools/danger-reflection";
 import type { AgentConfig } from "../types";
@@ -36,6 +37,10 @@ let captured: Array<{
 const PARENT_TOOL_NAME = "CachePrefixParentTool";
 let parentGateTools: unknown[] | undefined;
 
+function lastInput(history: unknown[]): string | undefined {
+	return (history.at(-1) as { content?: string } | undefined)?.content;
+}
+
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) =>
 		tools.map((t) => ({
@@ -47,9 +52,12 @@ const testProvider: ProviderAdapter = {
 	injectSystemPrompt: (history, systemPrompt) => {
 		(history as unknown[]).unshift({ role: "system", content: systemPrompt });
 	},
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	// Deterministic over rows, like the real builders: one entry per row, in order.
+	buildHistory: async (rows) => ({
+		history: rows.map((row) => ({ role: row.role, content: row.contentText ?? "" })),
+	}),
 	async *chat(params) {
-		const parentTurn = parentGateTools && params.content === "parent turn";
+		const parentTurn = parentGateTools && lastInput(params.history) === "parent turn";
 		params.onRequestStart?.(parentTurn ? { codexTools: parentGateTools } : undefined);
 		if (parentTurn) {
 			// The provider may mutate shared definitions after its concrete request was captured.
@@ -84,9 +92,6 @@ const testProvider: ProviderAdapter = {
 			toolUses: [{ toolUseId: "tu_decide", name: emittedTool, input: { value: "ok" } }],
 		};
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -97,6 +102,7 @@ await import("@server/services/narrator-session");
 const realProviderModule = { ...(await import("../provider")) };
 
 mock.module("../provider", () => ({
+	...realProviderModule,
 	getProvider: () => testProvider,
 	resolveProviderAndModel: () => ({
 		requestedProvider: "test",
@@ -139,32 +145,49 @@ function parentConfig(): AgentConfig {
 	};
 }
 
-/** The history shape a parent agentLoop hands down: system prompt already injected. */
-function parentHistory(): unknown[] {
-	return [
-		{ role: "system", content: SYSTEM_PROMPT },
-		{ role: "user", content: "first user turn" },
-		{ role: "assistant", content: "some work" },
-	];
+function row(id: string, role: DbMessage["role"], text: string): DbMessage {
+	return {
+		id,
+		role,
+		contentJson: [{ type: "text", text }],
+		contentText: text,
+		parentToolUseId: null,
+		messageUuid: null,
+	};
+}
+
+/** The conversation a parent request is projected from. */
+function parentRows(): DbMessage[] {
+	return [row("u1", "user", "first user turn"), row("a1", "assistant", "some work")];
 }
 
 async function runReflection(
-	history: unknown[],
-	injectParentSystemPrompt?: boolean,
+	rows: DbMessage[],
 	lastCodexTools?: AgentConfig["lastCodexTools"],
 ): Promise<unknown[]> {
 	captured = [];
 	await runReflectionLoop({
 		parentConfig: { ...parentConfig(), lastCodexTools },
-		history,
+		rows,
 		prompt: "REFLECTION_PROMPT",
 		reflectionLoop: {
 			allowedTools: [DECISION_TOOL_NAME],
 			context: { kind: "taskReflection", requestId: "req-cache" },
 		},
 		label: "Cache prefix test loop",
-		...(injectParentSystemPrompt === undefined ? {} : { injectParentSystemPrompt }),
 	});
+	expect(captured).toHaveLength(1);
+	return captured[0].history;
+}
+
+/** The parent's request: its rows plus the input it sends. */
+async function parentRequest(): Promise<unknown[]> {
+	captured = [];
+	for await (const _event of agentLoop({ ...parentConfig(), maxTurns: 1 }, "current input", {
+		rows: parentRows(),
+	})) {
+		/* drain */
+	}
 	expect(captured.length).toBe(1);
 	return captured[0].history;
 }
@@ -196,7 +219,7 @@ describe("reflection loop cacheable prefix", () => {
 			});
 			params.requestDump?.appendResponseText("actual response");
 			params.onRequestStart?.();
-			if (params.content === "normal diagnostic") {
+			if (lastInput(params.history) === "normal diagnostic") {
 				yield {
 					text: "done",
 					usage: { promptTokens: 10000, inputTokens: 10000, completionTokens: 1 },
@@ -219,13 +242,13 @@ describe("reflection loop cacheable prefix", () => {
 			for await (const _event of agentLoop(
 				{ ...parentConfig(), maxTurns: 1 },
 				"normal diagnostic",
-				[],
+				{ rows: [] },
 			)) {
 				/* drain */
 			}
 			await runReflectionLoop({
 				parentConfig: parentConfig(),
-				history: parentHistory(),
+				rows: parentRows(),
 				prompt: "diagnostic reflection",
 				reflectionLoop: {
 					allowedTools: [DECISION_TOOL_NAME],
@@ -262,7 +285,9 @@ describe("reflection loop cacheable prefix", () => {
 			yield { text: "done" };
 		});
 		try {
-			for await (const _event of agentLoop({ ...parentConfig(), maxTurns: 1 }, "normal", [])) {
+			for await (const _event of agentLoop({ ...parentConfig(), maxTurns: 1 }, "normal", {
+				rows: [],
+			})) {
 				/* drain */
 			}
 			expect(declarations).toEqual(
@@ -277,7 +302,9 @@ describe("reflection loop cacheable prefix", () => {
 	});
 	test("ordinary loops cannot execute reflection decisions", async () => {
 		const before = decisions;
-		for await (const _event of agentLoop({ ...parentConfig(), maxTurns: 1 }, "normal", [])) {
+		for await (const _event of agentLoop({ ...parentConfig(), maxTurns: 1 }, "normal", {
+			rows: [],
+		})) {
 			/* drain */
 		}
 		expect(decisions).toBe(before);
@@ -299,7 +326,7 @@ describe("reflection loop cacheable prefix", () => {
 		try {
 			const result = await runReflectionLoop({
 				parentConfig: parentConfig(),
-				history: parentHistory(),
+				rows: parentRows(),
 				prompt: "reflect",
 				reflectionLoop: {
 					allowedTools: [DECISION_TOOL_NAME],
@@ -342,7 +369,7 @@ describe("reflection loop cacheable prefix", () => {
 					planMode,
 					toolFilter: (tool: { name: string }) => tool.name === dynamicName,
 				};
-				for await (const _event of agentLoop(config, "parent", [])) {
+				for await (const _event of agentLoop(config, "parent", { rows: [] })) {
 					/* drain */
 				}
 				const parentTools = captured[0].tools;
@@ -352,7 +379,7 @@ describe("reflection loop cacheable prefix", () => {
 				expect(parentTools.map((t) => (t as { name: string }).name)).toContain(DECISION_TOOL_NAME);
 				await runReflectionLoop({
 					parentConfig: config,
-					history: parentHistory(),
+					rows: parentRows(),
 					prompt: "reflect",
 					reflectionLoop: {
 						allowedTools: [DECISION_TOOL_NAME],
@@ -370,41 +397,39 @@ describe("reflection loop cacheable prefix", () => {
 		});
 	}
 
-	test("does not duplicate the system prompt already present in the parent history", async () => {
-		const history = await runReflection(parentHistory());
+	test("injects the parent's system prompt exactly once", async () => {
+		captured = [];
+		const history = await runReflection(parentRows());
 
 		// Exactly one copy — a second copy is the cache-prefix bug.
 		expect(systemEntries(history)).toEqual([SYSTEM_PROMPT]);
 	});
 
-	test("keeps the reflection prefix byte-identical to the parent prefix", async () => {
-		const parent = parentHistory();
-		const history = await runReflection(parent);
+	test("keeps the reflection prefix byte-identical to the parent's request", async () => {
+		const parent = await parentRequest();
+		// The rows the parent's request was projected from: its transcript plus its input,
+		// which the loop writes as already in model form (no sender attribution).
+		const input = markSenderProjected(row("in", "user", "current input"));
+		const history = await runReflection([...parentRows(), input]);
 
-		// The parent turn's prefix must survive verbatim, in order, at the front.
+		// The parent request survives verbatim, in order, at the front.
 		expect(history.slice(0, parent.length)).toEqual(parent);
+		expect(history).toHaveLength(parent.length + 1);
 	});
 
-	test("the reflection prompt is the current turn, not part of the prefix", async () => {
-		const parent = parentHistory();
-		await runReflection(parent);
+	test("the reflection prompt is the input after the shared prefix", async () => {
+		captured = [];
+		const history = await runReflection(parentRows());
 
-		// The gate's question rides in `content`, after the shared prefix, so it
-		// cannot shift the cached bytes.
-		expect(captured[0].content).toBe("REFLECTION_PROMPT");
+		// The gate's question is the last input row, so it cannot shift the cached bytes.
+		expect(history.at(-1)).toEqual({ role: "user", content: "REFLECTION_PROMPT" });
+		expect(captured.at(-1)?.content).toBe("");
 	});
 
-	test("still injects when the caller supplies a raw history without one", async () => {
-		// A caller building its own history has no injected prompt to inherit.
-		const history = await runReflection([], true);
-
-		expect(systemEntries(history)).toEqual([SYSTEM_PROMPT]);
-	});
-
-	test("an empty inherited history injects the system prompt by default", async () => {
+	test("an empty parent conversation still gets the system prompt", async () => {
+		captured = [];
 		const history = await runReflection([]);
 
-		// Nothing was inherited, so suppressing injection would drop the prompt entirely.
 		expect(systemEntries(history)).toEqual([SYSTEM_PROMPT]);
 	});
 
@@ -415,7 +440,7 @@ describe("reflection loop cacheable prefix", () => {
 			["test", "test:other", false],
 		] as const) {
 			const tools = [{ type: "function", name: PARENT_TOOL_NAME }];
-			await runReflection(parentHistory(), undefined, { provider, model, tools });
+			await runReflection(parentRows(), { provider, model, tools });
 			expect(captured[0].parentTools).toEqual(matches ? tools : []);
 			expect(captured[0].tools).toEqual(
 				expect.arrayContaining([expect.objectContaining({ name: DECISION_TOOL_NAME })]),
@@ -464,11 +489,11 @@ describe("reflection loop cacheable prefix", () => {
 			const config = parentConfig();
 			config.maxTurns = 1;
 			config.toolFilter = (tool) => tool.name === PARENT_TOOL_NAME;
-			const history: unknown[] = [];
+			const rows: DbMessage[] = [];
 			config.permissionHandler = async () => {
 				const observed = await runReflectionLoop({
 					parentConfig: config,
-					history,
+					rows: [...rows, markSenderProjected(row("parent-input", "user", "parent turn"))],
 					prompt: "reflect",
 					reflectionLoop: {
 						allowedTools: [dangerConfirmTool.name, dangerCancelTool.name],
@@ -478,7 +503,7 @@ describe("reflection loop cacheable prefix", () => {
 				expect(observed.toolResults.some((result) => result.isError)).toBe(true);
 				return { behavior: "deny", message: "test cancelled" };
 			};
-			for await (const _event of agentLoop(config, "parent turn", history)) {
+			for await (const _event of agentLoop(config, "parent turn", { rows })) {
 				/* drain */
 			}
 			expect(captured).toHaveLength(2);

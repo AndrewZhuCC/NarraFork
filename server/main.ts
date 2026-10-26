@@ -12,7 +12,6 @@ import {
 } from "../frontend/plugin-runtime/paths";
 import { CHROMIUM_PATHS } from "../shared/browser-paths";
 import { urlHost } from "../shared/server-host";
-import { isSessionTokenVersionCurrent, SESSION_VERSION_CLAIM } from "../shared/session-auth";
 import { app } from "./app";
 import "./db"; // Ensure DB is initialized early
 import {
@@ -46,7 +45,6 @@ import { listenWithLanFallback, resolveListenHost } from "./lib/net/listen-host"
 import { reconcileNugRelayClients } from "./lib/nug-relay/manager";
 import { validateAccessTokenById } from "./lib/oauth-provider";
 import { IS_MACOS, IS_WINDOWS, initWslFlag } from "./lib/platform";
-import { projectDbManager } from "./lib/project-db";
 import { isProviderUnavailableError } from "./lib/provider-availability-error";
 import {
 	registerGracefulShutdownHandler,
@@ -97,7 +95,6 @@ import {
 	activatePostgresRuntimeQueue,
 	composePostgresStores,
 } from "./services/postgres-composition";
-import { shutdownPrivateArchiveWorkers } from "./services/project-archive/worker-client";
 import { ensureAllRecentTabsMigrated } from "./services/recent-tabs-service";
 
 // Parse --wsl=true|false CLI flag (default: false — WSL disallowed)
@@ -107,20 +104,15 @@ import {
 	backgroundOccupancyInitializer,
 	withBackgroundOccupancyInitialization,
 } from "./services/background-occupancy-startup";
-import { chapterBatchMerge } from "./services/chapter-batch-merge";
-import { chapterCleanup } from "./services/chapter-cleanup";
-import {
-	reconcileContainerStates,
-	startContainerProxy,
-	stopContainerProxy,
-} from "./services/container-proxy";
 import { ensureRootlessEnv } from "./services/container-service";
+import { retireLegacyChapterResources } from "./services/legacy-chapter-resource-cleanup";
 import {
 	failUnownedStartupRecovery,
 	recoverOnStartup as recoverNarrators,
 	recoverPendingQuestionAnswerDeliveries,
 	restorePendingModelOverrides,
 } from "./services/narrator-session";
+import { scheduleProjectIndexRebuild } from "./services/project-index";
 import "./services/notification-service"; // Register notification event listeners
 import {
 	startNotificationCenterMaintenance,
@@ -130,7 +122,6 @@ import { initNotificationFanout, stopNotificationFanout } from "./services/notif
 import "./services/attention-hook-bridge"; // Bridge attention events into the hook system
 import { killAllBashProcesses } from "./lib/agent/tools/bash";
 import { initChatNotify } from "./services/chat-notify";
-import { initContainerEventHandler } from "./services/container-event-handler";
 import { initDeviceConnectionService } from "./services/device-connection-service";
 import { initDeviceTransferService } from "./services/device-transfer-service";
 import { backfillIntegrationResourceBindingsOnStartup } from "./services/integration-resource-binding-service";
@@ -157,13 +148,11 @@ import {
 	prepareSignalRestartRecovery,
 	restoreOrdinaryRestartRecovery,
 } from "./services/restart-recovery-service";
-import { initReviewEventHandler } from "./services/review-event-handler";
 import { terminalService } from "./services/terminal-service";
 import {
 	getPlannedUpdateStartupProtection,
 	restoreNarratorsAfterPlannedUpdate,
 } from "./services/update-recovery-service";
-import { worktreeWatcher } from "./services/worktree-watcher";
 import { canAcceptExternalNarratorConnection } from "./websocket/oauth-connection-registry";
 import {
 	closeAllConnections,
@@ -213,21 +202,6 @@ if (postgresRuntime) {
 	// timeout fail the process closed with a diagnosable error — the request hot path
 	// never re-probes the catalog, and there is no SQLite fallback.
 	await activatePostgresRuntimeQueue();
-}
-
-// Invalidate interrupted merge sessions before HTTP/WS or narrator recovery can
-// accept an old continue/cancel decision. This gate only updates session metadata;
-// it must never restore a worktree or advance chapter snapshots. Fail closed if
-// the database cannot invalidate old sessions, rather than serving stale commands.
-if (activeDatabaseBackend === "sqlite") {
-	try {
-		await chapterBatchMerge.cleanupStaleSessions();
-	} catch (error) {
-		logger.error("Interrupted merge-session startup gate failed; refusing to serve requests", {
-			error: String(error),
-		});
-		throw error;
-	}
 }
 
 // Ordinary cold continuation recovery requires strict single-instance provenance.
@@ -852,7 +826,7 @@ async function resolveVNetRelayAuth(req: Request, url: URL): Promise<VNetRelayAu
 	if (token) {
 		try {
 			const payload = await verifyToken(token);
-			return { kind: "jwt", userId: payload.sub };
+			return { kind: "session", userId: payload.sub };
 		} catch {
 			// Fall through to anonymous only when explicitly enabled.
 		}
@@ -1046,7 +1020,7 @@ function startServer(listenPort: number, tlsCfg: typeof settings.server.tls) {
 				// WebSocket upgrade for /ws/narrator and /ws/terminal
 				if (url.pathname.startsWith("/ws")) {
 					// Anonymous public-share reader: `?share=<shareId>&token=<secret>` instead
-					// of a session JWT. Verified once at upgrade, scoped at subscribe time
+					// of a session token. Verified once at upgrade, scoped at subscribe time
 					// (narrator-ws reads `ws.data.publicShare`), and dropped on revocation.
 					const shareId = url.searchParams.get("share");
 					if (shareId && url.pathname === "/ws/narrator") {
@@ -1087,7 +1061,7 @@ function startServer(listenPort: number, tlsCfg: typeof settings.server.tls) {
 						return new Response("WebSocket upgrade failed", { status: 400 });
 					}
 
-					// Verify JWT from query param
+					// Verify the session token from the query param
 					const token = url.searchParams.get("token");
 					if (!token) {
 						return new Response("Authentication required", { status: 401 });
@@ -1107,22 +1081,14 @@ function startServer(listenPort: number, tlsCfg: typeof settings.server.tls) {
 							username: true,
 							avatarColor: true,
 							avatarImageId: true,
-							// Read live rather than taken from the token, so a demotion applies to
-							// the next socket instead of riding along until the JWT expires. The
-							// narrator subscribe path uses it for the admin short-circuit.
+							// Read live, so a demotion applies to the next socket. The narrator
+							// subscribe path uses it for the admin short-circuit.
 							role: true,
-							// The upgrade verifies only the JWT signature, so a revoked token (one left
-							// behind by a `token_version` bump — password change, "sign out everywhere")
-							// would otherwise still open a socket until its `exp`. Enforce the current
-							// generation here, exactly as the HTTP gate does, and fail the upgrade when
-							// it is stale (or the user row is gone).
-							tokenVersion: true,
 						},
 					});
-					if (
-						!user ||
-						!isSessionTokenVersionCurrent(payload[SESSION_VERSION_CLAIM], user.tokenVersion)
-					) {
+					// `verifyToken` already rejected revoked and expired sessions; a user row that
+					// vanished since still fails the upgrade.
+					if (!user) {
 						return new Response("Invalid or expired token", { status: 401 });
 					}
 					const userInfo = user
@@ -1135,11 +1101,11 @@ function startServer(listenPort: number, tlsCfg: typeof settings.server.tls) {
 							}
 						: undefined;
 
-					// Snapshot the credential's expiry so the heartbeat can drop the socket
-					// when it lapses; the upgrade is the only place the token is verified.
+					// Remember the session so the socket can be re-checked when it lapses or
+					// when the user's authorization changes (logout, revocation, role).
 					const wsData = resolveWSData(url, userInfo, undefined, {
 						sessionExp: payload.exp,
-						sessionTokenVersion: payload[SESSION_VERSION_CLAIM] ?? 0,
+						sessionId: payload.sid,
 						sessionUserId: payload.sub,
 					});
 					if (!wsData) {
@@ -1667,6 +1633,14 @@ withBackgroundOccupancyInitialization(
 		if (completions.length) startupReadiness.markRecovering();
 		else startupReadiness.markReady();
 		startupReadiness.settle({ ok: true });
+		// Convert legacy envelopes to block rows in the background, slice by slice (§10.3).
+		void import("./services/narrator-block-backfill")
+			.then(({ startBlockBackfill }) => startBlockBackfill())
+			.catch((err) =>
+				logger.warn("Block backfill did not start", {
+					error: err instanceof Error ? err.message : String(err),
+				}),
+			);
 		if (completions.length) {
 			Promise.all(completions)
 				.then(() => {
@@ -1770,6 +1744,11 @@ import { startChallengeCleanupTimer } from "./lib/webauthn";
 
 startChallengeCleanupTimer();
 
+// Periodically delete expired and revoked login sessions.
+import { startSessionCleanupTimer } from "./lib/auth";
+
+startSessionCleanupTimer();
+
 // Poll for due scheduled tasks (periodic prompt → narrator). Re-arms on startup.
 import {
 	startScheduledTaskScheduler,
@@ -1832,12 +1811,6 @@ dissolveOrphanWorkspaces()
 		logger.warn("Orphan workspace cleanup failed", { error: String(err) });
 	});
 
-// Register review event handler (inject feedback into source narrator on conclude)
-initReviewEventHandler();
-
-// Register container event handler (inject access info + auto-enable Browser on container start)
-initContainerEventHandler();
-
 // Register knowledge notification bridge (push publish/review state to reviewers + submitters)
 initKnowledgeNotify();
 
@@ -1848,22 +1821,19 @@ initChatNotify();
 initNotificationFanout();
 startNotificationCenterMaintenance();
 
-// Reconcile container states on startup (mark stale DB records as stopped)
-reconcileContainerStates().catch((err) => {
-	logger.warn("Container state reconciliation failed", { error: String(err) });
-});
+if (activeDatabaseBackend === "sqlite") {
+	// Stop containers and release ports that removed chapters left behind.
+	retireLegacyChapterResources().catch((err) => {
+		logger.warn("Legacy chapter resource cleanup failed", { error: String(err) });
+	});
+	// Re-derive which project every session belongs to, in bounded background pages.
+	void scheduleProjectIndexRebuild();
+}
 
 // Establish client-egress relay channels for NUG providers configured with
 // local egress (docs/CODEX_CLIENT_RELAY.md). Idempotent; also reconciled after
 // every settings save.
 reconcileNugRelayClients(settings.nugProviders ?? []);
-
-// Start container proxy if enabled
-if (settings.containers.proxy?.enabled) {
-	startContainerProxy().catch((err) => {
-		logger.error("Container proxy startup failed", { error: String(err) });
-	});
-}
 
 // One-time cleanup of legacy snapshot shadow repos (replaced by file-snapshot-service)
 const legacySnapshotsDir = getNarraforkPath("snapshots");
@@ -1994,14 +1964,10 @@ async function performGracefulShutdown(
 		stopScheduledTaskScheduler();
 		await shutdownStep(tracker, "notificationFanout.stop", stopNotificationFanout);
 		await shutdownStep(tracker, "notificationMaintenance.stop", stopNotificationCenterMaintenance);
-		await shutdownStep(tracker, "containerProxy.stop", () => stopContainerProxy());
 		await shutdownStep(tracker, "terminalService.shutdownAll", () => terminalService.shutdownAll());
 		if (!options.skipBashProcessKill) {
 			await shutdownStep(tracker, "killAllBashProcesses", () => killAllBashProcesses());
 		}
-		chapterCleanup.clearAllTimers();
-		worktreeWatcher.shutdown();
-		projectDbManager.closeAll();
 		// The background integrity probe is a separate PROCESS holding a read-only handle on the
 		// database for up to 10 minutes. Left running it becomes an orphan: it keeps scanning while a
 		// replacement process may swap the database file (startup recovery) or rewrite it (admin
@@ -2009,7 +1975,6 @@ async function performGracefulShutdown(
 		await shutdownStep(tracker, "integrityProbe.cancel", () => cancelBackgroundIntegrityCheck());
 		// Read workers hold their own read-only SQLite connections; terminate them before the clean
 		// marker is written so no thread is still touching the database afterwards.
-		await shutdownStep(tracker, "privateArchiveWorkers.shutdown", shutdownPrivateArchiveWorkers);
 		await shutdownStep(tracker, "dbWorkerPool.shutdown", () => shutdownDbWorkerPool());
 		// PostgreSQL: stop accepting new operations and close the client, in drain order — after
 		// HTTP/WS handlers have drained, before the lock release below. A no-op on the SQLite

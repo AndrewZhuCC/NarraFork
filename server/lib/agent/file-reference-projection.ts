@@ -132,42 +132,16 @@ export function projectFileReferenceText(
 	return result;
 }
 
-export interface FileReferenceProjectionOptions {
-	/** The exact input this caller will send as the current turn, before sys additions. */
-	currentInput?: string;
-}
-
-/** Match only the last model-visible non-sys row, never searching across an assistant. */
-function currentInputTailIndex(messages: readonly DbMessage[]): number {
-	for (let index = messages.length - 1; index >= 0; index--) {
-		const message = messages[index];
-		if (
-			message.parentToolUseId ||
-			message.role === "sys" ||
-			message.role === "disp" ||
-			message.role === "system"
-		)
-			continue;
-		return message.role === "user" ? index : -1;
-	}
-	return -1;
-}
-
 /**
  * Model-only projection. Stored rows retain the compact original text and the
  * accepted snapshot blocks. Both provider text representations receive identical
  * material; image/tool blocks are retained. Removing snapshot blocks from the
  * copy makes repeated projection idempotent without altering persisted objects.
  * Only user rows are eligible: file contents must never become system directives.
- * Without options every snapshot is projected (including summaries). With a known
- * current input, only the exact matching tail user row may omit its history copy.
+ * Every snapshot is projected, the current input's included: it is part of the history.
  */
-export function projectFileReferencesForModel<T extends DbMessage>(
-	messages: T[],
-	options?: FileReferenceProjectionOptions,
-): T[] {
-	const tailIndex = options?.currentInput === undefined ? -1 : currentInputTailIndex(messages);
-	return messages.map((message, index) => {
+export function projectFileReferencesForModel<T extends DbMessage>(messages: T[]): T[] {
+	return messages.map((message) => {
 		if (message.role !== "user") return message;
 		const snapshots = getFileReferenceSnapshots(message.contentJson);
 		if (!snapshots.length) return message;
@@ -179,13 +153,6 @@ export function projectFileReferencesForModel<T extends DbMessage>(
 				.map((block) => block.text)
 				.join("\n");
 		const text = projectFileReferenceText(originalText, snapshots);
-		if (index === tailIndex && text === options?.currentInput) {
-			// This exact tail input is already carried by the current turn. Official
-			// Anthropic can retain its user row before trailing sys messages; leave
-			// that row's original text/images untouched and omit only its snapshots.
-			// Never strip material from the current input or an older matching row.
-			return { ...message, contentJson: blocks.filter((block) => !isFileReferenceSnapshot(block)) };
-		}
 		let writtenText = false;
 		const contentJson = blocks.flatMap((block) => {
 			if (isFileReferenceSnapshot(block)) return [];

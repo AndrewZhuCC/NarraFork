@@ -682,7 +682,7 @@ export interface NarraForkSettings {
 	agent: {
 		defaultModel: string;
 		defaultPermissionMode: PermissionMode;
-		/** Creation default only; auto keeps chapter/project and standalone/private behavior. */
+		/** Creation default only; auto makes project-page sessions project-visible, others private. */
 		defaultNarratorVisibility: "auto" | "private" | "public";
 		/** Creation default only; narrowed to visibility, auto uses its widest legal audience. */
 		defaultNarratorWriteAudience: "auto" | "owner" | "project" | "public";
@@ -920,29 +920,40 @@ export interface NarraForkSettings {
 		 */
 		queueDuringCompaction?: boolean;
 	};
-	chapters: {
-		maxActiveWorktrees: number;
-		maxActiveContainers: number;
-		worktreeSizeWarningMb: number;
-		autoSaveOnDormant: boolean;
-		dormantAfterMinutes: number;
+	workspace: {
 		/**
 		 * Whether tool calls / external edits capture content-addressed whole-tree
 		 * snapshots of the workspace (the precise rollback boundary). When off, the
 		 * snapshot scan never runs on the tool path and rollback degrades to per-file
-		 * replay of recorded Write/Edit inputs. Structural captures (fork/merge/restore)
-		 * are unaffected. Default true; hot-path captures also degrade automatically
-		 * when a worktree proves too large to scan within the capture budget.
+		 * replay of recorded Write/Edit inputs. Default true; hot-path captures also
+		 * degrade automatically when a worktree proves too large to scan within the
+		 * capture budget. Stored as `chapters.treeSnapshotsEnabled` before chapters
+		 * were removed; migrated on load.
 		 */
 		treeSnapshotsEnabled: boolean;
 	};
-	containers: {
-		portRangeStart: number;
-		portRangeEnd: number;
-		proxy: {
-			enabled: boolean;
-			port: number;
-		};
+	/** Block storage rollout switches (docs/BLOCK_STORAGE-DESIGN.md §10.6). */
+	narratorBlocks: {
+		/**
+		 * Whether new envelopes are stored as blocks (`body_format = 2`), with the
+		 * compatible `content_json` derived alongside. Off: new envelopes use the legacy
+		 * format; envelopes already stored as blocks keep being maintained as blocks.
+		 */
+		write: boolean;
+		/**
+		 * Whether readers (model history, display pages, External API, exports) read a
+		 * block-format envelope's body from its block rows. Off: everything reads
+		 * `content_json`, which holds the same content while both are written.
+		 */
+		read: boolean;
+		/**
+		 * Whether a block-format envelope written from now on keeps its body only in its
+		 * block rows: `content_json` holds `[]` and `body_rows_only` is set (P3b). Takes
+		 * effect only on SQLite with `write` and `read` on. Off: new envelopes keep the
+		 * complete `content_json` projection; envelopes already rows-only stay so until the
+		 * restore job writes their projection back.
+		 */
+		compactJson: boolean;
 	};
 	editor: {
 		type: "vscode" | "cursor" | "windsurf" | "zed";

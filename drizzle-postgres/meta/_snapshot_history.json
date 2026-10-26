@@ -235,11 +235,123 @@
 		},
 		{
 			"idx": 29,
-			"tag": "0029_merge_selfuse_095",
-			"id": "da7625a5-5fd6-4a3e-a829-49db44c216cc",
+			"tag": "0029_block_storage",
+			"id": "6dea56dd-d7ff-4e06-ab8d-523579715da5",
 			"prevId": "99ad7e81-08d6-415e-85c1-b0a350926f04",
 			"version": "7",
-			"snapshotDigest": "f3ded58d2bb637f2da283f3e30391457f5977645940883bbe54d95dd3354f40e"
+			"snapshotDigest": "178a8dc056bd01e7dc5c5c8a44589feddfc3759d4933f09d6c7925106c8e2897"
+		},
+		{
+			"idx": 30,
+			"tag": "0030_block_backfill",
+			"id": "2527cdb4-9153-4cb9-ba62-3de8ed18498e",
+			"prevId": "6dea56dd-d7ff-4e06-ab8d-523579715da5",
+			"version": "7",
+			"snapshotDigest": "5e578336c6af458dbd932125cca0beda4d111ab389f5a5610a559c747efe6def"
+		},
+		{
+			"idx": 31,
+			"tag": "0031_legacy_body_index",
+			"id": "20534647-c4ef-455c-8c6f-4250ed5f2786",
+			"prevId": "2527cdb4-9153-4cb9-ba62-3de8ed18498e",
+			"version": "7",
+			"snapshotDigest": "99a5dcc17aa730f78b3b9d8a1683d3b5e0693d79541580d15b70961ec66c171b"
+		},
+		{
+			"idx": 32,
+			"tag": "0032_block_state_writes",
+			"id": "a2ff5b16-5c87-43fc-a770-b84045892e96",
+			"prevId": "20534647-c4ef-455c-8c6f-4250ed5f2786",
+			"version": "7",
+			"snapshotDigest": "0cd62b8a55a55325c3e2350bf052b92bc1dc89ae08618397eca2b168f8589bdf"
+		},
+		{
+			"idx": 33,
+			"tag": "0033_bot_rooms",
+			"id": "ae0bd9a2-3a8a-430f-83b1-497b4a3c46ba",
+			"prevId": "a2ff5b16-5c87-43fc-a770-b84045892e96",
+			"version": "7",
+			"snapshotDigest": "c82ec97b630961854083a4bb003d164a8b4b4fbf3d9f615d3c5adbd92eb14b01"
+		},
+		{
+			"idx": 34,
+			"tag": "0034_retire_chapter_references",
+			"id": "4edc054c-f934-4821-b4bc-d8cd2ed0bb1b",
+			"prevId": "ae0bd9a2-3a8a-430f-83b1-497b4a3c46ba",
+			"version": "7",
+			"snapshotDigest": "1683cc9494e5075796d42eb13384892e186ca28026266b47306d0ac3fe0c6132"
+		},
+		{
+			"idx": 35,
+			"tag": "0035_retire_narrative_line",
+			"id": "da73efaf-92c0-4786-9720-a50f994a0756",
+			"prevId": "4edc054c-f934-4821-b4bc-d8cd2ed0bb1b",
+			"version": "7",
+			"snapshotDigest": "4a7173eca8df5927e81db0478641eea947b3fb5fd81c166f59f9cea0c0d41cb2"
+		},
+		{
+			"idx": 36,
+			"tag": "0036_project_index",
+			"id": "ad79826f-3e84-4be5-8553-5879cace6553",
+			"prevId": "da73efaf-92c0-4786-9720-a50f994a0756",
+			"version": "7",
+			"snapshotDigest": "1e97f92d225b90b809a8659d946d4c9c7f0ef6a0d2786c6ec1cbfd6107a884f7"
+		},
+		{
+			"idx": 37,
+			"tag": "0037_body_rows_only",
+			"id": "08a277a3-303b-4df5-bef0-ee9535cae552",
+			"prevId": "ad79826f-3e84-4be5-8553-5879cace6553",
+			"version": "7",
+			"snapshotDigest": "4c2ccada37fb3978515b00bfd705e4bc3c744737e7db8e34690cbd4f168f4fd5"
+		},
+		{
+			"idx": 38,
+			"tag": "0038_rows_only_index",
+			"id": "4b2b3cbc-bad3-4cef-a238-234de6ae6642",
+			"prevId": "08a277a3-303b-4df5-bef0-ee9535cae552",
+			"version": "7",
+			"snapshotDigest": "50a4fd5898bb9a4b0dc51c430248cc5bba65381aa1db9e98362546457699a020"
+		},
+		{
+			"idx": 39,
+			"tag": "0039_block_projection_jobs",
+			"id": "3c8f5a32-e1a8-4bc5-99ef-7489da1a1cdc",
+			"prevId": "4b2b3cbc-bad3-4cef-a238-234de6ae6642",
+			"version": "7",
+			"snapshotDigest": "68b9403a288280826e61609c728574dcbbcf638e05b8f447a94067fcb4909306"
+		},
+		{
+			"idx": 40,
+			"tag": "0040_block_reindex_job",
+			"id": "37ee90e1-966f-4646-8711-b18d17576d47",
+			"prevId": "3c8f5a32-e1a8-4bc5-99ef-7489da1a1cdc",
+			"version": "7",
+			"snapshotDigest": "2dba7d428fd7926fc02c936fa76436d811253158ef0bb2d6ec82be9ec427526f"
+		},
+		{
+			"idx": 41,
+			"tag": "0041_auth_sessions",
+			"id": "91f6f10c-d8bb-4405-b309-5266d0e4d545",
+			"prevId": "37ee90e1-966f-4646-8711-b18d17576d47",
+			"version": "7",
+			"snapshotDigest": "83f0cabdb8bc32378f567ca096267d392395bc520a222aa130a37f042652e67c"
+		},
+		{
+			"idx": 42,
+			"tag": "0042_block_index_queue",
+			"id": "738f075a-db1e-4d17-ab16-032656d87253",
+			"prevId": "91f6f10c-d8bb-4405-b309-5266d0e4d545",
+			"version": "7",
+			"snapshotDigest": "326fc9d1e9cd8211c5c5de1518452ffc95bcaabedc7eeb78be2b23888d06519a"
+		},
+		{
+			"idx": 43,
+			"tag": "0043_merge_selfuse_098",
+			"id": "e0d3c559-183c-4e8a-a293-800e26851da5",
+			"prevId": "738f075a-db1e-4d17-ab16-032656d87253",
+			"version": "7",
+			"snapshotDigest": "1da0fa5d253a602c6446979e6b4dc3b20bbbf02ab80732406187835b0d63a0cf"
 		}
 	]
 }

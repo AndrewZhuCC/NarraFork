@@ -6,9 +6,8 @@ import type {
 	GitWorkspaceSubscribe,
 	GitWorkspaceView,
 } from "@shared/git-workspace-events";
-import { isSessionTokenVersionCurrent } from "@shared/session-auth";
+import { resolveLiveSession } from "../lib/auth";
 import { AppError } from "../lib/errors";
-import { authSessionStore } from "../services/auth/store";
 import type { GitWorkspaceTarget } from "../services/git-workspace";
 import { assertGitWorkspaceKey } from "../services/git-workspace";
 import {
@@ -20,9 +19,9 @@ import { GitWorkspaceWatchPool, projectGitSnapshot } from "../services/git-works
 interface Socket {
 	data: {
 		userId?: string;
+		sessionId?: string;
 		sessionUserId?: string;
 		sessionExp?: number;
-		sessionTokenVersion?: number;
 	};
 	send(message: string): unknown;
 	getBufferedAmount?(): number;
@@ -75,20 +74,14 @@ function cancel(ws: Socket, id: string) {
 }
 async function authorize(ws: Socket, message: GitWorkspaceSubscribe, signal: AbortSignal) {
 	const userId = ws.data.userId;
-	if (!userId || !!message.narratorId === !!message.chapterId)
-		throw new Error("Invalid Git subscription target");
-	const session = await authSessionStore.findSessionState(userId);
-	if (
-		!session ||
-		ws.data.sessionUserId !== userId ||
-		!Number.isFinite(ws.data.sessionExp) ||
-		(ws.data.sessionExp ?? 0) <= Date.now() / 1000 ||
-		!isSessionTokenVersionCurrent(ws.data.sessionTokenVersion, session.tokenVersion)
-	)
+	if (!userId || !message.narratorId) throw new Error("Invalid Git subscription target");
+	if (!ws.data.sessionId || ws.data.sessionUserId !== userId)
 		throw new AppError("Git workspace access denied", 403, "GIT_WORKSPACE_ACCESS_DENIED");
-	const origin = message.narratorId
-		? { narratorId: message.narratorId }
-		: { chapterId: message.chapterId ?? "" };
+	const session = await resolveLiveSession(ws.data.sessionId);
+	if (!session || session.sub !== userId)
+		throw new AppError("Git workspace access denied", 403, "GIT_WORKSPACE_ACCESS_DENIED");
+	ws.data.sessionExp = session.exp;
+	const origin = { narratorId: message.narratorId };
 	const target = await authorizeGitTargetForPrincipal(
 		{ userId, isAdmin: session.role === "admin" },
 		origin,
@@ -115,7 +108,6 @@ export async function handleGitWorkspaceMessage(
 		message.type === "git_workspace_subscribe" &&
 		existing &&
 		existing.target.narratorId === message.narratorId &&
-		existing.target.chapterId === message.chapterId &&
 		existing.target.workspaceKey === message.workspaceKey
 	) {
 		await existing.updateView?.(message.view ?? "details");
@@ -185,7 +177,6 @@ export async function handleGitWorkspaceMessage(
 			const identity = {
 				subscriptionId: message.subscriptionId,
 				narratorId: message.narratorId,
-				chapterId: message.chapterId,
 				workspaceKey,
 				repositoryKey,
 			};

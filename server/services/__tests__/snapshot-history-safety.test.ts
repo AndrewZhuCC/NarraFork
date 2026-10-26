@@ -13,7 +13,6 @@ import {
 } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
-import { batchDeleteBlocksSchema } from "../../lib/validators/narrators";
 import * as scopedRevert from "../narrator-scoped-revert";
 import { narratorService } from "../narrator-service";
 import * as snapshotRevert from "../snapshot-revert";
@@ -724,9 +723,20 @@ describe("fixed block selection and shared-message COW", () => {
 		expect(newId).not.toBe(messageId);
 		expect(messageBlocks(newId)).toEqual([{ type: "text", text: "keep" }]);
 		expect(messageBlocks(messageId)).toEqual(original);
+		// The copy belongs to the fork that holds it; the narrator that wrote it stays its author.
 		expect(
 			db.select().from(narratorMessages).where(eq(narratorMessages.narratorId, narratorId)).all(),
-		).toHaveLength(2);
+		).toHaveLength(1);
+		expect(
+			db
+				.select({
+					narratorId: narratorMessages.narratorId,
+					authorNarratorId: narratorMessages.authorNarratorId,
+				})
+				.from(narratorMessages)
+				.where(eq(narratorMessages.id, newId))
+				.get(),
+		).toEqual({ narratorId: forkId, authorNarratorId: narratorId });
 		expect(
 			db.query.narratorToolCalls
 				.findMany({ where: eq(narratorToolCalls.messageId, messageId) })
@@ -803,7 +813,7 @@ describe("fixed block selection and shared-message COW", () => {
 		).toBeDefined();
 	});
 
-	test("duplicate indices are removed once by both validator and service", async () => {
+	test("duplicate indices are removed once by the service", async () => {
 		const { narratorId, cwd } = fixture();
 		const toolUseId = generateId();
 		const original: Block[] = [
@@ -819,7 +829,6 @@ describe("fixed block selection and shared-message COW", () => {
 			{ messageId, blockIndex: 0 },
 			{ messageId, blockIndex: 0 },
 		];
-		expect(batchDeleteBlocksSchema.parse({ blocks: selection }).blocks).toHaveLength(1);
 		const result = await narratorService.deleteMessageBlocks(narratorId, selection);
 		expect(result).toMatchObject({ deleted: 1, failed: 0 });
 		expect(result.results).toHaveLength(1);
@@ -882,7 +891,6 @@ describe("history rollback refusal and independent file outcomes", () => {
 			const unavailable = snapshotRevert.unavailableSnapshotRevert("history_unavailable", path);
 			spyOn(scopedRevert, "revertNarratorScopedForMessages").mockResolvedValue(unavailable);
 			spyOn(scopedRevert, "revertNarratorScopedForToolUses").mockResolvedValue(unavailable);
-			const restore = spyOn(worktreeTreeSnapshot, "restore");
 			const action =
 				entry === "messages"
 					? narratorService.deleteMessage(narratorId, messageId)
@@ -890,7 +898,6 @@ describe("history rollback refusal and independent file outcomes", () => {
 						? narratorService.deleteMessageBlock(narratorId, messageId, 0)
 						: narratorService.deleteMessageBlocks(narratorId, [{ messageId, blockIndex: 0 }]);
 			await expect(action).rejects.toMatchObject({ result: unavailable });
-			expect(restore).not.toHaveBeenCalled();
 			expect(readFileSync(path, "utf8")).toBe("user's later bytes\n");
 			expect(messageBlocks(messageId)).toEqual([{ type: "tool_use", id: toolUseId }]);
 			expect(narratorState(narratorId)?.messageVersion).toBe(0);
@@ -917,7 +924,6 @@ describe("history rollback refusal and independent file outcomes", () => {
 		const toolUseId = generateId();
 		const messageId = addMessage(narratorId, [{ type: "tool_use", id: toolUseId }]);
 		addTool(narratorId, messageId, toolUseId, join(cwd, "workspace.txt"));
-		const restore = spyOn(worktreeTreeSnapshot, "restore");
 		const scoped = spyOn(scopedRevert, "revertNarratorScopedForMessages");
 		await expect(
 			narratorService.deleteMessage(narratorId, messageId, { scope: "workspace" }),
@@ -927,7 +933,6 @@ describe("history rollback refusal and independent file outcomes", () => {
 				scope: "workspace",
 			}),
 		).rejects.toMatchObject({ code: "SNAPSHOT_REVERT_FAILED" });
-		expect(restore).not.toHaveBeenCalled();
 		expect(scoped).not.toHaveBeenCalled();
 		expect(messageBlocks(messageId)).toEqual([{ type: "tool_use", id: toolUseId }]);
 	});
@@ -1181,8 +1186,6 @@ describe("keep-files range snapshot diagnostics", () => {
 			const warn = spyOn(logger, "warn").mockImplementation(() => {});
 			const capture = spyOn(worktreeTreeSnapshot, "capture");
 			const hotCapture = spyOn(worktreeTreeSnapshot, "tryCaptureHot");
-			const restore = spyOn(worktreeTreeSnapshot, "restore");
-			const reverse = spyOn(worktreeTreeSnapshot, "reverseAndRestore");
 			let lastBeat = performance.now();
 			let maxLagMs = 0;
 			const heartbeat = setInterval(() => {
@@ -1205,8 +1208,6 @@ describe("keep-files range snapshot diagnostics", () => {
 			expect(readFileSync(path, "utf8")).toBe("current workspace bytes\n");
 			expect(capture).not.toHaveBeenCalled();
 			expect(hotCapture).not.toHaveBeenCalled();
-			expect(restore).not.toHaveBeenCalled();
-			expect(reverse).not.toHaveBeenCalled();
 			const checkpoints = db
 				.select({
 					id: narratorToolCalls.id,

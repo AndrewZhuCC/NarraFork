@@ -7,6 +7,7 @@
  * an equivalent transaction) so a rollback never leaves a false healed mark.
  */
 import { db } from "../../db";
+import { flushQueuedSince, syncQueueMark } from "../narrator-block-sync";
 import { type NarratorRefsTx, raiseUnhealedSeqFloors, withSeqFloorRaiseScope } from "./seq-store";
 
 export function dbTransactionWithSeqFloor<T>(
@@ -16,8 +17,12 @@ export function dbTransactionWithSeqFloor<T>(
 	const ids = [...new Set(typeof narratorIds === "string" ? [narratorIds] : narratorIds)];
 	return withSeqFloorRaiseScope(() =>
 		db.transaction((tx) => {
+			const queueMark = syncQueueMark();
 			if (ids.length) raiseUnhealedSeqFloors(tx, ids);
-			return fn(tx);
+			const result = fn(tx);
+			// Envelopes written here get their block rows in the same transaction.
+			flushQueuedSince(queueMark);
+			return result;
 		}),
 	);
 }

@@ -1,5 +1,6 @@
 import { afterAll, afterEach, expect, mock, test } from "bun:test";
 import type { GitWorkspaceCategory, GitWorkspaceSnapshot } from "@shared/git-workspace-events";
+import { ABSOLUTE_SESSION_MAX_SECONDS } from "@shared/session-auth";
 import { posixPathSemantics } from "../lib/agent/execution/path-semantics";
 import { AppError } from "../lib/errors";
 
@@ -28,15 +29,33 @@ const originalStores = {
 };
 let liveRole: "admin" | "user" = "user";
 let liveVersion = 0;
+let liveSessionExp = Math.ceil(Date.now() / 1000) + 3600;
+let liveSessionStart = Math.floor(Date.now() / 1000);
 let sessionMissing = false;
+let sessionRevoked = false;
 let sessionFailure: unknown;
+const sessionLookups: string[] = [];
 sessionStoreModule.setAuthStores({
 	...originalStores,
 	session: {
 		...originalStores.session,
-		async findSessionState(userId) {
+		async findSessionById(sessionId) {
+			sessionLookups.push(sessionId);
 			if (sessionFailure) throw sessionFailure;
-			return sessionMissing ? null : { id: userId, role: liveRole, tokenVersion: liveVersion };
+			const userId =
+				sessionId === "session:owner" ? "owner" : sessionId === "session:viewer" ? "viewer" : null;
+			if (sessionMissing || !userId) return null;
+			return {
+				id: sessionId,
+				userId,
+				role: liveRole,
+				userTokenVersion: liveVersion,
+				sessionTokenVersion: 0,
+				sessionStart: liveSessionStart,
+				createdAt: liveSessionStart,
+				expiresAt: liveSessionExp,
+				revokedAt: sessionRevoked ? Math.floor(Date.now() / 1000) : null,
+			};
 		},
 	},
 });
@@ -177,9 +196,9 @@ const ws = {
 	data: {
 		userId: "owner",
 		userRole: "user",
+		sessionId: "session:owner",
 		sessionUserId: "owner",
 		sessionExp: Math.ceil(Date.now() / 1000) + 3600,
-		sessionTokenVersion: 0,
 	},
 	send(raw: string) {
 		frames.push(JSON.parse(raw));
@@ -203,14 +222,19 @@ afterEach(() => {
 	stops = 0;
 	liveRole = "user";
 	liveVersion = 0;
+	liveSessionExp = Math.ceil(Date.now() / 1000) + 3600;
+	liveSessionStart = Math.floor(Date.now() / 1000);
 	sessionMissing = false;
+	sessionRevoked = false;
 	sessionFailure = undefined;
+	sessionLookups.length = 0;
 	adminOnly = false;
 	principalIsAdmin = false;
 	requestedKey = undefined;
 	ws.data.userRole = "user";
+	ws.data.sessionId = "session:owner";
+	ws.data.sessionUserId = "owner";
 	ws.data.sessionExp = Math.ceil(Date.now() / 1000) + 3600;
-	ws.data.sessionTokenVersion = 0;
 	subscriptions = 0;
 	invalidations = 0;
 	refreshed.length = 0;
@@ -264,10 +288,11 @@ test("demotion revokes the old session even when the socket still holds its admi
 	]);
 	expect(stops).toBe(1);
 });
-test("a renewed session with the current token version still subscribes", async () => {
-	liveVersion = 2;
-	ws.data.sessionTokenVersion = 2;
+test("a session renewed beyond the upgrade expiry still subscribes and refreshes its expiry", async () => {
+	ws.data.sessionExp = Math.floor(Date.now() / 1000) - 1;
 	await handleGitWorkspaceMessage(ws, message);
+	expect(sessionLookups).toEqual(["session:owner"]);
+	expect(ws.data.sessionExp).toBe(liveSessionExp);
 	expect(frames[0]).toMatchObject({ type: "git_workspace_subscribed", workspaceKey: "key" });
 	await notify?.(["worktree"]);
 	expect(frames.at(-1)?.type).toBe("git_workspace_changed");
@@ -280,12 +305,13 @@ test("a selected child Git workspace key reaches the target authorizer", async (
 	expect(requestedKey).toBe("child-key");
 	expect(frames.at(-1)).toMatchObject({ type: "git_workspace_changed", workspaceKey: "child-key" });
 });
-test("denied subscription never acks; ambiguous target fails closed", async () => {
+test("denied subscription never acks; a target without a narrator fails closed", async () => {
 	denied = true;
 	await handleGitWorkspaceMessage(ws, message);
 	expect(frames.map((frame) => frame.type)).toEqual(["git_workspace_error"]);
 	frames.length = 0;
-	await handleGitWorkspaceMessage(ws, { ...message, chapterId: "chapter" });
+	denied = false;
+	await handleGitWorkspaceMessage(ws, { ...message, narratorId: undefined });
 	expect(frames.map((frame) => frame.type)).toEqual(["git_workspace_error"]);
 });
 test("revocation stops subscription without disclosing changes", async () => {
@@ -295,17 +321,69 @@ test("revocation stops subscription without disclosing changes", async () => {
 	expect(frames.at(-1)?.type).toBe("git_workspace_error");
 	expect(stops).toBe(1);
 });
-test("deleted users and expired sessions cannot subscribe", async () => {
-	sessionMissing = true;
+test.each([
+	"missing",
+	"expired",
+	"revoked",
+	"generation-revoked",
+	"absolute-ceiling",
+] as const)("%s opaque sessions cannot subscribe", async (reason) => {
+	switch (reason) {
+		case "missing":
+			sessionMissing = true;
+			break;
+		case "expired":
+			liveSessionExp = Math.floor(Date.now() / 1000) - 1;
+			break;
+		case "revoked":
+			sessionRevoked = true;
+			break;
+		case "generation-revoked":
+			liveVersion++;
+			break;
+		case "absolute-ceiling":
+			liveSessionStart -= ABSOLUTE_SESSION_MAX_SECONDS;
+			break;
+	}
 	await handleGitWorkspaceMessage(ws, message);
+	expect(sessionLookups).toEqual(["session:owner"]);
 	expect(frames.map((frame) => frame.type)).toEqual(["git_workspace_error"]);
+	expect(frames.at(-1)).toMatchObject({ code: "GIT_WORKSPACE_ACCESS_DENIED" });
 	expect(authorizations).toBe(0);
-	frames.length = 0;
-	sessionMissing = false;
-	ws.data.sessionExp = Math.floor(Date.now() / 1000) - 1;
+	expect(subscriptions).toBe(0);
+});
+test.each([
+	"sessionId",
+	"sessionUserId",
+] as const)("an absent or mismatched %s fails before session lookup", async (field) => {
+	ws.data[field] = field === "sessionId" ? "" : "viewer";
 	await handleGitWorkspaceMessage(ws, message);
+	expect(sessionLookups).toEqual([]);
 	expect(frames.map((frame) => frame.type)).toEqual(["git_workspace_error"]);
+	expect(frames.at(-1)).toMatchObject({ code: "GIT_WORKSPACE_ACCESS_DENIED" });
 	expect(authorizations).toBe(0);
+});
+test("a live session belonging to another subject cannot authorize the socket's user", async () => {
+	ws.data.userRole = "admin";
+	ws.data.sessionId = "session:viewer";
+	await handleGitWorkspaceMessage(ws, message);
+	expect(sessionLookups).toEqual(["session:viewer"]);
+	expect(frames.map((frame) => frame.type)).toEqual(["git_workspace_error"]);
+	expect(frames.at(-1)).toMatchObject({ code: "GIT_WORKSPACE_ACCESS_DENIED" });
+	expect(authorizations).toBe(0);
+});
+test("a revoked opaque session stops change metadata on the same socket", async () => {
+	await handleGitWorkspaceMessage(ws, message);
+	sessionRevoked = true;
+	await notify?.(["refs"]);
+	expect(sessionLookups).toEqual(["session:owner", "session:owner"]);
+	expect(frames.map((frame) => frame.type)).toEqual([
+		"git_workspace_subscribed",
+		"git_workspace_error",
+	]);
+	expect(frames.at(-1)).toMatchObject({ code: "GIT_WORKSPACE_ACCESS_DENIED" });
+	expect(authorizations).toBe(1);
+	expect(stops).toBe(1);
 });
 test("a DB failure never falls back to the socket's cached admin role", async () => {
 	liveRole = "admin";
@@ -592,7 +670,13 @@ test("revoked access rejects a same-id details upgrade without disclosing its re
 test("a shared snapshot never bypasses another principal's revoked access", async () => {
 	const otherFrames: typeof frames = [];
 	const other = {
-		data: { userId: "viewer", userRole: "user" },
+		data: {
+			userId: "viewer",
+			userRole: "user",
+			sessionId: "session:viewer",
+			sessionUserId: "viewer",
+			sessionExp: Math.ceil(Date.now() / 1000) + 3600,
+		},
 		send: (raw: string) => {
 			otherFrames.push(JSON.parse(raw));
 		},

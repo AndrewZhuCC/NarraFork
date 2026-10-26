@@ -888,6 +888,16 @@ export async function executeTool(
 			};
 		}
 
+		// Within a context epoch an unloaded tool stays declared (see tool-loading.ts), so
+		// the declaration alone no longer means the tool may run.
+		if (config.toolLoading?.managed.has(tu.name) && config.isToolLoaded?.(tu.name) === false) {
+			return {
+				output: `Tool is not loaded in this session: ${tu.name}. Ask the user to /load it if it is needed.`,
+				isError: true,
+				durationMs: 0,
+			};
+		}
+
 		if (
 			(config.reflectionLoop && !config.reflectionLoop.allowedTools.includes(tu.name)) ||
 			(tool.reflectionOnly && !config.reflectionLoop)
@@ -1266,16 +1276,15 @@ export async function executeTool(
 			model: config.model,
 			pipelineUnusedToolCallThreshold: config.pipelineUnusedToolCallThreshold,
 			locale: config.locale ?? "en",
-			chapterId: config.chapterId,
 			planFileId: config.planFileId,
 			planFilePath: config.getPlanFilePathForTool?.(tu.toolUseId) ?? config.planFilePath,
 			skillRoot: config.skillRoot,
 			projectGitPath: config.projectGitPath,
-			worktreePath: config.worktreePath,
 			skillScopeKey: config.skillScopeKey,
 			blockedSkills: config.blockedSkills,
 			parentNarratorId: config.parentNarratorId,
 			runtimePolicy: config.runtimePolicy,
+			bot: config.bot,
 			userId: config.userId,
 			projectId: config.projectId,
 			requestPermission: (toolName, input, toolUseId) =>

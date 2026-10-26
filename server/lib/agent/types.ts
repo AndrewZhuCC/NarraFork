@@ -122,8 +122,6 @@ export interface ToolContext {
 	pipelineUnusedToolCallThreshold?: number;
 	/** Locale for i18n of tool outputs */
 	locale: string;
-	/** Chapter ID the narrator belongs to (cached to avoid repeated DB lookups) */
-	chapterId?: string;
 	/** Plan file ID — set during plan mode, used by ExitPlanMode to locate the plan file */
 	planFileId?: string;
 	/** Plan file path — set during plan mode, passed to EnterPlanMode tool for the result prompt */
@@ -132,14 +130,14 @@ export interface ToolContext {
 	skillRoot?: string;
 	/** Project git path used to resolve project-level skills for this context. */
 	projectGitPath?: string | null;
-	/** Active chapter worktree root, used for cwd recovery suggestions. */
-	worktreePath?: string | null;
 	/** Resolved skill summary cache scope key for this context. */
 	skillScopeKey?: string;
 	/** Skills blocked by narrator custom traits. `all` blocks every skill. */
 	blockedSkills?: { all: boolean; names: string[] } | null;
 	/** Server-resolved capability ceiling, copied from AgentConfig, never tool input. */
 	runtimePolicy?: RuntimePolicy;
+	/** Copied from `AgentConfig.bot`: a bot's own loop stays free for the conversation. */
+	bot?: boolean;
 	/** Parent narrator ID — set for subagents, used for Team file-change tracking */
 	parentNarratorId?: string;
 	/**
@@ -449,11 +447,14 @@ export type AgentEvent =
 			type: "stream_text";
 			text: string;
 			outputIndex?: number;
-			/** Attempt-scoped identity and revision shared with persisted content. */
-			blockId?: string;
-			blockRevision?: number;
+			/**
+			 * Attempt-scoped identity and revision shared with persisted content: every delta
+			 * names its element, so clients match it to its block (protocol v2).
+			 */
+			blockId: string;
+			blockRevision: number;
 			/** Raw text characters preceding this delta (metadata may also advance revision). */
-			blockTextOffset?: number;
+			blockTextOffset: number;
 	  }
 	| {
 			type: "tool_call";
@@ -481,6 +482,8 @@ export type AgentEvent =
 			brokenInputOverride?: Record<string, unknown>;
 			updatedInput?: Record<string, unknown>;
 			metadata?: Record<string, unknown>;
+			/** Images the tool returned; the consumer saves them and stores references. */
+			images?: Array<{ format: string; base64: string }>;
 	  }
 	/**
 	 * The tool passed its permission gate and final admission — execution begins NOW.
@@ -723,10 +726,11 @@ export type AgentEvent =
 			text: string;
 			providerMetadata?: ReasoningProviderMetadata;
 			outputIndex?: number;
-			blockId?: string;
-			blockRevision?: number;
+			/** As on `stream_text`: the element this delta extends. */
+			blockId: string;
+			blockRevision: number;
 			/** Raw text characters preceding this delta (metadata may also advance revision). */
-			blockTextOffset?: number;
+			blockTextOffset: number;
 	  }
 	| {
 			type: "context_usage";
@@ -941,12 +945,29 @@ export interface AgentAfterToolsInput {
 	onConsumed?: () => void;
 }
 
+/**
+ * What an agent loop's first request is built from.
+ *
+ * `rows` are the conversation (`DbMessage` rows, the stored shape); the loop keeps them
+ * as its transcript (`loop-transcript.ts`) and projects every request that has no
+ * host-built history from them. A host that already built the request from the same
+ * rows passes that history as `built`, which then is what the first request sends.
+ */
+export interface AgentLoopHistory {
+	rows: readonly import("./provider").DbMessage[];
+	built?: unknown[];
+}
+
+/** A host's rebuild: the rows of the conversation and the history built from them. */
 export interface AgentHistoryReplacement {
 	history: unknown[];
-	pendingToolResults: unknown[];
+	/** The rows `history` was built from; they replace the loop's transcript. */
+	rows: readonly import("./provider").DbMessage[];
 	systemPrompt?: string;
-	/** Persisted input rows retained in history, excluding rows lifted into current input. */
+	/** Persisted input rows the rebuilt history carries. */
 	replayedInjectionMessageIds?: readonly string[];
+	/** Loading state of the rebuilt history; the `tools` array is re-derived from it. */
+	toolLoading?: import("./tool-loading").ToolLoadingState;
 }
 
 /** 请求前扩展上下文（每轮请求构建时提供给扩展） */
@@ -1020,10 +1041,14 @@ export interface AgentConfig {
 	onToolsCharacters?: (toolsChars: number) => void | Promise<void>;
 	locale?: string;
 	signal: AbortSignal;
-	/** Chapter ID the narrator belongs to (passed through to ToolContext) */
-	chapterId?: string;
 	/** Resolved by server runtime assembly; DB authorization remains the final authority. */
 	runtimePolicy?: RuntimePolicy;
+	/**
+	 * This narrator is a bot: people see only what it delivers with `Send({ user })`, so
+	 * Send offers that target. Shapes the offered schema only; the bot trait is re-read
+	 * when the message is delivered.
+	 */
+	bot?: boolean;
 	/** Parent narrator ID — set for subagents, passed through to ToolContext for Team tracking */
 	parentNarratorId?: string;
 	/** Parent Agent/Task/Send tool_use that spawned this subagent. */
@@ -1066,8 +1091,6 @@ export interface AgentConfig {
 	skillRoot?: string;
 	/** Project git path used to resolve project-level skills for this context. */
 	projectGitPath?: string | null;
-	/** Active chapter worktree root, used for cwd recovery suggestions. */
-	worktreePath?: string | null;
 	/** Resolved skill summary cache scope key for this context. */
 	skillScopeKey?: string;
 	/** User who triggered this loop turn — flows into ToolContext.userId for knowledge ACL. */
@@ -1197,6 +1220,14 @@ export interface AgentConfig {
 	toolFilter?: (tool: ToolDefinition) => boolean;
 	/** Request-level extensions (prompt persona / near-field guidance / tool anchoring). */
 	loopExtensions?: AgentLoopExtension[];
+	/**
+	 * Optional-tool loading state of the history this pass was built from. The loop
+	 * keeps managed tools out of `toolFilter` and decides their place here instead
+	 * (see `tool-loading.ts`).
+	 */
+	toolLoading?: import("./tool-loading").ToolLoadingState;
+	/** Live loaded state of a managed tool; a call to an unloaded one is rejected. */
+	isToolLoaded?: (name: string) => boolean;
 	/** Tool names disabled by narrator custom traits. Enforced again at execution time. */
 	disabledTools?: Set<string> | string[];
 	/** Optional hard allow-list. Unlike toolFilter, this is enforced again at execution time. */
@@ -1227,14 +1258,25 @@ export interface AgentConfig {
 	onEvent?: (event: AgentEvent) => void;
 	/**
 	 * Called before each non-first turn in the agent loop.
-	 * If it returns a new history + pendingToolResults, the loop replaces its
-	 * internal state — used for mid-turn context pruning and forced rebuilds
-	 * before model/provider switches.
+	 * If it returns a rebuilt history, the loop replaces its history and transcript —
+	 * used for mid-turn context pruning and forced rebuilds before model/provider switches.
 	 */
 	onBeforeTurn?: (
 		turnIndex: number,
 		reason?: { force?: boolean; cause?: "normal" | "model_switch" },
 	) => Promise<AgentHistoryReplacement | null>;
+	/**
+	 * Rebuild the history a request is sent with, from persisted rows.
+	 *
+	 * When present, every request after the first is built by this instead of from the
+	 * loop's own transcript, so a live request is byte-for-byte what a later rebuild of
+	 * the same rows produces. Everything the model saw in earlier turns is persisted by
+	 * then (assistant steps, tool results, notice rows); only text no row carries is
+	 * still sent as the request's current content. Hosts without a store leave it unset.
+	 */
+	rebuildRequestHistory?: () => Promise<AgentHistoryReplacement>;
+	/** Whether the initial history ends with tool results the model has not answered. */
+	historyEndsWithToolResults?: boolean;
 	/** End a reasoning-only turn quietly when the runtime is waiting for external work. */
 	shouldIdleOnReasoningOnly?: () => boolean | Promise<boolean>;
 	/** Latest context-window occupancy observed by the caller. */

@@ -6,9 +6,24 @@ import { NARRATOR_PANEL_SELECTOR, readPanelQuoteSelection } from "./quote-select
 
 /** Long enough to skip intermediate drag states, short enough to feel immediate. */
 export const QUOTE_SELECTION_SETTLE_MS = 120;
+/**
+ * Dragging the platform selection handles on iOS reaches the page only as a stream of
+ * selectionchange events (no touch events), so touch waits longer for the selection to rest.
+ */
+export const QUOTE_TOUCH_SELECTION_SETTLE_MS = 300;
 
 export type QuoteCandidate =
-	| { kind: "text"; key: string; quote: ComposerQuote }
+	| {
+			kind: "text";
+			key: string;
+			quote: ComposerQuote;
+			/** Live source range, only for positioning the floating button. */
+			range?: Range;
+			/** Focus precedes anchor: the selection "end" the user moved is its start. */
+			backward?: boolean;
+			/** Message the selection starts in, the fork point for 顺便提问. */
+			messageId?: string;
+	  }
 	| {
 			kind: "file";
 			key: string;
@@ -100,19 +115,18 @@ export function editorSelectionCandidate(
 }
 
 /**
- * The temporary message/tool or saved-file selection in this composer's own input.
- * File candidates also have a source-editor action; this hook owns only text-selection Tab.
+ * The temporary message/tool quote in this composer's own list, offered by a floating
+ * button that never changes the composer's layout. File selections use source-bound
+ * Monaco gutter buttons and Tab; this hook owns only text-selection Tab.
  * Consuming/dismissing hides a candidate until its source selection changes.
  */
 export function useQuoteCandidate({
 	textareaRef,
 	element,
-	fileSelection,
 	onShortcut,
 }: {
 	textareaRef: RefObject<HTMLElement | null>;
 	element?: HTMLElement | null;
-	fileSelection?: FileReferenceEditorSelection | null;
 	onShortcut: (candidate: QuoteCandidate) => void;
 }) {
 	const [candidate, setCandidate] = useState<QuoteCandidate | null>(null);
@@ -143,7 +157,7 @@ export function useQuoteCandidate({
 		};
 		const onQuoteControl = (event: Event) =>
 			!!targetElement(event.target)?.closest(
-				"[data-inline-quote-candidate], [data-composer-quote-candidate]",
+				"[data-quote-candidate], [data-composer-quote-candidate]",
 			);
 		const pointer = (event: PointerEvent) =>
 			record(event.pointerType === "touch" || event.pointerType === "pen", !onQuoteControl(event));
@@ -174,44 +188,64 @@ export function useQuoteCandidate({
 		if (!textarea) return;
 		const doc = textarea.ownerDocument;
 		let timer: ReturnType<typeof setTimeout> | undefined;
+		// A mouse drag shows the button once, on release, rather than chasing the pointer.
+		let mouseDragging = false;
 		const check = () => {
 			const panel = textarea.closest(NARRATOR_PANEL_SELECTOR);
-			const quote = panel ? readPanelQuoteSelection(panel, doc.getSelection()) : null;
-			if (!quote) {
+			const selection = doc.getSelection();
+			const quote = panel ? readPanelQuoteSelection(panel, selection) : null;
+			if (!quote || !selection) {
 				hiddenKeysRef.current.text = null;
 				setCandidate((current) => (current?.kind === "text" ? null : current));
 				return;
 			}
+			if (mouseDragging) return;
 			const key = textQuoteKey(quote);
 			if (key === hiddenKeysRef.current.text) return;
+			const range = selection.getRangeAt(0).cloneRange();
+			const backward =
+				!!selection.anchorNode &&
+				!!selection.focusNode &&
+				(range.startContainer !== selection.anchorNode ||
+					range.startOffset !== selection.anchorOffset);
+			const start = range.startContainer;
+			const messageId =
+				(start.nodeType === 1 ? (start as Element) : start.parentElement)
+					?.closest("[data-message-id]")
+					?.getAttribute("data-message-id")
+					?.trim() || undefined;
 			setShowShortcut(!touchInputRef.current);
-			setCandidate((current) => (current?.key === key ? current : { kind: "text", key, quote }));
+			setCandidate({ kind: "text", key, quote, range, backward, messageId });
 		};
 		const schedule = () => {
 			clearTimeout(timer);
-			timer = setTimeout(check, QUOTE_SELECTION_SETTLE_MS);
+			timer = setTimeout(
+				check,
+				touchInputRef.current ? QUOTE_TOUCH_SELECTION_SETTLE_MS : QUOTE_SELECTION_SETTLE_MS,
+			);
+		};
+		const pointerDown = (event: PointerEvent) => {
+			if (event.pointerType !== "mouse" || event.button !== 0) return;
+			if (targetElement(event.target)?.closest("[data-quote-candidate]")) return;
+			mouseDragging = true;
+		};
+		const pointerUp = () => {
+			if (!mouseDragging) return;
+			mouseDragging = false;
+			schedule();
 		};
 		doc.addEventListener("selectionchange", schedule);
+		doc.addEventListener("pointerdown", pointerDown, { capture: true, passive: true });
+		doc.addEventListener("pointerup", pointerUp, { capture: true, passive: true });
+		doc.addEventListener("pointercancel", pointerUp, { capture: true, passive: true });
 		return () => {
 			clearTimeout(timer);
 			doc.removeEventListener("selectionchange", schedule);
+			doc.removeEventListener("pointerdown", pointerDown, true);
+			doc.removeEventListener("pointerup", pointerUp, true);
+			doc.removeEventListener("pointercancel", pointerUp, true);
 		};
 	}, [textareaRef, element]);
-
-	useEffect(() => {
-		const next = editorSelectionCandidate(fileSelection);
-		if (!next) {
-			hiddenKeysRef.current.file = null;
-			setCandidate((current) => (current?.kind === "file" ? null : current));
-			return;
-		}
-		if (next.key === hiddenKeysRef.current.file) return;
-		const textarea = element ?? textareaRef.current;
-		const panel = textarea?.closest(NARRATOR_PANEL_SELECTOR);
-		if (textarea && panel && readPanelQuoteSelection(panel, textarea.ownerDocument.getSelection()))
-			return;
-		setCandidate((current) => (current?.key === next.key ? current : next));
-	}, [fileSelection, element, textareaRef]);
 
 	useEffect(() => {
 		const owner = ownerRef.current;

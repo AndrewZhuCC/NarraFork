@@ -7,7 +7,6 @@ function narrator(
 	return {
 		id: overrides.id,
 		parentNarratorId: overrides.parentNarratorId ?? null,
-		chapterId: overrides.chapterId ?? null,
 		type: overrides.type ?? "primary",
 		variant: overrides.variant ?? "primary",
 		traits: overrides.traits ?? null,

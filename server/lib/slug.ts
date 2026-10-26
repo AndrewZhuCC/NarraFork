@@ -12,6 +12,6 @@ export function slugify(text: string): string {
 			.replace(/[^\p{L}\p{N}]+/gu, "-") // keep Unicode letters & digits, replace rest with -
 			.replace(/(^-|-$)/g, "") // trim leading/trailing dashes
 			.toLowerCase()
-			.slice(0, 30) || "chapter" // fallback for empty result
+			.slice(0, 30) || "entry" // fallback for empty result
 	);
 }

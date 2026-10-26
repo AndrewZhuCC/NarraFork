@@ -35,10 +35,8 @@ import type { ToolCallBinding } from "../lib/agent/types";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
-import { advanceChapterSnapshot } from "./chapter-snapshot-ref";
 import { specVfsService } from "./spec-vfs-service";
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
-import { worktreeWatcher } from "./worktree-watcher";
 import {
 	closeClaim,
 	foreignDeclaredPaths,
@@ -165,7 +163,7 @@ function worktreeRelativePath(cwd: string, value: unknown): string | null {
  *
  * Never throws. Returns null for a remote target, a non-git cwd, or a git error.
  *
- * Two deliberate degradation valves live here. The `chapters.treeSnapshotsEnabled`
+ * Two deliberate degradation valves live here. The `workspace.treeSnapshotsEnabled`
  * setting is the manual escape hatch for worktrees where the whole-tree scan is
  * not viable at all; and the capture itself goes through `tryCaptureHot`, which
  * bounds how long the narrator's event consumer may stall on it and lets an
@@ -180,7 +178,7 @@ export async function captureSessionTree(
 	// Even a failed/disabled capture must not leave a stale observation looking fresh.
 	session._lastTreeHash = undefined;
 	session._lastTreeHashAt = undefined;
-	if (!settings.chapters.treeSnapshotsEnabled) return null;
+	if (!settings.workspace.treeSnapshotsEnabled) return null;
 	if ((session._defaultDeviceId ?? LOCAL_DEVICE_ID) !== LOCAL_DEVICE_ID) return null;
 	const treeHash = await worktreeTreeSnapshot.tryCaptureHot(session.cwd, LOCAL_DEVICE_ID, {
 		// Before boundaries also reject an older in-flight warm scan. It may have
@@ -416,19 +414,6 @@ export async function recordTreeSnapshotAfter(
 				),
 			)
 			.returning({ messageId: narratorToolCalls.messageId });
-		// Link this state into the workspace's snapshot DAG. Done with the tree that
-		// was just captured rather than by re-capturing: `add -A` is the one cost here
-		// that scales with repository size, and it has already been paid.
-		//
-		// The lineage is what makes this boundary usable as a *fork or merge* endpoint,
-		// not just a rollback target: a bare tree has no ancestry, so two diverging
-		// workspaces have no computable merge base. Failure is tolerated — the boundary
-		// hashes above are already durable, so the worst case is that forking from this
-		// point falls back to the older commit-plus-replay path.
-		const linked = after
-			? await advanceChapterSnapshot(session.cwd, after, "narrator tool boundary")
-			: null;
-
 		// Mirror the resulting state onto the owning message so rolling back "to just
 		// after this message" has a boundary to restore. A later tool in the same
 		// message overwrites it, which is correct: the boundary is the state after the
@@ -438,7 +423,7 @@ export async function recordTreeSnapshotAfter(
 				.update(narratorMessages)
 				.set({
 					treeHashAfter: after,
-					snapshotCommitSha: linked?.commitSha ?? null,
+					snapshotCommitSha: null,
 				})
 				.where(eq(narratorMessages.id, updated.messageId));
 		}
@@ -454,29 +439,13 @@ export async function recordTreeSnapshotAfter(
 }
 
 /**
- * Publish a tool call's workspace delta to everyone viewing that workspace.
+ * Publish a tool call's workspace delta to the session that made it.
  *
- * ## Why this is the good event source
- *
- * Unlike the filesystem watcher, this fires from the code that just performed the
- * write, so it needs no native watcher (which is opt-in — the default deployment
- * polls git status and observes no paths at all), it has no ignore list to disagree
- * with, and its paths come from a real `diff-tree` between two boundaries rather
- * than from OS notifications. It is also inherently deduplicated and coalesced: one
- * event per tool call, describing the net effect of that call.
- *
- * What it does NOT cover, and why the watcher path stays: writes from the user's own
- * editor, an external build, or a terminal command that ran outside the tool path.
- * Those have no tool boundary, so only a watcher can see them. The two sources are
- * complementary and the tree treats both as the same kind of hint.
- *
- * ## Fan-out
- *
- * Delivered to every narrator attached to the worktree, not just the one that wrote:
- * a shared worktree can have several sessions open beside each other, and a tree in
- * any of them is showing the same directory. The attached set is read from the
- * watcher's registry, which already maintains exactly this mapping — querying the
- * database for it would put a lookup on the tool-execution hot path.
+ * Fires from the code that just performed the write, so its paths come from a real
+ * `diff-tree` between two boundaries rather than from OS notifications, and it is
+ * inherently deduplicated: one event per tool call, describing the net effect of that
+ * call. Writes from the user's own editor or a terminal have no tool boundary and are
+ * not reported here.
  *
  * Never throws: a failed broadcast must not fail the tool call that succeeded.
  */
@@ -492,27 +461,17 @@ function emitWorkspacePathChanges(
 		// to every subscriber).
 		const bounded = changes.slice(0, MAX_BROADCAST_PATHS);
 		const truncated = bounded.length < changes.length;
-		const attached = worktreeWatcher.getAttachedNarratorIds(worktreePath);
-		// The acting narrator is always a recipient, even when no watcher is registered
-		// for its worktree (a chapterless session, or one whose watcher was torn down):
-		// it is the surface most likely to be showing this tree right now.
-		const recipients = new Set<string>(attached);
-		recipients.add(actingNarratorId);
-
-		for (const narratorId of recipients) {
-			eventBus.emit({
-				type: "narrator:ws_broadcast",
-				narratorId,
-				message: {
-					type: "workspace_paths_changed",
-					narratorId,
-					chapterId: "",
-					toolUseId: "",
-					changes: bounded,
-					truncated,
-				},
-			});
-		}
+		eventBus.emit({
+			type: "narrator:ws_broadcast",
+			narratorId: actingNarratorId,
+			message: {
+				type: "workspace_paths_changed",
+				narratorId: actingNarratorId,
+				toolUseId: "",
+				changes: bounded,
+				truncated,
+			},
+		});
 	} catch (err) {
 		logger.debug("Failed to broadcast workspace path changes", {
 			worktreePath,
@@ -527,7 +486,7 @@ function emitWorkspacePathChanges(
  * A single tool call can legitimately touch a great many files (a formatter over a
  * repository, a dependency install). Past this the client is told `truncated` and
  * revalidates what it has loaded, which is both smaller and more correct than a
- * enormous path list — see the same trade in the watcher's `MAX_PENDING_PATHS`.
+ * enormous path list.
  */
 const MAX_BROADCAST_PATHS = 500;
 

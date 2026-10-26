@@ -588,7 +588,7 @@ renderContent(revisionContent, viewContext, collection.viewDimensions, missingKe
 
 ### 3.10 全文搜索（FTS5）
 
-不在 schema.ts，而在 `server/db/fts.ts` 追加（与 `chapters_fts`/`narrator_messages_fts`/`narrators_fts` 同样的 trigram tokenizer + 外部内容表 + 同步触发器模式）。
+不在 schema.ts，而在 `server/db/fts.ts` 追加（与 `narrator_messages_fts`/`narrators_fts` 同样的 trigram tokenizer + 外部内容表 + 同步触发器模式）。
 
 现有 FTS 表用 `content='<基表>', content_rowid=rowid`（SQLite 隐式整型 rowid）+ AFTER INSERT/UPDATE/DELETE 触发器同步（见 `fts.ts` 第 47-131 行）。知识库沿用同一模式：
 

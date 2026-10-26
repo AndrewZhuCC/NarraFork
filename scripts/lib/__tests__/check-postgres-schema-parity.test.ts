@@ -523,10 +523,10 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 122 tables and 1719 columns including editor recovery and local extensions", () => {
-		expect(target.tables.length).toBe(122);
-		// Upstream schema plus turnEndedAt and scheduled-task reasoningEffort.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1719);
+	test("covers 126 tables and 1677 columns including local extensions, bot authors and sessions", () => {
+		expect(target.tables.length).toBe(126);
+		// Upstream block/auth/project schema plus turnEndedAt and scheduled-task reasoningEffort.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1677);
 		expect(
 			target.tables
 				.find((table) => table.name === "narrator_context_pins")

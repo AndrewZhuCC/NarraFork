@@ -20,12 +20,10 @@ import {
 	EditorState,
 	NodeSelection,
 	Plugin,
-	PluginKey,
 	type Selection,
 	type SelectionBookmark,
 	TextSelection,
 } from "@tiptap/pm/state";
-import { Decoration, DecorationSet } from "@tiptap/pm/view";
 import {
 	EditorContent,
 	Extension,
@@ -47,12 +45,10 @@ import {
 	useContext,
 	useEffect,
 	useImperativeHandle,
-	useLayoutEffect,
 	useMemo,
 	useRef,
 	useState,
 } from "react";
-import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { fileReferenceToken } from "./file-reference-input";
 import classes from "./InlineComposerEditor.module.css";
@@ -125,12 +121,11 @@ export interface InlineComposerEditorProps {
 	onOpenAttachment?: (asset: ComposerAsset) => void;
 	controls?: ReactNode;
 	leadingControls?: ReactNode;
-	/** Transient preview only; never becomes a document node or history entry. */
-	candidate?: { key: string; content: ReactNode };
 	adaptive?: boolean;
 }
 
-const candidateKey = new PluginKey<number | null>("inlineComposerCandidate");
+/** Bounds the unacknowledged-emission queue for a parent that never renders changes back. */
+const MAX_PENDING_ECHOES = 32;
 
 type AtomNode = Exclude<ComposerInlineNode, { type: "text" } | { type: "break" }>;
 type AtomContextValue = Pick<
@@ -511,10 +506,16 @@ export const InlineComposerEditor = forwardRef<
 	const latestRef = useRef(props.value);
 	const signatureRef = useRef(JSON.stringify(props.value));
 	const actualSignatureRef = useRef<string | null>(null);
+	/*
+	 * Documents emitted through onChange that the parent has not rendered back yet,
+	 * oldest first. Under load the parent can commit an older emission after the
+	 * editor moved on (an insert's render landing after the next undo); such a stale
+	 * echo is not a new controlled value, and replacing the document with it would
+	 * rebuild the state and wipe the undo history.
+	 */
+	const pendingEchoesRef = useRef<string[]>([]);
 	const receivedValueRef = useRef(props.value);
 	const transactionStartedRef = useRef(0);
-	const candidateHostRef = useRef<HTMLSpanElement | null>(null);
-	const [candidateHost, setCandidateHost] = useState<HTMLSpanElement | null>(null);
 	const bookmarksRef = useRef(new Set<{ value: SelectionBookmark | null }>());
 	const clearBookmarks = useCallback(() => {
 		for (const bookmark of bookmarksRef.current) bookmark.value = null;
@@ -572,42 +573,6 @@ export const InlineComposerEditor = forwardRef<
 			Extension.create({
 				name: "composerBoundaries",
 				addProseMirrorPlugins: () => [
-					new Plugin<number | null>({
-						key: candidateKey,
-						state: {
-							init: () => null,
-							apply: (transaction, position) => {
-								const change = transaction.getMeta(candidateKey) as
-									| { visible: boolean }
-									| undefined;
-								const next = change
-									? change.visible
-										? transaction.selection.from
-										: null
-									: position == null
-										? null
-										: transaction.mapping.map(position);
-								// AllSelection starts outside the paragraph. Keep only the preview
-								// in inline content, without changing the user's real selection.
-								return next == null ? null : TextSelection.near(transaction.doc.resolve(next)).from;
-							},
-						},
-						props: {
-							decorations: (state) => {
-								const position = candidateKey.getState(state);
-								const host = candidateHostRef.current;
-								if (position == null || !host || !propsRef.current.candidate) return null;
-								return DecorationSet.create(state.doc, [
-									Decoration.widget(position, () => host, {
-										key: "pending-quote",
-										side: -1,
-										ignoreSelection: true,
-										stopEvent: () => true,
-									}),
-								]);
-							},
-						},
-					}),
 					new Plugin({
 						state: {
 							init: () => null,
@@ -669,7 +634,6 @@ export const InlineComposerEditor = forwardRef<
 				"data-empty": String(
 					state.doc.childCount === 1 && state.doc.firstChild?.content.size === 0,
 				),
-				"data-has-candidate": String(!!propsRef.current.candidate),
 			}),
 			handleKeyDown: (_view, event) => event.defaultPrevented,
 			clipboardTextSerializer: (slice) =>
@@ -749,6 +713,8 @@ export const InlineComposerEditor = forwardRef<
 			latestRef.current = document;
 			signatureRef.current = JSON.stringify(document);
 			actualSignatureRef.current = signatureRef.current;
+			pendingEchoesRef.current.push(signatureRef.current);
+			if (pendingEchoesRef.current.length > MAX_PENDING_ECHOES) pendingEchoesRef.current.shift();
 			propsRef.current.onChange(document);
 			for (const asset of removed) propsRef.current.onRemoveAsset?.(asset.id);
 			if (transactionStartedRef.current)
@@ -816,10 +782,6 @@ export const InlineComposerEditor = forwardRef<
 		signatureRef.current = JSON.stringify(parsed);
 		clearBookmarks();
 		if (editor && !editor.isDestroyed) {
-			if (propsRef.current.candidate)
-				editor.view.dispatch(
-					editor.state.tr.setMeta(candidateKey, { visible: true }).setMeta("addToHistory", false),
-				);
 			actualSignatureRef.current = JSON.stringify(
 				readEditorDocument(editor.state.doc, assetsRef.current),
 			);
@@ -830,29 +792,19 @@ export const InlineComposerEditor = forwardRef<
 	useEffect(() => {
 		if (!editor || receivedValueRef.current === props.value) return;
 		receivedValueRef.current = props.value;
+		const signature = JSON.stringify(props.value);
+		const echo = pendingEchoesRef.current.indexOf(signature);
+		if (echo >= 0) {
+			// The parent caught up to (at least) this emission; anything older is settled.
+			pendingEchoesRef.current.splice(0, echo + 1);
+			return;
+		}
 		// Internal render/imperative restore is not a newly received controlled value.
-		if (JSON.stringify(props.value) !== signatureRef.current) replaceDocument(props.value);
+		if (signature !== signatureRef.current) {
+			pendingEchoesRef.current = [];
+			replaceDocument(props.value);
+		}
 	});
-	useLayoutEffect(() => {
-		if (!editor) return;
-		const host = editor.view.dom.ownerDocument.createElement("span");
-		host.contentEditable = "false";
-		host.dataset.composerCandidateHost = "true";
-		candidateHostRef.current = host;
-		setCandidateHost(host);
-		return () => {
-			candidateHostRef.current = null;
-		};
-	}, [editor]);
-	const pendingKey = props.candidate?.key;
-	useLayoutEffect(() => {
-		if (!editor || !candidateHost) return;
-		editor.view.dispatch(
-			editor.state.tr
-				.setMeta(candidateKey, { visible: pendingKey !== undefined })
-				.setMeta("addToHistory", false),
-		);
-	}, [editor, candidateHost, pendingKey]);
 	useEffect(() => () => clearBookmarks(), [clearBookmarks]);
 	useEffect(() => {
 		editor?.setEditable(!props.disabled, false);
@@ -1067,7 +1019,6 @@ export const InlineComposerEditor = forwardRef<
 	);
 	return (
 		<AtomContext.Provider value={atomContext}>
-			{candidateHost && props.candidate && createPortal(props.candidate.content, candidateHost)}
 			<div
 				ref={rootRef}
 				className={classes.root}

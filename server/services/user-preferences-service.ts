@@ -1,7 +1,6 @@
 import { and, count as countFn, eq, inArray, isNull } from "drizzle-orm";
 import { db } from "../db";
-import { containerInstances, narrators, terminals } from "../db/schema";
-import { CONTAINER_STATUS_PRIORITY } from "../lib/constants";
+import { narrators, terminals } from "../db/schema";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { broadcastToUser, getNarratorPresenceBatch } from "../websocket/narrator-ws";
@@ -24,9 +23,6 @@ export function migrateTabTypes(tabs: Record<string, unknown>[]): void {
 export function getTabNarratorId(tab: Record<string, unknown>): string | undefined {
 	if (tab.type === "narrator" || tab.type === "subagent") {
 		return typeof tab.id === "string" ? tab.id : undefined;
-	}
-	if (tab.type === "chapter") {
-		return typeof tab.narratorId === "string" ? tab.narratorId : undefined;
 	}
 	return undefined;
 }
@@ -118,40 +114,6 @@ export async function enrichTabs(
 				if (viewers && viewers.length > 0) {
 					tab.viewers = viewers;
 				}
-			}
-		}
-	}
-
-	// Container status for chapter tabs
-	const chapterIds = tabs.filter((t) => t.type === "chapter").map((t) => t.id as string);
-	if (chapterIds.length > 0) {
-		const containerRows = await db
-			.select({
-				chapterId: containerInstances.chapterId,
-				status: containerInstances.status,
-			})
-			.from(containerInstances)
-			.where(
-				and(
-					inArray(containerInstances.chapterId, chapterIds),
-					isNull(containerInstances.worktreeResourceId),
-				),
-			);
-
-		const containerStatusMap = new Map<string, string>();
-		for (const row of containerRows) {
-			if (row.chapterId === null) continue;
-			const existing = containerStatusMap.get(row.chapterId);
-			if (
-				!existing ||
-				(CONTAINER_STATUS_PRIORITY[row.status] ?? 0) > (CONTAINER_STATUS_PRIORITY[existing] ?? 0)
-			) {
-				containerStatusMap.set(row.chapterId, row.status);
-			}
-		}
-		for (const tab of tabs) {
-			if (tab.type === "chapter" && containerStatusMap.has(tab.id as string)) {
-				tab.containerStatus = containerStatusMap.get(tab.id as string);
 			}
 		}
 	}

@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import type { PretextDocumentPageResult, TreeMessage } from "@frontend/lib/api/types";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { refreshPretextDocumentWindow } from "./pretext-document-loader";
 import { PretextLayoutCoordinator } from "./pretext-layout-coordinator";
@@ -10,7 +11,7 @@ beforeAll(() => {
 });
 afterAll(() => restoreCanvas());
 
-const row = (id: string, seq: number) => ({ id, seq, contentJson: [] }) as unknown as TreeMessage;
+const row = (id: string, seq: number) => rowWithElements({ id, seq }, []) as unknown as TreeMessage;
 const previous = {
 	messages: [row("source", 1), row("tail", 2)],
 	messageVersion: 7,
@@ -33,16 +34,20 @@ const page = (
 
 for (const boundary of ["streaming-layout", "append", "cancel"] as const) {
 	test(`coordinator refresh preserves pure layout but retires persistent changes: ${boundary}`, async () => {
-		const message = (id: string, seq: number): TreeMessage => ({
-			...row(id, seq),
-			narratorId: "refresh-boundaries",
-			parentToolUseId: null,
-			role: "assistant",
-			createdAt: "2026-10-16T00:00:00.000Z",
-			contentJson: [{ type: "text", text: id }],
-			toolCalls: [],
-			children: [],
-		});
+		const message = (id: string, seq: number): TreeMessage =>
+			rowWithElements(
+				{
+					id,
+					seq,
+					narratorId: "refresh-boundaries",
+					parentToolUseId: null,
+					role: "assistant",
+					createdAt: "2026-10-16T00:00:00.000Z",
+					contentText: null,
+					toolCalls: [],
+				},
+				[{ type: "text" as const, text: id }],
+			);
 		const buildOptions = {
 			lod: 5 as const,
 			widthBucket: "860",

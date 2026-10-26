@@ -16,6 +16,7 @@ import {
 	useUpdateCheck,
 	useUpdateDownload,
 } from "./useUpdateCheck";
+import { OFFICIAL_UPDATE_SERVER_URL, useUpdateSourcePrompt } from "./useUpdateSourcePrompt";
 
 describe("extractUpdateFailureDiagnostic", () => {
 	test("prefers reason, then message, error, code, and fallback", () => {
@@ -174,8 +175,13 @@ async function mountHarness(
 	await settle();
 }
 
+let promptLanguage = "zh-CN";
+let promptState: ReturnType<typeof useUpdateSourcePrompt> | undefined;
+
 function Harness() {
-	renders.push(useUpdateCheck());
+	const check = useUpdateCheck();
+	renders.push(check);
+	promptState = useUpdateSourcePrompt(check, promptLanguage);
 	return null;
 }
 
@@ -197,6 +203,8 @@ function latest(): UpdateCheckResult {
 
 beforeEach(() => {
 	restoreDom = installDom();
+	promptLanguage = "zh-CN";
+	promptState = undefined;
 	renders = [];
 	checkUpdateCalls = 0;
 	api.getSettings = async () => ({
@@ -726,5 +734,265 @@ describe("useUpdateCheck admin gate", () => {
 		expect(latest().updateAvailable).toBe(true);
 		expect(latest().latestVersion).toBe("1.1.0");
 		expect(latest().isLoading).toBe(false);
+	});
+});
+
+describe("first GitHub check mirror prompt", () => {
+	function configure(errorCode?: string) {
+		api.getSettings = async () => ({
+			update: {
+				source: "github",
+				githubRepository: "NarraFork/NarraFork",
+				channel: "beta",
+				autoDownload: false,
+				proxy: { mode: "direct" },
+			},
+		});
+		api.checkUpdate = async () => ({
+			updateAvailable: false,
+			currentVersion: "1.0.0",
+			source: "github",
+			repository: "NarraFork/NarraFork",
+			errorCode,
+		});
+	}
+
+	for (const code of ["NETWORK_ERROR", "TIMEOUT", "GITHUB_RATE_LIMIT", "RATE_LIMITED"]) {
+		test(`Chinese admin is prompted on first ${code}`, async () => {
+			configure(code);
+			await mountAs("admin");
+			expect(promptState?.opened).toBe(true);
+		});
+	}
+
+	for (const code of [
+		undefined,
+		"NO_RELEASE",
+		"INVALID_METADATA",
+		"REPOSITORY_NOT_FOUND",
+		"PLATFORM_UNAVAILABLE",
+		"UPDATE_SOURCE_CHANGED",
+	]) {
+		test(`does not mistake ${code ?? "success"} for connectivity trouble`, async () => {
+			configure(code);
+			await mountAs("admin");
+			expect(promptState?.opened).toBe(false);
+		});
+	}
+
+	test("a later failed poll does not prompt after a successful first check", async () => {
+		configure();
+		await mountAs("admin");
+		configure("NETWORK_ERROR");
+		await latest().refetch();
+		await settle();
+		expect(promptState?.opened).toBe(false);
+	});
+
+	test("English first check is consumed without prompting after a language change", async () => {
+		configure("TIMEOUT");
+		promptLanguage = "en";
+		await mountAs("admin");
+		expect(promptState?.opened).toBe(false);
+		promptLanguage = "zh-CN";
+		await mountAs("admin");
+		expect(promptState?.opened).toBe(false);
+	});
+
+	test("non-admin, custom repository and server sources do not prompt", async () => {
+		configure("TIMEOUT");
+		await mountAs("user");
+		expect(promptState?.opened).toBe(false);
+		api.getSettings = async () => ({
+			update: { source: "github", githubRepository: "fork/project" },
+		});
+		await mountAs("admin");
+		expect(promptState?.opened).toBe(false);
+		queryClient?.setQueryData(["settings"], { update: { source: "update-server" } });
+		await latest().refetch();
+		await settle();
+		expect(promptState?.opened).toBe(false);
+	});
+
+	test("a browser-to-NarraFork failure does not prompt or consume the check", async () => {
+		configure("TIMEOUT");
+		const check = api.checkUpdate;
+		api.checkUpdate = async () => {
+			throw new Error("API offline");
+		};
+		await mountAs("admin");
+		expect(promptState?.opened).toBe(false);
+		expect(localStorage.getItem("narrafork:first-github-update-check:u1")).toBeNull();
+		api.checkUpdate = check;
+		await latest().refetch();
+		await settle();
+		expect(promptState?.opened).toBe(true);
+	});
+
+	test("dismissal writes no settings and survives a remount", async () => {
+		configure("NETWORK_ERROR");
+		let writes = 0;
+		api.updateSettings = async () => {
+			writes++;
+			return {};
+		};
+		await mountAs("admin");
+		promptState?.dismiss();
+		await settle();
+		await latest().refetch();
+		await settle();
+		expect(promptState?.opened).toBe(false);
+		root?.unmount();
+		if (!container) throw new Error("harness container is missing");
+		root = createRoot(container);
+		await mountAs("admin");
+		expect(promptState?.opened).toBe(false);
+		expect(writes).toBe(0);
+	});
+
+	test("confirmation patches only mirror fields, refreshes checks and preserves prepared state", async () => {
+		configure("TIMEOUT");
+		let payload: Record<string, unknown> | undefined;
+		let saved = false;
+		const settings = await api.getSettings();
+		api.getSettings = async () =>
+			saved
+				? {
+						update: {
+							...settings.update,
+							source: "update-server",
+							serverUrl: OFFICIAL_UPDATE_SERVER_URL,
+						},
+					}
+				: settings;
+		api.updateSettings = async (data) => {
+			payload = data;
+			saved = true;
+			return api.getSettings();
+		};
+		let checks = 0;
+		api.checkUpdate = async () => {
+			checks++;
+			return {
+				updateAvailable: false,
+				currentVersion: "1.0.0",
+				source: saved ? "update-server" : "github",
+				errorCode: "TIMEOUT",
+			};
+		};
+		const prepared = { ready: true, preparedIdentity: { id: "keep" } };
+		queryClient?.setQueryData(["update-status", "1.1.0"], prepared);
+		await mountAs("admin");
+		expect(promptState?.opened).toBe(true);
+		await promptState?.confirm();
+		await settle();
+		expect(payload).toEqual({
+			expectedUpdateSettingsKey: updateSettingsKey(settings.update),
+			update: {
+				source: "update-server",
+				serverUrl: OFFICIAL_UPDATE_SERVER_URL,
+				product: "narrafork",
+			},
+		});
+		expect(promptState?.opened).toBe(false);
+		expect(checks).toBe(2);
+		expect(queryClient?.getQueryData(["settings"])).toEqual(await api.getSettings());
+		expect(queryClient?.getQueryData(["update-status", "1.1.0"])).toEqual(prepared);
+	});
+
+	test("failed save keeps the dialog open and can be retried", async () => {
+		configure("TIMEOUT");
+		api.updateSettings = async () => {
+			throw new Error("save failed");
+		};
+		await mountAs("admin");
+		await promptState?.confirm();
+		await settle();
+		expect(promptState?.opened).toBe(true);
+		expect(promptState?.error).toBe("updateMirrorSwitchFailed");
+		expect(promptState?.saving).toBe(false);
+		api.updateSettings = async () => ({ update: { source: "update-server" } });
+		await promptState?.confirm();
+		await settle();
+		expect(promptState?.opened).toBe(false);
+	});
+
+	test("duplicate confirmation and dismissal cannot interrupt an in-flight save", async () => {
+		configure("TIMEOUT");
+		let writes = 0;
+		let finish: ((value: Awaited<ReturnType<typeof api.updateSettings>>) => void) | undefined;
+		api.updateSettings = () => {
+			writes++;
+			return new Promise((resolve) => {
+				finish = resolve;
+			});
+		};
+		await mountAs("admin");
+		const first = promptState?.confirm();
+		const second = promptState?.confirm();
+		promptState?.dismiss();
+		await settle();
+		expect(writes).toBe(1);
+		expect(promptState?.opened).toBe(true);
+		expect(promptState?.saving).toBe(true);
+		finish?.({ update: { source: "update-server" } });
+		await Promise.all([first, second]);
+		await settle();
+		expect(promptState?.opened).toBe(false);
+	});
+
+	test("restricted localStorage does not break checks or repeat prompts within the mount", async () => {
+		configure("TIMEOUT");
+		const getItem = localStorage.getItem;
+		localStorage.getItem = (key) => {
+			if (key.startsWith("narrafork:first-github-update-check:")) throw new Error("storage denied");
+			return getItem(key);
+		};
+		await mountAs("admin");
+		expect(promptState?.opened).toBe(true);
+		promptState?.dismiss();
+		await settle();
+		await latest().refetch();
+		await settle();
+		expect(promptState?.opened).toBe(false);
+		localStorage.getItem = getItem;
+	});
+
+	test("a source changed between GET and PATCH is not overwritten and refreshes the cached settings", async () => {
+		configure("TIMEOUT");
+		let writes = 0;
+		const concurrent = {
+			update: { source: "update-server", serverUrl: "https://private.example" },
+		};
+		api.updateSettings = async (payload) => {
+			writes++;
+			expect(payload.expectedUpdateSettingsKey).toBe(latest().settingsKey);
+			api.getSettings = async () => concurrent;
+			throw new ApiError("Update settings changed", 409, { code: "UPDATE_SOURCE_CHANGED" });
+		};
+		await mountAs("admin");
+		await promptState?.confirm();
+		await settle();
+		expect(writes).toBe(1);
+		expect(promptState?.opened).toBe(true);
+		expect(promptState?.error).toBe("updateSourceChanged");
+		expect(queryClient?.getQueryData(["settings"])).toEqual(concurrent);
+	});
+
+	test("rechecks settings before saving and refuses changed sources", async () => {
+		configure("TIMEOUT");
+		let writes = 0;
+		api.updateSettings = async () => {
+			writes++;
+			return {};
+		};
+		await mountAs("admin");
+		api.getSettings = async () => ({
+			update: { source: "update-server", serverUrl: "https://private.example" },
+		});
+		await promptState?.confirm();
+		await settle();
+		expect(writes).toBe(0);
+		expect(promptState?.error).toBe("updateSourceChanged");
 	});
 });

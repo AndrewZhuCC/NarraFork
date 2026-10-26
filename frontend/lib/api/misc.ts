@@ -18,6 +18,7 @@ import {
 import { parseContentDispositionFileName } from "./narrators";
 import type {
 	ApiEntity,
+	BlockBackfillStatus,
 	ChangelogEntry,
 	CodexCredentialEntry,
 	CodexLoadBalancingMode,
@@ -37,11 +38,15 @@ import type {
 	LearningDoc,
 	LearningIndexResponse,
 	LearningSearchResponse,
+	LegacyRequestDumpClearResult,
 	LicenseManifestResponse,
 	OpencodeUsageCache,
 	PublicCodexQuotaOverview,
 	RuntimeScanResult,
-	SearchResponse,
+	SearchRequest,
+	SearchSectionName,
+	SearchSectionsResponse,
+	SessionHitsResponse,
 	StorageCategoryKey,
 	StorageScanJobState,
 	StorageScanResult,
@@ -63,6 +68,22 @@ export interface WorkspaceDetail extends ApiEntity {
 }
 
 /** Server code for a layout save that lost a race against another session. */
+/** Query string for a global-search request; empty and default values stay out of it. */
+export function searchParams(query: SearchRequest): URLSearchParams {
+	const params = new URLSearchParams({ q: query.q });
+	if (query.sort === "time") params.set("sort", "time");
+	if (query.include?.length) params.set("include", query.include.join(","));
+	if (query.projectId) params.set("projectId", query.projectId);
+	if (query.from) params.set("from", query.from);
+	if (query.to) params.set("to", query.to);
+	if (query.mine) params.set("mine", "1");
+	if (query.fullHistory) params.set("history", "all");
+	if (query.cursor) params.set("cursor", query.cursor);
+	if (query.page && query.page > 1) params.set("page", String(query.page));
+	if (query.limit) params.set("limit", String(query.limit));
+	return params;
+}
+
 export const WORKSPACE_LAYOUT_CONFLICT_CODE = "WORKSPACE_LAYOUT_CONFLICT";
 
 /**
@@ -109,14 +130,20 @@ export const miscApi = {
 		),
 
 	// Search
-	search: (
-		q: string,
-		entities = "chapters,messages",
-		sort?: "time" | "relevance",
+	/** Sectioned global search; a cursor continues one section, so pass exactly one. */
+	searchSections: (
+		query: SearchRequest,
+		sections: readonly SearchSectionName[],
 		signal?: AbortSignal,
-	) =>
-		request<SearchResponse>(
-			`/search?q=${encodeURIComponent(q)}&entities=${entities}${sort ? `&sort=${sort}` : ""}`,
+	) => {
+		const params = searchParams(query);
+		params.set("sections", sections.join(","));
+		return request<SearchSectionsResponse>(`/search?${params}`, { signal });
+	},
+	/** More hits of one session, for expanding its result card. */
+	searchSessionHits: (narratorId: string, query: SearchRequest, signal?: AbortSignal) =>
+		request<SessionHitsResponse>(
+			`/search/sessions/${encodeURIComponent(narratorId)}/hits?${searchParams(query)}`,
 			{ signal },
 		),
 
@@ -1416,9 +1443,25 @@ export const miscApi = {
 			method: "POST",
 			body: JSON.stringify(data),
 		}),
+	clearLegacyRequestDumps: () =>
+		request<LegacyRequestDumpClearResult>("/storage/database/legacy-request-dumps/clear", {
+			method: "POST",
+		}),
 	vacuumDatabase: () =>
 		request<DatabaseVacuumResult>("/storage/database/vacuum", {
 			method: "POST",
+		}),
+	getBlockBackfillStatus: () =>
+		request<{ status: BlockBackfillStatus }>("/storage/blocks/backfill"),
+	setBlockBackfillPaused: (paused: boolean) =>
+		request<{ status: BlockBackfillStatus }>("/storage/blocks/backfill/pause", {
+			method: "POST",
+			body: JSON.stringify({ paused }),
+		}),
+	runBlockProjectionAction: (action: "clear" | "restore" | "stop") =>
+		request<{ status: BlockBackfillStatus }>("/storage/blocks/projection", {
+			method: "POST",
+			body: JSON.stringify({ action }),
 		}),
 
 	// Runtime Resources

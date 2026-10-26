@@ -110,10 +110,10 @@ describe("measureReviewCard — the body is a capped scroll box", () => {
 });
 
 describe("measureReviewCard — header chrome is height-neutral", () => {
-	it("the verdict label, revision badge and action label never move the geometry", async () => {
-		// All three can change on a row that is already measured and cached: a revision
-		// arrives with a second badge, and starting a turn flips the action's wording. If any
-		// of them moved the height, the painted row would disagree with its committed box.
+	it("the verdict label and revision badge never move the geometry", async () => {
+		// Both can change on a row that is already measured and cached: a revision arrives
+		// with a second badge. If either moved the height, the painted row would disagree
+		// with its committed box.
 		const { measureReviewCard } = await import("./measure-review-card");
 		const base = measureReviewCard({ text: findings(3), verdictLabel: "Approved" }, 800);
 		const decorated = measureReviewCard(
@@ -121,8 +121,6 @@ describe("measureReviewCard — header chrome is height-neutral", () => {
 				text: findings(3),
 				verdictLabel: "Changes Requested — a much longer verdict label",
 				revisedLabel: "Revised",
-				actionLabel: "Handled",
-				applied: true,
 				color: "orange",
 			},
 			800,

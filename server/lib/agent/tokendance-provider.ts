@@ -261,7 +261,6 @@ export class TokenDanceProvider implements ProviderAdapter {
 				transport,
 			);
 			delegate.setReasoningSourceOverride(source);
-			delegate.noteActiveModel(model);
 			this.delegate = delegate;
 		}
 		this.model = parsed.model;
@@ -279,20 +278,14 @@ export class TokenDanceProvider implements ProviderAdapter {
 	formatTools(...args: Parameters<ProviderAdapter["formatTools"]>) {
 		return this.active().formatTools(...args);
 	}
+	toolLoadingTarget(model: string) {
+		return this.active(model).toolLoadingTarget?.(model);
+	}
 	buildHistory(...args: Parameters<ProviderAdapter["buildHistory"]>) {
 		return this.active(args[1]).buildHistory(...args);
 	}
 	injectSystemPrompt(...args: Parameters<ProviderAdapter["injectSystemPrompt"]>) {
 		this.active(args[2]).injectSystemPrompt(...args);
-	}
-	formatToolResult(...args: Parameters<ProviderAdapter["formatToolResult"]>) {
-		return this.active().formatToolResult(...args);
-	}
-	pushUserTurn(...args: Parameters<ProviderAdapter["pushUserTurn"]>) {
-		this.active(args[2]).pushUserTurn(...args);
-	}
-	pushAssistantTurn(...args: Parameters<ProviderAdapter["pushAssistantTurn"]>) {
-		this.active().pushAssistantTurn(...args);
 	}
 	async *chat(params: ChatParams) {
 		yield* this.active(params.model).chat(params);

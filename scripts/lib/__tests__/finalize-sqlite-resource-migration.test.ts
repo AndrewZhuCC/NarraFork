@@ -2,7 +2,13 @@ import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { readSqliteModelHistorySignature } from "../../../server/services/agent-runtime/model-history-revision";
 import {
+	MODEL_HISTORY_SQLITE_TRIGGERS,
+	renderModelHistoryRevisionSql,
+} from "../../../server/services/agent-runtime/model-history-revision-sql";
+import {
+	appendModelHistoryReinstall,
 	assertResourceMigrationValidated,
 	finalizeResourceMigration,
 	type ResourceMigrationSnapshot,
@@ -11,8 +17,14 @@ import { generatePostgresSchema } from "../../generate-postgres-schema";
 import {
 	appendGeneratedModelHistoryTriggers,
 	generatedModelHistoryTriggerSuffix,
+	modelHistoryReinstall,
 } from "../generated-model-history-triggers";
-import { modelHistorySnapshots, revisionMigrationSql } from "./model-history-migration-fixture";
+import {
+	modelHistoryBlockSnapshot,
+	modelHistorySnapshots,
+	modelHistoryStateSnapshot,
+	revisionMigrationSql,
+} from "./model-history-migration-fixture";
 
 test("only the exact generated trigger suffix is allowed, installed and validated read-only", () => {
 	const { before, after, previousDDL } = modelHistorySnapshots();
@@ -71,6 +83,216 @@ test("machine triggers are compiled against every target column and later destru
 	expect(() => finalizeResourceMigration("DROP TABLE narrator_messages;", after, after)).toThrow(
 		"versioned reinstall",
 	);
+});
+
+/** Plain DDL of a fixture snapshot (text/integer columns, single-column FKs). */
+function fixtureDDL(snapshot: ResourceMigrationSnapshot): string {
+	return Object.entries(snapshot.tables)
+		.map(([name, table]) => {
+			const columns = Object.values(table.columns).map(
+				(column) =>
+					`"${column.name}" ${column.type}${column.primaryKey ? " PRIMARY KEY" : ""}${column.notNull ? " NOT NULL" : ""}${column.default !== undefined ? ` DEFAULT ${column.default}` : ""}`,
+			);
+			const foreignKeys = Object.values(table.foreignKeys).map(
+				(fk) =>
+					`FOREIGN KEY ("${fk.columnsFrom[0]}") REFERENCES "${fk.tableTo}"("${fk.columnsTo[0]}")`,
+			);
+			return `CREATE TABLE "${name}" (${[...columns, ...foreignKeys].join(", ")});`;
+		})
+		.join("\n");
+}
+/** A current-contract (v3) database whose narrators still carry a chapter FK, and Drizzle's
+ * raw rebuild batch. */
+function narratorRebuildFixture() {
+	const after = modelHistoryStateSnapshot();
+	const before = structuredClone(after);
+	before.tables.chapters = {
+		columns: { id: { name: "id", type: "text", primaryKey: true } },
+		foreignKeys: {},
+	};
+	before.tables.narrators.columns.chapter_id = { name: "chapter_id", type: "text" };
+	before.tables.narrators.foreignKeys = {
+		narrators_chapter_id_chapters_id_fk: {
+			columnsFrom: ["chapter_id"],
+			tableTo: "chapters",
+			columnsTo: ["id"],
+			onDelete: "no action",
+			onUpdate: "no action",
+		},
+	};
+	const kept = Object.keys(after.tables.narrators.columns);
+	const list = kept.map((column) => `"${column}"`).join(", ");
+	// Drizzle's own order: the plain drop precedes its first PRAGMA, which the finalizer hoists.
+	const raw = [
+		"DROP TABLE `chapters`;",
+		"PRAGMA foreign_keys=OFF;",
+		"CREATE TABLE `__new_narrators` (\n\t`id` text PRIMARY KEY,\n\t`title` text,\n\t`context_summary` text,\n\t`model_history_revision` integer DEFAULT 0 NOT NULL\n);",
+		`INSERT INTO \`__new_narrators\`(${list}) SELECT ${list} FROM \`narrators\`;`,
+		"DROP TABLE `narrators`;",
+		"ALTER TABLE `__new_narrators` RENAME TO `narrators`;",
+		"PRAGMA foreign_keys=ON;",
+	].join("--> statement-breakpoint\n");
+	return { before, after, raw };
+}
+/** The previous migration's end state: tables, the installed contract and history rows. */
+function installedContractDatabase(before: ResourceMigrationSnapshot): Database {
+	const db = new Database(":memory:");
+	db.exec(fixtureDDL(before));
+	db.exec(renderModelHistoryRevisionSql("sqlite"));
+	db.exec(`INSERT INTO users(id, username) VALUES ('user', 'name');
+		INSERT INTO chapters(id) VALUES ('chapter');
+		INSERT INTO narrators(id, title, chapter_id) VALUES ('owner', 'kept', 'chapter'), ('holder', 'fork', NULL);
+		INSERT INTO narrator_messages(id, narrator_id, content_json, body_format) VALUES ('message', 'owner', '[]', 1);
+		INSERT INTO narrator_message_refs(id, narrator_id, message_id, seq) VALUES ('own', 'owner', 'message', 0), ('held', 'holder', 'message', 0);
+		INSERT INTO narrator_tool_calls(id, message_id, narrator_id, tool_use_id, status) VALUES ('tool', 'message', 'owner', 'use', 'success');`);
+	return db;
+}
+const triggerCatalog = (db: Database) =>
+	db
+		.query("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger' ORDER BY name")
+		.all();
+const historyRows = (db: Database) => ({
+	narrators: db.query("SELECT id, title, model_history_revision FROM narrators ORDER BY id").all(),
+	messages: db.query("SELECT id, narrator_id, body_revision FROM narrator_messages").all(),
+	refs: db.query("SELECT id, narrator_id, message_id FROM narrator_message_refs ORDER BY id").all(),
+	tools: db.query("SELECT id, model_revision FROM narrator_tool_calls").all(),
+});
+
+test("a rebuild of a current-contract trigger table is a canonical versioned reinstall", () => {
+	const { before, after, raw } = narratorRebuildFixture();
+	const reinstall = modelHistoryReinstall(before, after, "sqlite");
+	if (!reinstall) throw new Error("v3 fixture must offer a reinstall");
+	expect(() => finalizeResourceMigration(raw, before, after)).toThrow("versioned reinstall");
+	const wrapped = appendModelHistoryReinstall(raw, before, after);
+	expect(wrapped.startsWith(reinstall.prefix)).toBe(true);
+	expect(wrapped.endsWith(reinstall.suffix)).toBe(true);
+	const finalized = finalizeResourceMigration(wrapped, before, after);
+	expect(finalized.startsWith(`${reinstall.prefix}PRAGMA foreign_keys=OFF;`)).toBe(true);
+	expect(finalized.endsWith(`PRAGMA foreign_keys=ON;${reinstall.suffix}`)).toBe(true);
+	expect(finalizeResourceMigration(finalized, before, after)).toBe(finalized);
+	expect(appendModelHistoryReinstall(finalized, before, after)).toBe(finalized);
+	expect(() => assertResourceMigrationValidated(finalized, before, after)).not.toThrow();
+	// Every current-contract trigger is dropped ahead of the rebuild and recreated after it.
+	for (const name of MODEL_HISTORY_SQLITE_TRIGGERS) {
+		expect(reinstall.prefix).toContain(`DROP TRIGGER IF EXISTS ${name};`);
+		expect(reinstall.suffix).toContain(`DROP TRIGGER IF EXISTS ${name};`);
+	}
+	expect(reinstall.suffix.endsWith(`${renderModelHistoryRevisionSql("sqlite").trimEnd()}\n`)).toBe(
+		true,
+	);
+
+	const db = installedContractDatabase(before);
+	const clean = new Database(":memory:");
+	try {
+		db.run("PRAGMA foreign_keys=ON");
+		const rows = historyRows(db);
+		db.exec(finalized);
+		// No FK action or revision bump touched the copied rows.
+		expect(historyRows(db)).toEqual(rows);
+		expect(db.query("PRAGMA table_info(narrators)").all()).not.toContainEqual(
+			expect.objectContaining({ name: "chapter_id" }),
+		);
+		expect(db.query("SELECT name FROM sqlite_master WHERE name = 'chapters'").get()).toBeNull();
+		clean.exec(fixtureDDL(after));
+		clean.exec(renderModelHistoryRevisionSql("sqlite"));
+		expect(triggerCatalog(db)).toEqual(triggerCatalog(clean));
+		expect(readSqliteModelHistorySignature(db, "owner").trusted).toBe(true);
+		expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
+		// The reinstalled contract is live: a title change bumps the owner and every holder.
+		const revisions = () =>
+			db
+				.query<{ id: string; model_history_revision: number }, []>(
+					"SELECT id, model_history_revision FROM narrators ORDER BY id",
+				)
+				.all()
+				.map((row) => row.model_history_revision);
+		const [holder, owner] = revisions();
+		db.run("UPDATE narrators SET title = 'renamed' WHERE id = 'owner'");
+		const [holderAfter, ownerAfter] = revisions();
+		expect(holderAfter).toBeGreaterThan(holder);
+		expect(ownerAfter).toBeGreaterThan(owner);
+	} finally {
+		clean.close();
+		db.close();
+	}
+});
+
+test("a reinstall suffix alone cannot rebuild: SQLite refuses the RENAME while triggers name the table", () => {
+	const { before, after, raw } = narratorRebuildFixture();
+	const reinstall = modelHistoryReinstall(before, after, "sqlite");
+	if (!reinstall) throw new Error("v3 fixture must offer a reinstall");
+	const finalized = finalizeResourceMigration(
+		appendModelHistoryReinstall(raw, before, after),
+		before,
+		after,
+	);
+	const suffixOnly = finalized.slice(reinstall.prefix.length);
+	const db = installedContractDatabase(before);
+	try {
+		expect(() => db.exec(suffixOnly)).toThrow("no such table: main.narrators");
+	} finally {
+		db.close();
+	}
+	expect(() => finalizeResourceMigration(suffixOnly, before, after)).toThrow();
+});
+
+test("model-history reinstall wrappers fail closed unless byte-exact and needed", () => {
+	const { before, after, raw } = narratorRebuildFixture();
+	const reinstall = modelHistoryReinstall(before, after, "sqlite");
+	if (!reinstall) throw new Error("v3 fixture must offer a reinstall");
+	const finalized = finalizeResourceMigration(
+		appendModelHistoryReinstall(raw, before, after),
+		before,
+		after,
+	);
+	const firstDrop = `DROP TRIGGER IF EXISTS ${MODEL_HISTORY_SQLITE_TRIGGERS[0]};\n--> statement-breakpoint\n`;
+	for (const damaged of [
+		finalized.replace(firstDrop, ""),
+		finalized.slice(0, -reinstall.suffix.length),
+		`${finalized.trimEnd()}\n--> statement-breakpoint\nDELETE FROM narrators;\n`,
+		finalized.replace("model_history_revision + 1", "model_history_revision + 2"),
+		finalized.replace(
+			"PRAGMA foreign_keys=OFF;",
+			"PRAGMA foreign_keys=OFF;\n--> statement-breakpoint\nCREATE TRIGGER untrusted AFTER UPDATE ON users BEGIN DELETE FROM narrators; END;",
+		),
+	]) {
+		expect(() => finalizeResourceMigration(damaged, before, after)).toThrow();
+		expect(() => assertResourceMigrationValidated(damaged, before, after)).toThrow();
+	}
+	// A wrapper without a trigger-table rebuild is not a canonical migration.
+	const noRebuild = `${reinstall.prefix}DROP TABLE \`chapters\`;${reinstall.suffix}`;
+	const plainBefore = structuredClone(before);
+	plainBefore.tables.narrators = after.tables.narrators;
+	expect(appendModelHistoryReinstall("DROP TABLE `chapters`;", plainBefore, after)).toBe(
+		"DROP TABLE `chapters`;",
+	);
+	expect(() => finalizeResourceMigration(noRebuild, plainBefore, after)).toThrow(
+		"without a trigger table rebuild",
+	);
+	// The block sync queue is named by the block contracts' trigger bodies, so its rebuild is
+	// guarded too.
+	expect(() =>
+		finalizeResourceMigration(
+			'CREATE TABLE `__new_narrator_block_sync_queue` (`message_id` text PRIMARY KEY); INSERT INTO `__new_narrator_block_sync_queue`("message_id") SELECT "message_id" FROM `narrator_block_sync_queue`; DROP TABLE `narrator_block_sync_queue`; ALTER TABLE `__new_narrator_block_sync_queue` RENAME TO `narrator_block_sync_queue`;',
+			after,
+			after,
+		),
+	).toThrow("versioned reinstall");
+	// Only the current (v3) contract is reinstalled: v1 and v2 databases keep refusing rebuilds.
+	const { after: v1 } = modelHistorySnapshots();
+	const v2 = modelHistoryBlockSnapshot();
+	expect(modelHistoryReinstall(after, after, "postgres")).toBeUndefined();
+	for (const older of [v1, v2]) {
+		expect(modelHistoryReinstall(older, older, "sqlite")).toBeUndefined();
+		expect(appendModelHistoryReinstall("DROP TABLE narrators;", older, older)).toBe(
+			"DROP TABLE narrators;",
+		);
+		expect(() => finalizeResourceMigration("DROP TABLE narrators;", older, older)).toThrow(
+			"versioned reinstall",
+		);
+	}
+	// The migration introducing v3 carries the v3 install suffix, never a reinstall wrapper.
+	expect(modelHistoryReinstall(v2, after, "sqlite")).toBeUndefined();
 });
 
 const before: ResourceMigrationSnapshot = {
@@ -769,6 +991,31 @@ test("real 0017 finalizes with both pre-existing generated expressions preserved
 		next,
 	);
 	expect(() => assertResourceMigrationValidated(finalized, previous, next)).not.toThrow();
+});
+test("every real reinstall migration is the canonical wrapper around a trigger-table rebuild", () => {
+	const read = (path: string) => readFileSync(resolve(import.meta.dir, "../../..", path), "utf8");
+	const journal = JSON.parse(read("drizzle/meta/_journal.json")) as {
+		entries: { idx: number; tag: string }[];
+	};
+	const snapshot = (idx: number) =>
+		JSON.parse(
+			read(`drizzle/meta/${String(idx).padStart(4, "0")}_snapshot.json`),
+		) as ResourceMigrationSnapshot;
+	const marker = `DROP TRIGGER IF EXISTS ${MODEL_HISTORY_SQLITE_TRIGGERS[0]};`;
+	const reinstalls = journal.entries.filter((entry) =>
+		read(`drizzle/${entry.tag}.sql`).startsWith(marker),
+	);
+	// Retiring the narrative line rebuilt `narrators` (its chapter FK column went away).
+	expect(reinstalls.map((entry) => entry.tag)).toContain("0218_retire_narrative_line");
+	for (const entry of reinstalls) {
+		const before = snapshot(entry.idx - 1);
+		const after = snapshot(entry.idx);
+		const sql = read(`drizzle/${entry.tag}.sql`);
+		const wrapper = modelHistoryReinstall(before, after, "sqlite");
+		expect(wrapper && sql.startsWith(wrapper.prefix) && sql.endsWith(wrapper.suffix)).toBe(true);
+		expect(() => assertResourceMigrationValidated(sql, before, after)).not.toThrow();
+		expect(finalizeResourceMigration(sql, before, after)).toBe(sql);
+	}
 });
 test("PG maps exact UTC text defaults and byte rather than character budgets", () => {
 	const source = `import { sql } from "drizzle-orm"; import { check, sqliteTable, text } from "drizzle-orm/sqlite-core";

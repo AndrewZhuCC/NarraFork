@@ -1,6 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import { outputToText } from "@shared/agent-protocol/tool-output";
-import { historyInputMessageIds, modelTextFromContentBlocks } from "@shared/native-injection";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import {
@@ -21,7 +19,6 @@ import {
 	resolveModelContextWindow,
 } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
-import { getImagePath, imageToBase64 } from "../uploads";
 import { extractAnthropicUsage } from "../usage-tracking";
 import {
 	CLAUDE_CLI_VERSION,
@@ -35,6 +32,12 @@ import { isCompletionLimitReason, ProviderInvalidStateError } from "./error-hand
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
 import { reportInputCharacters } from "./input-characters";
 import { buildOpencodeSessionHeader, isOpencodeEndpoint } from "./opencode-session";
+import {
+	type NeutralTurn,
+	projectHistory,
+	type ResolvedImage,
+	webSearchSummary,
+} from "./projection";
 import type {
 	BuiltHistory,
 	ChatParams,
@@ -51,18 +54,19 @@ import {
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
 import { type ProviderTransport, runProviderTransport } from "./provider-transport";
-import { signatureSourcesCompatible } from "./reasoning-source";
 import {
 	type ApiRequestDumpCollector,
-	captureDumpResponse,
+	captureResponseStream,
 	readResponsePrefix,
 	sanitizeHeaders,
 } from "./request-dump";
 import { parseJsonResponseWithBody } from "./response-body";
+import type { StreamProgress } from "./stream-progress";
 import { ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
+import type { ToolLoadingChange, ToolLoadingStrategy, ToolLoadingTarget } from "./tool-loading";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { flattenTopLevelUnion } from "./tool-schema-compat";
-import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
+import { ApiError, type ResolvedToolDefinition } from "./types";
 import { orderUserContent } from "./user-content-order";
 
 // === Claude Code protocol constants ===
@@ -365,7 +369,12 @@ function applyFinalCacheBreakpoint(messages: AnthropicMessage[]): void {
 
 	for (let blockIndex = message.content.length - 1; blockIndex >= 0; blockIndex--) {
 		const block = message.content[blockIndex];
-		if (block.type === "text" || block.type === "image" || block.type === "tool_result") {
+		if (
+			block.type === "text" ||
+			block.type === "image" ||
+			block.type === "tool_result" ||
+			isToolChangePart(block)
+		) {
 			Object.assign(block, CACHE_CONTROL);
 			return;
 		}
@@ -403,7 +412,60 @@ type AnthropicContentPart =
 			cache_control?: CacheControl;
 	  }
 	| { type: "thinking"; thinking: string; signature: string }
-	| { type: "redacted_thinking"; data: string };
+	| { type: "redacted_thinking"; data: string }
+	| {
+			type: "tool_addition";
+			tool:
+				| { type: "tool_definition"; definition: AnthropicTool }
+				| { type: "tool_reference"; name: string };
+			cache_control?: CacheControl;
+	  }
+	| {
+			type: "tool_removal";
+			tool: { type: "tool_reference"; name: string };
+			cache_control?: CacheControl;
+	  };
+
+/** Tool-change blocks only live in mid-conversation system messages. */
+type AnthropicToolChangePart = Extract<
+	AnthropicContentPart,
+	{ type: "tool_addition" | "tool_removal" }
+>;
+
+function isToolChangePart(part: AnthropicContentPart): part is AnthropicToolChangePart {
+	return part.type === "tool_addition" || part.type === "tool_removal";
+}
+
+/** Whether a message carries tool changes, which only the system role can deliver. */
+function hasToolChangeParts(message: AnthropicMessage): boolean {
+	return Array.isArray(message.content) && message.content.some(isToolChangePart);
+}
+
+/**
+ * Beta that enables the tool-change blocks a strategy writes. Inline definitions need
+ * `inline-tools` (Claude API only); by-reference changes also work with the older beta,
+ * which Bedrock, Vertex and the DeepSeek Anthropic endpoint accept.
+ */
+function toolLoadingBetaFlag(strategy: ToolLoadingStrategy | undefined): string | undefined {
+	if (strategy === "anthropic_tool_addition") return "inline-tools-2026-09-15";
+	if (strategy === "anthropic_deferred_tail") return "mid-conversation-tool-changes-2026-07-01";
+	return undefined;
+}
+
+/** The `role:"system"` message announcing one history position's tool changes. */
+function toolChangeMessage(change: ToolLoadingChange): AnthropicMessage {
+	const content: AnthropicContentPart[] = [];
+	for (const name of change.removals)
+		content.push({ type: "tool_removal", tool: { type: "tool_reference", name } });
+	for (const addition of change.additions)
+		content.push({
+			type: "tool_addition",
+			tool: addition.definition
+				? { type: "tool_definition", definition: formatAnthropicTool(addition.definition) }
+				: { type: "tool_reference", name: addition.name },
+		});
+	return { role: "system", content };
+}
 
 /** Ensure content parts have at least one text or tool_use block (some APIs reject thinking-only messages). */
 function ensureTextOrToolBlock(parts: AnthropicContentPart[]): void {
@@ -424,6 +486,18 @@ interface AnthropicTool {
 	description: string;
 	input_schema: Record<string, unknown>;
 	cache_control?: { type: string };
+}
+
+/** One tool in Messages API shape; also the body of an inline `tool_addition`. */
+function formatAnthropicTool(tool: ResolvedToolDefinition): AnthropicTool {
+	return {
+		name: tool.name,
+		description: tool.description,
+		input_schema: {
+			$schema: "https://json-schema.org/draft/2020-12/schema",
+			...flattenTopLevelUnion(resolveToolJsonSchema(tool)),
+		},
+	};
 }
 
 interface AnthropicContextManagement {
@@ -1381,6 +1455,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		path: string,
 		init: RequestInit,
 		collector?: ApiRequestDumpCollector,
+		progress?: StreamProgress,
 	): Promise<Response> {
 		const baseUrl = this.getBaseUrl();
 		const url = `${baseUrl}${path}`;
@@ -1394,8 +1469,21 @@ export class AnthropicProvider implements ProviderAdapter {
 				headers: sanitizeHeaders(new Headers(requestInit.headers)),
 				bodyText: typeof requestInit.body === "string" ? requestInit.body : undefined,
 			});
+			progress?.beginAttempt();
 			try {
-				return captureDumpResponse(await this.pfetch(actualUrl, requestInit), collector);
+				const response = await this.pfetch(actualUrl, requestInit);
+				progress?.onHeaders(response.status);
+				collector?.setResponseMeta({
+					status: response.status,
+					headers: sanitizeHeaders(response.headers),
+				});
+				if ((!collector && !progress) || !response.body) return response;
+				const tap = captureResponseStream(response.body, collector, progress);
+				return new Response(tap.stream, {
+					status: response.status,
+					statusText: response.statusText,
+					headers: response.headers,
+				});
 			} catch (error) {
 				collector?.setResponseError(error);
 				collector?.finishResponseCapture(false);
@@ -1477,16 +1565,7 @@ export class AnthropicProvider implements ProviderAdapter {
 	}
 
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
-		return tools.map(
-			(tool): AnthropicTool => ({
-				name: tool.name,
-				description: tool.description,
-				input_schema: {
-					$schema: "https://json-schema.org/draft/2020-12/schema",
-					...flattenTopLevelUnion(resolveToolJsonSchema(tool)),
-				},
-			}),
-		);
+		return tools.map(formatAnthropicTool);
 	}
 
 	async buildHistory(
@@ -1505,6 +1584,10 @@ export class AnthropicProvider implements ProviderAdapter {
 			narratorId,
 			hasCredentialBoundReasoning(parseModelId(model).model),
 		);
+	}
+
+	toolLoadingTarget(): ToolLoadingTarget {
+		return { protocol: "anthropic-messages" };
 	}
 
 	getActiveReasoningSource(): string | undefined {
@@ -1551,8 +1634,11 @@ export class AnthropicProvider implements ProviderAdapter {
 		// equivalent is the downgrade the compatible path already performs, so a
 		// model without the capability never receives a message role it will reject.
 		const midConversationSystem = isOfficial && supportsMidConversationSystem(model);
+		// Tool changes are exempt: they exist only because the selected tool loading
+		// strategy targets mid-conversation system messages, and as user content they
+		// would be rejected outright.
 		const history = (params.history as AnthropicMessage[]).map((message) =>
-			!midConversationSystem && message.role === "system"
+			!midConversationSystem && message.role === "system" && !hasToolChangeParts(message)
 				? { ...message, role: "user" as const }
 				: message,
 		);
@@ -1805,6 +1891,11 @@ export class AnthropicProvider implements ProviderAdapter {
 			"application/json",
 			params.conversationId,
 		);
+		const toolBeta = toolLoadingBetaFlag(params.toolLoadingStrategy);
+		if (toolBeta) {
+			const declared = reqHeaders["anthropic-beta"];
+			reqHeaders["anthropic-beta"] = declared ? `${declared},${toolBeta}` : toolBeta;
+		}
 
 		logger.debug("Anthropic chat request", {
 			model,
@@ -1830,6 +1921,7 @@ export class AnthropicProvider implements ProviderAdapter {
 				signal: params.signal,
 			},
 			params.requestDump,
+			params.streamProgress,
 		);
 		try {
 			if (!response.ok) {
@@ -1848,214 +1940,6 @@ export class AnthropicProvider implements ProviderAdapter {
 			// The parser releases its reader on early return. Cancel the observational tap
 			// too, so abandoning an async generator never leaves a background drain.
 			if (response.body && !response.body.locked) void response.body.cancel().catch(() => {});
-		}
-	}
-
-	formatToolResult(
-		toolUseId: string,
-		output: string,
-		isError: boolean,
-		images?: Array<{ format: string; base64: string }>,
-	): unknown {
-		if (images?.length) {
-			const content: Array<
-				| { type: "image"; source: { type: "base64"; media_type: string; data: string } }
-				| { type: "text"; text: string }
-			> = [];
-			for (const img of images) {
-				content.push({
-					type: "image",
-					source: {
-						type: "base64",
-						media_type: `image/${img.format}`,
-						data: img.base64,
-					},
-				});
-			}
-			content.push({ type: "text", text: output });
-			return { tool_use_id: toolUseId, content, is_error: isError || undefined };
-		}
-		return { tool_use_id: toolUseId, content: output, is_error: isError || undefined };
-	}
-
-	pushUserTurn(
-		history: unknown[],
-		content: string,
-		_model: string,
-		toolResults: unknown[],
-		images?: Array<{ format: string; base64: string }>,
-	): void {
-		const h = history as AnthropicMessage[];
-		const parts: AnthropicContentPart[] = [];
-
-		for (const tr of toolResults as Array<{
-			tool_use_id: string;
-			content:
-				| string
-				| Array<
-						| { type: "text"; text: string }
-						| { type: "image"; source: { type: "base64"; media_type: string; data: string } }
-				  >;
-			is_error?: boolean;
-		}>) {
-			parts.push({
-				type: "tool_result",
-				tool_use_id: tr.tool_use_id,
-				content: tr.content,
-				is_error: tr.is_error,
-			});
-		}
-
-		const hasText = !!content && content !== ".";
-		if (hasText) {
-			parts.push(...anthropicUserParts(content, images));
-		} else if (images?.length) {
-			parts.push(...anthropicUserParts("[user sent image(s)]", images));
-		}
-
-		if (parts.length > 0) {
-			h.push({ role: "user", content: parts });
-		}
-	}
-
-	pushAssistantTurn(
-		history: unknown[],
-		text: string,
-		toolUses: AgentToolUse[],
-		reasoningBlocks?: Array<{
-			text: string;
-			providerMetadata?: import("./types").ReasoningProviderMetadata;
-			outputIndex?: number;
-		}>,
-		_webSearches?: Array<{
-			id: string;
-			query?: string;
-			queries?: string[];
-			outputIndex?: number;
-		}>,
-		_messageId?: string,
-		_imageGenerations?: Array<{
-			id: string;
-			revisedPrompt?: string;
-			result?: string;
-			outputIndex?: number;
-		}>,
-		textOutputIndex?: number,
-		redactedThinkingBlocks?: Array<{
-			data: string;
-			outputIndex?: number;
-			signatureSource?: string;
-		}>,
-		orderedContent?: readonly import("./types").ContentBlock[],
-	): void {
-		const h = history as AnthropicMessage[];
-		if (orderedContent) {
-			const parts: AnthropicContentPart[] = [];
-			for (const block of orderedContent) {
-				if (block.type === "text" && block.text.trim()) {
-					parts.push({ type: "text", text: block.text });
-				} else if (block.type === "reasoning" && block.text.trim()) {
-					parts.push({
-						type: "thinking",
-						thinking: block.text,
-						signature: block.providerMetadata?.anthropic?.signature ?? "",
-					});
-				} else if (block.type === "redacted_thinking") {
-					parts.push({ type: "redacted_thinking", data: block.data });
-				} else if (block.type === "tool_use") {
-					parts.push({
-						type: "tool_use",
-						id: block.toolUseId,
-						name: block.name,
-						input: block.input,
-					});
-				}
-			}
-			if (parts.length) {
-				ensureTextOrToolBlock(parts);
-				h.push({ role: "assistant", content: parts });
-			}
-			return;
-		}
-
-		// Collect all blocks with their outputIndex and sort by position.
-		// When no block has an explicit outputIndex (legacy messages), fall back
-		// to the fixed ordering: reasoning → text → tool_use.
-		const indexed: Array<{ part: AnthropicContentPart; outputIndex: number }> = [];
-
-		if (reasoningBlocks) {
-			for (let i = 0; i < reasoningBlocks.length; i++) {
-				const rb = reasoningBlocks[i];
-				// A thinking block with empty text is rejected upstream
-				// ("messages.N.content.M.thinking: ... too short"), and because the
-				// offending block lives in replayed history every later turn fails at
-				// the same index — the conversation is permanently wedged.
-				//
-				// Empty text with a signature is produced by an interrupted stream:
-				// content_block_start opens a thinking block, signature_delta fills the
-				// signature, and the connection dies before any thinking_delta arrives.
-				// Such a block carries no information — the signature is only meaningful
-				// as proof-of-origin for text that exists — so it is dropped rather than
-				// padded. Padding is not an option: the signature is cryptographically
-				// bound to the original text, so invented filler turns a length error
-				// into a harder-to-diagnose signature verification failure.
-				if (!rb.text || rb.text.trim() === "") continue;
-				const sig = rb.providerMetadata?.anthropic?.signature ?? "";
-				indexed.push({
-					part: { type: "thinking", thinking: rb.text, signature: sig },
-					// Fallback uses the kept-block count (indexed.length), not the raw
-					// loop index i: dropping an empty block above must not leave a gap
-					// that reorders the surviving block after the text/tool_use blocks,
-					// which anchor their own fallback to indexed.length too.
-					outputIndex: rb.outputIndex ?? indexed.length,
-				});
-			}
-		}
-
-		if (redactedThinkingBlocks) {
-			for (const rb of redactedThinkingBlocks) {
-				indexed.push({
-					part: { type: "redacted_thinking", data: rb.data },
-					outputIndex: rb.outputIndex ?? indexed.length,
-				});
-			}
-		}
-
-		// Whitespace-only text is rejected upstream ("text content blocks must
-		// contain non-whitespace text"), and because the block lands in replayed
-		// history every later turn fails at the same index — the conversation is
-		// permanently wedged, exactly like the empty-thinking case above. A plain
-		// truthiness check is not enough: it stops "" but passes " " and "\n".
-		if (text?.trim()) {
-			// Use the real textOutputIndex when available; otherwise place text
-			// after reasoning blocks but before tool_use blocks.
-			const fallbackIdx = indexed.length;
-			indexed.push({
-				part: { type: "text", text },
-				outputIndex: textOutputIndex ?? fallbackIdx,
-			});
-		}
-
-		for (let i = 0; i < toolUses.length; i++) {
-			const tu = toolUses[i];
-			const fallbackIdx = indexed.length;
-			indexed.push({
-				part: {
-					type: "tool_use",
-					id: tu.toolUseId,
-					name: tu.name,
-					input: tu.input,
-				},
-				outputIndex: tu.outputIndex ?? fallbackIdx,
-			});
-		}
-
-		indexed.sort((a, b) => a.outputIndex - b.outputIndex);
-		const parts = indexed.map((e) => e.part);
-
-		if (parts.length > 0) {
-			ensureTextOrToolBlock(parts);
-			h.push({ role: "assistant", content: parts });
 		}
 	}
 
@@ -3044,386 +2928,129 @@ async function buildAnthropicHistory(
 	strictReasoning = false,
 ): Promise<{
 	history: AnthropicMessage[];
-	trailingToolResults: Array<{ tool_use_id: string; content: string; is_error?: boolean }>;
-	trailingUserText?: string;
 	replayedInjectionMessageIds: string[];
 }> {
-	// Filter model-visible messages: user, assistant, sys (system context)
-	// Exclude: system (legacy, kept for backward compatibility), disp (UI-only display messages)
-	const topLevel = dbMessages.filter(
-		(m) => !m.parentToolUseId && (m.role === "user" || m.role === "assistant" || m.role === "sys"),
+	const projected = await projectHistory(
+		dbMessages,
+		{ strict: strictReasoning, reasoningSource: currentReasoningSource },
+		narratorId,
 	);
-
-	// Trailing `sys` rows are fresh model-visible context (a Dynamic Spec reminder,
-	// a goal continuation). They are lifted out of history and returned so the
-	// caller can send them as the CURRENT turn.
-	//
-	// Position is the whole point: left in history they become the last thing
-	// before the current turn, so the model reads them as background rather than as
-	// what it was just asked. The injection still arrives either way, which is why
-	// getting this wrong is invisible — the model simply weights it lower.
-	//
-	// Only when the mid-conversation system role is unavailable. With
-	// `officialApi` the row stays in history as `role:"system"`, which already
-	// marks it as standing instruction — that is deliberate Claude Code behaviour
-	// and must not be rewritten.
-	const trailingSysMessages: DbMessage[] = [];
-	if (!useMidConversationSystemRole) {
-		while (topLevel.length > 0 && topLevel[topLevel.length - 1].role === "sys") {
-			const message = topLevel.pop();
-			if (message) trailingSysMessages.unshift(message);
-		}
-	}
-	const trailingSysText = trailingSysMessages
-		.map((message) => dbMessageVisibleText(message))
-		.filter(Boolean)
-		.join("\n\n");
-
-	// Drop the last user message — it's sent as the current message
-	if (topLevel.length > 0 && topLevel[topLevel.length - 1].role === "user") {
-		topLevel.pop();
-	}
-
-	const history: AnthropicMessage[] = [];
-	const emittedMessages: DbMessage[] = [];
-	let pendingToolResults: Array<{ tool_use_id: string; content: string; is_error?: boolean }> = [];
-
-	for (const msg of topLevel) {
-		if (msg.role === "assistant") {
-			// Flush pending tool results as a user message
-			if (pendingToolResults.length > 0) {
-				history.push({
-					role: "user",
-					content: pendingToolResults.map((tr) => ({
-						type: "tool_result" as const,
-						tool_use_id: tr.tool_use_id,
-						content: tr.content,
-						is_error: tr.is_error,
-					})),
-				});
-				pendingToolResults = [];
-			}
-
-			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-			const parts: AnthropicContentPart[] = [];
-
-			// Web search blocks — inject as user context before the assistant message
-			const webSearchBlocks = content.filter(
-				(b: { type: string }) => b.type === "web_search",
-			) as Array<{ type: "web_search"; query?: string; queries?: string[] }>;
-			if (webSearchBlocks.length > 0) {
-				const searchSummary = webSearchBlocks
-					.map((ws) => {
-						const q = ws.query || ws.queries?.join(", ") || "unknown";
-						return `[Web search: ${q}]`;
-					})
-					.join("\n");
-				history.push({ role: "user", content: searchSummary });
-			}
-
-			// Build a set of completed tool call IDs for filtering
-			const completedToolUseIds = new Set(
-				msg.toolCalls
-					?.filter((tc) => tc.status === "success" || tc.status === "fail")
-					.map((tc) => tc.toolUseId) ?? [],
-			);
-
-			// Build a map of tool call data for quick lookup
-			const toolCallMap = new Map<
-				string,
-				{ toolName: string; toolUseId: string; inputJson: unknown }
-			>();
-			if (msg.toolCalls) {
-				for (const tc of msg.toolCalls) {
-					if (tc.toolName && tc.toolUseId && completedToolUseIds.has(tc.toolUseId)) {
-						toolCallMap.set(tc.toolUseId, tc);
-					}
-				}
-			}
-
-			// Track which tool_use IDs have been emitted via contentJson blocks
-			const emittedToolUseIds = new Set<string>();
-
-			// Single-pass: iterate contentJson in original order to preserve
-			// interleaved thinking block positions (required by interleaved-thinking beta).
-			for (const b of content) {
-				const block = b as {
-					type: string;
-					thinking?: string;
-					text?: string;
-					signature?: string;
-					data?: string;
-					id?: string;
-					name?: string;
-					input?: Record<string, unknown>;
-					signatureSource?: string;
-					providerMetadata?: { anthropic?: { signature?: string }; signatureSource?: string };
-				};
-				if (block.type === "thinking" && block.thinking) {
-					// Legacy shape: signature stored on the block directly, with the
-					// source (if any) on providerMetadata. Strict models only echo the
-					// signature back when it was minted by the current upstream; relay
-					// models mint no signatures, so their text is always preserved and
-					// an absent signature stays empty.
-					const sig = strictReasoning
-						? signatureSourcesCompatible(
-								block.providerMetadata?.signatureSource,
-								currentReasoningSource,
-							)
-							? (block.signature ?? "")
-							: ""
-						: (block.signature ?? "");
-					parts.push({
-						type: "thinking",
-						thinking: block.thinking,
-						signature: sig,
-					});
-				} else if (block.type === "reasoning" && block.text) {
-					// DB stores thinking as "reasoning" blocks with signature in providerMetadata.
-					// Strict models drop the signature when it belongs to a different
-					// upstream server (e.g. a different NUG channel), since replaying it
-					// would fail signature verification. Relay models skip the source
-					// check entirely — their reasoning text crosses upstreams freely.
-					const sig = strictReasoning
-						? signatureSourcesCompatible(
-								block.providerMetadata?.signatureSource,
-								currentReasoningSource,
-							)
-							? (block.providerMetadata?.anthropic?.signature ?? "")
-							: ""
-						: (block.providerMetadata?.anthropic?.signature ?? "");
-					parts.push({
-						type: "thinking",
-						thinking: block.text,
-						signature: sig,
-					});
-				} else if (block.type === "redacted_thinking" && block.data) {
-					// Encrypted thinking is server-specific — only replay it to the
-					// upstream that produced it. When the source does not match (or is
-					// unknown on legacy messages), drop the block entirely rather than
-					// echo an opaque payload the current server cannot validate. Relay
-					// models never validate it either, and the block carries no text
-					// worth preserving, so it is dropped for them unconditionally.
-					if (
-						strictReasoning &&
-						signatureSourcesCompatible(block.signatureSource, currentReasoningSource)
-					) {
-						parts.push({ type: "redacted_thinking", data: block.data });
-					}
-				} else if (block.type === "text" && block.text) {
-					parts.push({ type: "text", text: block.text });
-				} else if (block.type === "tool_use" && block.id) {
-					// contentJson may store tool_use blocks directly; use them if
-					// the tool call is completed, otherwise look up from toolCalls.
-					const tc = toolCallMap.get(block.id);
-					if (tc) {
-						let input: Record<string, unknown> = {};
-						try {
-							input =
-								typeof tc.inputJson === "string"
-									? JSON.parse(tc.inputJson)
-									: ((tc.inputJson as Record<string, unknown>) ?? {});
-						} catch {
-							input = {};
-						}
-						parts.push({
-							type: "tool_use",
-							id: tc.toolUseId,
-							name: tc.toolName,
-							input,
-						});
-						emittedToolUseIds.add(tc.toolUseId);
-					}
-				}
-				// Skip web_search, image_generation, and other non-API block types
-			}
-
-			// Append any completed tool calls not already emitted via contentJson
-			// (backward compat: older messages may not have tool_use in contentJson)
-			for (const [toolUseId, tc] of toolCallMap) {
-				if (!emittedToolUseIds.has(toolUseId)) {
-					let input: Record<string, unknown> = {};
-					try {
-						input =
-							typeof tc.inputJson === "string"
-								? JSON.parse(tc.inputJson)
-								: ((tc.inputJson as Record<string, unknown>) ?? {});
-					} catch {
-						input = {};
-					}
-					parts.push({
-						type: "tool_use",
-						id: tc.toolUseId,
-						name: tc.toolName,
-						input,
-					});
-				}
-			}
-
-			// If no text block was found in contentJson, fall back to contentText
-			if (!parts.some((p) => p.type === "text") && msg.contentText) {
-				// Insert text before the first tool_use block
-				const firstToolIdx = parts.findIndex((p) => p.type === "tool_use");
-				const textPart: AnthropicContentPart = { type: "text", text: msg.contentText };
-				if (firstToolIdx >= 0) {
-					parts.splice(firstToolIdx, 0, textPart);
-				} else {
-					parts.push(textPart);
-				}
-			}
-
-			if (parts.length > 0) {
-				ensureTextOrToolBlock(parts);
-				history.push({ role: "assistant", content: parts });
-			}
-
-			// Collect tool results for next turn
-			if (msg.toolCalls) {
-				for (const tc of msg.toolCalls) {
-					if (tc.status === "success" || tc.status === "fail") {
-						pendingToolResults.push({
-							tool_use_id: tc.toolUseId,
-							content: outputToText(tc.outputJson),
-							is_error: tc.status === "fail" || undefined,
-						});
-					}
-				}
-			}
-		} else if (msg.role === "user" || msg.role === "sys") {
-			// Flush pending tool results before the next model-visible context message.
-			// Official Claude Code requests retain sys rows as mid-conversation system
-			// messages; compatible relays receive the historical user-role fallback.
-			if (pendingToolResults.length > 0) {
-				history.push({
-					role: "user",
-					content: pendingToolResults.map((tr) => ({
-						type: "tool_result" as const,
-						tool_use_id: tr.tool_use_id,
-						content: tr.content,
-						is_error: tr.is_error,
-					})),
-				});
-				pendingToolResults = [];
-			}
-
-			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-			const text = modelTextFromContentBlocks(content) || msg.contentText || "";
-
-			// Images attached to a past user turn have to be rebuilt from disk: the
-			// row stores an imageId, not the bytes. This branch previously read text
-			// only, so every history image was dropped and a follow-up question
-			// about an earlier screenshot reached the model with nothing to look at.
-			const images = await resolveHistoryImages(msg, narratorId);
-
-			const role = msg.role === "sys" && useMidConversationSystemRole ? "system" : "user";
-			if (images.some((image) => image !== null)) {
-				// A mid-conversation system message cannot carry image parts, so an
-				// image forces the user role. That only affects `sys` rows, which do
-				// not carry uploads in practice. Unplaced images lead, exactly as the live turn
-				// sent them: a rebuilt turn that reorders its parts misses the prompt cache.
-				const parts: AnthropicContentPart[] = orderUserContent(text, images, "before").map(
-					(part) => (part.type === "text" ? { type: "text", text: part.text } : part.image),
-				);
-				history.push({ role: "user", content: parts });
-				emittedMessages.push(msg);
-			} else if (text) {
-				history.push({ role, content: text });
-				emittedMessages.push(msg);
-			}
-		}
-	}
-
 	return {
-		history,
-		trailingToolResults: pendingToolResults,
-		trailingUserText: trailingSysText || undefined,
-		replayedInjectionMessageIds: historyInputMessageIds(emittedMessages),
+		history: anthropicWireHistory(projected.turns, {
+			midConversationSystem: useMidConversationSystemRole,
+			strict: strictReasoning,
+		}),
+		replayedInjectionMessageIds: projected.replayedInjectionMessageIds,
 	};
 }
 
 /**
- * Text of a stored message as the model would see it.
+ * Second projection stage for the Messages API: neutral turns → Anthropic messages.
  *
- * Reads the structured blocks first and falls back to the flat column, matching
- * how the other history builders read a row: `contentText` is not always populated
- * for rows written through the block path.
+ * Positions are left to `ensureAlternating` at send time: adjacent same-role messages
+ * merge there, and mid-conversation system messages move to the slot the API allows.
  */
-function dbMessageVisibleText(msg: DbMessage): string {
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-	return modelTextFromContentBlocks(blocks) || msg.contentText || "";
-}
-
-/**
- * Rebuild the image parts of a past user message from disk.
- *
- * Returns an empty array when there is nothing to replay, which covers the common
- * case (no images) as well as every failure: a missing file, an unreadable file, or
- * a message whose owning narrator is unknown. Failures are logged and skipped
- * rather than thrown — losing one image from replayed history is bad, but failing
- * the whole turn because an old upload was cleaned up is worse.
- *
- * Mirrors the Responses-API implementation in `openai-provider.ts`; the two differ
- * only in the content-part shape each protocol expects.
- */
-async function resolveHistoryImages(
-	msg: DbMessage,
-	narratorId?: string,
-): Promise<
-	Array<{
-		type: "image";
-		source: { type: "base64"; media_type: string; data: string };
-	} | null>
-> {
-	const ownerNarratorId = msg.narratorId ?? narratorId;
-	if (!ownerNarratorId || !Array.isArray(msg.contentJson)) return [];
-
-	const blocks = (msg.contentJson as Array<Record<string, unknown>>).filter(
-		(block) => block.type === "image" && typeof block.imageId === "string",
-	);
-	if (blocks.length === 0) return [];
-
-	// Index-aligned with the stored image blocks: `[image #N]` placeholders name positions.
-	const parts: Array<{
-		type: "image";
-		source: { type: "base64"; media_type: string; data: string };
-	} | null> = [];
-	for (const block of blocks) {
-		const imageId = block.imageId as string;
-		const uploadNarratorId =
-			typeof block.uploadNarratorId === "string" ? block.uploadNarratorId : ownerNarratorId;
-		const filePath = getImagePath(uploadNarratorId, imageId);
-		if (!filePath) {
-			logger.warn("Anthropic history image missing on disk; skipping replay", {
-				messageId: msg.id,
-				uploadNarratorId,
-				imageId,
-			});
-			parts.push(null);
+function anthropicWireHistory(
+	turns: readonly NeutralTurn[],
+	options: { midConversationSystem: boolean; strict: boolean },
+): AnthropicMessage[] {
+	const history: AnthropicMessage[] = [];
+	for (const turn of turns) {
+		if (turn.kind === "input") {
+			for (const item of turn.items) {
+				// A tool load's change rides next to its notice; `ensureAlternating` moves it
+				// in front of the next assistant turn, where every rebuild puts it too.
+				if (item.toolChange) history.push(toolChangeMessage(item.toolChange as ToolLoadingChange));
+				if (item.images.some((image) => image !== null)) {
+					// A mid-conversation system message cannot carry images, so an image forces
+					// the user role. Unplaced images lead, exactly as the live turn sends them.
+					history.push({
+						role: "user",
+						content: orderUserContent(item.text, item.images, "before").map((part) =>
+							part.type === "text" ? { type: "text", text: part.text } : anthropicImage(part.image),
+						),
+					});
+				} else if (item.text) {
+					history.push({
+						role: item.role === "sys" && options.midConversationSystem ? "system" : "user",
+						content: item.text,
+					});
+				}
+			}
 			continue;
 		}
-		try {
-			const result = await imageToBase64(filePath);
-			// The detected type wins over the stored one: a file renamed or saved
-			// with the wrong extension would otherwise be declared as a media type
-			// its bytes contradict, which the API rejects.
-			const mediaType =
-				result.detectedMediaType ??
-				(typeof block.mediaType === "string" ? block.mediaType : "image/png");
-			parts.push({
-				type: "image",
-				source: { type: "base64", media_type: mediaType, data: result.base64 },
+		if (turn.kind === "tool_results") {
+			history.push({
+				role: "user",
+				content: turn.results.map((result) => ({
+					type: "tool_result" as const,
+					tool_use_id: result.wireId,
+					content: result.images.length
+						? [
+								...result.images.map(anthropicImage),
+								...(result.text ? [{ type: "text" as const, text: result.text }] : []),
+							]
+						: result.text,
+					is_error: result.isError || undefined,
+				})),
 			});
-		} catch (error) {
-			logger.warn("Failed to rebuild Anthropic history image; skipping replay", {
-				messageId: msg.id,
-				uploadNarratorId,
-				imageId,
-				error: error instanceof Error ? error.message : String(error),
-			});
-			parts.push(null);
+			continue;
+		}
+		const searches = turn.items.filter((item) => item.kind === "web_search");
+		// Searches ran on the provider; the model only learns of them as context.
+		if (searches.length)
+			history.push({ role: "user", content: searches.map(webSearchSummary).join("\n") });
+		const parts: AnthropicContentPart[] = [];
+		for (const item of turn.items) {
+			switch (item.kind) {
+				case "reasoning": {
+					if (!item.text) break;
+					// Strict models only echo a signature the current upstream minted; relay
+					// models keep their text with whatever (usually empty) signature it had.
+					const signature = anthropicSignature(item.credentials);
+					parts.push({
+						type: "thinking",
+						thinking: item.text,
+						signature: options.strict ? (item.sameSource ? signature : "") : signature,
+					});
+					break;
+				}
+				case "redacted_reasoning":
+					// Encrypted thinking is only meaningful to the upstream that produced it.
+					if (options.strict && item.sameSource)
+						parts.push({ type: "redacted_thinking", data: item.data });
+					break;
+				case "text":
+					parts.push({ type: "text", text: item.text });
+					break;
+				case "tool_call":
+					parts.push({ type: "tool_use", id: item.wireId, name: item.name, input: item.input });
+					break;
+				default:
+					break;
+			}
+		}
+		if (parts.length > 0) {
+			ensureTextOrToolBlock(parts);
+			history.push({ role: "assistant", content: parts });
 		}
 	}
-	return parts;
+	return history;
+}
+
+function anthropicSignature(credentials: Record<string, unknown>): string {
+	const anthropic = credentials.anthropic as { signature?: unknown } | undefined;
+	return typeof anthropic?.signature === "string" ? anthropic.signature : "";
+}
+
+function anthropicImage(image: ResolvedImage): {
+	type: "image";
+	source: { type: "base64"; media_type: string; data: string };
+} {
+	return {
+		type: "image",
+		source: { type: "base64", media_type: image.mediaType, data: image.base64 },
+	};
 }
 
 // === Helpers ===
@@ -3500,6 +3127,8 @@ function ensureAlternating(messages: AnthropicMessage[]): AnthropicMessage[] {
 	const result: AnthropicMessage[] = [];
 	/** Mid-conversation system text awaiting a legal position. */
 	const pendingSystem: string[] = [];
+	/** Tool changes awaiting the same position; they cannot fall back to user content. */
+	const pendingToolChanges: AnthropicToolChangePart[] = [];
 
 	const pushOrMerge = (message: AnthropicMessage): void => {
 		const last = result[result.length - 1];
@@ -3511,6 +3140,19 @@ function ensureAlternating(messages: AnthropicMessage[]): AnthropicMessage[] {
 	};
 
 	const flushSystem = (): void => {
+		if (pendingToolChanges.length > 0) {
+			const changes = pendingToolChanges.splice(0);
+			const text = pendingSystem.splice(0).join("\n\n");
+			// Never observed (a change always follows its user-role notice), but a system
+			// turn may only follow a user turn, so keep the request legal regardless.
+			if (result[result.length - 1]?.role !== "user")
+				pushOrMerge({ role: "user", content: [{ type: "text", text: "…" }] });
+			result.push({
+				role: "system",
+				content: [...(text ? [{ type: "text" as const, text }] : []), ...changes],
+			});
+			return;
+		}
 		if (pendingSystem.length === 0) return;
 		const text = pendingSystem.join("\n\n");
 		pendingSystem.length = 0;
@@ -3527,6 +3169,8 @@ function ensureAlternating(messages: AnthropicMessage[]): AnthropicMessage[] {
 		if (msg.role === "system") {
 			const text = systemMessageText(msg);
 			if (text) pendingSystem.push(text);
+			if (Array.isArray(msg.content))
+				pendingToolChanges.push(...msg.content.filter(isToolChangePart));
 			continue;
 		}
 
@@ -3760,8 +3404,8 @@ function dropEmptyThinkingBlocks(messages: AnthropicMessage[]): void {
  *     before `signatureSource` existed). Echoing a foreign signature would fail
  *     verification, so blanking it was the safe half of the decision — but
  *     keeping the text alongside a blank signature is not a legal request.
- *   - `pushAssistantTurn` defaults the signature to `""` when a stream died
- *     between `content_block_start` and `signature_delta`.
+ *   - a reasoning block whose stream died between `content_block_start` and
+ *     `signature_delta` is stored, and replayed, without a signature.
  *
  * Dropping is what Anthropic prescribes for exactly this case: thinking blocks are
  * "passed back unchanged on the same model; other models drop them silently

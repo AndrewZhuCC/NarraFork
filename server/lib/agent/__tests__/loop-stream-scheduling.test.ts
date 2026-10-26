@@ -51,7 +51,7 @@ const names = [
 
 const provider: ProviderAdapter = {
 	formatTools: (tools) => tools.map(({ name, description }) => ({ name, description })),
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		params.onRequestStart?.();
@@ -61,15 +61,13 @@ const provider: ProviderAdapter = {
 		}
 		yield* script(params);
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
 };
 const realProviderModule = { ...(await import("../provider")) };
 mock.module("../provider", () => ({
+	...realProviderModule,
 	getProvider: () => provider,
 	resolveProviderAndModel: () => ({
 		requestedProvider: "test",
@@ -149,7 +147,7 @@ function run(
 		...overrides,
 	};
 	return (async () => {
-		for await (const event of agentLoop(config, "execute in order", [])) {
+		for await (const event of agentLoop(config, "execute in order", { rows: [] })) {
 			events.push(event);
 			await onEvent?.(event);
 		}
@@ -176,53 +174,35 @@ describe("event-driven immediate guidance", () => {
 			guidance.abort();
 			let softStopTaken = false;
 			let softStopCalls = 0;
-			const pushes: Parameters<ProviderAdapter["pushUserTurn"]>[] = [];
-			const originalUser = provider.pushUserTurn;
-			provider.pushUserTurn = (...args) => {
-				pushes.push(args);
-			};
 			script = async function* () {
 				yield { text: "Unexpected provider activation" };
 				throw new Error("Pre-aborted guidance activated provider");
 			};
-			const results = [
-				{ toolUseId: "previous", output: "completed before guidance", isError: false },
-			];
 			const events: AgentEvent[] = [];
-			const history: unknown[] = [];
-			try {
-				for await (const event of agentLoop(
-					{
-						narratorId: "n-preaborted-guidance",
-						conversationId: "conv-preaborted-guidance",
-						provider: "test",
-						model: "test:model",
-						cwd: "/tmp",
-						signal: new AbortController().signal,
-						[channel]: guidance.signal,
-						permissionHandler: async () => ({ behavior: "allow" }),
-						shouldStop: () => {
-							softStopCalls++;
-							softStopTaken = true;
-							return true;
-						},
+			for await (const event of agentLoop(
+				{
+					narratorId: "n-preaborted-guidance",
+					conversationId: "conv-preaborted-guidance",
+					provider: "test",
+					model: "test:model",
+					cwd: "/tmp",
+					signal: new AbortController().signal,
+					[channel]: guidance.signal,
+					permissionHandler: async () => ({ behavior: "allow" }),
+					shouldStop: () => {
+						softStopCalls++;
+						softStopTaken = true;
+						return true;
 					},
-					"queued guidance",
-					history,
-					results,
-				))
-					events.push(event);
-				expect(attempts).toBe(0);
-				expect(softStopTaken).toBe(true);
-				expect(softStopCalls).toBe(1);
-				expect(pushes).toHaveLength(1);
-				expect(pushes[0]?.[0]).toEqual(history);
-				expect(pushes[0]?.[1]).toBe("queued guidance");
-				expect(pushes[0]?.[3]).toBe(results);
-				expect(events).toEqual([{ type: "turn_complete", turnIndex: 0 }]);
-			} finally {
-				provider.pushUserTurn = originalUser;
-			}
+				},
+				"queued guidance",
+			))
+				events.push(event);
+			// The queued input stays with the host (nothing was sent, nothing is written).
+			expect(attempts).toBe(0);
+			expect(softStopTaken).toBe(true);
+			expect(softStopCalls).toBe(1);
+			expect(events).toEqual([{ type: "turn_complete", turnIndex: 0 }]);
 		});
 	}
 
@@ -424,19 +404,9 @@ describe("event-driven immediate guidance", () => {
 		expectSuccess(events);
 	});
 
-	test("guidance commits matched assistant/tool results to model history", async () => {
+	test("guidance settles the matched assistant step and its results for the host", async () => {
 		const guidance = new AbortController();
 		const a = watch("history", true);
-		const assistantTurns: Parameters<ProviderAdapter["pushAssistantTurn"]>[] = [];
-		const userTurns: Parameters<ProviderAdapter["pushUserTurn"]>[] = [];
-		const originalAssistant = provider.pushAssistantTurn;
-		const originalUser = provider.pushUserTurn;
-		provider.pushAssistantTurn = (...args) => {
-			assistantTurns.push(args);
-		};
-		provider.pushUserTurn = (...args) => {
-			userTurns.push(args);
-		};
 		script = async function* (params) {
 			yield { text: "partial" };
 			yield { toolUses: [tool("Read", "history", 0), tool("Write", "queued", 1)] };
@@ -446,20 +416,24 @@ describe("event-driven immediate guidance", () => {
 			yield { toolUses: [tool("Write", "cut", 9)] };
 			await waitForAbort(params.signal);
 		};
-		try {
-			await run({ guidanceSignal: guidance.signal });
-			expect(assistantTurns).toHaveLength(1);
-			expect(assistantTurns[0]?.[1]).toBe("partial");
-			expect(assistantTurns[0]?.[2]?.map((tu) => tu.toolUseId)).toEqual(["history", "queued"]);
-			expect(userTurns).toHaveLength(2);
-			expect(userTurns[1]?.[3]).toEqual([
-				expect.objectContaining({ toolUseId: "history", output: "ok:history", isError: false }),
-				expect.objectContaining({ toolUseId: "queued", isError: true }),
-			]);
-		} finally {
-			provider.pushAssistantTurn = originalAssistant;
-			provider.pushUserTurn = originalUser;
-		}
+		const events = await run({ guidanceSignal: guidance.signal });
+		// The step the host stores: the text and the calls before the cut, not the cut call.
+		const steps = events.filter((event) => event.type === "assistant_message");
+		expect(steps).toHaveLength(1);
+		const step = steps[0] as Extract<AgentEvent, { type: "assistant_message" }>;
+		expect(step.text).toBe("partial");
+		expect(step.toolUses.map((tu) => tu.toolUseId)).toEqual(["history", "queued"]);
+		// Each call settles exactly once: the one that ran, and the one skipped by the stop.
+		const results = events.filter(
+			(event): event is Extract<AgentEvent, { type: "tool_result" }> =>
+				event.type === "tool_result",
+		);
+		expect(results.map((result) => [result.toolUseId, result.isError])).toEqual([
+			["history", false],
+			["queued", true],
+		]);
+		expect(results[0]?.output).toBe("ok:history");
+		expect(events.at(-1)).toEqual({ type: "turn_complete", turnIndex: 0 });
 	});
 
 	for (const mode of ["urgent", "urgent-post-stream", "safe-then-hard-abort"] as const) {
@@ -1081,10 +1055,53 @@ describe("ordered streaming tool scheduling", () => {
 		expectSuccess(await result);
 	});
 
+	for (const name of ["Agent", "Await", "Send"]) {
+		test(`${name} is deferred until the ordinary parent stream releases with a following parallel Read`, async () => {
+			const control = watch("control", true);
+			const read = watch("read", true);
+			const streamPending = gate();
+			const endStream = gate();
+			let streamReleased = false;
+			const executionAfterRelease: boolean[] = [];
+			script = async function* () {
+				try {
+					yield { toolUses: [tool(name, "control", 0), tool("Read", "read", 1)] };
+					streamPending.resolve();
+					await endStream.promise;
+				} finally {
+					streamReleased = true;
+				}
+			};
+			const result = run({
+				onToolExecutionInvoking: () => {
+					executionAfterRelease.push(streamReleased);
+				},
+			});
+			try {
+				await streamPending.promise;
+				await nextTick();
+				expect(started).toEqual([]);
+				expect(streamReleased).toBe(false);
+				endStream.resolve();
+				await control.started;
+				await read.started;
+				expect(started).toEqual(["control", "read"]);
+			} finally {
+				control.release();
+				read.release();
+				endStream.resolve();
+			}
+			const events = await result;
+			expectSuccess(events);
+			expect(executionAfterRelease).toEqual([true, true]);
+			expect(events.filter((event) => event.type === "tool_result")).toMatchObject([
+				{ toolUseId: "control", toolName: name, output: "ok:control", isError: false },
+				{ toolUseId: "read", toolName: "Read", output: "ok:read", isError: false },
+			]);
+		});
+	}
+
 	for (const name of [
-		"Agent",
-		"Await",
-		"Send",
 		"EnterPlanMode",
 		"DangerConfirm",
 		"TaskReflectConfirm",
@@ -1093,29 +1110,65 @@ describe("ordered streaming tool scheduling", () => {
 		"Edit",
 	]) {
 		const virtualWrite = name === "Write" || name === "Edit";
-		test(`${virtualWrite ? `virtual spec ${name}` : name} defers itself and following Read until stream end`, async () => {
+		test(`${virtualWrite ? `virtual spec ${name}` : name} is deferred in ordinary streams and releases a following Read after its result is consumed`, async () => {
+			const control = watch("control", true);
+			const read = watch("read");
 			const streamPending = gate();
 			const endStream = gate();
+			let streamReleased = false;
+			const executionAfterRelease: boolean[] = [];
 			script = async function* () {
-				yield {
-					toolUses: [
-						tool(name, "control", 0, virtualWrite ? { file_path: "spec://notes.json" } : {}),
-						tool("Read", "read", 1),
-					],
-				};
-				streamPending.resolve();
-				await endStream.promise;
+				try {
+					yield {
+						toolUses: [
+							tool(name, "control", 0, virtualWrite ? { file_path: "spec://notes.json" } : {}),
+							tool("Read", "read", 1),
+						],
+					};
+					streamPending.resolve();
+					await endStream.promise;
+				} finally {
+					streamReleased = true;
+				}
 			};
-			const result = run();
+			const startedWhenConsumed: string[][] = [];
+			const result = run(
+				{
+					onToolExecutionInvoking: () => {
+						executionAfterRelease.push(streamReleased);
+					},
+				},
+				(event) => {
+					if (event.type === "tool_result" && event.toolUseId === "control")
+						startedWhenConsumed.push([...started]);
+				},
+			);
 			try {
 				await streamPending.promise;
 				await nextTick();
 				expect(started).toEqual([]);
+				expect(streamReleased).toBe(false);
+				endStream.resolve();
+				await control.started;
+				await nextTick();
+				expect(started).toEqual(["control"]);
+				control.release();
+				// Deferred tools still preserve the result-consumption barrier: effects
+				// applied by the consumer must be visible before the following Read starts.
+				await read.started;
+				expect(startedWhenConsumed).toEqual([["control"]]);
 			} finally {
+				control.release();
 				endStream.resolve();
 			}
-			expectSuccess(await result);
+			const events = await result;
+			expectSuccess(events);
 			expect(started).toEqual(["control", "read"]);
+			expect(executionAfterRelease).toEqual([true, true]);
+			expect(events.filter((event) => event.type === "tool_result")).toMatchObject([
+				{ toolUseId: "control", toolName: name, output: "ok:control", isError: false },
+				{ toolUseId: "read", toolName: "Read", output: "ok:read", isError: false },
+			]);
 		});
 	}
 

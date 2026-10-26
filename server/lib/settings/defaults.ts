@@ -124,21 +124,13 @@ export const DEFAULTS: NarraForkSettings = {
 		queueDuringCompaction: true,
 		contextThresholds: cloneDefaultContextThresholds(),
 	},
-	chapters: {
-		maxActiveWorktrees: 10,
-		maxActiveContainers: 5,
-		worktreeSizeWarningMb: 500,
-		autoSaveOnDormant: true,
-		dormantAfterMinutes: 0,
+	workspace: {
 		treeSnapshotsEnabled: true,
 	},
-	containers: {
-		portRangeStart: 10000,
-		portRangeEnd: 20000,
-		proxy: {
-			enabled: false,
-			port: 7780,
-		},
+	narratorBlocks: {
+		write: true,
+		read: true,
+		compactJson: false,
 	},
 	editor: {
 		type: "vscode",
@@ -237,19 +229,19 @@ export const DEFAULTS: NarraForkSettings = {
  */
 export const SETTING_DOCS: Record<string, FieldDoc> = {
 	customApiProviders: {
-		desc: "通过自定义提供商面板维护的结构化 API 提供商配置。密钥由对应面板管理，不作为普通文本设置展示。",
+		desc: "通过自定义供应商面板维护的结构化 API 供应商配置。密钥由对应面板管理，不作为普通文本设置展示。",
 		type: "array",
 	},
 	openaiProviders: {
-		desc: "通过 OpenAI 兼容提供商面板维护的结构化配置，包括模型、协议和连接设置。",
+		desc: "通过 OpenAI 兼容供应商面板维护的结构化配置，包括模型、协议和连接设置。",
 		type: "array",
 	},
 	anthropicProviders: {
-		desc: "通过 Anthropic 兼容提供商面板维护的结构化配置。",
+		desc: "通过 Anthropic 兼容供应商面板维护的结构化配置。",
 		type: "array",
 	},
 	geminiProviders: {
-		desc: "通过 Gemini 提供商面板维护的结构化配置。",
+		desc: "通过 Gemini 供应商面板维护的结构化配置。",
 		type: "array",
 	},
 	"tokendance.apiKey": {
@@ -669,7 +661,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		valid: "always / blockStop / protectedOnly / off，默认 protectedOnly",
 	},
 	"agent.maxTransientRetries": {
-		desc: "可恢复的 API 错误最大重试次数。-1 表示无限重试；有状态提供商（Responses/Codex）会在外层重建历史后重试。",
+		desc: "可恢复的 API 错误最大重试次数。-1 表示无限重试；有状态供应商（Responses/Codex）会在外层重建历史后重试。",
 		type: "number",
 		valid: "-1 = 无限重试, 默认 10",
 	},
@@ -794,53 +786,28 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		valid: "true / false，默认 true",
 	},
 
-	// ── chapters ────────────────────────────────────────────────────────
-	"chapters.maxActiveWorktrees": {
-		desc: "最大活跃 worktree 数量。超出时自动将最不活跃的章节休眠。≤0 禁用自动休眠。",
-		type: "number",
-		valid: "≥1, 默认 10",
-	},
-	"chapters.maxActiveContainers": {
-		desc: "最大活跃容器数量。超出时新容器创建会被拒绝。",
-		type: "number",
-		valid: "≥0, 默认 5",
-	},
-	"chapters.worktreeSizeWarningMb": {
-		desc: "Worktree 大小警告阈值(MB)。超出时向用户发出警告。0 表示禁用警告。",
-		type: "number",
-		valid: "≥0, 默认 500",
-	},
-	"chapters.autoSaveOnDormant": {
-		desc: "章节休眠时是否自动 git commit 保存未提交的更改。",
-		type: "boolean",
-	},
-	"chapters.dormantAfterMinutes": {
-		desc: "章节不活跃多少分钟后自动休眠。0 表示禁用自动休眠（仅在超出 maxActiveWorktrees 时休眠）。",
-		type: "number",
-		valid: "≥0, 默认 0 (禁用)",
-	},
-	"chapters.treeSnapshotsEnabled": {
-		desc: "是否为工具调用/外部编辑捕获工作区整树快照（精确回退边界）。关闭后该扫描不再运行，回退退化为按记录的 Write/Edit 输入逐文件重放；超大工作区（如游戏整合包目录）上扫描过慢时可关闭。结构性快照（fork/merge/restore）不受影响。默认 true；热路径捕获在工作区大到超出预算时也会自动降级。",
+	// ── workspace ───────────────────────────────────────────────────────
+	"workspace.treeSnapshotsEnabled": {
+		desc: "是否为工具调用/外部编辑捕获工作区整树快照（精确回退边界）。关闭后该扫描不再运行，回退退化为按记录的 Write/Edit 输入逐文件重放；超大工作区（如游戏整合包目录）上扫描过慢时可关闭。默认 true；热路径捕获在工作区大到超出预算时也会自动降级。",
 		type: "boolean",
 		valid: "true / false，默认 true",
 	},
 
-	// ── containers ──────────────────────────────────────────────────────
-	"containers.portRangeStart": {
-		desc: "容器端口分配范围起始值。",
-		type: "number",
-	},
-	"containers.portRangeEnd": {
-		desc: "容器端口分配范围结束值。",
-		type: "number",
-	},
-	"containers.proxy.enabled": {
-		desc: "是否启用容器代理服务。代理将 Host 头匹配的请求路由到对应容器。",
+	// ── narratorBlocks ──────────────────────────────────────────────────
+	"narratorBlocks.write": {
+		desc: "新消息是否以原生块存储（narrator_blocks 表），同时写入兼容的 content_json。关闭后新消息回到只写 content_json 的旧格式；已是块格式的消息仍按块维护。默认 true。",
 		type: "boolean",
+		valid: "true / false，默认 true",
 	},
-	"containers.proxy.port": {
-		desc: "容器代理服务监听端口。",
-		type: "number",
+	"narratorBlocks.read": {
+		desc: "读取方（模型历史、消息页、External API、导出）是否从块表读取块格式消息的正文。关闭后全部回到读取 content_json，与块表并存期间两者内容一致。默认 true。",
+		type: "boolean",
+		valid: "true / false，默认 true",
+	},
+	"narratorBlocks.compactJson": {
+		desc: "新写入的块格式消息是否只把正文存在块表里（content_json 写 []，body_rows_only 置 1），省去重复的兼容投影。只在 SQLite 且 write、read 都开启时生效。关闭后新消息恢复写完整的 content_json；已是只存块的消息保持不变，需要回退时先在存储页运行「恢复副本」。默认 false。",
+		type: "boolean",
+		valid: "true / false，默认 false",
 	},
 
 	// ── editor ──────────────────────────────────────────────────────────

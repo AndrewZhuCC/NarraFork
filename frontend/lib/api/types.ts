@@ -9,6 +9,7 @@ import type { FileReference, FileReferenceContext } from "@shared/file-reference
 import type { LocalizedValue } from "@shared/i18n-locales";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import type { NarratorVisibility, NarratorWriteAudience } from "@shared/narrator-access";
+import type { RowBlock } from "@shared/narrator-blocks/message-blocks";
 import type { StorageCategoryKey } from "@shared/storage-categories";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 
@@ -206,33 +207,94 @@ export interface LearningSearchResponse {
 	results: LearningDocSummary[];
 }
 
-export interface SearchFallback {
-	feature?: string;
-	entity?: string;
+/** Sections of the global search page, in display order. */
+export type SearchSectionName = "sessions" | "knowledge";
+
+/** One page of a search section. */
+export interface SearchSectionPage<T> {
+	items: T[];
+	/** Matches in the section's candidate window. */
+	total: number;
+	/** The window filled up, so there may be more than `total`. */
+	totalIsLowerBound: boolean;
+	nextCursor: string | null;
+	/** The search limited itself to this many recent days (a query of only short terms). */
+	recentDays?: number;
+}
+
+/** A message hit listed under its session. */
+export interface SessionSearchHit {
+	id: string;
+	snippet: string;
+	messageRole?: string;
+	createdAt?: string;
+	blockId?: string;
+	/** Set when the hit is in a tool call: the jump then lands on that tool's row. */
+	toolUseId?: string;
+	toolName?: string;
+}
+
+/** A session (narrator) matching by its title, its messages, or both. */
+export interface SessionSearchResult {
+	type: "session";
+	id: string;
+	title?: string;
+	narratorType?: string;
+	subagentType?: string;
+	status?: string;
+	projectId?: string;
+	projectName?: string;
+	lastActivityAt?: string;
+	titleMatch: boolean;
+	hitCount: number;
+	hits: SessionSearchHit[];
+	score: number;
+}
+
+/** A knowledge entry hit. */
+export interface EntitySearchResult {
+	type: "knowledge";
+	id: string;
+	title?: string;
+	snippet: string;
+	projectName?: string;
+	collectionName?: string;
+	tags?: string[];
+	status?: string;
+	createdAt?: string;
+	updatedAt?: string;
+}
+
+export interface SearchSectionsResponse {
+	sections: {
+		sessions?: SearchSectionPage<SessionSearchResult>;
+		knowledge?: SearchSectionPage<EntitySearchResult>;
+	};
+}
+
+export interface SessionHitsResponse {
+	hits: SessionSearchHit[];
+	nextCursor: string | null;
+}
+
+/** Query, sort, scope and filters every global-search request carries. */
+export interface SearchRequest {
+	q: string;
+	sort?: "relevance" | "time";
+	/** Content added to the default scope: subagents, system, tools, archived. */
+	include?: readonly string[];
+	projectId?: string;
+	/** Inclusive ISO bounds. */
 	from?: string;
 	to?: string;
-	reason?: string;
-	error?: string;
-	message?: string;
-	code?: string;
-	[key: string]: unknown;
-}
-
-export interface SearchMetadata {
-	degraded?: boolean;
-	fallbacks?: SearchFallback[];
-	mode?: string;
-	ftsReady?: boolean | null;
-	shortQuery?: boolean;
-	requestedEntities?: string[];
-	[key: string]: unknown;
-}
-
-export interface SearchResponse {
-	results: ApiEntity[];
-	degraded?: boolean;
-	fallbacks?: SearchFallback[];
-	searchMetadata?: SearchMetadata;
+	/** Only the viewer's own sessions. */
+	mine?: boolean;
+	/** Search all of history even for a query of only short terms. */
+	fullHistory?: boolean;
+	cursor?: string;
+	/** 1-based page of a single section, in place of `cursor`. */
+	page?: number;
+	limit?: number;
 }
 
 export interface StorageCategoryResult {
@@ -353,12 +415,13 @@ export interface DatabaseStorageBreakdown {
 		 */
 		toolCallPayloads: DatabaseCleanupCandidateSummary;
 	};
+	/** Request dumps kept by an upgrade that deferred migration 0207's column rewrites. */
+	legacyRequestDumps?: { retained: boolean };
 }
 
 export type DatabaseCleanupTarget = "archivedSessions" | "staleSessions" | "toolCallPayloads";
 
 export type DatabaseCleanupBlockedReasonCode =
-	| "chapterBound"
 	| "runningTerminal"
 	| "backgroundRunning"
 	| "nonArchived"
@@ -403,7 +466,6 @@ export interface DatabaseCleanupApiRequestSample extends FallbackDiagnostics {
 	id: string;
 	narratorId: string | null;
 	narratorTitle: string | null;
-	chapterTitle: string | null;
 	createdAt: string;
 	approxBytes: number;
 }
@@ -437,6 +499,52 @@ export interface DatabaseCleanupExecutionResult extends DatabaseCleanupPreviewRe
 	freedBytes: number;
 	vacuumRan: boolean;
 	changed: boolean;
+	/** Planned sessions left in place because they changed mid-cleanup. */
+	skippedSessions?: number;
+}
+
+export interface LegacyRequestDumpClearResult {
+	ok: true;
+	cleared: number;
+	beforeBytes: number;
+	afterBytes: number;
+	restartRequired: boolean;
+}
+
+/** One background block job (`server/services/narrator-block-backfill.ts`). */
+export interface BlockJobState {
+	cursor: number;
+	complete: boolean;
+	paused: boolean;
+	processed: number;
+	updatedAt: string;
+}
+
+/** What a projection job needs that is missing. */
+export type BlockProjectionBlock =
+	| "unavailable"
+	| "compact_json_off"
+	| "compact_json_on"
+	| "backfill_incomplete";
+
+export interface BlockBackfillStatus {
+	available: boolean;
+	convert: BlockJobState | null;
+	verify: BlockJobState | null;
+	/** Rewrites every block's search index text; the message index retires after it. */
+	reindex: BlockJobState | null;
+	/** Drops verified messages' duplicate `content_json` (admin-started). */
+	clear: BlockJobState | null;
+	/** Writes it back from the block rows (admin-started). */
+	restore: BlockJobState | null;
+	blocked: { clear: BlockProjectionBlock | null; restore: BlockProjectionBlock | null };
+	/** Some message keeps its body only in block rows. */
+	rowsOnly: boolean;
+	projectionRunning: boolean;
+	/** Newest message row: a job's cursor against it is its progress. */
+	maxRowid: number;
+	diagnostics: number;
+	running: boolean;
 }
 
 export interface DatabaseVacuumResult {
@@ -920,6 +1028,9 @@ export interface BufferMessageSummary {
 	queueMode?: "turn" | "tool" | "interrupt";
 }
 
+/** One block a message row holds: its identity and its elements (`messageBlocks`). */
+export type MessageRowBlock = RowBlock<ContentBlock>;
+
 export interface TreeMessage {
 	/** Actual model/provider for this message, not the narrator's current selection. */
 	model?: string | null;
@@ -929,7 +1040,11 @@ export interface TreeMessage {
 	parentToolUseId: string | null;
 	messageUuid?: string | null;
 	role: string;
-	contentJson: ContentBlock[];
+	/**
+	 * The message's body as blocks, in order. Read it through `messageBody` (elements) or
+	 * `messageBlocks` (blocks); rewrite it through the helpers next to them.
+	 */
+	blocks: MessageRowBlock[];
 	contentText: string | null;
 	toolCalls: ToolCallRecord[];
 	tokensIn?: number | null;
@@ -972,9 +1087,11 @@ export interface TreeMessage {
 	deliveryKind?: "user_input" | "agent_message" | "task_notice" | null;
 	deliveryState?: "queued" | "claimed" | "materialized" | "failed" | "cancelled" | null;
 	createdAt: string;
-	children: TreeMessage[];
-	/** Maps each index in the (possibly filtered/reordered) contentJson back to its index in the original contentJson. */
-	_blockOriginalIndices?: number[];
+	/**
+	 * The row this one is nested under; absent at the top. Rows are flat, each row
+	 * followed by the rows nested under it (`message/nested-rows.ts`).
+	 */
+	parentMessageId?: string | null;
 	/**
 	 * Synthetic live row only: index of the text/reasoning block still being written,
 	 * or -1 when the model has moved on to tool calls.

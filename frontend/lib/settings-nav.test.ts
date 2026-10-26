@@ -43,7 +43,7 @@ const EXPECTED_INSTANCE = [
 	"/settings/agent",
 	"/settings/search",
 	"/settings/proxy",
-	"/settings/chapters",
+	"/settings/workspace",
 	"/settings/server",
 	"/settings/authentication",
 	"/settings/oauth-apps",

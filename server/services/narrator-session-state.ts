@@ -90,16 +90,16 @@ export interface ActiveNarrator {
 	/** Set when ExitPlanMode completes — the loop should restart with a user message.
 	 *  "continue" = no compact; "compact" = compact was performed, needs fresh context. */
 	_planApprovedContinue?: "continue" | "compact";
-	/** Cached chapter ID (set when narrator is bound to an active chapter) */
-	_chapterId?: string;
-	/** Cached project ID (set when narrator is bound to a chapter with a project) */
+	/**
+	 * Plan approval that landed while the approving response was still streaming. The
+	 * restart (plan compact + pass abort) runs once that assistant message is finalized,
+	 * so the response is recorded and persisted whole before the pass ends.
+	 */
+	_planApprovalFinish?: () => Promise<void>;
+	/** Cached project ID (set when the narrator has a project context) */
 	_projectId?: string;
-	/** Cached chapter role (trunk/branch/exploration/review) */
-	_chapterRole?: string;
 	/** Narrator kind for specialized standalone types (e.g. "knowledge" steward). */
 	_narratorKind?: "knowledge";
-	/** Cached worktree path (set when narrator is bound to an active chapter with a worktree) */
-	_worktreePath?: string;
 	/** Plan file ID — set when entering plan mode, used to lock Write/Edit to .narrafork/plans/plan-{id}.md */
 	_planFileId?: string;
 	/** Plan file path — set when entering plan mode, passed to EnterPlanMode tool for the prompt */
@@ -124,8 +124,6 @@ export interface ActiveNarrator {
 	_preparedPlanModes?: Map<string, PreparedPlanMode>;
 	/** Legacy permission mode snapshot from before entering plan mode; retained for migration/UI context. */
 	_previousPermissionMode?: string;
-	/** Cached base branch (for commits-ahead tracking) */
-	_baseBranch?: string;
 	/** Trailing-edge throttle timer for git status tracking */
 	_gitTrackTimer?: ReturnType<typeof setTimeout>;
 	/** ID of the partial assistant message being incrementally built via block_complete events */
@@ -339,6 +337,8 @@ export interface BufferedExecutionIntent {
 	modelOverride?: { model: string; mode: "temporary" | "permanent" };
 	/** Built-in control command; execute only after the previous owner has finalized. */
 	controlCommand?: boolean;
+	/** Text a person said (a bot's chat): never parsed as a queued `/new` or `/goal`. */
+	literal?: boolean;
 }
 
 export interface BufferedMessage {
@@ -515,7 +515,7 @@ export function invalidateWorkspaceTreeCache(worktreePath: string): void {
  * with whoever is writing the *directory*, and that is not only the narrator being
  * rolled back: subagents share their parent's cwd, and a background subagent keeps
  * writing after the parent loop returned — so the parent reads as idle while its
- * child is still mutating files. Other narrators attached to the same chapter are
+ * child is still mutating files. Other narrators working in the same directory are
  * the same situation.
  *
  * Reads `_loopRunning` rather than the DB status because that flag is the

@@ -1,5 +1,7 @@
+import { bodyBytesSql, bodySql } from "../../lib/narrator-bodies";
 import { modelJsonContainerBytes } from "./model-history-json";
 import {
+	assembleBlockBodies,
 	type HistoryQuery,
 	MODEL_HISTORY_BATCH_BYTES,
 	MODEL_HISTORY_MAX_BYTES,
@@ -63,6 +65,7 @@ export async function queryModelHistoryDelta(
 		reusedTools: 0,
 	};
 	const maxBytes = Math.min(options.maxBytes ?? MODEL_HISTORY_MAX_BYTES, MODEL_HISTORY_MAX_BYTES);
+	const fromBlocks = options.bodiesFromBlocks === true;
 	const remainingBytes = () => maxBytes - (counters.preparedBytes ?? 0);
 	const check = (bytes = 0, rows = 0, objectBytes = 0) => {
 		if (Date.now() >= options.deadline)
@@ -91,9 +94,10 @@ export async function queryModelHistoryDelta(
 		check();
 		const page = await query<Ref>(
 			`SELECT m.id, r.seq, m.body_revision AS "bodyRevision", u.username, n.title,
-		 length(CAST(m.content_json AS BLOB))+coalesce(length(CAST(m.content_text AS BLOB)),0) AS bytes
+		 ${bodyBytesSql("m", fromBlocks)}+coalesce(length(CAST(m.content_text AS BLOB)),0) AS bytes
 		 FROM narrator_message_refs r JOIN narrator_messages m ON m.id=r.message_id
-		 LEFT JOIN users u ON u.id=m.created_by LEFT JOIN narrators n ON n.id=m.narrator_id
+		 LEFT JOIN users u ON u.id=m.created_by
+		 LEFT JOIN narrators n ON n.id=coalesce(m.author_narrator_id, m.narrator_id)
 		 WHERE r.narrator_id=? AND r.seq>? AND r.segment_compact_id IS NULL AND m.role<>'disp'
 		 ORDER BY r.seq LIMIT 200`,
 			[options.narratorId, cursor],
@@ -160,22 +164,29 @@ export async function queryModelHistoryDelta(
 					title: string | null;
 				}
 			>(
-				`SELECT m.id,m.narrator_id AS "narratorId",m.body_revision AS "bodyRevision",m.role,m.content_json AS "contentJson",
+				`SELECT m.id,m.narrator_id AS "narratorId",m.author_narrator_id AS "authorNarratorId",
+				 m.body_revision AS "bodyRevision",m.role,${bodySql("m", fromBlocks)} AS "contentJson",
 				 m.content_text AS "contentText",m.parent_tool_use_id AS "parentToolUseId",m.sdk_message_uuid AS "messageUuid",
 				 m.created_by AS "createdBy",m.origin,m.origin_label AS "originLabel",u.username,n.title
-				 FROM narrator_messages m LEFT JOIN users u ON u.id=m.created_by LEFT JOIN narrators n ON n.id=m.narrator_id
+				 FROM narrator_messages m LEFT JOIN users u ON u.id=m.created_by
+				 LEFT JOIN narrators n ON n.id=coalesce(m.author_narrator_id, m.narrator_id)
 				 WHERE m.id IN (${ids.map(() => "?").join(",")})`,
 				ids,
 			);
 			if (bodies.length !== ids.length)
 				throw new Error("Model history snapshot contains missing messages");
+			const fromRows = await assembleBlockBodies(
+				query,
+				bodies.filter((body) => body.contentJson === null).map((body) => body.id),
+				options.deadline,
+				remainingBytes,
+			);
 			const byId = new Map(
 				bodies.map(({ username, title, ...body }) => {
-					const jsonContainerBytes = modelJsonContainerBytes(
-						body.contentJson,
-						options.deadline,
-						remainingBytes(),
-					);
+					const assembled = fromRows.get(body.id);
+					const jsonContainerBytes =
+						assembled?.jsonContainerBytes ??
+						modelJsonContainerBytes(body.contentJson, options.deadline, remainingBytes());
 					check(0, 0, jsonContainerBytes);
 					return [
 						body.id,
@@ -183,7 +194,7 @@ export async function queryModelHistoryDelta(
 							...body,
 							jsonContainerBytes,
 							seq: batch.find((row) => row.id === body.id)?.seq ?? 0,
-							contentJson: decode(body.contentJson),
+							contentJson: assembled ? assembled.content : decode(body.contentJson),
 							creator: username == null ? null : { username },
 							narrator: { title },
 							toolCalls: [],

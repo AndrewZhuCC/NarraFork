@@ -1,5 +1,5 @@
 /**
- * chat.ts — `/api/chat` — human-to-human messaging.
+ * chat.ts — `/api/chat` — conversations with people, and with bot narrators.
  *
  * Mounted after `requireSessionAuth`, so every handler has `c.get("user")`.
  * Authorization for a room is never assembled here: it goes through
@@ -25,13 +25,14 @@ import {
 	discardChatAttachment,
 	getChatMessageLocation,
 	getUnreadSummary,
+	listConversationRooms,
 	listDirectory,
-	listDmRooms,
 	listMessages,
 	loadChatAttachmentForRead,
 	markRead,
 	materializeAttachmentsForNarrator,
 	postMessage,
+	resolveBotRoom,
 	resolveDmRoom,
 	resolveNarratorRoom,
 	softDeleteMessage,
@@ -56,7 +57,7 @@ chatRoutes.get("/directory", async (c) => {
 
 chatRoutes.get("/rooms", async (c) => {
 	const userId = c.get("user").sub;
-	return c.json(await listDmRooms(userId));
+	return c.json(await listConversationRooms(userId));
 });
 
 chatRoutes.get("/unread", async (c) => {
@@ -74,6 +75,12 @@ chatRoutes.post("/rooms/dm", async (c) => {
 chatRoutes.get("/rooms/narrator/:narratorId", async (c) => {
 	const userId = c.get("user").sub;
 	return c.json(await resolveNarratorRoom(c.req.param("narratorId"), userId));
+});
+
+/** The caller's own conversation with a bot narrator (created on first open). */
+chatRoutes.get("/rooms/bot/:narratorId", async (c) => {
+	const userId = c.get("user").sub;
+	return c.json(await resolveBotRoom(c.req.param("narratorId"), userId));
 });
 
 chatRoutes.get("/rooms/:roomId/messages", async (c) => {

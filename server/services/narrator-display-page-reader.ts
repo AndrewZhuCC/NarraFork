@@ -11,6 +11,7 @@ import { runReadTask, WorkersUnavailableError } from "../lib/db-worker/pool";
 import { AppError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
+import { blockReadsEnabled } from "./narrator-block-scans";
 
 export type { NarratorDisplayMessage } from "../lib/db-worker/display-page-protocol";
 
@@ -185,6 +186,11 @@ function mapReadError(error: unknown): Error {
 		case "DISPLAY_PAGE_READER_UNAVAILABLE":
 			return new AppError(message, 503, code);
 		default:
+			// The client sees a generic 503; keep the real cause in the server log.
+			logger.warn("History display read failed", {
+				error: message,
+				...(code !== null && code !== undefined && { code: String(code) }),
+			});
 			return unavailable("read failed");
 	}
 }
@@ -213,6 +219,8 @@ export async function readNarratorDisplayMessages(
 		ioBudget: options.ioBudget,
 		...(options.maxRawBytes !== undefined && { maxRawBytes: options.maxRawBytes }),
 		deadlineAt: startedAt + Math.min(timeoutMs, DISPLAY_PAGE_LIMITS.timeoutMs),
+		// PostgreSQL is still written in the legacy shape only.
+		...(source.backend !== "postgres" && blockReadsEnabled() && { bodiesFromBlocks: true }),
 	};
 	try {
 		validateDisplayPageRequest(request, limits);

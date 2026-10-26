@@ -8,6 +8,8 @@ import { Hono } from "hono";
 import { isValidChannel, isValidPlatform } from "../lib/platform";
 import { getAllReleases, getLatestRelease, getReleaseByVersion } from "../lib/release-cache";
 import { compareVersions, isNewerVersion } from "../lib/version";
+import { MirrorIngestService } from "../services/mirror-ingest";
+import { readV2Canonical, V2CanonicalProjection } from "../services/v2-canonical-projection";
 import type { StorageBackend } from "../storage/types";
 import type { CheckUpdateResponse, PlatformFileInfo, ZstdPatchMeta } from "../types";
 
@@ -59,12 +61,35 @@ async function resolvePatch(
 	return null;
 }
 
-export function createCheckRoutes(storage: StorageBackend) {
+export function createCheckRoutes(
+	storage: StorageBackend,
+	ingest = new MirrorIngestService(storage),
+) {
 	const routes = new Hono();
+	// A configured but broken canonical catalog must never look like a successful legacy check.
+	routes.onError((_error, c) =>
+		c.json(
+			{
+				error:
+					"Canonical update unavailable for this legacy client; download the release from GitHub",
+				code: "CANONICAL_UPDATE_UNAVAILABLE",
+			},
+			503,
+		),
+	);
 
 	routes.get("/:product/releases/:version/metadata", async (c) => {
 		const product = c.req.param("product");
 		const version = c.req.param("version");
+		const canonical = await readV2Canonical(ingest, product);
+		// Prefer canonical for this exact version; unrelated legacy history remains readable.
+		if (canonical?.index.releases.some((release) => release.version === version)) {
+			return c.json(
+				await new V2CanonicalProjection(storage, product, canonical, c.req.raw.signal).metadata(
+					version,
+				),
+			);
+		}
 		const release = await getReleaseByVersion(storage, product, version);
 		if (!release) return c.json({ error: "Release not found" }, 404);
 		return c.json(release);
@@ -82,6 +107,17 @@ export function createCheckRoutes(storage: StorageBackend) {
 
 		if (!isValidChannel(channel)) {
 			return c.json({ error: "Invalid channel parameter" }, 400);
+		}
+
+		const canonical = await readV2Canonical(ingest, product);
+		if (canonical) {
+			return c.json(
+				await new V2CanonicalProjection(storage, product, canonical, c.req.raw.signal).latest(
+					channel,
+					platform,
+					currentVersion,
+				),
+			);
 		}
 
 		// O(1) cache lookup instead of filesystem scan

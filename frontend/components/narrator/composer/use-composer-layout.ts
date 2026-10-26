@@ -124,6 +124,6 @@ export function useComposerLayout({
 				root.style.removeProperty(key);
 		};
 	}, [adaptive, editor, rootRef, leadingRef, trailingRef]);
-	// Controlled loads and resource/candidate renders need measuring too; calls coalesce per frame.
+	// Controlled loads and resource renders need measuring too; calls coalesce per frame.
 	useLayoutEffect(() => scheduleRef.current?.());
 }

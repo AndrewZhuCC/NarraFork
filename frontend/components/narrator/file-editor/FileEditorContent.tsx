@@ -640,6 +640,10 @@ function FileEditorDocument({
 			dirty: sessionDirty(current),
 		});
 		if (!reference) return false;
+		editorRef.current?.getEditor()?.setPosition({
+			lineNumber: range.endLineNumber,
+			column: range.endColumn,
+		});
 		editorSelectionRef.current = null;
 		publishSelectionRef.current?.(null);
 		addReferenceRef.current(reference);

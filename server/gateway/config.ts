@@ -219,7 +219,6 @@ export async function loadGatewayConfig(): Promise<GatewayConfig> {
 	return {
 		enabled,
 		defaultProjectId: process.env.GATEWAY_DEFAULT_PROJECT_ID ?? dbCfg.defaultProjectId,
-		defaultChapterId: process.env.GATEWAY_DEFAULT_CHAPTER_ID ?? dbCfg.defaultChapterId,
 		defaultPermissionMode,
 		sessionIdleMinutes: sessionIdleMinutesEnv
 			? Number(sessionIdleMinutesEnv)

@@ -25,8 +25,8 @@ function resetObserved(): void {
 }
 
 const testProvider: ProviderAdapter = {
-	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	formatTools: (tools) => tools.map(({ name, description }) => ({ name, description })),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: (history, systemPrompt) => {
 		observed.injectedSystemPrompt = systemPrompt;
 		history.push({ role: "system", content: systemPrompt });
@@ -38,9 +38,6 @@ const testProvider: ProviderAdapter = {
 		yield { text: "hello from extension test provider" };
 		return;
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -50,6 +47,7 @@ const testProvider: ProviderAdapter = {
 const realProviderModule = { ...(await import("../provider")) };
 
 mock.module("../provider", () => ({
+	...realProviderModule,
 	getProvider: () => testProvider,
 	resolveProviderAndModel: () => ({
 		requestedProvider: "test",
@@ -106,7 +104,9 @@ async function drain(
 	overrides: Partial<AgentConfig> = {},
 ): Promise<AgentEvent[]> {
 	const events: AgentEvent[] = [];
-	for await (const event of agentLoop(makeConfig(ac.signal, extensions, overrides), "hi", [])) {
+	for await (const event of agentLoop(makeConfig(ac.signal, extensions, overrides), "hi", {
+		rows: [],
+	})) {
 		events.push(event);
 	}
 	return events;

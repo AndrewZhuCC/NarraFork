@@ -7,13 +7,36 @@ import { ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { getBlockedSkills, isSkillBlocked } from "../lib/narrator-custom-traits";
 import { policySourceIdOf, RUNTIME_SOURCE_COLUMNS } from "../lib/runtime-source";
-import type { Command, CommandModelOverride, CommandParam } from "./chapter-service";
 import {
 	loadSkillSummariesForContext,
 	resolveSkillContextForNarrator,
 	type SkillContext,
 } from "./skill-service";
 import { resolveEffectiveTraits, resolveNarratorProjectId } from "./trait-layer-service";
+
+export interface CommandParam {
+	name: string;
+	description?: string;
+	required?: boolean;
+	defaultValue?: string;
+}
+
+export interface CommandModelOverride {
+	/** Model identifier, e.g. "anthropic:claude-opus-4.6" */
+	model: string;
+	/** "temporary" = revert after this command; "permanent" = keep the new model */
+	mode: "temporary" | "permanent";
+}
+
+export interface Command {
+	name: string;
+	prompt: string;
+	description?: string;
+	runBashFirst?: boolean;
+	bashCommand?: string;
+	params?: CommandParam[];
+	modelOverride?: CommandModelOverride;
+}
 
 /** Safely extract commands array from a chapterSettings value. */
 function parseChapterSettingsCommands(raw: unknown): Command[] {
@@ -174,7 +197,7 @@ async function getUserCommands(userId: string): Promise<Command[]> {
 async function getProjectCommandsForNarrator(narratorId: string): Promise<Command[]> {
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { chapterId: true, contextProjectId: true },
+		columns: { id: true, contextProjectId: true },
 	});
 	if (!narrator) return [];
 	const projectId = await resolveNarratorProjectId(narrator);
@@ -477,8 +500,8 @@ export async function getSlashMenuItems(
 		db.query.narrators.findFirst({
 			where: eq(narrators.id, narratorId),
 			columns: {
+				id: true,
 				traits: true,
-				chapterId: true,
 				contextProjectId: true,
 				...RUNTIME_SOURCE_COLUMNS,
 			},

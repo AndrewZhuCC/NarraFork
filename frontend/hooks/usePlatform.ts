@@ -16,14 +16,9 @@ import { api } from "../lib/api";
  * capabilities object would have flipped every other getter's absent-payload fallback
  * off at once and turned 30+ working features unsupported.
  *
- * The inert structure was not free. `getChapterSplitCapability` deliberately failed closed
- * while `POST /chapters/:id/split` was missing, which was correct at the time; once the
- * route landed the fail-closed default kept the feature permanently unreachable, because
- * no payload ever arrived to say otherwise. Split was the bug that got noticed. The
- * compressed-summary warning in `ChapterSplitModal` was another: `compressedAISummary`
- * had no absent-payload fallback, so it read `false` and the modal told users this
- * backend cannot generate an AI summary for compressed splits, while `narrator-service`
- * generates one via `narratorContext.generateContextSummary`.
+ * The inert structure was not free: getters that deliberately failed closed while a route
+ * was missing stayed closed after the route landed, because no payload ever arrived to say
+ * otherwise, and features became permanently unreachable.
  *
  * So the getters are gone and what they returned is stated directly. Hook names and
  * return shapes are unchanged, so call sites still read `.supported` / `.reason` and can
@@ -62,20 +57,6 @@ export type ProviderCapabilityKey =
 	| "CommandCode"
 	| "gemini"
 	| "grok";
-
-type ChapterContainerRoute =
-	| "setup"
-	| "podmanStatus"
-	| "podmanInstall"
-	| "composeInfo"
-	| "list"
-	| "start"
-	| "stop"
-	| "pause"
-	| "unpause"
-	| "logs"
-	| "remove";
-type ChapterContainerRoutes = Record<ChapterContainerRoute, boolean>;
 
 interface FeatureCapability {
 	supported?: boolean;
@@ -288,67 +269,18 @@ export function useGatewayCapability(): typeof GATEWAY_CAPABILITY {
 	return GATEWAY_CAPABILITY;
 }
 
-// === chapters: containers ===
+// === containers ===
 
-type ChapterContainersCapability = {
-	supported: boolean;
-	reason?: string;
-	routes: ChapterContainerRoutes;
-	runtime: {
-		podmanCompose?: boolean;
-		podmanComposeFallbackCommand?: boolean;
-		boundedOutput?: boolean;
-		syncStartRequest?: boolean;
-		backgroundStart?: boolean;
-		backgroundStartReason?: string;
-		streamingLogs?: boolean;
-		perChapterLock?: boolean;
-	};
-	ports: {
-		legacyHostPortAllocation?: boolean;
-		portRelease?: boolean;
-	};
-	proxy: {
-		metadataSupported?: boolean;
-		requiresPastaPasst?: boolean;
-		overridePortsReset?: boolean;
-		reverseProxyServer?: boolean;
-		http?: boolean;
-		websocket?: boolean;
-		dynamicSettingsHook?: boolean;
-	};
-};
+type ContainersCapability = { supported: boolean; reason?: string };
 
-function chapterContainerRoutes(supported: boolean): ChapterContainerRoutes {
-	return {
-		setup: supported,
-		podmanStatus: supported,
-		podmanInstall: supported,
-		composeInfo: supported,
-		list: supported,
-		start: supported,
-		stop: supported,
-		pause: supported,
-		unpause: supported,
-		logs: supported,
-		remove: supported,
-	};
-}
-
-const CHAPTER_CONTAINERS_SUPPORTED: ChapterContainersCapability = Object.freeze({
-	supported: true,
-	routes: Object.freeze(chapterContainerRoutes(true)),
-	runtime: Object.freeze({}),
-	ports: Object.freeze({}),
-	proxy: Object.freeze({}),
-});
+const CONTAINERS_SUPPORTED: ContainersCapability = Object.freeze({ supported: true });
 
 /**
  * The one capability with a real runtime signal behind it: Android/proot/Termux hosts
  * report `containerSupport: false` in `runtimeEnvironment`, and there is no local Podman
  * to talk to there.
  */
-export function useChapterContainersCapability(): ChapterContainersCapability {
+export function useContainersCapability(): ContainersCapability {
 	const { data } = useHealthQuery();
 	const environment = data?.runtimeEnvironment;
 	if (environment && !environment.containerSupport) {
@@ -357,75 +289,9 @@ export function useChapterContainersCapability(): ChapterContainersCapability {
 			reason:
 				environment.containerUnsupportedReason ??
 				"Local container management is unavailable in this runtime.",
-			routes: chapterContainerRoutes(false),
-			runtime: {},
-			ports: {},
-			proxy: {},
 		};
 	}
-	return CHAPTER_CONTAINERS_SUPPORTED;
-}
-
-// === chapters: batch merge ===
-
-const CHAPTER_BATCH_MERGE_CAPABILITY: {
-	supported: boolean;
-	reason?: string;
-	mode?: string;
-	startRouteSupported: boolean;
-	sessionRouteSupported: boolean;
-	mergeSessionIdResponse: boolean;
-	targetChapterIdResponse: boolean;
-	createdTargetResponse: boolean;
-	statusResponse: boolean;
-	decisionWs: boolean;
-	staleSessionCleanup: boolean;
-	createdTargetRollback: boolean;
-	frontendCompletionMode?: string;
-	events: string[];
-} = Object.freeze({
-	supported: true,
-	startRouteSupported: true,
-	sessionRouteSupported: true,
-	mergeSessionIdResponse: true,
-	targetChapterIdResponse: true,
-	createdTargetResponse: true,
-	statusResponse: true,
-	decisionWs: true,
-	staleSessionCleanup: true,
-	createdTargetRollback: true,
-	events: [] as string[],
-});
-
-export function useChapterBatchMergeCapability(): typeof CHAPTER_BATCH_MERGE_CAPABILITY {
-	return CHAPTER_BATCH_MERGE_CAPABILITY;
-}
-
-// === chapters: split ===
-
-/**
- * `compressedAISummarySupported` is true because compressed splits do get an AI summary:
- * `chapter-split` passes `inheritMode` through to `chapterFork.fork`, and
- * `narrator-service` calls `narratorContext.generateContextSummary` for the compressed
- * mode. The old getter had no fallback for this field so it read `false`, which made
- * `ChapterSplitModal` warn about a fallback that was not in use.
- */
-const CHAPTER_SPLIT_CAPABILITY: {
-	supported: boolean;
-	reason?: string;
-	mode?: string;
-	compressedAISummarySupported: boolean;
-	compressedAISummaryFallback: boolean;
-	compressedAISummaryMode?: string;
-	compressedAISummaryReason?: string;
-} = Object.freeze({
-	supported: true,
-	compressedAISummarySupported: true,
-	compressedAISummaryFallback: false,
-});
-
-export function useChapterSplitCapability(): typeof CHAPTER_SPLIT_CAPABILITY {
-	return CHAPTER_SPLIT_CAPABILITY;
+	return CONTAINERS_SUPPORTED;
 }
 
 // === narrator ===

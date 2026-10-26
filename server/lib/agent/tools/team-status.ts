@@ -208,20 +208,19 @@ export const teamStatusTool: ToolDefinition = {
 				: null;
 
 			// Bash tasks are keyed by the narrator that STARTED them, so the team scope has
-			// to include the parent, this narrator and every sibling. The sibling ids come
-			// from the unbounded listing on purpose: a bounded one would drop tasks owned
-			// by siblings outside the display window, which is a wrong answer rather than
-			// a shortened one. Only ids are read, so no large columns are materialized.
+			// to include the parent, this narrator and every sibling. Siblings are the whole
+			// team on purpose: a bounded set would drop tasks owned by siblings outside the
+			// display window, which is a wrong answer rather than a shortened one. The
+			// service resolves them in SQL, so a large team never becomes one bound
+			// parameter per member.
 			const bashView = wantBash
-				? await (async () => {
-						const siblingIds = (await narratorService.listTeamMembers(scopeId)).map((s) => s.id);
-						return backgroundTaskService.listTeamBashTasks({
-							parentNarratorIds: [scopeId, ctx.narratorId, ...siblingIds],
-							limit: rowLimit,
-							recentTerminalLimit: LIST_RECENT_TERMINAL_LIMIT,
-							query: needle,
-						});
-					})()
+				? await backgroundTaskService.listTeamBashTasks({
+						parentNarratorIds: [scopeId, ctx.narratorId],
+						teamRootId: scopeId,
+						limit: rowLimit,
+						recentTerminalLimit: LIST_RECENT_TERMINAL_LIMIT,
+						query: needle,
+					})
 				: null;
 
 			const { agentLabelFromNarrator } = await import("@server/services/subagent-label");

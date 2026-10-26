@@ -5,6 +5,7 @@
 import { and, desc, eq, lt } from "drizzle-orm";
 import { db } from "../../db";
 import { narratorMessageRefs } from "../../db/schema";
+import { bodyColumns, fillBodies } from "../../services/narrator-body-reads";
 
 /**
  * Maximum number of context messages to include.
@@ -77,14 +78,12 @@ export async function loadRecentMessages(
 
 	// Load the actual messages
 	const messageIds = refs.map((r) => r.messageId);
-	const messages = await db.query.narratorMessages.findMany({
-		where: (msgs, { inArray }) => inArray(msgs.id, messageIds),
-		columns: {
-			id: true,
-			role: true,
-			contentJson: true,
-		},
-	});
+	const messages = fillBodies(
+		await db.query.narratorMessages.findMany({
+			where: (msgs, { inArray }) => inArray(msgs.id, messageIds),
+			...bodyColumns({ id: true, role: true, contentJson: true }),
+		}),
+	);
 
 	// Build a map for ordering
 	const seqMap = new Map(refs.map((r) => [r.messageId, r.seq]));

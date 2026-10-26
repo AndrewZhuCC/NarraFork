@@ -142,40 +142,27 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 	let receiptEntry: Dirent | null | undefined;
 	let receiptImport: Promise<void> | undefined;
 	let receiptRetryCursor = "";
-	// New shadow-only projections use slot -1. Upgrade old slots in bounded
-	// maintenance pages; this cursor is never a global read/admission barrier.
-	let shadowProjectionCursor: [string, number] = ["", -2];
-	let shadowProjectionComplete = false;
-	function shadowProjectionPage(limit: number) {
-		return database
-			.query(`SELECT source_id, slot, shadow_key IS NOT NULL AS has_shadow FROM resource_protection_paths
-			WHERE source = 'chapter' AND (source_id, slot) > (?, ?)
-			ORDER BY source_id, slot LIMIT ?`)
-			.all(...shadowProjectionCursor, limit) as {
-			source_id: string;
-			slot: number;
-			has_shadow: number;
-		}[];
-	}
-	function legacyShadowProjection(row: { slot: number; has_shadow: number }): boolean {
-		return row.slot >= 0 && row.has_shadow !== 0;
-	}
-	function invalidateLegacyShadowProjections() {
-		if (shadowProjectionComplete) return;
-		const rows = shadowProjectionPage(PAGE);
+	/**
+	 * Chapters were removed. Their rows in the index would otherwise stay as permanent,
+	 * unmaintained claims; retire them one bounded page per maintenance pass.
+	 */
+	let chapterSourcePurged = false;
+	function purgeRemovedChapterSource() {
+		if (chapterSourcePurged) return;
+		let removed = 0;
 		database.transaction(() => {
-			for (const row of rows) {
-				if (!legacyShadowProjection(row)) continue;
-				const result = database
-					.query(`UPDATE resource_protection_sources SET dirty = 1, revision = revision + 1
-					WHERE source = 'chapter' AND source_id = ? AND dirty = 0`)
-					.run(row.source_id);
-				if (result.changes) changedSource("chapter");
-			}
+			removed += database
+				.query(`DELETE FROM resource_protection_paths WHERE source = 'chapter'
+				AND source_id IN (SELECT source_id FROM resource_protection_paths
+					WHERE source = 'chapter' LIMIT ?)`)
+				.run(PAGE).changes;
+			removed += database
+				.query(`DELETE FROM resource_protection_sources WHERE source = 'chapter'
+				AND source_id IN (SELECT source_id FROM resource_protection_sources
+					WHERE source = 'chapter' LIMIT ?)`)
+				.run(PAGE).changes;
 		})();
-		const last = rows.at(-1);
-		if (last) shadowProjectionCursor = [last.source_id, last.slot];
-		if (rows.length < PAGE) shadowProjectionComplete = true;
+		if (removed === 0) chapterSourcePurged = true;
 	}
 	// Project bounded scalars before crossing the SQLite/JS boundary, including malformed legacy rows.
 	const smallText = (column: string, max = 4096) =>
@@ -197,31 +184,13 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 			requireSmall(row);
 			return row ? [{ kind: "registry", ...row }] : [];
 		}
-		if (source === "chapter") {
-			const row = database
-				.query(`SELECT ${smallText("id")} AS id, ${smallText("worktree_path")} AS path,
-				${smallText("snapshot_shadow_key", 8193)} AS shadowKey FROM chapters WHERE id = ?`)
-				.get(id) as { id: string; path: string | null; shadowKey: string | null } | null;
-			requireSmall(row);
-			return row
-				? [
-						{
-							kind: "chapter",
-							id: row.id,
-							...(row.path ? { path: row.path } : {}),
-							...(row.shadowKey ? { shadowKey: row.shadowKey } : {}),
-						},
-					]
-				: [];
-		}
 		const row = database
-			.query(`SELECT ${smallText("id")} AS id, ${smallText("chapter_id")} AS chapter_id,
+			.query(`SELECT ${smallText("id")} AS id,
 			${smallText("cwd")} AS cwd, ${smallText("default_device_id", 256)} AS default_device_id, workspace_revision,
 			CASE WHEN length(cast(workspace_context AS blob)) <= ${MAX_ROW_BYTES} THEN workspace_context END AS context,
 			length(cast(workspace_context AS blob)) AS context_bytes FROM narrators WHERE id = ?`)
 			.get(id) as {
 			id: string;
-			chapter_id: string | null;
 			cwd: string | null;
 			default_device_id: string | null;
 			workspace_revision: number;
@@ -251,9 +220,7 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 		const base = {
 			kind: "narrator" as const,
 			id: row.id,
-			chapterId: row.chapter_id,
 			revision: row.workspace_revision,
-			legacyChapterCwd: !!row.chapter_id && row.workspace_revision === 0,
 		};
 		const claims: ResourceClaim[] = [];
 		if (row.cwd)
@@ -605,8 +572,8 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 		signal?: AbortSignal,
 	): Promise<void> {
 		check(deadline, signal);
-		invalidateLegacyShadowProjections();
-		for (const source of ["narrator", "chapter", "registry"] as const) {
+		purgeRemovedChapterSource();
+		for (const source of ["narrator", "registry"] as const) {
 			check(deadline, signal);
 			const progress = database
 				.query(
@@ -820,7 +787,7 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 				check(deadline, signal);
 				const states = database
 					.query(`SELECT source, source_id, revision FROM resource_protection_sources
-					WHERE dirty = 1 AND source IN ('narrator', 'chapter', 'registry') AND source_id != '' AND (source, source_id) > (?, ?) ORDER BY source, source_id LIMIT ?`)
+					WHERE dirty = 1 AND source IN ('narrator', 'registry') AND source_id != '' AND (source, source_id) > (?, ?) ORDER BY source, source_id LIMIT ?`)
 					.all(...cursor, PAGE) as SourceState[];
 				for (const state of states) {
 					if (bootstrapKeys.has(`${state.source}\0${state.source_id}`)) continue;
@@ -833,53 +800,6 @@ export function createResourceProtectionIndex(database: Database, receiptDirecto
 				if (!last) break;
 				cursor = [last.source, last.source_id];
 				await tick();
-			}
-			// Before maintenance upgrades old shadow slots, only physical shadow
-			// deletion needs their missing hash-derived path projection. Checkout
-			// reads and cold births do not depend on unrelated migration history.
-			if (
-				!shadowProjectionComplete &&
-				includeLegacyReceipts &&
-				targets.some((target) => target.path)
-			) {
-				const storage = await bounded(
-					canonicalProtectionPath(dirname(treeSnapshotPhysicalDir("local", "/"))),
-					deadline,
-					signal,
-				);
-				const physicalDeletion = targets.some(
-					(target) =>
-						(target.deviceId ?? "local") === "local" &&
-						target.path &&
-						(localPathSemantics.contains(storage, target.path) ||
-							localPathSemantics.contains(target.path, storage)),
-				);
-				if (physicalDeletion) {
-					let oldCursor: [string, number] = ["", -2];
-					let foundLegacy = false;
-					while (true) {
-						check(deadline, signal);
-						const rows = database
-							.query(`SELECT 'chapter' AS source, source_id, slot, shadow_key IS NOT NULL AS has_shadow
-							FROM resource_protection_paths WHERE source = 'chapter' AND (source_id, slot) > (?, ?)
-							ORDER BY source_id, slot LIMIT ?`)
-							.all(...oldCursor, PAGE) as (PathRow & { has_shadow: number })[];
-						for (const row of rows) {
-							if (!legacyShadowProjection(row)) continue;
-							foundLegacy = true;
-							if (skipCandidate(row) || seen.has(`${row.source}\0${row.source_id}\0${row.slot}`))
-								continue;
-							for (const projection of await indexed(candidateClaim(row), deadline, signal))
-								if (matches(targets, projection)) yield projection.claim;
-						}
-						if (rows.length < PAGE) break;
-						const last = rows.at(-1);
-						if (!last) break;
-						oldCursor = [last.source_id, last.slot];
-						await tick();
-					}
-					if (!foundLegacy) shadowProjectionComplete = true;
-				}
 			}
 			let aliasCursor: [string, string, number] = ["", "", -1];
 			while (true) {

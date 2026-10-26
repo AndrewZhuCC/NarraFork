@@ -253,7 +253,8 @@ export function composerFileReferenceToken(ref: FileReference): string {
 			: s.endLineNumber;
 	return `#file:${ref.label}:${s.startLineNumber}-${end}`;
 }
-function composerQuoteBlock(node: {
+/** The canonical blockquote a quote node is sent as; sent bubbles turn it back into a chip. */
+export function composerQuoteBlock(node: {
 	label: string;
 	text: string;
 	anchor?: string;

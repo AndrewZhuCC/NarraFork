@@ -69,11 +69,7 @@ function fixture(
 }
 
 describe("resource owner selectors", () => {
-	test("discriminates all four owner forms", () => {
-		expect(resolveWorktreeResourceOwner({ chapterId: "c" })).toEqual({
-			kind: "legacyChapter",
-			chapterId: "c",
-		});
+	test("discriminates all three owner forms", () => {
 		expect(resolveWorktreeResourceOwner({ narratorId: "n" })).toEqual({
 			kind: "legacyNarrator",
 			narratorId: "n",
@@ -88,10 +84,8 @@ describe("resource owner selectors", () => {
 		null,
 		[],
 		"r",
-		{ chapterId: "" },
+		{ narratorId: "" },
 		{ worktreeResourceId: 1 },
-		{ worktreeResourceId: "r", chapterId: "c" },
-		{ chapterId: "c", narratorId: "n" },
 		{ worktreeResourceId: "r", narratorId: "n" },
 	]) {
 		test(`malformed/mixed selector rejects: ${JSON.stringify(input)}`, () => {

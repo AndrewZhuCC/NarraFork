@@ -697,14 +697,17 @@ async function runWorkspacePluginPanelCheck(
 	base: string,
 	token: string,
 	contribution: ContributionItem,
+	home: string,
 ): Promise<void> {
 	let browser: Browser | undefined;
 	let page: import("puppeteer-core").Page | undefined;
 	try {
+		// An explicit directory: the isolated home has no default project directory, and
+		// the server refuses to guess one.
 		const narrator = await jsonRequest<{ id?: string }>(base, "/api/narrators", {
 			method: "POST",
 			headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-			body: JSON.stringify({}),
+			body: JSON.stringify({ cwd: home }),
 		});
 		if (!narrator.response.ok || !narrator.body.id) {
 			throw new Error(`narrator create failed: ${narrator.response.status}`);
@@ -716,6 +719,14 @@ async function runWorkspacePluginPanelCheck(
 		});
 		if (!workspace.response.ok || !workspace.body.id)
 			throw new Error(`workspace create failed: ${workspace.response.status}`);
+		// A fresh instance sends its admin to the add-provider page until setup is done, which
+		// would navigate away from the workspace this check drives.
+		const setup = await jsonRequest(base, "/api/user-preferences", {
+			method: "PATCH",
+			headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+			body: JSON.stringify({ setupWizardCompleted: true }),
+		});
+		if (!setup.response.ok) throw new Error(`setup completion failed: ${setup.response.status}`);
 		const member = await jsonRequest(base, `/api/workspaces/${workspace.body.id}/panels`, {
 			method: "POST",
 			headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
@@ -1047,7 +1058,7 @@ async function main(): Promise<void> {
 		check("backend creates a principal-bound UI session", true);
 
 		await runBrowserChecks(base, token, hostile, created.body);
-		await runWorkspacePluginPanelCheck(base, token, hostile);
+		await runWorkspacePluginPanelCheck(base, token, hostile, home);
 
 		const crossWindow = await runCrossWindowDisableCheck(base, token, hostile.pluginId);
 		const disabled = crossWindow.disabled;

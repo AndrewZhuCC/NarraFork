@@ -9,6 +9,7 @@ export type FieldKind =
 	| "boolean"
 	| "list"
 	| "modalities"
+	| "toolModes"
 	| "mode"
 	| "basis"
 	| "string";
@@ -26,6 +27,7 @@ export const catalogFields: ReadonlyArray<{
 	{ key: "supported_modalities", section: "capabilities", kind: "modalities" },
 	{ key: "supported_output_modalities", section: "capabilities", kind: "modalities" },
 	{ key: "supports_web_search", section: "capabilities", kind: "boolean" },
+	{ key: "tool_loading_modes", section: "capabilities", kind: "toolModes" },
 	{ key: "supports_reasoning", section: "capabilities", kind: "boolean" },
 	{ key: "reasoning_mode", section: "capabilities", kind: "mode" },
 	{ key: "reasoning_effort_levels", section: "capabilities", kind: "list" },
@@ -41,6 +43,14 @@ export const catalogFields: ReadonlyArray<{
 	{ key: "long_context_pricing_basis", section: "prices", kind: "basis" },
 	{ key: "long_context_input_cost_multiplier", section: "prices", kind: "multiplier" },
 	{ key: "long_context_output_cost_multiplier", section: "prices", kind: "multiplier" },
+];
+/** Values `tool_loading_modes` accepts; mirrors `TOOL_LOADING_MODES` on the server. */
+export const TOOL_LOADING_MODE_VALUES = [
+	"anthropic_tool_addition",
+	"anthropic_deferred_tail",
+	"openai_additional_tools",
+	"kimi_system_tools",
+	"custom_injection",
 ];
 export const fieldOptions: Partial<Record<FieldKind, string[]>> = {
 	boolean: ["true", "false"],
@@ -94,7 +104,8 @@ export function buildCatalogPatch(
 				set[key] = text === "true";
 				break;
 			case "list":
-			case "modalities": {
+			case "modalities":
+			case "toolModes": {
 				const values = text
 					.split(",")
 					.map((v) => v.trim())
@@ -103,6 +114,8 @@ export function buildCatalogPatch(
 					field.kind === "modalities" &&
 					values.some((v) => !["text", "image", "audio", "video"].includes(v))
 				)
+					throw new Error(key);
+				if (field.kind === "toolModes" && values.some((v) => !TOOL_LOADING_MODE_VALUES.includes(v)))
 					throw new Error(key);
 				set[key] = values;
 				break;

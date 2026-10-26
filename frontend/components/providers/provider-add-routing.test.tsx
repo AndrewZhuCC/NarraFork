@@ -452,6 +452,110 @@ function expectNoSave() {
 	);
 }
 
+/** Read through a call so TS does not narrow the mock slot after a reset. */
+const currentCustomDetail = () => customDetail;
+const resetCustomDetail = () => {
+	customDetail = undefined;
+};
+
+describe("provider deep link", () => {
+	test("`?provider=` opens the provider and follows URL changes while mounted", async () => {
+		await mount("/settings/providers?provider=existing");
+		expect(currentCustomDetail()?.provider.id).toBe("existing");
+		expect(container.querySelector("button.mantine-ActionIcon-root")).not.toBeNull();
+
+		// Leaving the detail returns to the overview and clears the link.
+		await leaveDetail();
+		expect(router.state.location.search).toEqual({});
+		resetCustomDetail();
+
+		// A link arriving while the page is already mounted (the model picker's
+		// provider settings button) must still open the provider.
+		await act(async () => {
+			await router.navigate({ to: "/settings/providers", search: { provider: "existing" } });
+		});
+		expect(currentCustomDetail()?.provider.id).toBe("existing");
+
+		// Browser back closes it again.
+		resetCustomDetail();
+		await act(async () => {
+			router.history.back();
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		});
+		expect(router.state.location.search).toEqual({});
+		expect(container.querySelector("button.mantine-ActionIcon-root")).toBeNull();
+	});
+});
+
+describe("provider deep link resolution", () => {
+	test("a prefix opens the configured provider, case-insensitively", async () => {
+		await mount("/settings/providers?provider=EXISTING");
+		expect(currentCustomDetail()?.provider.id).toBe("existing");
+	});
+
+	test("a prefix link still opens the provider when its group loads before the provider list", async () => {
+		// The overview groups come from the models query, the provider list from the
+		// settings query; a group can exist before its provider id is known. A one-shot
+		// resolution in that window used to settle on the bare prefix: an empty detail.
+		// As in real settings, the provider id differs from its model prefix.
+		serverSettings = {
+			...clone(initialSettings),
+			customApiProviders: [
+				{ ...initialSettings.customApiProviders[0], id: "xiaomi-id", prefix: "xiaomi" },
+			],
+		};
+		queryClient.removeQueries({ queryKey: ["admin", "settings"] });
+		const ready = Promise.withResolvers<void>();
+		spyOn(api, "getSettings").mockImplementation(async () => {
+			await ready.promise;
+			return clone(serverSettings);
+		});
+		spyOn(models, "useAllModels").mockReturnValue({
+			providerLabels: { xiaomi: "Xiaomi" },
+			codexModels: [],
+			commandcodeModels: [],
+			openaiByProvider: [
+				{
+					prefix: "xiaomi",
+					name: "Xiaomi",
+					models: [{ value: "xiaomi:mimo", label: "mimo", provider: "xiaomi" }],
+				},
+			],
+			anthropicByProvider: [],
+			geminiByProvider: [],
+			nugByProvider: [],
+			pluginProviderGroups: [],
+		} as unknown as ReturnType<typeof models.useAllModels>);
+		await mount("/settings/providers?provider=xiaomi");
+		expect(currentCustomDetail()).toBeUndefined();
+		await act(async () => {
+			ready.resolve();
+		});
+		for (let i = 0; i < 20 && !currentCustomDetail(); i++) {
+			await act(async () => {
+				await new Promise((resolve) => setTimeout(resolve, 5));
+			});
+		}
+		expect(currentCustomDetail()?.provider.id).toBe("xiaomi-id");
+	});
+
+	test("a prefix with no configured provider shows the overview, not an empty detail", async () => {
+		// A custom model under a prefix no provider owns still forms an overview group; a
+		// bare prefix with no provider behind it must never become the open detail.
+		serverSettings = {
+			...clone(initialSettings),
+			agent: {
+				...initialSettings.agent,
+				customModels: [{ value: "xiaomi:mimo-v2.6-pro", label: "MiMo", provider: "xiaomi" }],
+			},
+		};
+		await mount("/settings/providers?provider=xiaomi");
+		expect(currentCustomDetail()).toBeUndefined();
+		expect(container.querySelector("button.mantine-ActionIcon-root")).toBeNull();
+		expect(container.querySelector('a[href="/settings/providers/add"]')).not.toBeNull();
+	});
+});
+
 describe("provider add nested route", () => {
 	test("overview Link opens a page, retaining outer navigation and hiding overview/save controls", async () => {
 		await mount();
@@ -644,7 +748,9 @@ describe("provider add nested route", () => {
 				providers.filter((provider) => provider.id !== "existing"),
 			),
 		);
-		await leaveDetail();
+		// The removed provider no longer resolves from `?provider=`, so the page is back
+		// on the overview instead of an empty detail view.
+		expect(container.querySelector("button.mantine-ActionIcon-root")).toBeNull();
 		await openAdd();
 		await fillDraft();
 		await submit();

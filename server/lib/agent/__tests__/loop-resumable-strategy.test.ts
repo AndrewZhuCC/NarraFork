@@ -44,7 +44,7 @@ function resumableErrorEvent(): ParsedStreamEvent {
 /** Scripted attempts: each entry is the event sequence for one provider.chat() call. */
 let attempts: ParsedStreamEvent[][] = [];
 let attemptCount = 0;
-/** `content` (the user-side turn text) seen by each provider.chat() call, in order. */
+/** The input each provider.chat() call ends with (its last input row), in order. */
 let sentContents: string[] = [];
 
 /** Sentinel entry: makes the scripted provider throw mid-stream instead of yielding. */
@@ -54,11 +54,14 @@ function throwMarker(err: unknown): ParsedStreamEvent {
 
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async (rows) => ({
+		history: rows.map((row) => ({ role: row.role, content: row.contentText ?? "" })),
+	}),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		params.onRequestStart?.();
-		sentContents.push(params.content ?? "");
+		const last = params.history.at(-1) as { role?: string; content?: string } | undefined;
+		sentContents.push(params.content || (last?.role === "user" ? (last.content ?? "") : ""));
 		const script = attempts[attemptCount++];
 		if (!script) throw new Error(`Unexpected provider.chat() call ${attemptCount}`);
 		for (const event of script) {
@@ -67,9 +70,6 @@ const testProvider: ProviderAdapter = {
 			yield event;
 		}
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -119,11 +119,9 @@ async function runLoop(
 	sentContents = [];
 	const events: AgentEvent[] = [];
 	const controller = new AbortController();
-	for await (const event of agentLoop(
-		makeConfig(controller.signal, options.overrides),
-		"answer",
-		[],
-	)) {
+	for await (const event of agentLoop(makeConfig(controller.signal, options.overrides), "answer", {
+		rows: [],
+	})) {
 		events.push(event);
 		if (options.stopAfter && event.type === options.stopAfter) break;
 	}

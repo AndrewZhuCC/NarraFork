@@ -43,7 +43,7 @@ function transientError(): ApiError {
 
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		params.onRequestStart?.();
@@ -56,9 +56,6 @@ const testProvider: ProviderAdapter = {
 		if (typeof script === "function") script();
 		else for (const event of script) yield event;
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -110,7 +107,7 @@ async function runLoop(
 	sentRequests = [];
 	const ac = new AbortController();
 	const events: AgentEvent[] = [];
-	for await (const event of agentLoop(makeConfig(ac.signal, overrides), prompt, [])) {
+	for await (const event of agentLoop(makeConfig(ac.signal, overrides), prompt, { rows: [] })) {
 		events.push(event);
 	}
 	return events;
@@ -151,7 +148,7 @@ describe("请求发起用户快照", () => {
 		};
 		try {
 			const starts: AgentEvent[] = [];
-			for await (const event of agentLoop(config, "hello", [])) {
+			for await (const event of agentLoop(config, "hello", { rows: [] })) {
 				if (event.type === "api_request_start") starts.push(event);
 			}
 			expect(starts).toHaveLength(1);
@@ -165,7 +162,10 @@ describe("请求发起用户快照", () => {
 describe("重试不得丢弃已产生的工具进展", () => {
 	for (const failure of ["throw", "invalidState"] as const) {
 		for (const mode of ["allow", "mixed", "deny", "abortBefore", "abort", "softStop"] as const) {
-			test(`Browser deferred 在 ${failure}/${mode} 中正常结算且不重放`, async () => {
+			// A completed call that has not started when the stream fails (here held by the
+			// safe-stop opt-in, which keeps every start until the stream ends) is executed
+			// normally afterwards and never replayed.
+			test(`未启动的 Browser 在 ${failure}/${mode} 中正常结算且不重放`, async () => {
 				const originalChat = testProvider.chat;
 				const ac = new AbortController();
 				let calls = 0;
@@ -218,6 +218,7 @@ describe("重试不得丢弃已产生的工具进展", () => {
 					for await (const event of agentLoop(
 						makeConfig(ac.signal, {
 							maxTransientRetries: 3,
+							deferEagerToolsForSafeStop: true,
 							shouldStop: () => mode === "softStop" && browserExecutions > 0,
 							permissionHandler: async (toolName) => {
 								if (toolName !== "Browser") return { behavior: "allow" };
@@ -229,7 +230,7 @@ describe("重试不得丢弃已产生的工具进展", () => {
 							},
 						}),
 						"fill the input",
-						[],
+						{ rows: [] },
 					)) {
 						events.push(event);
 						if (mode === "abortBefore" && event.type === "assistant_message") ac.abort();
@@ -271,6 +272,63 @@ describe("重试不得丢弃已产生的工具进展", () => {
 		}
 	}
 
+	for (const failure of ["throw", "invalidState"] as const) {
+		test(`Browser 在流中启动后遇 ${failure} 只执行一次且不重放`, async () => {
+			const originalChat = testProvider.chat;
+			let calls = 0;
+			let browserExecutions = 0;
+			const browserStarted = Promise.withResolvers<void>();
+			toolRegistry.register({
+				name: "Browser",
+				description: "Mock browser; never accesses a real browser",
+				parameters: z.object({ action: z.string() }),
+				execute: async () => {
+					browserExecutions++;
+					browserStarted.resolve();
+					return { output: "filled" };
+				},
+			});
+			testProvider.chat = async function* (params) {
+				params.onRequestStart?.();
+				calls++;
+				if (calls > 1) throw new Error("Unexpected provider replay");
+				yield { toolUseChunk: { toolUseId: "tu-browser", name: "Browser", stop: false } };
+				yield {
+					toolUseChunk: {
+						toolUseId: "tu-browser",
+						name: "Browser",
+						input: '{"action":"fill"}',
+						stop: false,
+					},
+				};
+				yield { toolUseChunk: { toolUseId: "tu-browser", name: "Browser", stop: true } };
+				// Browser starts while the response is still streaming.
+				await browserStarted.promise;
+				if (failure === "throw") throw transientError();
+				yield { invalidState: { reason: "overloaded_error", message: "upstream overloaded" } };
+			};
+			try {
+				const events: AgentEvent[] = [];
+				for await (const event of agentLoop(
+					makeConfig(new AbortController().signal, { maxTransientRetries: 3 }),
+					"fill the input",
+					{ rows: [] },
+				)) {
+					events.push(event);
+				}
+				expect(calls).toBe(1);
+				expect(browserExecutions).toBe(1);
+				const results = events.filter((event) => event.type === "tool_result");
+				expect(results).toMatchObject([{ toolUseId: "tu-browser", isError: false }]);
+				expect(events.at(-1)).toMatchObject({ type: "resumable_error" });
+				expect(events.some((event) => event.type === "retrying")).toBe(false);
+			} finally {
+				testProvider.chat = originalChat;
+				toolRegistry.unregister("Browser");
+			}
+		});
+	}
+
 	test("工具已执行后瞬态失败不得原地重放，必须把结果交回调用方", async () => {
 		// The scripted-array provider cannot throw mid-sequence, and that is exactly the
 		// shape under test: the tool call must LAND before the stream dies. Swap in a
@@ -298,7 +356,7 @@ describe("重试不得丢弃已产生的工具进展", () => {
 			for await (const event of agentLoop(
 				makeConfig(ac.signal, { maxTransientRetries: 3 }),
 				"read the file",
-				[],
+				{ rows: [] },
 			)) {
 				events.push(event);
 			}
@@ -378,11 +436,9 @@ describe("重试不得丢弃已产生的工具进展", () => {
 			sentRequests = [];
 			const ac = new AbortController();
 			const events: AgentEvent[] = [];
-			for await (const event of agentLoop(
-				makeConfig(ac.signal, { maxTransientRetries: 3 }),
-				"go",
-				[],
-			)) {
+			for await (const event of agentLoop(makeConfig(ac.signal, { maxTransientRetries: 3 }), "go", {
+				rows: [],
+			})) {
 				events.push(event);
 			}
 

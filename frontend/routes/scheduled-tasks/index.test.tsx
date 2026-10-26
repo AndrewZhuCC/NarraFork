@@ -40,7 +40,6 @@ const task: ScheduledTask = {
 	runContext: "standalone",
 	cwd: null,
 	projectId: null,
-	chapterId: null,
 	narratorMode: "reuse",
 	cleanupPolicy: { mode: "none" },
 	reuseNarratorId: "narrator-1",

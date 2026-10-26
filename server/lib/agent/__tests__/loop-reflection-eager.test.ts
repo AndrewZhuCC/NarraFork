@@ -1,392 +1,181 @@
-import { afterAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { z } from "zod/v4";
+import * as apiRequestTracker from "../../api-request-tracker";
 import type { ProviderAdapter } from "../provider";
 import { toolRegistry } from "../tool-registry";
-import type { AgentConfig, AgentEvent } from "../types";
+import type { AgentConfig } from "../types";
 
-const REFLECTION_TOOL_NAME = "TestReflectDecisionTool";
-const NORMAL_TOOL_NAME = "TestReflectNormalTool";
-const PROVIDER_SESSION_TOOLS = ["Bash", "Write", "Edit", "StructSed"] as const;
-const EAGER_READ_TOOL = "Read";
+/**
+ * Reflection decision tools run as soon as their input is complete. The decision
+ * settles the gate and aborts its controller, but a self-made decision must leave
+ * the reflection request streaming long enough to collect its natural usage tail.
+ */
+const DECISION_TOOL = "EagerReflectionDecision";
+const SECOND_DECISION_TOOL = "EagerReflectionSecondDecision";
+const USAGE = {
+	promptTokens: 128,
+	inputTokens: 128,
+	completionTokens: 9,
+	cachedInputTokens: 64,
+};
 
-/** Records the order in which each tool's execute() started. */
-const executionOrder: string[] = [];
+let gateAbort = new AbortController();
+let decisions: string[] = [];
+let streamCompleted = false;
+let releaseTail: (() => void) | undefined;
+let scenario: "self-decision" | "takeover" | "double-decision" = "self-decision";
 
-const KNOWLEDGE_TOOLS = ["KnowledgeCreate", "KnowledgeEdit", "KnowledgeReview", "KnowledgeAdmin"];
-let scenario: "reflection" | "normal" | "reflection_then_normal" | "knowledge" | "session_tool" =
-	"reflection";
-let knowledgeToolName = KNOWLEDGE_TOOLS[0];
-let knowledgeChunks = false;
-let sessionToolName: (typeof PROVIDER_SESSION_TOOLS)[number] | typeof EAGER_READ_TOOL = "Bash";
-let sessionToolInputOverride: Record<string, unknown> | undefined;
-let streamReleased = false;
-let knowledgeRequests = 0;
-let sessionToolRequests = 0;
-const permissionAfterRelease: boolean[] = [];
-const executionAfterRelease: boolean[] = [];
-let onNormalStarted: (() => void) | undefined;
-let onSessionToolStarted: (() => void) | undefined;
-
-const testProvider: ProviderAdapter = {
+const provider: ProviderAdapter = {
 	formatTools: (tools) => tools.map(({ name, description }) => ({ name, description })),
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		params.onRequestStart?.();
-		if (scenario === "session_tool") {
-			if (sessionToolRequests++ > 0) {
-				yield { text: "done" };
-				return;
-			}
-			try {
-				let resolveSessionToolStarted!: () => void;
-				const sessionToolStarted = new Promise<void>((resolve) => {
-					resolveSessionToolStarted = resolve;
-				});
-				onSessionToolStarted = resolveSessionToolStarted;
-				const input =
-					sessionToolInputOverride ??
-					(sessionToolName === "Bash"
-						? { command: "custom-command" }
-						: sessionToolName === "Read"
-							? { file_path: "/tmp/input.txt" }
-							: sessionToolName === "StructSed"
-								? { file_path: "/tmp/output.txt", content: "x", dry_run: false }
-								: { file_path: "/tmp/output.txt", content: "x" });
-				yield {
-					toolUses: [{ toolUseId: "tu_session_tool", name: sessionToolName, input }],
-				};
-				yield { text: "trailing text before provider cleanup" };
-				if (sessionToolName === EAGER_READ_TOOL) {
-					await sessionToolStarted;
-				} else {
-					await new Promise((resolve) => setTimeout(resolve, 1));
-				}
-			} finally {
-				streamReleased = true;
-			}
-			return;
-		}
-		if (scenario === "knowledge") {
-			if (knowledgeRequests++ > 0) {
-				yield { text: "done" };
-				return;
-			}
-			try {
-				if (knowledgeChunks) {
-					yield {
-						toolUseChunk: {
-							toolUseId: "tu_knowledge",
-							name: knowledgeToolName,
-							input: '{"value":"x"}',
-							outputIndex: 0,
-						},
-					};
-					yield { toolUseChunk: { toolUseId: "tu_knowledge", stop: true } };
-				} else {
-					yield {
-						toolUses: [
-							{ toolUseId: "tu_knowledge", name: knowledgeToolName, input: { value: "x" } },
-						],
-					};
-				}
-				yield { text: "trailing text before provider cleanup" };
-				await new Promise((resolve) => setTimeout(resolve, 1));
-				if (params.signal.aborted) throw new Error("Aborted");
-			} finally {
-				// Models the WebSocket session's busy flag being cleared in finally.
-				streamReleased = true;
-			}
-			return;
-		}
-		// The ordinary eager baseline has no preceding reflection barrier. A separate
-		// scenario verifies that ordinary work cannot overtake such a barrier.
-		const toolName = scenario === "normal" ? NORMAL_TOOL_NAME : REFLECTION_TOOL_NAME;
-		yield {
-			toolUses: [
-				{ toolUseId: "tu_decision", name: toolName, input: { value: "x" } },
-				...(scenario === "reflection_then_normal"
-					? [{ toolUseId: "tu_after_reflection", name: NORMAL_TOOL_NAME, input: { value: "y" } }]
-					: []),
-			],
-		};
-		yield { text: "trailing text after tool call" };
-		// Hang until the caller aborts mid-stream (mirrors a real provider stream that is
-		// still open when the reflection decision settles and aborts the reflection signal).
-		while (!params.signal.aborted) {
-			await new Promise((resolve) => setTimeout(resolve, 1));
-		}
-		throw new Error("Aborted");
+		const tail = Promise.withResolvers<void>();
+		releaseTail = tail.resolve;
+		if (scenario === "takeover") yield { text: "still thinking" };
+		else
+			yield {
+				toolUses: [
+					{ toolUseId: "tu-decision", name: DECISION_TOOL, input: {} },
+					...(scenario === "double-decision"
+						? [{ toolUseId: "tu-second", name: SECOND_DECISION_TOOL, input: {} }]
+						: []),
+				],
+			};
+		// The provider keeps streaming after the decision call: trailing text, then usage.
+		if (scenario === "takeover") gateAbort.abort();
+		const aborted = new Promise<never>((_, reject) => {
+			if (params.signal.aborted) reject(new Error("Aborted"));
+			params.signal.addEventListener("abort", () => reject(new Error("Aborted")), {
+				once: true,
+			});
+		});
+		await Promise.race([tail.promise, aborted]);
+		yield { text: "decided" };
+		yield { usage: USAGE };
+		streamCompleted = true;
 	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
 };
 
-// Snapshot real provider before mocking; afterAll re-points it back (Bun mock.module is global and leaks; mock.restore() does not undo it).
+// Observe the durable completion boundary without needing a persisted narrator fixture.
+const finishedRequests = spyOn(apiRequestTracker, "finishApiRequest").mockImplementation(
+	async (handle) => handle.id,
+);
+// mock.restore() alone does not restore Bun's module mocks.
 const realProviderModule = { ...(await import("../provider")) };
-
 mock.module("../provider", () => ({
-	getProvider: () => testProvider,
+	...realProviderModule,
+	getProvider: () => provider,
 	resolveProviderAndModel: () => ({
 		requestedProvider: "test",
 		requestedModel: "test:model",
 		provider: "test",
-		adapter: testProvider,
+		adapter: provider,
 		model: "test:model",
 	}),
 }));
+const { runReflectionLoop } = await import("../loop");
 
-const { agentLoop } = await import("../loop");
-
-toolRegistry.register({
-	name: REFLECTION_TOOL_NAME,
-	description: "Fake reflection decision tool",
-	reflectionOnly: true,
-	parameters: z.object({ value: z.string() }),
-	execute: async (args) => {
-		executionOrder.push(REFLECTION_TOOL_NAME);
-		return { output: `reflect:${args.value}` };
-	},
-});
-
-toolRegistry.register({
-	name: NORMAL_TOOL_NAME,
-	description: "Fake normal (eager-eligible) tool",
-	parameters: z.object({ value: z.string() }),
-	execute: async (args) => {
-		executionOrder.push(NORMAL_TOOL_NAME);
-		onNormalStarted?.();
-		return { output: `normal:${args.value}` };
-	},
-});
-
-const originalKnowledgeTools = KNOWLEDGE_TOOLS.map((name) => toolRegistry.get(name));
-const sessionToolNames = [...PROVIDER_SESSION_TOOLS, EAGER_READ_TOOL];
-const originalSessionTools = sessionToolNames.map((name) => toolRegistry.get(name));
-for (const name of sessionToolNames) {
+for (const name of [DECISION_TOOL, SECOND_DECISION_TOOL]) {
 	toolRegistry.register({
 		name,
-		description: `Provider-session boundary test tool ${name}`,
-		parameters: z.object({
-			command: z.string().optional(),
-			file_path: z.string().optional(),
-			content: z.string().optional(),
-			dry_run: z.boolean().optional(),
-		}),
-		execute: async (args, ctx) => {
-			executionOrder.push(name);
-			executionAfterRelease.push(streamReleased);
-			onSessionToolStarted?.();
-			if (name !== EAGER_READ_TOOL) {
-				await ctx.requestPermission(name, args, ctx.currentToolUseId ?? "");
-			}
-			return { output: `ran:${name}` };
-		},
-	});
-}
-for (const name of KNOWLEDGE_TOOLS) {
-	toolRegistry.register({
-		name,
-		description: "Knowledge write with internal approval",
-		parameters: z.object({ value: z.string() }),
-		async execute(args, ctx) {
-			executionOrder.push(name);
-			permissionAfterRelease.push(streamReleased);
-			await ctx.requestPermission(name, args, ctx.currentToolUseId ?? "");
-			return { output: "saved" };
+		description: "Fake reflection decision; settling it aborts the gate like the real gates",
+		reflectionOnly: true,
+		parameters: z.object({}),
+		execute: async () => {
+			decisions.push(name);
+			// The real gates race the decision and abort the reflection controller when it
+			// settles (`decision.finally(() => reflectionAbort.abort())`).
+			queueMicrotask(() => gateAbort.abort());
+			// The response is still streaming when the decision lands.
+			queueMicrotask(() => releaseTail?.());
+			return { output: "decision accepted" };
 		},
 	});
 }
 
 afterAll(() => {
-	for (let i = 0; i < KNOWLEDGE_TOOLS.length; i++) {
-		const original = originalKnowledgeTools[i];
-		if (original) toolRegistry.register(original);
-		else toolRegistry.unregister(KNOWLEDGE_TOOLS[i]);
-	}
-	for (let i = 0; i < sessionToolNames.length; i++) {
-		const original = originalSessionTools[i];
-		if (original) toolRegistry.register(original);
-		else toolRegistry.unregister(sessionToolNames[i]);
-	}
+	finishedRequests.mockRestore();
 	mock.module("../provider", () => realProviderModule);
-	toolRegistry.unregister(REFLECTION_TOOL_NAME);
-	toolRegistry.unregister(NORMAL_TOOL_NAME);
+	for (const name of [DECISION_TOOL, SECOND_DECISION_TOOL]) toolRegistry.unregister(name);
 	mock.restore();
 });
 
-function makeConfig(signal: AbortSignal, overrides: Partial<AgentConfig> = {}): AgentConfig {
+beforeEach(() => {
+	gateAbort = new AbortController();
+	decisions = [];
+	streamCompleted = false;
+	releaseTail = undefined;
+	finishedRequests.mockClear();
+});
+
+function parentConfig(): AgentConfig {
 	return {
-		narratorId: "n-reflect-eager",
-		conversationId: "conv-reflect-eager",
-		model: "test:model",
+		narratorId: "n-reflection-eager",
+		conversationId: "conv-reflection-eager",
 		provider: "test",
+		model: "test:model",
 		cwd: "/tmp",
-		signal,
+		signal: new AbortController().signal,
 		permissionHandler: async () => ({ behavior: "allow" }),
-		...overrides,
 	};
 }
 
-async function runUntilAbortMidStream(): Promise<AgentEvent[]> {
-	const ac = new AbortController();
-	const events: AgentEvent[] = [];
-	const normalStarted = new Promise<void>((resolve) => {
-		onNormalStarted = resolve;
+function run() {
+	return runReflectionLoop({
+		parentConfig: parentConfig(),
+		rows: [],
+		prompt: "decide",
+		abortController: gateAbort,
+		reflectionLoop: {
+			allowedTools: [DECISION_TOOL, SECOND_DECISION_TOOL],
+			context: { kind: "exitPlanMode", requestId: "eager-request" },
+		},
 	});
-	for await (const event of agentLoop(makeConfig(ac.signal), "decide", [])) {
-		events.push(event);
-		// Abort while the provider stream is still open (trailing text just arrived),
-		// mirroring the reflection abort race that produced spurious "Aborted" records.
-		if (event.type === "stream_text") {
-			// A tool_call announcement alone does not imply execute() has started.
-			// Wait for real execution only in the independent, barrier-free baseline.
-			if (scenario === "normal") await normalStarted;
-			ac.abort();
-		}
-	}
-	onNormalStarted = undefined;
-	return events;
 }
 
-describe("knowledge approval waits for the parent provider stream to close", () => {
-	for (const name of KNOWLEDGE_TOOLS) {
-		for (const chunks of [false, true]) {
-			for (const abort of [false, true]) {
-				test(`${name}: chunks=${chunks}, abort=${abort}`, async () => {
-					scenario = "knowledge";
-					knowledgeToolName = name;
-					knowledgeChunks = chunks;
-					knowledgeRequests = 0;
-					streamReleased = false;
-					executionOrder.length = 0;
-					permissionAfterRelease.length = 0;
-					if (abort) {
-						await runUntilAbortMidStream();
-					} else {
-						const config = makeConfig(new AbortController().signal);
-						for await (const event of agentLoop(config, "save", [])) {
-							if (event.type === "error") throw new Error(event.message);
-						}
-					}
-					expect(streamReleased).toBe(true);
-					expect(executionOrder).toEqual(abort ? [] : [name]);
-					expect(permissionAfterRelease).toEqual(abort ? [] : [true]);
-				});
-			}
-		}
-	}
-});
-
-describe("provider-session tools wait for the parent stream release", () => {
-	for (const name of PROVIDER_SESSION_TOOLS) {
-		test(`${name} permission and execution start after provider finally`, async () => {
-			scenario = "session_tool";
-			sessionToolName = name;
-			sessionToolInputOverride = undefined;
-			sessionToolRequests = 0;
-			streamReleased = false;
-			executionOrder.length = 0;
-			executionAfterRelease.length = 0;
-			permissionAfterRelease.length = 0;
-			onSessionToolStarted = undefined;
-			const config = makeConfig(new AbortController().signal, {
-				permissionHandler: async () => {
-					permissionAfterRelease.push(streamReleased);
-					return { behavior: "allow" };
-				},
-			});
-			for await (const event of agentLoop(config, "run session tool", [])) {
-				if (event.type === "error") throw new Error(event.message);
-			}
-			expect(streamReleased).toBe(true);
-			expect(executionOrder).toEqual([name]);
-			expect(executionAfterRelease).toEqual([true]);
-			expect(permissionAfterRelease.length).toBeGreaterThan(0);
-			expect(permissionAfterRelease.every(Boolean)).toBe(true);
-		});
-	}
-
-	test("spec task Write remains post-stream while ordinary Read remains eager", async () => {
-		scenario = "session_tool";
-		sessionToolName = "Write";
-		sessionToolInputOverride = { file_path: "spec://tasks.json", content: '{"tasks":[]}' };
-		sessionToolRequests = 0;
-		streamReleased = false;
-		executionOrder.length = 0;
-		executionAfterRelease.length = 0;
-		for await (const event of agentLoop(
-			makeConfig(new AbortController().signal),
-			"update tasks",
-			[],
-		)) {
-			if (event.type === "error") throw new Error(event.message);
-		}
-		expect(executionAfterRelease).toEqual([true]);
-
-		sessionToolName = EAGER_READ_TOOL;
-		sessionToolInputOverride = undefined;
-		sessionToolRequests = 0;
-		streamReleased = false;
-		executionOrder.length = 0;
-		executionAfterRelease.length = 0;
-		onSessionToolStarted = undefined;
-		for await (const event of agentLoop(makeConfig(new AbortController().signal), "read", [])) {
-			if (event.type === "error") throw new Error(event.message);
-		}
-		expect(executionOrder).toEqual([EAGER_READ_TOOL]);
-		expect(executionAfterRelease).toEqual([false]);
+function expectNaturalCompletion() {
+	expect(streamCompleted).toBe(true);
+	expect(finishedRequests).toHaveBeenCalledTimes(1);
+	expect(finishedRequests.mock.calls[0][1]).toMatchObject({
+		errorMessage: null,
+		usage: { inputTokens: 128, outputTokens: 9, cachedInputTokens: 64 },
 	});
-});
+}
 
-describe("reflection-only tools are not eager-executed mid-stream", () => {
-	test("reflection decision tool is deferred until the post-stream tool phase", async () => {
-		scenario = "reflection";
-		executionOrder.length = 0;
+describe("reflection decisions made mid-stream", () => {
+	test("a self-made decision lets the reflection request finish cleanly with usage", async () => {
+		scenario = "self-decision";
+		const observed = await run();
 
-		const events = await runUntilAbortMidStream();
-
-		// The reflection tool must NOT execute eagerly during streaming. When the stream is
-		// aborted mid-flight (before the post-stream tool phase), a deferred tool never runs,
-		// so its execute() is never called. This is the exact behavior that prevents the
-		// reflection decision from aborting the reflection provider.chat() mid-stream and
-		// recording a spurious "Aborted" API request.
-		expect(executionOrder).not.toContain(REFLECTION_TOOL_NAME);
-		expect(events.at(-1)).toEqual({ type: "error", message: "Aborted" });
+		expect(decisions).toEqual([DECISION_TOOL]);
+		expect(observed.decisionSucceeded).toBe(true);
+		expect(observed.errors).toEqual([]);
+		expectNaturalCompletion();
 	});
 
-	test("ordinary tools after a reflection barrier do not execute mid-stream", async () => {
-		scenario = "reflection_then_normal";
-		executionOrder.length = 0;
+	test("a takeover without a self-made decision still cuts the request at once", async () => {
+		scenario = "takeover";
+		const observed = await run();
 
-		const events = await runUntilAbortMidStream();
-
-		expect(executionOrder).toEqual([]);
-		// Persisted but unstarted calls receive cancellation results, not execution.
-		const results = events.filter((event) => event.type === "tool_result");
-		expect(results).toHaveLength(2);
-		expect(results.every((event) => event.isError && event.durationMs === 0)).toBe(true);
-		expect(events.at(-1)).toEqual({ type: "error", message: "Aborted" });
+		expect(decisions).toEqual([]);
+		expect(streamCompleted).toBe(false);
+		expect(observed.errors).toContain("Aborted");
+		expect(finishedRequests).toHaveBeenCalledTimes(1);
+		expect(finishedRequests.mock.calls[0][1]).toMatchObject({ errorMessage: "Aborted" });
 	});
 
-	test("a normal eager-eligible tool still executes during streaming", async () => {
-		scenario = "normal";
-		executionOrder.length = 0;
+	test("a second decision in the same response does not start after the first settled", async () => {
+		scenario = "double-decision";
+		const observed = await run();
 
-		const events = await runUntilAbortMidStream();
-
-		// Baseline: a non-reflection tool IS eager-executed, so its execute() starts during
-		// streaming even though the stream is aborted mid-flight. This guards against the fix
-		// over-broadly disabling eager execution for ordinary tools.
-		expect(executionOrder).toEqual([NORMAL_TOOL_NAME]);
-		expect(events.some((event) => event.type === "assistant_message")).toBe(false);
-		expect(events.filter((event) => event.type === "tool_result")).toMatchObject([
-			{ toolUseId: "tu_decision", output: "normal:x", isError: false },
-		]);
-		expect(events.at(-1)).toEqual({ type: "error", message: "Aborted" });
+		expect(decisions).toEqual([DECISION_TOOL]);
+		expect(observed.decisionSucceeded).toBe(true);
+		expect(observed.errors).toEqual([]);
+		expectNaturalCompletion();
 	});
 });

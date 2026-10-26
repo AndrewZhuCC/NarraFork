@@ -22,6 +22,7 @@ test.each([
 	"/n/messages",
 	"/n/draft",
 	"/n/edit-and-regenerate/m",
+	"/n/blocks/b/edit-and-regenerate",
 	"/n/buffer/m",
 ])("composer JSON budget bounds streamed and dishonest-length requests at %s", async (path) => {
 	const app = new Hono();
@@ -81,6 +82,7 @@ test("JSON-only draft cannot bypass its limit with a forged multipart header", a
 test.each([
 	"/n/messages",
 	"/n/edit-and-regenerate/m",
+	"/n/blocks/b/edit-and-regenerate",
 	"/n/buffer/m",
 ])("%s budgets the actual decoder rather than a MIME substring", async (path) => {
 	const app = new Hono();
@@ -118,6 +120,8 @@ function fixture(options: { member?: boolean; content?: string | null } = {}) {
 	const message = {
 		composerDocument: document,
 		bodyRevision: 8,
+		// The route's SQL admits user bodies within the limit; an oversized one comes back 0.
+		admitted: options.content === null ? 0 : 1,
 		content:
 			options.content === undefined
 				? JSON.stringify([
@@ -151,6 +155,10 @@ function fixture(options: { member?: boolean; content?: string | null } = {}) {
 		NotFoundError,
 		ValidationError,
 		getFileReferenceSnapshots,
+		// Block reads off: the plain column, as before block storage.
+		storedBodyBytesSql: () => sql`length(CAST(${narratorMessages.contentJson} AS BLOB))`,
+		contentJsonSql: () => narratorMessages.contentJson,
+		blockBody: () => [],
 		db: {
 			query: {
 				narratorMessageRefs: {

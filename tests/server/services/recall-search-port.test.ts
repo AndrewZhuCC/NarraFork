@@ -19,7 +19,6 @@
  */
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import {
-	chapters,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -28,7 +27,7 @@ import {
 import { getTestDb } from "../../setup";
 
 const { db, sqlite } = getTestDb();
-mock.module("../../../server/db", () => ({ db, sqlite }));
+mock.module("../../../server/db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 
 const { createSqliteSearchStore } = await import("../../../server/services/search/sqlite-store");
 const searchStore = createSqliteSearchStore(async (sql, params) =>
@@ -48,7 +47,7 @@ function seedNarrator(id: string, title: string) {
 	db.insert(narrators)
 		.values({
 			id,
-			chapterId: "chap-recall",
+			contextProjectId: "proj-recall",
 			type: "primary",
 			inheritMode: "fresh",
 			title,
@@ -117,30 +116,13 @@ beforeEach(() => {
 			updatedAt: EARLY,
 		})
 		.run();
-	db.insert(chapters)
-		.values({
-			id: "chap-recall",
-			projectId: "proj-recall",
-			title: "Chapter",
-			branch: "chapter/chap-recall",
-			baseBranch: "main",
-			createdAt: EARLY,
-			updatedAt: EARLY,
-		})
-		.run();
 	seedNarrator("narr-self", "Self");
 	seedNarrator("narr-other", "Other");
 });
 
 afterEach(() => {
 	sqlite.run("PRAGMA foreign_keys = OFF");
-	for (const table of [
-		"narrator_message_refs",
-		"narrator_messages",
-		"narrators",
-		"chapters",
-		"projects",
-	]) {
+	for (const table of ["narrator_message_refs", "narrator_messages", "narrators", "projects"]) {
 		sqlite.run(`DELETE FROM "${table}"`);
 	}
 	sqlite.run("PRAGMA foreign_keys = ON");
@@ -283,6 +265,41 @@ describe("Recall result presentation", () => {
 		});
 		const { ids } = await recallSearch("narr-self", { query: "XY" });
 		expect(ids).toEqual(["msg-short"]);
+	});
+
+	// Each term matches on its own; a term too short for the index filters the indexed ones.
+	it("narrows an indexed term by a 2-char term", async () => {
+		seedMessage({
+			id: "msg-login",
+			ownerId: "narr-self",
+			refFor: ["narr-self"],
+			text: "refresh 后登录失败",
+			createdAt: EARLY,
+			seq: 2,
+		});
+		seedMessage({
+			id: "msg-other",
+			ownerId: "narr-self",
+			refFor: ["narr-self"],
+			text: "refresh 之后正常",
+			createdAt: EARLY,
+			seq: 3,
+		});
+		expect((await recallSearch("narr-self", { query: "refresh 登录" })).ids).toEqual(["msg-login"]);
+		expect((await recallSearch("narr-self", { query: "refresh 注销" })).ids).toEqual([]);
+	});
+
+	it("matches several short terms apart, not as one phrase", async () => {
+		seedMessage({
+			id: "msg-apart",
+			ownerId: "narr-self",
+			refFor: ["narr-self"],
+			text: "登录之后一直失败",
+			createdAt: EARLY,
+			seq: 2,
+		});
+		const { ids } = await recallSearch("narr-self", { query: "登录 失败", all_narrators: true });
+		expect(ids).toEqual(["msg-apart"]);
 	});
 
 	it("reports an empty result for a query that sanitizes away", async () => {

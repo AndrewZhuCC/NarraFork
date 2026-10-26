@@ -6,7 +6,7 @@ import type { AgentConfig, AgentEvent } from "../types";
 
 // Records which tools' execute() actually started, in start order.
 const executionOrder: string[] = [];
-// Model-facing tool_result order (provider.formatToolResult call order).
+// Model-facing tool_result order: the settled calls of the latest step, in call order.
 const modelResultOrder: string[] = [];
 
 let scenario:
@@ -28,7 +28,24 @@ const PARALLEL_TOOL_NAMES = ["Read", "Glob", "Grep"] as const;
 
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	// The model reads a step's results in call order: record the settled calls of the
+	// latest step in the order its blocks hold them.
+	buildHistory: async (rows) => {
+		const step = rows.findLast((row) => row.role === "assistant");
+		if (step) {
+			const settled = new Set(
+				(step.toolCalls ?? [])
+					.filter((call) => call.status !== "running")
+					.map((call) => call.toolUseId),
+			);
+			const blocks = step.contentJson as Array<{ type?: string; id?: string }>;
+			modelResultOrder.length = 0;
+			for (const block of blocks)
+				if (block.type === "tool_use" && block.id && settled.has(block.id))
+					modelResultOrder.push(block.id);
+		}
+		return { history: [] };
+	},
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		providerAttempts++;
@@ -108,15 +125,19 @@ const testProvider: ProviderAdapter = {
 			return;
 		}
 		if (scenario === "await_send_not_eager") {
-			// An Agent-like tool then Await + Send. We only assert that Await/Send do not
-			// execute eagerly during streaming (their execute() must not run before the
-			// post-stream tool phase, which never arrives because we abort mid-stream).
+			// Await + Send execute while the response is still streaming: the provider only
+			// produces its trailing text (where the test aborts) once both have started, so
+			// the post-stream tool phase never runs.
 			yield {
 				toolUses: [
 					{ toolUseId: "tu_await", name: "Await", input: { type: "bash", id: "x" } },
 					{ toolUseId: "tu_send", name: "Send", input: { id: "y", message: "hi" } },
 				],
 			};
+			while (!executionOrder.includes("Await") || !executionOrder.includes("Send")) {
+				if (params.signal.aborted) throw new Error("Aborted");
+				await new Promise((resolve) => setTimeout(resolve, 1));
+			}
 			yield { text: "trailing text so we can abort mid-stream" };
 			while (!params.signal.aborted) {
 				await new Promise((resolve) => setTimeout(resolve, 1));
@@ -124,12 +145,6 @@ const testProvider: ProviderAdapter = {
 			throw new Error("Aborted");
 		}
 	},
-	formatToolResult: (toolUseId, output, isError) => {
-		modelResultOrder.push(String(toolUseId));
-		return { toolUseId, output, isError };
-	},
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
@@ -256,7 +271,7 @@ describe("Bash streaming barriers", () => {
 				for await (const event of agentLoop(
 					makeConfig(new AbortController().signal),
 					"run Bash then Read",
-					[],
+					{ rows: [] },
 				)) {
 					events.push(event);
 				}
@@ -287,7 +302,7 @@ describe("agent loop tool-result settlement", () => {
 		for await (const event of agentLoop(
 			makeConfig(ac.signal, { deferEagerToolsForSafeStop: true }),
 			"run parallel tools with one failure",
-			[],
+			{ rows: [] },
 		)) {
 			events.push(event);
 		}
@@ -323,7 +338,7 @@ describe("agent loop tool-result settlement", () => {
 		for await (const event of agentLoop(
 			makeConfig(ac.signal, { deferEagerToolsForSafeStop: true }),
 			"run parallel tools that all throw",
-			[],
+			{ rows: [] },
 		)) {
 			events.push(event);
 		}
@@ -348,7 +363,7 @@ describe("agent loop tool-result settlement", () => {
 		for await (const event of agentLoop(
 			makeConfig(ac.signal, { deferEagerToolsForSafeStop: true }),
 			"run a serial tool that throws",
-			[],
+			{ rows: [] },
 		)) {
 			events.push(event);
 		}
@@ -363,7 +378,7 @@ describe("agent loop tool-result settlement", () => {
 		expect(events.some((e) => e.type === "turn_complete")).toBe(true);
 	});
 
-	test("Await and Send are not eager-executed mid-stream", async () => {
+	test("Await and Send execute mid-stream", async () => {
 		scenario = "await_send_not_eager";
 		providerAttempts = 0;
 		executionOrder.length = 0;
@@ -371,7 +386,7 @@ describe("agent loop tool-result settlement", () => {
 		const ac = new AbortController();
 		const events: AgentEvent[] = [];
 
-		for await (const event of agentLoop(makeConfig(ac.signal), "await then send", [])) {
+		for await (const event of agentLoop(makeConfig(ac.signal), "await then send", { rows: [] })) {
 			events.push(event);
 			if (event.type === "stream_text") {
 				await Promise.resolve();
@@ -379,10 +394,10 @@ describe("agent loop tool-result settlement", () => {
 			}
 		}
 
-		// Aborting mid-stream means the post-stream tool phase never runs. Because Await/Send
-		// are eager-disabled, their execute() must not have started during streaming.
-		expect(executionOrder).not.toContain("Await");
-		expect(executionOrder).not.toContain("Send");
+		// Aborting mid-stream means the post-stream tool phase never runs: both calls ran
+		// while the provider was still streaming.
+		expect(executionOrder).toContain("Await");
+		expect(executionOrder).toContain("Send");
 		expect(events.at(-1)).toEqual({ type: "error", message: "Aborted" });
 	});
 });

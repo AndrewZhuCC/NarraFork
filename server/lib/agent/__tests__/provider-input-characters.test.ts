@@ -473,15 +473,18 @@ describe("providers report their final logical inputs", () => {
 				signature: "cipher".repeat(10000),
 			},
 			{ type: "model_output", content: [{ type: "text", text: "reply" }] },
+			// The call's result, as the history builder writes a result with an image.
+			{
+				type: "function_result",
+				call_id: "call-1",
+				name: "Read",
+				result: [
+					{ type: "text", text: "result" },
+					{ type: "image", data: "image-bytes".repeat(10000), mime_type: "image/png" },
+				],
+			},
 		];
 		provider.injectSystemPrompt(history, "system", "input:gemini-2.5-pro");
-		const toolResult = provider.formatToolResult(
-			"call-1",
-			"result",
-			false,
-			[{ format: "png", base64: "image-bytes".repeat(10000) }],
-			"Read",
-		);
 		const snapshots: Array<ContextInputCharacters | null> = [];
 		let sent: Record<string, unknown> = {};
 		globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
@@ -493,7 +496,6 @@ describe("providers report their final logical inputs", () => {
 			model: "input:gemini-2.5-pro",
 			history,
 			tools,
-			toolResults: [toolResult],
 			onInputCharacters: (value) => {
 				snapshots.push(value);
 			},
@@ -660,7 +662,8 @@ describe("providers report their final logical inputs", () => {
 					},
 				});
 				await drive(provider, chat);
-				provider.pushUserTurn(history, "first", chat.model, []);
+				// The next request's history carries the first input as a row of its own.
+				history.push({ role: "user", content: "first" });
 				await drive(provider, { ...chat, content: "second" });
 				expect(frames).toHaveLength(2);
 				expect(frames[1].previous_response_id).toBe("response-1");

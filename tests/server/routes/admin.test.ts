@@ -1,7 +1,6 @@
 import { afterAll, afterEach, describe, expect, it, mock } from "bun:test";
 import { Hono } from "hono";
 import { narrators } from "../../../server/db/schema";
-import { invalidateUserCache } from "../../../server/middleware/auth";
 import type { AuthSessionStore } from "../../../server/services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../../server/services/auth/store";
 import { cleanDb, getTestDb } from "../../setup";
@@ -12,23 +11,15 @@ const { db, sqlite } = getTestDb();
 // back. Bun's mock.module is process-wide and mock.restore() does NOT undo it.
 const realDbModule = { ...(await import("../../../server/db")) };
 const realTerminalService = { ...(await import("../../../server/services/terminal-service")) };
-const realWorktreeWatcher = { ...(await import("../../../server/services/worktree-watcher")) };
 const realAdminModules: Record<string, () => unknown> = {
 	"../../../server/db": () => realDbModule,
 	"../../../server/services/terminal-service": () => realTerminalService,
-	"../../../server/services/worktree-watcher": () => realWorktreeWatcher,
 };
 
 mock.module("../../../server/db", () => ({ db, sqlite }));
 mock.module("../../../server/services/terminal-service", () => ({
 	terminalService: {
 		listAll: async () => [{ status: "running" }, { status: "exited" }],
-	},
-}));
-mock.module("../../../server/services/worktree-watcher", () => ({
-	worktreeWatcher: {
-		getActivePaths: () => ["/repo/.worktrees/chapter-a"],
-		getActiveCount: () => 1,
 	},
 }));
 
@@ -71,7 +62,6 @@ afterEach(() => cleanDb(sqlite));
 
 afterAll(() => {
 	setAuthStores(undefined);
-	invalidateUserCache(authUser.sub);
 	for (const [specifier, factory] of Object.entries(realAdminModules)) {
 		mock.module(specifier, factory);
 	}
@@ -105,10 +95,10 @@ describe("admin diagnostics", () => {
 		const body = (await res.json()) as {
 			narrators: { thinking: number; waiting: number };
 			terminals: { total: number; running: number };
-			worktreeWatchers: { count: number; paths: string[] };
+			worktreeWatchers?: unknown;
 		};
 		expect(body.narrators).toEqual({ thinking: 2, waiting: 1 });
 		expect(body.terminals).toEqual({ total: 2, running: 1 });
-		expect(body.worktreeWatchers).toEqual({ count: 1, paths: ["/repo/.worktrees/chapter-a"] });
+		expect(body.worktreeWatchers).toBeUndefined();
 	});
 });

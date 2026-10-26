@@ -24,9 +24,9 @@
  * - project: additionally the members of the owning project
  * - public:  additionally every signed-in user
  *
- * `project` resolves the owning project the same way every other check does — chapter
- * first, then `contextProjectId` — so a session that belongs to no project grants
- * nothing through this tier.
+ * `project` resolves the owning project the same way every other check does — the
+ * explicit `contextProjectId`, else the project its directory was indexed into — so a
+ * session that belongs to no project grants nothing through this tier.
  */
 export const NARRATOR_VISIBILITIES = ["private", "project", "public"] as const;
 export type NarratorVisibility = (typeof NARRATOR_VISIBILITIES)[number];

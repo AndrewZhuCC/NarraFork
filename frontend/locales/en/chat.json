@@ -48,7 +48,18 @@
 	"attachmentNoLongerAvailable": "Attachment expired on the server; attach it again",
 	"attachmentPreviewFailed": "Preview unavailable",
 	"attachmentLimitTitle": "Too many attachments",
+	"messageTooLong": "Messages are limited to {{count}} characters",
 	"attachmentLimit": "At most {{count}} attachments per message",
 	"attachmentForwardFailed": "Some attachments could not be sent to the narrator",
-	"attachmentDownloadFailed": "Download failed"
+	"attachmentDownloadFailed": "Download failed",
+	"botBadge": "Bot",
+	"botFallbackName": "Bot",
+	"botThinking": "Thinking…",
+	"botWaiting": "Needs a decision — open the monitor",
+	"botWaitingReadOnly": "Waiting for a decision",
+	"botWaitingModel": "Waiting for the model to become available",
+	"botFailed": "The bot ran into an error — open the monitor for details",
+	"botMonitor": "Monitor",
+	"botReadOnly": "You can't send messages to this bot.",
+	"openBot": "Open bot"
 }

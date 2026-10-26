@@ -76,10 +76,11 @@ async function seedBashTask(opts: {
 	title?: string;
 	alias?: string;
 	completed?: boolean;
+	parentNarratorId?: string;
 }): Promise<void> {
 	await backgroundTaskService.createBashTask({
 		id: opts.id,
-		parentNarratorId: PARENT,
+		parentNarratorId: opts.parentNarratorId ?? PARENT,
 		command: opts.command ?? `cmd ${opts.id}`,
 		title: opts.title,
 		alias: opts.alias,
@@ -517,5 +518,131 @@ describe("listTeamBashTasks", () => {
 			recentTerminalLimit: 5,
 		});
 		expect(view).toEqual({ tasks: [], omitted: 0, omittedCapped: false });
+	});
+});
+
+describe("listTeamBashTasks team scope", () => {
+	test("resolves thousands of members in SQL instead of binding one parameter each", async () => {
+		await seedParent();
+		for (let batch = 0; batch < 10; batch++) {
+			await db.insert(narrators).values(
+				Array.from({ length: 500 }, (_, i) => ({
+					id: `member-${batch * 500 + i}`,
+					type: "subagent" as const,
+					variant: "subagent:general",
+					parentNarratorId: PARENT,
+					...MEMBER,
+					createdAt: isoAt(0),
+					updatedAt: isoAt(0),
+				})),
+			);
+		}
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({
+			id: "stranger",
+			type: "subagent",
+			variant: "subagent:general",
+			parentNarratorId: PARENT,
+			runtimeRegistrationJson: delegationRegistration("someone-else", "general"),
+			createdAt: now,
+			updatedAt: now,
+		});
+		await seedBashTask({ id: "root-task", createdAt: isoAt(1) });
+		await seedBashTask({
+			id: "far-member-task",
+			createdAt: isoAt(2),
+			parentNarratorId: "member-4999",
+		});
+		await seedBashTask({ id: "stranger-task", createdAt: isoAt(3), parentNarratorId: "stranger" });
+
+		const statements: Array<{ sql: string; bindings: number }> = [];
+		const prepare = sqlite.prepare.bind(sqlite);
+		const query = sqlite.query.bind(sqlite);
+		const record = (text: string) => {
+			if (text.includes("background_tasks")) {
+				statements.push({ sql: text, bindings: (text.match(/\?/g) ?? []).length });
+			}
+		};
+		sqlite.prepare = ((text: string, ...rest: unknown[]) => {
+			record(text);
+			return (prepare as (...args: unknown[]) => unknown)(text, ...rest);
+		}) as typeof sqlite.prepare;
+		sqlite.query = ((text: string) => {
+			record(text);
+			return query(text);
+		}) as typeof sqlite.query;
+		let view: Awaited<ReturnType<typeof backgroundTaskService.listTeamBashTasks>>;
+		try {
+			view = await backgroundTaskService.listTeamBashTasks({
+				parentNarratorIds: [PARENT],
+				teamRootId: PARENT,
+				limit: 20,
+				recentTerminalLimit: 5,
+			});
+		} finally {
+			sqlite.prepare = prepare;
+			sqlite.query = query;
+		}
+
+		expect(view.tasks.map((t) => t.id).sort()).toEqual(["far-member-task", "root-task"]);
+		expect(statements.length).toBeGreaterThan(0);
+		for (const statement of statements) expect(statement.bindings).toBeLessThan(20);
+	});
+});
+
+describe("listTeamMembers", () => {
+	test("returns every member across keyset pages, oldest first, with tied createdAt", async () => {
+		await seedParent();
+		// More than one 500-row page, and every row shares one createdAt so the page
+		// boundary falls inside a tie that only the `id` tiebreaker can resolve.
+		const createdAt = "2026-01-01T00:00:00.000Z";
+		const ids = Array.from({ length: 1203 }, (_, i) => `m-${String(i).padStart(4, "0")}`);
+		for (const id of ids) await seedSubagent({ id, createdAt });
+		await seedSubagent({ id: "a-newest", createdAt: "2026-01-02T00:00:00.000Z" });
+
+		const members = await narratorService.listTeamMembers(PARENT);
+
+		expect(members.map((m) => m.id)).toEqual([...ids, "a-newest"]);
+	});
+
+	test("reads only the selector handles, never the large prompt columns", async () => {
+		await seedParent();
+		await seedSubagent({
+			id: "big",
+			createdAt: "2026-01-01T00:00:00.000Z",
+			title: "Explore Payment Flow",
+			traits: ["subagent-alias:payments"],
+		});
+		await db
+			.update(narrators)
+			.set({ systemPrompt: "x".repeat(50_000), contextSummary: "y".repeat(50_000) });
+
+		const [member] = await narratorService.listTeamMembers(PARENT);
+
+		expect(member).toEqual({
+			id: "big",
+			title: "Explore Payment Flow",
+			traits: ["subagent-alias:payments"],
+			createdAt: "2026-01-01T00:00:00.000Z",
+		});
+	});
+
+	test("excludes the root and narrators outside the team", async () => {
+		await seedParent();
+		await seedSubagent({ id: "member", createdAt: "2026-01-01T00:00:00.000Z" });
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({
+			id: "stranger",
+			type: "subagent",
+			variant: "subagent:general",
+			parentNarratorId: PARENT,
+			runtimeRegistrationJson: delegationRegistration("someone-else", "general"),
+			createdAt: now,
+			updatedAt: now,
+		});
+
+		const members = await narratorService.listTeamMembers(PARENT);
+
+		expect(members.map((m) => m.id)).toEqual(["member"]);
 	});
 });

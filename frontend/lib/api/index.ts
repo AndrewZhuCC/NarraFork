@@ -1,8 +1,8 @@
 import { authApi } from "./auth";
-import { chaptersApi } from "./chapters";
 import { chatApi } from "./chat";
 import { apiBase } from "./client";
 import { commandCodeApi } from "./commandcode";
+import { containersApi } from "./containers";
 import { devicesApi } from "./devices";
 import { gitApi } from "./git";
 import { grammarsApi } from "./grammars";
@@ -15,6 +15,7 @@ import { oauthAppsApi } from "./oauth-apps";
 import { oauthGrantsApi } from "./oauth-grants";
 import { pluginsApi } from "./plugins";
 import { projectsApi } from "./projects";
+import { providerImportApi } from "./provider-import";
 import { scheduledTasksApi } from "./scheduled-tasks";
 import { sessionInterchangeApi } from "./session-interchange";
 import { settingsApi } from "./settings";
@@ -32,7 +33,7 @@ export function getAvatarUrl(userId: string, avatarImageId: string): string {
 export const api = {
 	...authApi,
 	...projectsApi,
-	...chaptersApi,
+	...containersApi,
 	...chatApi,
 	...narratorsApi,
 	...notificationsApi,
@@ -55,6 +56,7 @@ export const api = {
 	...pluginsApi,
 	...sessionInterchangeApi,
 	...commandCodeApi,
+	...providerImportApi,
 };
 
 export {
@@ -76,10 +78,10 @@ export {
 } from "./auth";
 export {
 	ApiError,
-	absorbRenewedToken,
 	authorizedFetch,
 	clearToken,
 	clearTokenOnSessionFailure,
+	endSession,
 	getToken,
 	isAbortError,
 	readFetchError,
@@ -219,6 +221,9 @@ export type {
 	BaseContentBlock,
 	BlacklistCmd,
 	BlacklistDir,
+	BlockBackfillStatus,
+	BlockJobState,
+	BlockProjectionBlock,
 	BufferCreator,
 	BufferMessageSummary,
 	ChangelogEntry,
@@ -245,6 +250,7 @@ export type {
 	DatabaseStorageTableSummary,
 	DatabaseTableKind,
 	DatabaseVacuumResult,
+	EntitySearchResult,
 	HookApiRecord,
 	LearningAction,
 	LearningCategory,
@@ -265,9 +271,13 @@ export type {
 	PublicCodexQuotaSegment,
 	PublicCodexQuotaTrendPoint,
 	RuntimeScanResult,
-	SearchFallback,
-	SearchMetadata,
-	SearchResponse,
+	SearchRequest,
+	SearchSectionName,
+	SearchSectionPage,
+	SearchSectionsResponse,
+	SessionHitsResponse,
+	SessionSearchHit,
+	SessionSearchResult,
 	StorageCategoryJobState,
 	StorageCategoryKey,
 	StorageCategoryResult,

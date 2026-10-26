@@ -1,18 +1,23 @@
 /**
  * Query-shape tests: sanitizing, the index/substring threshold, and the match expressions.
  *
- * These are the parts of search most easily broken without anything failing. A phrase match
- * quietly becoming a prefix match, or an escaped `%` quietly becoming a wildcard, changes
+ * These are the parts of search most easily broken without anything failing. A prefix match
+ * quietly becoming a phrase match, or an escaped `%` quietly becoming a wildcard, changes
  * WHICH ROWS come back — not whether the code runs — so nothing here can be inferred from a
  * green suite elsewhere.
  *
  * The expression builders are pure and import no database, so this file needs no fixture.
  */
 import { describe, expect, it } from "bun:test";
-import { canUseIndex, sanitizeQuery } from "../../../server/services/search/query";
+import {
+	canUseIndex,
+	globalQueryTerms,
+	globalStrategy,
+	MAX_GLOBAL_QUERY_TERMS,
+	sanitizeQuery,
+} from "../../../server/services/search/query";
 import {
 	escapedContains,
-	phraseExpr,
 	prefixExpr,
 	rawContains,
 	snippetCall,
@@ -21,7 +26,7 @@ import { GLOBAL_SNIPPET, RECALL_SNIPPET } from "../../../server/services/search/
 
 describe("search query sanitization", () => {
 	it("strips SQL injection attempts", () => {
-		expect(sanitizeQuery("test'; DROP TABLE chapters;--")).toBe("test DROP TABLE chapters--");
+		expect(sanitizeQuery("test'; DROP TABLE narrators;--")).toBe("test DROP TABLE narrators--");
 	});
 
 	it("preserves alphanumeric, spaces, hyphens, dots, underscores", () => {
@@ -82,12 +87,28 @@ describe("FTS prefix expressions (timeline, Recall, knowledge)", () => {
 	});
 });
 
-describe("FTS phrase expression (global search)", () => {
-	// Global search matches the whole query as ONE phrase, so it finds contiguous text and
-	// does not prefix-match. That asymmetry with the other three paths is long-standing
-	// behaviour, pinned here so a "harmonizing" change has to be deliberate.
-	it("quotes the whole query rather than each term", () => {
-		expect(phraseExpr("hello world")).toBe('"hello world"');
+describe("global search terms", () => {
+	// Global search matches every term on its own, anywhere and in any order. Terms the
+	// trigram index cannot tokenize are split off so they are checked as substrings instead of
+	// silently matching nothing.
+	it("splits terms by whether the index can match them", () => {
+		expect(globalQueryTerms("登录 失败 refresh")).toEqual({
+			indexed: ["refresh"],
+			short: ["登录", "失败"],
+		});
+	});
+
+	it("uses the index whenever any term can, and the substring path only when none can", () => {
+		expect(globalStrategy("登录 refresh")).toBe("index");
+		expect(globalStrategy("登录 失败")).toBe("substring");
+		// A long query of short words is still a substring query: no single term is indexable.
+		expect(globalStrategy("ab cd ef")).toBe("substring");
+	});
+
+	it("counts a repeated term once and bounds the number of terms", () => {
+		expect(globalQueryTerms("Token token TOKEN")).toEqual({ indexed: ["Token"], short: [] });
+		const many = Array.from({ length: 20 }, (_, i) => `term${i}`).join(" ");
+		expect(globalQueryTerms(many).indexed).toHaveLength(MAX_GLOBAL_QUERY_TERMS);
 	});
 });
 
@@ -107,8 +128,8 @@ describe("substring patterns", () => {
 
 describe("snippet rendering", () => {
 	it("renders the unmarked global format", () => {
-		expect(snippetCall("chapters_fts", 1, GLOBAL_SNIPPET)).toBe(
-			"snippet(chapters_fts, 1, '', '', '...', 96)",
+		expect(snippetCall("narrators_fts", 0, GLOBAL_SNIPPET)).toBe(
+			"snippet(narrators_fts, 0, '', '', '...', 96)",
 		);
 	});
 

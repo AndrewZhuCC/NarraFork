@@ -208,8 +208,106 @@
 		{
 			"idx": 29,
 			"version": "7",
-			"when": 1792497145553,
-			"tag": "0029_merge_selfuse_095",
+			"when": 1792649984934,
+			"tag": "0029_block_storage",
+			"breakpoints": true
+		},
+		{
+			"idx": 30,
+			"version": "7",
+			"when": 1792655877288,
+			"tag": "0030_block_backfill",
+			"breakpoints": true
+		},
+		{
+			"idx": 31,
+			"version": "7",
+			"when": 1792659185981,
+			"tag": "0031_legacy_body_index",
+			"breakpoints": true
+		},
+		{
+			"idx": 32,
+			"version": "7",
+			"when": 1792663582482,
+			"tag": "0032_block_state_writes",
+			"breakpoints": true
+		},
+		{
+			"idx": 33,
+			"version": "7",
+			"when": 1792684370944,
+			"tag": "0033_bot_rooms",
+			"breakpoints": true
+		},
+		{
+			"idx": 34,
+			"version": "7",
+			"when": 1792700453990,
+			"tag": "0034_retire_chapter_references",
+			"breakpoints": true
+		},
+		{
+			"idx": 35,
+			"version": "7",
+			"when": 1792700455801,
+			"tag": "0035_retire_narrative_line",
+			"breakpoints": true
+		},
+		{
+			"idx": 36,
+			"version": "7",
+			"when": 1792700457769,
+			"tag": "0036_project_index",
+			"breakpoints": true
+		},
+		{
+			"idx": 37,
+			"version": "7",
+			"when": 1792724756605,
+			"tag": "0037_body_rows_only",
+			"breakpoints": true
+		},
+		{
+			"idx": 38,
+			"version": "7",
+			"when": 1792724989809,
+			"tag": "0038_rows_only_index",
+			"breakpoints": true
+		},
+		{
+			"idx": 39,
+			"version": "7",
+			"when": 1792728129984,
+			"tag": "0039_block_projection_jobs",
+			"breakpoints": true
+		},
+		{
+			"idx": 40,
+			"version": "7",
+			"when": 1792731579735,
+			"tag": "0040_block_reindex_job",
+			"breakpoints": true
+		},
+		{
+			"idx": 41,
+			"version": "7",
+			"when": 1792778673208,
+			"tag": "0041_auth_sessions",
+			"breakpoints": true
+		},
+		{
+			"idx": 42,
+			"version": "7",
+			"when": 1792828249880,
+			"tag": "0042_block_index_queue",
+			"breakpoints": true
+		},
+		{
+			"idx": 43,
+			"version": "7",
+			"when": 1793009651643,
+			"tag": "0043_merge_selfuse_098",
 			"breakpoints": true
 		}
   ]

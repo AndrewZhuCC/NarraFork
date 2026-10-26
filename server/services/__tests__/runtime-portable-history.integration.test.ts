@@ -66,9 +66,6 @@ const provider: ProviderAdapter = {
 		return result;
 	},
 	injectSystemPrompt: base.injectSystemPrompt.bind(base),
-	formatToolResult: base.formatToolResult.bind(base),
-	pushUserTurn: base.pushUserTurn.bind(base),
-	pushAssistantTurn: base.pushAssistantTurn.bind(base),
 	async *chat(params) {
 		params.onRequestStart?.();
 		principals.push(getRunControl("recipient")?.principal);

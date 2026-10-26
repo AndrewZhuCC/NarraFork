@@ -74,6 +74,7 @@ export function subagentToolEventMeta(data: Record<string, unknown>): SubagentTo
 	};
 	return {
 		toolCallId: typeof data.toolCallId === "string" ? data.toolCallId : null,
+		...(typeof data.blockId === "string" ? { blockId: data.blockId } : {}),
 		toolName: typeof data.toolName === "string" ? data.toolName : null,
 		createdAt:
 			typeof data.createdAt === "string" || typeof data.createdAt === "number"
@@ -250,35 +251,6 @@ function eventDiagnosticMessage(data: Record<string, unknown>, fallback = "Unkno
 	return fallback;
 }
 
-export interface CommitSyncErrorEvent {
-	chapterId: string;
-	code?: string;
-	reason?: string;
-	error?: string;
-	message?: string;
-	fallback?: boolean;
-	fatal?: boolean;
-	backgroundSync?: boolean;
-	[key: string]: unknown;
-}
-
-export function coerceCommitSyncErrorEvent(
-	data: Record<string, unknown>,
-): CommitSyncErrorEvent | null {
-	if (typeof data.chapterId !== "string" || !data.chapterId) return null;
-	return {
-		...data,
-		chapterId: data.chapterId,
-		code: typeof data.code === "string" ? data.code : undefined,
-		reason: typeof data.reason === "string" ? data.reason : undefined,
-		error: typeof data.error === "string" ? data.error : undefined,
-		message: typeof data.message === "string" ? data.message : undefined,
-		fallback: typeof data.fallback === "boolean" ? data.fallback : undefined,
-		fatal: typeof data.fatal === "boolean" ? data.fatal : undefined,
-		backgroundSync: typeof data.backgroundSync === "boolean" ? data.backgroundSync : undefined,
-	};
-}
-
 /** Identity aliases attached to a COW compact replacement event. */
 export interface MessageReplacementAliases {
 	oldMessageId?: string;
@@ -381,6 +353,8 @@ export function coerceReflectionProgressEvent(
 
 export interface SubagentToolEventMeta {
 	toolCallId?: string | null;
+	/** The tool block the event is about, in the block-keyed protocol (§8.2). */
+	blockId?: string | null;
 	toolName?: string | null;
 	createdAt?: string | number | null;
 	timing?: SubagentToolCallTiming | null;
@@ -686,14 +660,7 @@ export interface NarratorWSCallbacks {
 		compactStart?: number,
 		snapshot?: import("@shared/context-usage").ContextUsageSnapshot,
 	) => void;
-	onGitStatus?: (data: {
-		/** Null for chapter-less narrators; workspace-keyed queries still apply. */
-		chapterId: string | null;
-		commitsAhead: number;
-		baseBranch: string;
-		linesAdded?: number;
-		linesRemoved?: number;
-	}) => void;
+	onGitStatus?: (data: { linesAdded?: number; linesRemoved?: number }) => void;
 	/**
 	 * Individual worktree paths changed, so a file tree can patch the affected
 	 * directories instead of refetching.
@@ -706,7 +673,6 @@ export interface NarratorWSCallbacks {
 	 * rather than the whole set — invalidate broadly instead of applying it literally.
 	 */
 	onWorkspacePathsChanged?: (data: {
-		chapterId: string;
 		changes: { path: string; kind: "added" | "updated" | "deleted" }[];
 		truncated: boolean;
 	}) => void;
@@ -810,8 +776,6 @@ export interface NarratorWSCallbacks {
 	onSubscribeDenied?: () => void;
 	/** Sharing settings changed; anything showing access state should re-read it. */
 	onAccessChanged?: (reason: string) => void;
-	onCommitsUpdated?: (chapterId: string, newCount: number) => void;
-	onCommitSyncError?: (event: CommitSyncErrorEvent) => void;
 	onBackgroundTaskStarted?: (
 		taskNarratorId: string,
 		toolUseId: string,
@@ -1465,9 +1429,6 @@ export function useNarratorWS(
 						break;
 					case "git_status":
 						callbackOwner.callbacks.onGitStatus?.({
-							chapterId: (data.chapterId as string | null) ?? null,
-							commitsAhead: (data.commitsAhead as number) ?? 0,
-							baseBranch: (data.baseBranch as string) ?? "",
 							linesAdded: isFileChangeCount(data.linesAdded) ? data.linesAdded : undefined,
 							linesRemoved: isFileChangeCount(data.linesRemoved) ? data.linesRemoved : undefined,
 						});
@@ -1483,7 +1444,6 @@ export function useNarratorWS(
 							return [{ path: item.path, kind } as const];
 						});
 						callbackOwner.callbacks.onWorkspacePathsChanged?.({
-							chapterId: (data.chapterId as string) ?? "",
 							changes,
 							truncated: data.truncated === true,
 						});
@@ -1694,19 +1654,6 @@ export function useNarratorWS(
 							);
 						}
 						break;
-					case "commits_updated":
-						if (data.chapterId) {
-							callbackOwner.callbacks.onCommitsUpdated?.(
-								data.chapterId as string,
-								(data.newCount as number) ?? 0,
-							);
-						}
-						break;
-					case "commit_sync_error": {
-						const event = coerceCommitSyncErrorEvent(data);
-						if (event) callbackOwner.callbacks.onCommitSyncError?.(event);
-						break;
-					}
 					case "background_task_started":
 						callbackOwner.callbacks.onBackgroundTaskStarted?.(
 							data.taskNarratorId as string,
@@ -1988,7 +1935,6 @@ export interface NarratorListWSEvent {
 		| "presence"
 		| "terminalCount"
 		| "backgroundTaskCount"
-		| "containerStatus"
 		| "draft"
 		/**
 		 * An agent started or stopped BLOCKING on an async question (`Await`).
@@ -2024,7 +1970,6 @@ export interface NarratorListWSEvent {
 	activeBackgroundTaskCount?: number;
 	activeBackgroundWorkCount?: number;
 	activeBackgroundServiceCount?: number;
-	containerStatus?: "created" | "running" | "paused" | "stopped" | null;
 	hasDraft?: boolean;
 	/** `awaitedQuestion` only: true when an agent just started blocking on a question. */
 	awaited?: boolean;

@@ -258,9 +258,8 @@ interval 语义：`> 0` 每 N 次触发；`-1` 关闭；`0` 也当关闭（"每�
 | `bg_agent`（`flavor === "agent"`） | `narrator`（+ 消息） | `task.id`（后台代理的任务 id **就是**其叙述者 id）/ `SideCarDoneTask.resultMessageId` |
 | `knowledge_base_hint` | `knowledge` | `hit.entryId` + `hit.scope`（global / personal；旧消息缺省 global）。personal 命中来自当前用户未发布的个人条目 |
 | `spec_update`（**仅单文件**） | `spec` | `item.uri` |
-| `review_feedback` | `chapter` | `block.reviewChapterId`（producer 早已写入） |
-| `merge_summary` | `chapter` | `block.sourceChapterId`（producer 早已写入） |
 | `bg_bash` / 任务摘要 / 多文件 spec 保存 | — 不可点 | — |
+| `review_feedback` / `merge_summary`（叙事线移除前的历史消息） | — 不可点 | 所指章节已不存在 |
 
 三条刻意的"不给目标"：
 - **`bg_bash`**：`speakerId` 有值（它是 identicon 种子，**每种说话人都有**），但 bash 任务 id 指的是一次 shell 调用。用 identicon 种子导航就会去打开一个不存在的叙述者——这是分开两个字段要防的唯一 bug。

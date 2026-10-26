@@ -28,6 +28,19 @@ describe("model catalog explicit leaf operations", () => {
 			reasoning_effort_levels: [],
 		});
 	});
+	test("tool loading modes accept known modes in order, and empty disables", () => {
+		expect(
+			buildCatalogPatch({
+				tool_loading_modes: { mode: "set", value: "custom_injection, anthropic_tool_addition" },
+			}),
+		).toEqual({ set: { tool_loading_modes: ["custom_injection", "anthropic_tool_addition"] } });
+		expect(buildCatalogPatch({ tool_loading_modes: { mode: "set", value: "" } })).toEqual({
+			set: { tool_loading_modes: [] },
+		});
+		expect(() =>
+			buildCatalogPatch({ tool_loading_modes: { mode: "set", value: "tool_search" } }),
+		).toThrow();
+	});
 	test("blank prices and zero token limits never silently become free or inherit", () => {
 		for (const value of ["", " ", "-1", "1e2", "NaN"])
 			expect(() => buildCatalogPatch({ input_cost_per_token: { mode: "set", value } })).toThrow();

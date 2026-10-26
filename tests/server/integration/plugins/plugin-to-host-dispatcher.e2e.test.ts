@@ -74,7 +74,7 @@ describe("C1 real Plugin→Host dispatcher acceptance", () => {
 				return {
 					allowed: false,
 					code: "PERMISSION_DENIED",
-					message: "Reference fixture is not allowed to mutate chapters",
+					message: "Reference fixture is not allowed to run this command",
 					retryable: false,
 				};
 			}
@@ -105,7 +105,7 @@ describe("C1 real Plugin→Host dispatcher acceptance", () => {
 				},
 				"commands.execute": {
 					method: "commands.execute",
-					capability: "command.chapter.write",
+					capability: "command.routine.write",
 					sideEffect: "unknown",
 					handler: async () => {
 						deniedHandlerCalls += 1;
@@ -200,7 +200,7 @@ describe("C1 real Plugin→Host dispatcher acceptance", () => {
 				},
 				{
 					method: "commands.execute",
-					capability: "command.chapter.write",
+					capability: "command.routine.write",
 					pluginId: manifest.pluginId,
 					projectId: "host-owned-project",
 				},

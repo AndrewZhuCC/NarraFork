@@ -176,7 +176,7 @@ describe("resolveAgentLabel (only an id in hand)", () => {
 		expect(await resolveAgentLabel(PARENT, AGENT_ID)).toBe(shortAgentId(AGENT_ID));
 	});
 
-	// A title is mutable (PATCH /narrators/:id/title, chapter title sync). Caching a
+	// A title is mutable (PATCH /narrators/:id/title). Caching a
 	// title-derived label meant a renamed subagent kept being PRINTED under its old
 	// slug — and that slug matches nothing, so the model was handed a selector that
 	// fails with "No accessible subagent found".

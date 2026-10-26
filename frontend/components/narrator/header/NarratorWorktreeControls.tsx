@@ -45,7 +45,7 @@ const EMPTY_DRAFT: WorktreeDraft = {
 	baseRef: "",
 };
 
-/** Kept in the Git strip, not chapter creation: name OR requirement is sufficient. */
+/** Kept in the Git strip: name OR requirement is sufficient. */
 export function NarratorWorktreeControls({
 	narratorId,
 	onRequirement,

@@ -31,7 +31,6 @@ import { isRunningStatus, type MeasuredToolCall } from "./measure/measure-tool-c
 import type { MeasuredTraceRow } from "./measure/measure-tool-run";
 import { CaretFiller } from "./render/caret-filler";
 import type { AskInPassingPendingInteraction } from "./render/RenderAskInPassing";
-import type { ReviewCardActions } from "./render/RenderReviewCard";
 import type {
 	ErrorNoticeActions,
 	InjectionGuardActions,
@@ -184,7 +183,7 @@ export interface ExactRowProps {
 	reviewTruncatedLabel?: string;
 	/**
 	 * What this host can do when the reader clicks an injection bubble's speaker row:
-	 * open a child session, a knowledge entry, a Dynamic Spec file, or a chapter.
+	 * open a child session, a knowledge entry, or a Dynamic Spec file.
 	 *
 	 * Same gating rule as `onOpenFilePanel`, applied per kind: only hosts that can
 	 * actually reach a destination supply that opener, and a row whose destination has
@@ -296,11 +295,6 @@ export interface ExactRowProps {
 	 */
 	injectionGuardActions?: InjectionGuardActions;
 	/**
-	 * Live handler for a review-feedback card's action button. Present only on review
-	 * rows; absent → the button renders disabled instead of silently inert.
-	 */
-	reviewFeedbackActions?: ReviewCardActions;
-	/**
 	 * Compact-marker callbacks for THIS row (open summary / cancel a running
 	 * compaction). Absent for every non-marker row; referentially stable per key so
 	 * the memo below keeps skipping.
@@ -399,7 +393,6 @@ export const ExactRow = memo(
 		specCarryoverActions,
 		errorNoticeActions,
 		injectionGuardActions,
-		reviewFeedbackActions,
 		compactActions,
 		compactCancelTitle,
 		askInPassingPending,
@@ -693,11 +686,6 @@ export const ExactRow = memo(
 		// the dismiss DELETE lives outside vlist/, so the shell injects it. Without
 		// this the card shows no close button at all.
 		if (injectionGuardActions) extra.injectionGuardActions = injectionGuardActions;
-		// Review feedback card: the button hands the conclusion to the narrator through a
-		// REST call, so the shell injects it. Without this the card would show findings the
-		// reader has no way to act on — and an idle narrator is never woken by a conclusion
-		// on purpose, so this button is the only path.
-		if (reviewFeedbackActions) extra.reviewFeedbackActions = reviewFeedbackActions;
 		if (kind === "review-card" && reviewTruncatedLabel) {
 			extra.truncatedLabel = reviewTruncatedLabel;
 		}
@@ -1108,7 +1096,6 @@ export const ExactRow = memo(
 		prev.specCarryoverActions === next.specCarryoverActions &&
 		prev.errorNoticeActions === next.errorNoticeActions &&
 		prev.injectionGuardActions === next.injectionGuardActions &&
-		prev.reviewFeedbackActions === next.reviewFeedbackActions &&
 		prev.compactActions === next.compactActions &&
 		prev.compactCancelTitle === next.compactCancelTitle &&
 		prev.askInPassingPending === next.askInPassingPending &&

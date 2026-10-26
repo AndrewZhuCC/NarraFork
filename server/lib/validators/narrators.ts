@@ -1,4 +1,4 @@
-import { parseComposerDocument } from "@shared/composer-document";
+import { MAX_COMPOSER_QUOTE_CHARS, parseComposerDocument } from "@shared/composer-document";
 import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 import {
 	HUMAN_ATTENTION_DEFAULT_PAGE_SIZE,
@@ -71,7 +71,6 @@ export const narratorHandleSchema = z
 export const createNarratorSchema = z.object({
 	/** 自定义会话标题；留空（或不传）时由首条消息自动命名。 */
 	title: z.string().trim().min(1).max(200).optional(),
-	chapterId: z.string().min(1).nullish(),
 	contextProjectId: z.string().min(1).max(128).nullish(),
 	type: z.enum(["primary"]).optional(),
 	model: z.string().optional(),
@@ -113,12 +112,14 @@ export const createNarratorSchema = z.object({
 	// mentionable via @handle in any session.
 	makeNamed: z.boolean().optional(),
 	handle: narratorHandleSchema.optional(),
-	// Specialized standalone narrator kind. Both must be standalone.
+	// Specialized standalone narrator kind. All must be standalone.
 	//   "knowledge" → Knowledge Steward (knowledge-base mgmt): preinstalls the knowledge
 	//                 toolset and a steward system prompt.
 	//   "setup"     → Setup Assistant (installs missing system dependencies): preinstalls
 	//                 Terminal and a setup-assistant system prompt.
-	kind: z.enum(["knowledge", "setup"]).optional(),
+	//   "bot"       → a bot: people talk to it in a chat room and see only what it sends
+	//                 them with Send({ user }). Requires `title`, its name in that room.
+	kind: z.enum(["knowledge", "setup", "bot"]).optional(),
 });
 
 /**
@@ -571,6 +572,21 @@ export const extractPrimarySchema = z.object({
 export const askInPassingSchema = z.object({
 	question: z.string().min(1).max(10000),
 	pendingMessageId: z.string().min(1),
+	/** Selected excerpt the question is about; sent to the fork ahead of the question. */
+	quote: z
+		.object({
+			label: z
+				.string()
+				.min(1)
+				.max(200)
+				.regex(/^\S[^\r\n]*$/u),
+			text: z.string().min(1).max(MAX_COMPOSER_QUOTE_CHARS),
+			anchor: z
+				.string()
+				.regex(/^[mt]:[A-Za-z0-9_-]{4,}$/u)
+				.optional(),
+		})
+		.optional(),
 });
 
 /** Resume error subagents listed on the post-error recovery card. */
@@ -710,32 +726,32 @@ export const suggestAnswersSchema = z.object({
 
 export const MAX_BATCH_DELETE_BLOCKS = 200;
 
-export const batchDeleteBlocksSchema = z.object({
-	blocks: z
-		.array(
-			z.object({
-				messageId: z.string().min(1),
-				blockIndex: z.number().int().min(0),
-			}),
-		)
-		.min(1)
-		.max(MAX_BATCH_DELETE_BLOCKS)
-		.transform((blocks) => {
-			const seen = new Map<string, Set<number>>();
-			return blocks.filter(({ messageId, blockIndex }) => {
-				const indices = seen.get(messageId) ?? new Set<number>();
-				if (indices.has(blockIndex)) return false;
-				indices.add(blockIndex);
-				seen.set(messageId, indices);
-				return true;
-			});
-		}),
-	// When true, delete the blocks from history only, leaving files/spec untouched.
+/** Block ids of one operation (docs/BLOCK_STORAGE-DESIGN.md §5.5): rows, or decoded ids. */
+export const blockIdsSchema = z
+	.array(z.string().min(1).max(256))
+	.min(1)
+	.max(MAX_BATCH_DELETE_BLOCKS)
+	.transform((ids) => [...new Set(ids)]);
+
+export const deleteBlocksSchema = z.object({
+	blockIds: blockIdsSchema,
 	skipRevert: z.boolean().optional(),
-	// The narrator scope is the default and refuses on conflict, so the caller needs
-	// a way to ask for the wider one its error suggests.
 	scope: revertScopeSchema,
 });
+
+export const rollbackToBlocksSchema = rollbackToBlockSchema
+	.omit({ blockIndex: true })
+	.extend({ blockIds: blockIdsSchema });
+
+/** A file-restore preview for an operation addressed by block id. */
+export const blockRevertActionPreviewSchema = z
+	.object({
+		action: z.enum(["rollback_to_block", "delete_tool_block"]),
+		blockIds: blockIdsSchema,
+		idempotencyKey: revertPlanIdentifierSchema,
+		recoveryMode: z.literal("snapshot").optional(),
+	})
+	.strict();
 
 export const forkFromMessagesSchema = z.object({
 	messageIds: z.array(z.string().min(1)).min(1).max(500),

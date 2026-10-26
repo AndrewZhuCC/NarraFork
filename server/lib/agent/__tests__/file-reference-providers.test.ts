@@ -4,7 +4,6 @@ import type { FileReferenceSnapshot } from "@shared/file-reference";
 import { getTestDb } from "../../../../tests/setup";
 import { setNugCachedModels } from "../../nug-model-cache";
 import { settings } from "../../settings";
-import { projectFileReferenceText } from "../file-reference-projection";
 import type { DbMessage } from "../provider";
 
 if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "providers") {
@@ -156,115 +155,54 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "providers") {
 				const messages = [user("history"), assistant(), user("current", "again", [current])];
 				const original = structuredClone(messages);
 				const built = await buildHistory(messages, `refs:${model}`, "refs", "n");
-				expect(occurrences(built.history, body.split("\n")[0])).toBe(1);
-				expect(occurrences([built.history, built.trailingToolResults], "tool result")).toBe(1);
-				const currentText = projectFileReferenceText("again", [current]);
-				expect(occurrences(currentText, body.split("\n")[0])).toBe(1);
-				expect(occurrences([built.history, currentText], body.split("\n")[0])).toBe(2);
+				// The history carries the current input too, each occurrence with its material.
+				expect(occurrences(built.history, body.split("\n")[0])).toBe(2);
+				expect(occurrences(built.history, "tool result")).toBe(1);
 				expect(messages).toEqual(original);
 			});
 
-			test("restoring and resending the same occurrence keeps the older message, even before sys", async () => {
+			test("restoring and resending the same occurrence keeps both messages, even before sys", async () => {
 				const model = configure(mode);
-				const current = projectFileReferenceText("inspect", [reference]);
 				const sys: DbMessage = { ...user("sys", "standing reminder", []), role: "sys" };
 				const built = await buildHistory(
 					[user("old"), assistant(), user("new"), sys],
 					`refs:${model}`,
 					"refs",
-					undefined,
-					{ currentInput: current },
 				);
-				expect(occurrences(built.history, "const x")).toBe(1);
-				expect(occurrences([built.history, current], "const x")).toBe(2);
+				expect(occurrences(built.history, "const x")).toBe(2);
+				expect(occurrences(built.history, "standing reminder")).toBe(1);
 			});
 
-			test("an exact current input keeps referenced bytes once across tail sys and current turn", async () => {
+			test("a tail sys row follows the current input in the history", async () => {
 				const model = configure(mode);
-				const currentInput = projectFileReferenceText("inspect", [reference]);
 				const sys: DbMessage = { ...user("sys", "standing reminder", []), role: "sys" };
 				const messages = [user("current"), sys];
 				const saved = structuredClone(messages);
-				const built = await buildHistory(messages, `refs:${model}`, "refs", undefined, {
-					currentInput,
-				});
-				expect(occurrences(built.history, "const x")).toBe(0);
-				expect(occurrences([built.history, built.trailingUserText, currentInput], "const x")).toBe(
-					1,
-				);
+				const built = await buildHistory(messages, `refs:${model}`, "refs");
+				expect(occurrences(built.history, "const x")).toBe(1);
+				expect(occurrences(built.history, "standing reminder")).toBe(1);
+				const serialized = JSON.stringify(built.history);
+				expect(serialized.indexOf("inspect")).toBeLessThan(serialized.indexOf("standing reminder"));
 				if (mode === "official") {
 					expect(built.history).toContainEqual({
 						role: "system",
 						content: '<sender kind="system" />\nstanding reminder',
 					});
-					expect(built.history).toContainEqual({
-						role: "user",
-						content: '<sender kind="human" />\ninspect',
-					});
-					expect(built.trailingUserText).toBeUndefined();
-				} else if (mode === "anthropic" || mode === "nug-anthropic") {
-					expect(built.trailingUserText).toBe('<sender kind="system" />\nstanding reminder');
-				} else {
-					const baseline = await buildHistory(messages, `refs:${model}`, "refs");
-					expect(built.trailingUserText).toBe(baseline.trailingUserText);
-					expect(occurrences([built.history, built.trailingUserText], "standing reminder")).toBe(
-						occurrences([baseline.history, baseline.trailingUserText], "standing reminder"),
-					);
 				}
 				expect(messages).toEqual(saved);
 				expect(sys.contentText).toBe("standing reminder");
-				expect(occurrences([built.history, built.trailingUserText], "standing reminder")).toBe(1);
 			});
 		});
 	}
 
-	test("official history keeps snapshots when input differs or the tail is assistant", async () => {
-		configure("official");
+	test("compatible Anthropic sends sys rows as user content", async () => {
 		const sys: DbMessage = { ...user("sys", "standing reminder", []), role: "sys" };
-		const current = projectFileReferenceText("inspect", [reference]);
-		for (const currentInput of [`${current} `, `other instructions\n${current}`, "inspect"]) {
-			const built = await buildHistory([user("u"), sys], "refs:model", "refs", undefined, {
-				currentInput,
-			});
-			expect(occurrences(built.history, "const x")).toBe(1);
-		}
-		const built = await buildHistory(
-			[user("u"), assistant(), sys],
-			"refs:model",
-			"refs",
-			undefined,
-			{ currentInput: current },
-		);
-		expect(occurrences(built.history, "const x")).toBe(1);
-	});
-
-	test("official summary without currentInput still sees the complete accepted material", async () => {
-		configure("official");
-		const sys: DbMessage = { ...user("sys", "standing reminder", []), role: "sys" };
-		const messages = [user("u"), sys];
-		const currentInput = projectFileReferenceText("inspect", [reference]);
-		await buildHistory(messages, "refs:model", "refs", undefined, { currentInput });
-		const summaryHistory = await buildHistory(messages, "refs:model", "refs");
-		expect(occurrences(summaryHistory.history, "const x")).toBe(1);
-	});
-
-	test("official trailing sys preserves its historical user row; compatible sys stays current", async () => {
-		const sys: DbMessage = { ...user("sys", "standing reminder", []), role: "sys" };
-		configure("official");
-		const original = [user("user"), sys];
-		const official = await buildHistory(original, "refs:model", "refs");
-		expect(occurrences(official.history, "const x")).toBe(1);
-		expect(official.history).toContainEqual({
-			role: "system",
+		configure("anthropic");
+		const compatible = await buildHistory([user("user"), sys], "refs:model", "refs");
+		expect(compatible.history).toContainEqual({
+			role: "user",
 			content: '<sender kind="system" />\nstanding reminder',
 		});
-		expect(official.trailingUserText).toBeUndefined();
-		// This no-options path is also used by summaries: its history must retain
-		// every snapshot even when a live caller could supply an exact current input.
-		expect(projectFileReferenceText("inspect", [reference])).toContain("const x");
-		configure("anthropic");
-		const compatible = await buildHistory(original, "refs:model", "refs");
-		expect(compatible.trailingUserText).toBe('<sender kind="system" />\nstanding reminder');
-		expect(occurrences(compatible.history, "const x")).toBe(0);
+		expect(occurrences(compatible.history, "const x")).toBe(1);
 	});
 }

@@ -1,4 +1,5 @@
 import { markRuntimeInstructions, reportInputCharacters } from "./input-characters";
+import type { ToolLoadingTarget } from "./tool-loading";
 
 // Codex Provider — uses the centralized CodexManager for multi-account OAuth
 // Wraps OpenAIProvider with dynamic credential selection
@@ -33,6 +34,7 @@ import {
 	applyOpenAIModelMetadata,
 	CODEX_DEFAULT_INSTRUCTIONS,
 	convertHistoryToResponsesApi,
+	isResponsesInputItem,
 	type OAIContentPart,
 	type OAIMessage,
 	OpenAIProvider,
@@ -49,7 +51,7 @@ import type {
 	ProviderAdapter,
 	RemoteCompactResult,
 } from "./provider";
-import type { AgentToolUse, ResolvedToolDefinition } from "./types";
+import type { ResolvedToolDefinition } from "./types";
 import { orderUserContent } from "./user-content-order";
 
 function getCodexProviderErrorMessage(err: unknown): string {
@@ -159,8 +161,6 @@ export class CodexProvider implements ProviderAdapter {
 	private useWebSearch: boolean;
 	private useImageGeneration: boolean;
 	private useRemoteCompact: boolean;
-	/** Cached dummy provider for synchronous operations (formatToolResult, pushUserTurn, etc.) */
-	private dummyProvider: OpenAIProvider;
 
 	constructor(options?: CodexProviderOptions) {
 		const mode = settings.codex?.loadBalancingMode;
@@ -172,20 +172,6 @@ export class CodexProvider implements ProviderAdapter {
 		this.useWebSearch = options?.useWebSearch ?? true;
 		this.useImageGeneration = options?.useImageGeneration ?? true;
 		this.useRemoteCompact = options?.useRemoteCompact ?? false;
-		// Create dummy provider once and reuse it
-		this.dummyProvider = new OpenAIProvider({
-			id: "codex",
-			name: "Codex",
-			prefix: "codex",
-			apiKey: "",
-			baseUrl: CODEX_BASE_URL,
-			defaultModel: "gpt-5.5",
-			apiMode: "codex",
-			codexWebSearch: this.useWebSearch,
-			codexImageGeneration: this.useImageGeneration,
-			codexRemoteCompact: this.useRemoteCompact,
-			...codexFingerprintConfig(),
-		});
 	}
 
 	/** Get or acquire a valid credential context. */
@@ -510,6 +496,10 @@ export class CodexProvider implements ProviderAdapter {
 
 	isRemoteCompactEnabled(): boolean {
 		return this.useRemoteCompact;
+	}
+
+	toolLoadingTarget(): ToolLoadingTarget {
+		return { protocol: "openai-responses", codexBackend: true };
 	}
 
 	async buildHistory(
@@ -878,7 +868,7 @@ export class CodexProvider implements ProviderAdapter {
 		for (const msg of messages) {
 			// biome-ignore lint/suspicious/noExplicitAny: Responses API uses "developer" role
 			const role = (msg as any).role;
-			if (role === "system" || role === "developer") {
+			if (!isResponsesInputItem(msg) && (role === "system" || role === "developer")) {
 				if (typeof msg.content === "string") {
 					instructions += (instructions ? "\n\n" : "") + msg.content;
 				}
@@ -932,68 +922,6 @@ export class CodexProvider implements ProviderAdapter {
 
 		applyOpenAIModelMetadata(request, params.model, "codex", params.maxOutputTokens);
 		return request;
-	}
-
-	formatToolResult(
-		toolUseId: string,
-		output: string,
-		isError: boolean,
-		images?: Array<{ format: string; base64: string }>,
-		toolName?: string,
-	): unknown {
-		void toolName;
-		return this.dummyProvider.formatToolResult(toolUseId, output, isError, images);
-	}
-
-	pushUserTurn(
-		history: unknown[],
-		content: string,
-		model: string,
-		toolResults: unknown[],
-		images?: Array<{ format: string; base64: string }>,
-	): void {
-		this.dummyProvider.pushUserTurn(history, content, model, toolResults, images);
-	}
-
-	pushAssistantTurn(
-		history: unknown[],
-		text: string,
-		toolUses: AgentToolUse[],
-		reasoningBlocks?: Array<{
-			text: string;
-			providerMetadata?: import("./types").ReasoningProviderMetadata;
-			outputIndex?: number;
-		}>,
-		webSearches?: Array<{
-			id: string;
-			query?: string;
-			queries?: string[];
-			outputIndex?: number;
-			action?: import("./provider").WebSearchAction;
-		}>,
-		messageId?: string,
-		imageGenerations?: Array<{
-			id: string;
-			revisedPrompt?: string;
-			result?: string;
-			outputIndex?: number;
-		}>,
-		textOutputIndex?: number,
-		redactedThinkingBlocks?: Parameters<ProviderAdapter["pushAssistantTurn"]>[8],
-		orderedContent?: readonly import("./types").ContentBlock[],
-	): void {
-		this.dummyProvider.pushAssistantTurn(
-			history,
-			text,
-			toolUses,
-			reasoningBlocks,
-			webSearches,
-			messageId,
-			imageGenerations,
-			textOutputIndex,
-			redactedThinkingBlocks,
-			orderedContent,
-		);
 	}
 
 	async generate(text: string, model: string): Promise<string> {

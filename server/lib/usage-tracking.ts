@@ -1,5 +1,5 @@
 import { db } from "@server/db";
-import { narratorMessages, narratorToolCalls } from "@server/db/schema";
+import { narratorMessages } from "@server/db/schema";
 import type { ReferencePricingSnapshot } from "@shared/agent-protocol/types";
 import { eq } from "drizzle-orm";
 import type { CostEstimate } from "./cost-estimate";
@@ -157,41 +157,6 @@ export function calculateCostDetailed(
 		cacheCreationCost: costs.cacheWrite,
 		totalCost: knownCost,
 	};
-}
-
-/**
- * 更新工具调用的 token 使用和费用信息
- */
-export async function updateToolCallUsage(
-	toolCallId: string,
-	usage: UsageData,
-	provider: string,
-	model: string,
-): Promise<void> {
-	const cost = calculateCostDetailed(usage, provider, model);
-
-	const updateData: Record<string, unknown> = {
-		inputTokens: usage.inputTokens,
-		outputTokens: usage.outputTokens,
-		cacheReadTokens: usage.cachedInputTokens || 0,
-		cacheCreationTokens: usage.cacheCreationInputTokens || 0,
-		cacheCreation5mTokens: usage.cacheCreation5mInputTokens || 0,
-		cacheCreation1hTokens: usage.cacheCreation1hInputTokens || 0,
-		provider,
-		model,
-		costStatus: cost.status,
-		costMissingFields: cost.missingFields,
-	};
-
-	if (cost) {
-		updateData.inputCost = cost.inputCost;
-		updateData.outputCost = cost.outputCost;
-		updateData.cacheCreationCost = cost.cacheCreationCost;
-		updateData.cacheReadCost = cost.cacheReadCost;
-		updateData.totalCost = cost.totalCost;
-	}
-
-	await db.update(narratorToolCalls).set(updateData).where(eq(narratorToolCalls.id, toolCallId));
 }
 
 export async function updateMessageUsage(

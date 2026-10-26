@@ -27,7 +27,6 @@ import type { RecentTab } from "@frontend/hooks/recent-tabs-utils";
 
 export function getRecentTabNarratorId(tab: RecentTab): string | null {
 	if (tab.type === "narrator" || tab.type === "subagent") return tab.id;
-	if (tab.type === "chapter") return tab.narratorId ?? null;
 	return null;
 }
 
@@ -91,9 +90,6 @@ export function autoScrollAllowedForPointer(
 export function isTabActive(tab: RecentTab, pathname: string): boolean {
 	if (tab.type === "project") {
 		return pathname === `/projects/${tab.id}`;
-	}
-	if (tab.type === "chapter") {
-		return tab.narratorId ? pathname === `/narrators/${tab.narratorId}` : false;
 	}
 	if (tab.type === "workspace") {
 		return pathname === `/narrators/workspace/${tab.id}`;

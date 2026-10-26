@@ -4,7 +4,6 @@ import {
 	Divider,
 	Modal,
 	Stack,
-	Switch,
 	Text,
 	Textarea,
 	TextInput,
@@ -30,7 +29,6 @@ import { ProjectAccessPanel } from "./ProjectAccessPanel";
 
 interface ProjectSettingsModalProps {
 	projectId: string;
-	proxyDomain: string | null;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON
 	chapterSettings: any;
 	opened: boolean;
@@ -48,7 +46,6 @@ function normalizeRules<T extends { selector: ReturnType<typeof normalizeRuleTar
 
 export function ProjectSettingsModal({
 	projectId,
-	proxyDomain,
 	chapterSettings,
 	opened,
 	onClose,
@@ -76,21 +73,6 @@ export function ProjectSettingsModal({
 		staleTime: 30_000,
 		enabled: opened,
 	});
-	const [domain, setDomain] = useState(proxyDomain ?? "");
-	const normalized = domain.trim().toLowerCase();
-	const hasInvalidChars = /[^a-z0-9.-]/.test(normalized);
-	const hasConsecutiveDots = normalized.includes("..");
-	const validShape =
-		/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))+$/.test(
-			normalized,
-		);
-	const domainError =
-		normalized.length === 0
-			? null
-			: hasInvalidChars || hasConsecutiveDots || !validShape
-				? t("proxyDomainInvalid")
-				: null;
-
 	const cs =
 		typeof chapterSettings === "string"
 			? (() => {
@@ -114,11 +96,9 @@ export function ProjectSettingsModal({
 	const [commandBlacklist, setCommandBlacklist] = useState<CommandBlacklistRuleInput[]>(() =>
 		normalizeRules<CommandBlacklistRuleInput>(cs.commandBlacklist),
 	);
-	const [requireReview, setRequireReview] = useState<boolean>(cs.requireReviewBeforeMerge ?? false);
 
 	useEffect(() => {
 		if (opened) {
-			setDomain(proxyDomain ?? "");
 			const fresh =
 				typeof chapterSettings === "string"
 					? (() => {
@@ -133,12 +113,11 @@ export function ProjectSettingsModal({
 			setBlacklistDirs(normalizeRules<DirectoryBlacklistRuleInput>(fresh.blacklistDirs));
 			setCommandWhitelist(normalizeRules<CommandWhitelistRuleInput>(fresh.commandWhitelist));
 			setCommandBlacklist(normalizeRules<CommandBlacklistRuleInput>(fresh.commandBlacklist));
-			setRequireReview(fresh.requireReviewBeforeMerge ?? false);
 		}
-	}, [opened, proxyDomain, chapterSettings]);
+	}, [opened, chapterSettings]);
 
 	const handleSave = () => {
-		if (domainError || !name.trim() || !gitPath.trim() || project.isError) return;
+		if (!name.trim() || !gitPath.trim() || project.isError) return;
 		update.mutate(
 			{
 				id: projectId,
@@ -146,13 +125,11 @@ export function ProjectSettingsModal({
 					name: name.trim(),
 					description: description.trim(),
 					gitPath: gitPath.trim(),
-					proxyDomain: normalized || null,
 					chapterSettings: {
 						whitelistDirs,
 						blacklistDirs,
 						commandWhitelist,
 						commandBlacklist,
-						requireReviewBeforeMerge: requireReview,
 					},
 				},
 			},
@@ -182,17 +159,6 @@ export function ProjectSettingsModal({
 					required
 					onChange={(event) => setGitPath(event.currentTarget.value)}
 				/>
-				<TextInput
-					label={t("proxyDomain")}
-					description={t("proxyDomainDesc")}
-					placeholder="dev.example.com"
-					value={domain}
-					onChange={(e) => setDomain(e.currentTarget.value)}
-					error={domainError}
-				/>
-				<Text size="xs" c="dimmed">
-					{t("proxyDomainHint")}
-				</Text>
 
 				<Title order={5} mt="sm">
 					{t("projectWhitelistDirs")}
@@ -306,22 +272,11 @@ export function ProjectSettingsModal({
 					}
 				/>
 
-				<Title order={5} mt="sm">
-					{t("requireReviewBeforeMerge")}
-				</Title>
-				<Switch
-					label={t("requireReviewBeforeMergeDesc")}
-					checked={requireReview}
-					onChange={(e) => setRequireReview(e.currentTarget.checked)}
-				/>
-
 				{update.isError && <Alert color="red">{update.error.message}</Alert>}
 				<Button
 					onClick={handleSave}
 					loading={update.isPending}
-					disabled={
-						!!domainError || !name.trim() || !gitPath.trim() || project.isError || project.isLoading
-					}
+					disabled={!name.trim() || !gitPath.trim() || project.isError || project.isLoading}
 				>
 					{tc("save")}
 				</Button>

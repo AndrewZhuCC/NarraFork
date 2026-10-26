@@ -1,5 +1,6 @@
 import "@mantine/core/styles.css";
 import { MantineProvider } from "@mantine/core";
+import { QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
 import { StrictMode } from "react";
 import { flushSync } from "react-dom";
@@ -40,6 +41,9 @@ import { setToken } from "../frontend/lib/api/client";
 import { narratorWSManager } from "../frontend/lib/narrator-ws-manager";
 import en from "../frontend/locales/en/narrator.json";
 import type { EditorRawEncoding } from "../shared/editor-document";
+import { createSmokeEditorQueryClient } from "./smoke-editor-query-client";
+
+const queryClient = createSmokeEditorQueryClient();
 
 const config = (await (await fetch("/fixture-config")).json()) as {
 	narratorId: string;
@@ -145,16 +149,18 @@ export async function openDefault(filePath: string) {
 	path = filePath;
 	flushSync(() =>
 		root.render(
-			<MantineProvider>
-				<I18nextProvider i18n={i18n}>
-					<FilePanelContent
-						filePath={path}
-						narratorId={config.narratorId}
-						deviceId={config.deviceId ?? "local"}
-						confirmed
-					/>
-				</I18nextProvider>
-			</MantineProvider>,
+			<QueryClientProvider client={queryClient}>
+				<MantineProvider>
+					<I18nextProvider i18n={i18n}>
+						<FilePanelContent
+							filePath={path}
+							narratorId={config.narratorId}
+							deviceId={config.deviceId ?? "local"}
+							confirmed
+						/>
+					</I18nextProvider>
+				</MantineProvider>
+			</QueryClientProvider>,
 		),
 	);
 }
@@ -194,23 +200,25 @@ export function restoredTabs(visible = true) {
 	flushSync(() =>
 		root.render(
 			<StrictMode>
-				<MantineProvider>
-					<I18nextProvider i18n={i18n}>
-						<div style={{ display: "flex", height: "100vh" }}>
-							{restoredTabDescriptors.map(({ id, index }) => (
-								<div key={id} style={{ width: "50%", display: index < 2 ? "block" : "none" }}>
-									<FilePanelContent
-										filePath={index < 2 ? path : `${path}.hidden-${index}`}
-										narratorId={config.narratorId}
-										deviceId={config.deviceId ?? "local"}
-										confirmed
-										visible={visible && index < 2}
-									/>
-								</div>
-							))}
-						</div>
-					</I18nextProvider>
-				</MantineProvider>
+				<QueryClientProvider client={queryClient}>
+					<MantineProvider>
+						<I18nextProvider i18n={i18n}>
+							<div style={{ display: "flex", height: "100vh" }}>
+								{restoredTabDescriptors.map(({ id, index }) => (
+									<div key={id} style={{ width: "50%", display: index < 2 ? "block" : "none" }}>
+										<FilePanelContent
+											filePath={index < 2 ? path : `${path}.hidden-${index}`}
+											narratorId={config.narratorId}
+											deviceId={config.deviceId ?? "local"}
+											confirmed
+											visible={visible && index < 2}
+										/>
+									</div>
+								))}
+							</div>
+						</I18nextProvider>
+					</MantineProvider>
+				</QueryClientProvider>
 			</StrictMode>,
 		),
 	);
@@ -219,32 +227,34 @@ export function dualViews(visible = true) {
 	lease?.setVisible(visible);
 	flushSync(() =>
 		root.render(
-			<MantineProvider>
-				<I18nextProvider i18n={i18n}>
-					<NarratorPanelVisibilityProvider value={visible}>
-						<div style={{ display: "flex", height: "100vh" }}>
-							<div style={{ width: "50%" }}>
-								<FileEditorContent
-									filePath={path}
-									narratorId={config.narratorId}
-									deviceId={config.deviceId ?? "local"}
-									rawProtocol
-									rawEncoding={encodingHint}
-								/>
+			<QueryClientProvider client={queryClient}>
+				<MantineProvider>
+					<I18nextProvider i18n={i18n}>
+						<NarratorPanelVisibilityProvider value={visible}>
+							<div style={{ display: "flex", height: "100vh" }}>
+								<div style={{ width: "50%" }}>
+									<FileEditorContent
+										filePath={path}
+										narratorId={config.narratorId}
+										deviceId={config.deviceId ?? "local"}
+										rawProtocol
+										rawEncoding={encodingHint}
+									/>
+								</div>
+								<div style={{ width: "50%" }}>
+									<FileEditorContent
+										filePath={path}
+										narratorId={config.narratorId}
+										deviceId={config.deviceId ?? "local"}
+										rawProtocol
+										rawEncoding={encodingHint}
+									/>
+								</div>
 							</div>
-							<div style={{ width: "50%" }}>
-								<FileEditorContent
-									filePath={path}
-									narratorId={config.narratorId}
-									deviceId={config.deviceId ?? "local"}
-									rawProtocol
-									rawEncoding={encodingHint}
-								/>
-							</div>
-						</div>
-					</NarratorPanelVisibilityProvider>
-				</I18nextProvider>
-			</MantineProvider>,
+						</NarratorPanelVisibilityProvider>
+					</I18nextProvider>
+				</MantineProvider>
+			</QueryClientProvider>,
 		),
 	);
 }
@@ -298,36 +308,38 @@ export async function refresh() {
 function panelViews(rawOnly: boolean, a = true, b = true, secondary = true) {
 	flushSync(() =>
 		root.render(
-			<MantineProvider>
-				<I18nextProvider i18n={i18n}>
-					<div style={{ display: "flex", height: "100vh" }}>
-						<div style={{ width: "50%" }}>
-							<FilePanelContent
-								key={rawOnly ? "raw-a" : "v1"}
-								rawProtocol={rawOnly}
-								filePath={path}
-								narratorId={config.narratorId}
-								deviceId={config.deviceId ?? "local"}
-								confirmed
-								visible={a}
-							/>
-						</div>
-						{secondary && (
+			<QueryClientProvider client={queryClient}>
+				<MantineProvider>
+					<I18nextProvider i18n={i18n}>
+						<div style={{ display: "flex", height: "100vh" }}>
 							<div style={{ width: "50%" }}>
 								<FilePanelContent
-									key={rawOnly ? "raw-b" : "raw"}
-									rawProtocol
+									key={rawOnly ? "raw-a" : "v1"}
+									rawProtocol={rawOnly}
 									filePath={path}
 									narratorId={config.narratorId}
 									deviceId={config.deviceId ?? "local"}
 									confirmed
-									visible={b}
+									visible={a}
 								/>
 							</div>
-						)}
-					</div>
-				</I18nextProvider>
-			</MantineProvider>,
+							{secondary && (
+								<div style={{ width: "50%" }}>
+									<FilePanelContent
+										key={rawOnly ? "raw-b" : "raw"}
+										rawProtocol
+										filePath={path}
+										narratorId={config.narratorId}
+										deviceId={config.deviceId ?? "local"}
+										confirmed
+										visible={b}
+									/>
+								</div>
+							)}
+						</div>
+					</I18nextProvider>
+				</MantineProvider>
+			</QueryClientProvider>,
 		),
 	);
 }

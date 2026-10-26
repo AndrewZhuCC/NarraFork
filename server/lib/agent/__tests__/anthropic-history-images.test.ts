@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
+import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
 import { setUploadsDirForTests } from "../../uploads";
 import { AnthropicProvider } from "../anthropic-provider";
 import type { DbMessage } from "../provider";
@@ -315,5 +316,82 @@ describe("anthropic history image replay", () => {
 		);
 
 		expect(imagePartsOf(history)).toHaveLength(2);
+	});
+});
+
+describe("tool result image replay", () => {
+	test("rebuilds the images a tool returned inside its result", async () => {
+		registerTestImage("n1", "shot1");
+		const assistant: DbMessage = {
+			id: "assistant-1",
+			role: "assistant",
+			contentJson: [{ type: "tool_use", id: "toolu_shot", name: "Screenshot", input: {} }],
+			contentText: null,
+			parentToolUseId: null,
+			messageUuid: null,
+			toolCalls: [
+				{
+					toolUseId: "toolu_shot",
+					toolName: "Screenshot",
+					inputJson: {},
+					outputJson: encodeToolOutput("captured", {
+						images: [{ imageId: "shot1", mediaType: "image/png", uploadNarratorId: "n1" }],
+					}),
+					status: "success",
+				},
+			],
+		};
+		const { history } = await provider().buildHistory(
+			[userMessage({ contentText: "take one" }), assistant],
+			"anthro:claude-sonnet-4.5",
+			"n1",
+		);
+		expect(history.at(-1)).toEqual({
+			role: "user",
+			content: [
+				{
+					type: "tool_result",
+					tool_use_id: "toolu_shot",
+					content: [
+						{
+							type: "image",
+							source: { type: "base64", media_type: "image/png", data: SAMPLE_PNG_BASE64 },
+						},
+						{ type: "text", text: "captured" },
+					],
+				},
+			],
+		});
+	});
+
+	test("a missing tool image leaves the result text", async () => {
+		const assistant: DbMessage = {
+			id: "assistant-1",
+			role: "assistant",
+			contentJson: [{ type: "tool_use", id: "toolu_shot", name: "Screenshot", input: {} }],
+			contentText: null,
+			parentToolUseId: null,
+			messageUuid: null,
+			toolCalls: [
+				{
+					toolUseId: "toolu_shot",
+					toolName: "Screenshot",
+					inputJson: {},
+					outputJson: encodeToolOutput("captured", {
+						images: [{ imageId: "gone", mediaType: "image/png", uploadNarratorId: "n1" }],
+					}),
+					status: "success",
+				},
+			],
+		};
+		const { history } = await provider().buildHistory(
+			[userMessage({ contentText: "take one" }), assistant],
+			"anthro:claude-sonnet-4.5",
+			"n1",
+		);
+		expect(history.at(-1)).toEqual({
+			role: "user",
+			content: [{ type: "tool_result", tool_use_id: "toolu_shot", content: "captured" }],
+		});
 	});
 });

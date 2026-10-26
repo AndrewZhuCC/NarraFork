@@ -32,6 +32,13 @@ import {
 } from "@shared/file-change-protocol";
 import { AppError } from "../lib/errors";
 import {
+	bodyLengthSql,
+	boundedBodyText,
+	hasBlockStorage,
+	hasRowsOnlyBodies,
+} from "../lib/narrator-bodies";
+import { settings } from "../lib/settings";
+import {
 	createFileChangeIdentity,
 	fileChangeExecutionBindingMatches,
 	fileChangeIdentityKey,
@@ -270,7 +277,7 @@ interface ScopeState {
  * history writers must bump messageVersion, and execution must recheck returned versions/digests.
  * A direct unversioned write after its source's last verification can still race the preview.
  *
- * Current FK actions are inventoried explicitly, including spec revisions/chapter commits;
+ * Current FK actions are inventoried explicitly, including spec revisions;
  * COW of a shared partial message counts retained tool payload bytes without loading them.
  * No record is physically deleted by this class. Device authorization/current-state checks,
  * history execution, reversal, blob publication and plan proof generation remain downstream.
@@ -527,7 +534,7 @@ export class RevertSelectionService {
 	private ref(state: ScopeState, narratorId: string, messageId: string): RefRow {
 		const ref = this.one<RefRow>(
 			state,
-			`${REF_SELECT} WHERE r.narrator_id = ? AND r.message_id = ? LIMIT 1`,
+			`${refSelect(this.database.$client)} WHERE r.narrator_id = ? AND r.message_id = ? LIMIT 1`,
 			[narratorId, messageId],
 		);
 		if (!ref) throw fail("NOT_FOUND", "Selected message has no actual owning ref");
@@ -579,7 +586,7 @@ export class RevertSelectionService {
 		for (;;) {
 			const page = this.rows<RefRow>(
 				state,
-				`${REF_SELECT} WHERE r.narrator_id = ? AND (r.seq, r.rowid) >= (?, ?) ORDER BY r.seq, r.rowid LIMIT ?`,
+				`${refSelect(this.database.$client)} WHERE r.narrator_id = ? AND (r.seq, r.rowid) >= (?, ?) ORDER BY r.seq, r.rowid LIMIT ?`,
 				[narratorId, cursor.seq, cursor.rowid, REVERT_SELECTION_PAGE_ITEMS + 1],
 			);
 			for (const ref of page.slice(0, REVERT_SELECTION_PAGE_ITEMS))
@@ -608,14 +615,19 @@ export class RevertSelectionService {
 		return summary;
 	}
 	private readBody(state: ScopeState, ref: RefRow): string {
-		const content = this.one<{ body: string }>(
-			state,
-			"SELECT content_json AS body FROM narrator_messages WHERE id = ? AND octet_length(content_json) = ? AND octet_length(content_json) <= ? LIMIT 1",
-			[ref.id, ref.contentBytes, REVERT_SELECTION_LIMITS.messageBytes],
-			false,
+		this.check(state);
+		state.queries++;
+		const body = boundedBodyText(
+			this.database.$client,
+			ref.id,
+			bodiesFromBlocks(this.database.$client),
+			{
+				exactBytes: ref.contentBytes,
+				maxBytes: REVERT_SELECTION_LIMITS.messageBytes,
+			},
 		);
-		if (!content) throw fail("STALE", "Message changed before bounded inspection");
-		return content.body;
+		if (body === undefined) throw fail("STALE", "Message changed before bounded inspection");
+		return body;
 	}
 
 	private async message(
@@ -1210,15 +1222,22 @@ function sourceRowsDigest(rows: unknown[]): string {
 }
 
 const NARRATOR_SELECT = `SELECT id, owner_user_id AS ownerUserId, visibility, write_audience AS writeAudience, type,
- acl_root_narrator_id AS aclRootNarratorId, chapter_id AS chapterId, context_project_id AS contextProjectId,
+ acl_root_narrator_id AS aclRootNarratorId, context_project_id AS contextProjectId,
  message_version AS messageVersion, refs_inherited_from AS refsInheritedFrom, status,
  parent_narrator_id AS parentNarratorId, origin_tool_call_id AS originToolCallId FROM narrators`;
 const READ_ONLY_TOOLS = new Set(["Read", "Glob", "Grep", "StructView", "WebSearch", "WebFetch"]);
-const REF_SELECT = `SELECT r.rowid, r.id AS refId, r.message_id AS id, r.narrator_id AS narratorId, r.seq,
- coalesce(m.role,'assistant') AS role, r.segment_compact_id AS segmentCompactId, octet_length(m.content_json) AS contentBytes,
- octet_length(m.content_json) + coalesce(octet_length(m.content_text),0) + coalesce(octet_length(m.original_content_json),0) AS copyBytes,
+/** Whether bodies are read from block rows (`narrator-bodies.ts`); the database is SQLite. */
+const bodiesFromBlocks = (db: Database) =>
+	hasBlockStorage(db) && (settings.narratorBlocks.read || hasRowsOnlyBodies(db));
+/** Refs with their message's sizes; a body is measured as readers read it. */
+const refSelect = (db: Database) => {
+	const body = bodyLengthSql("m", bodiesFromBlocks(db));
+	return `SELECT r.rowid, r.id AS refId, r.message_id AS id, r.narrator_id AS narratorId, r.seq,
+ coalesce(m.role,'assistant') AS role, r.segment_compact_id AS segmentCompactId, ${body} AS contentBytes,
+ ${body} + coalesce(octet_length(m.content_text),0) + coalesce(octet_length(m.original_content_json),0) AS copyBytes,
  m.tree_hash_after AS treeHashAfter, m.snapshot_commit_sha AS snapshotCommitSha
  FROM narrator_message_refs r LEFT JOIN narrator_messages m ON m.id = r.message_id`;
+};
 const TOOL_SELECT = `SELECT id, narrator_id AS narratorId, message_id AS messageId, tool_use_id AS toolUseId, tool_name AS toolName, status,
  CASE WHEN tool_name = 'GenUI' AND octet_length(input_json) <= 8192
  THEN CASE WHEN json_valid(input_json) THEN CASE WHEN json_extract(input_json, '$.action') = 'show'
@@ -1357,7 +1376,6 @@ function stateRef(state: FileChangeState) {
 type AssociationSpec = readonly [table: string, column: string, index: string, idColumn?: string];
 const MESSAGE_ASSOCIATIONS: readonly AssociationSpec[] = [
 	["narrators", "fork_message_id", "idx_narrators_fork_message"],
-	["chapter_commits", "narrator_message_id", "idx_chapter_commits_narrator_message"],
 	["spec_file_revisions", "source_message_id", "idx_spec_file_revisions_source_message"],
 	["narrator_patches", "message_id", "idx_patches_message"],
 	["api_requests", "message_id", "idx_api_requests_message"],

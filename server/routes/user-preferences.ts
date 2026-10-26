@@ -578,7 +578,7 @@ userPreferencesRoutes.delete("/recent-tabs/:type/:id", async (c) => {
 	const parsed = removeRecentTabSchema.safeParse({
 		type: c.req.param("type"),
 		id: c.req.param("id"),
-		// `?cascade=1` marks entity-teardown cleanups (chapter deleted, narrator archived).
+		// `?cascade=1` marks entity-teardown cleanups (project deleted, narrator archived).
 		cascade: c.req.query("cascade") === "1" ? true : undefined,
 	});
 	if (!parsed.success) throw new ValidationError(parsed.error.message);

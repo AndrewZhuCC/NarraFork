@@ -1,4 +1,4 @@
-import { FORK_WORKTREE_SOURCES, type ForkWorktreeSource } from "@shared/chapter-fork";
+import { FORK_WORKTREE_SOURCES, type ForkWorktreeSource } from "@shared/fork-worktree-source";
 import { formatOriginLabel } from "@shared/message-origin";
 import { z } from "zod/v4";
 import { getVisibleModels } from "../../settings";
@@ -131,10 +131,7 @@ export const forkNarratorTool: ToolDefinition = {
 			// Refuse before creating anything. A forked narrator holds this same tool and
 			// its first message is written by the AI that forked it, so nothing else stops
 			// a chain — every hop starts another independent running loop.
-			const parentDepth = await resolveForkDepth({
-				id: parent.id,
-				chapterId: parent.chapterId ?? null,
-			});
+			const parentDepth = await resolveForkDepth({ id: parent.id });
 			if (exceedsForkDepthLimit(parentDepth)) {
 				return {
 					output: getToolMessageWithParams("forkNarratorDepthExceeded", locale, {
@@ -151,6 +148,7 @@ export const forkNarratorTool: ToolDefinition = {
 				userId: ctx.userId ?? null,
 				model,
 				locale: ctx.locale,
+				callingToolCallId: ctx.toolCallBinding?.toolCallId,
 			});
 			const newNarratorId = newNarrator.id;
 			const newTitle = newNarrator.title ?? title ?? "Forked narrator";
@@ -183,7 +181,6 @@ export const forkNarratorTool: ToolDefinition = {
 				output: getToolMessageWithParams("forkNarratorSuccess", locale, {
 					narratorId: newNarratorId,
 					title: newTitle,
-					chapterInfo: "",
 				}),
 			};
 		} catch (err) {

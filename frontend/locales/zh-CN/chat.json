@@ -48,7 +48,18 @@
 	"attachmentNoLongerAvailable": "附件已在服务器过期，请重新添加",
 	"attachmentPreviewFailed": "无法预览",
 	"attachmentLimitTitle": "附件过多",
+	"messageTooLong": "每条消息最多 {{count}} 个字符",
 	"attachmentLimit": "每条消息最多 {{count}} 个附件",
 	"attachmentForwardFailed": "部分附件未能发送给叙述者",
-	"attachmentDownloadFailed": "下载失败"
+	"attachmentDownloadFailed": "下载失败",
+	"botBadge": "Bot",
+	"botFallbackName": "Bot",
+	"botThinking": "思考中…",
+	"botWaiting": "需要处理——请打开监控界面",
+	"botWaitingReadOnly": "等待处理中",
+	"botWaitingModel": "正在等待模型恢复可用",
+	"botFailed": "bot 运行出错——打开监控查看详情",
+	"botMonitor": "监控",
+	"botReadOnly": "你没有给这个 bot 发消息的权限。",
+	"openBot": "打开 bot"
 }

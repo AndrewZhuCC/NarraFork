@@ -7,7 +7,6 @@
 
 import { db } from "@server/db";
 import {
-	chapters,
 	chatMessages,
 	chatRoomMembers,
 	chatRooms,
@@ -18,6 +17,7 @@ import {
 import { eventBus } from "@server/lib/event-bus";
 import { hotSafe } from "@server/lib/hot-safe";
 import { logger } from "@server/lib/logger";
+import { type ChatRoomKind, isConversationRoomKind } from "@shared/chat-room-kinds";
 import {
 	NOTIFICATION_FANOUT_MAX_RECIPIENTS,
 	NOTIFICATION_PREVIEW_MAX_LENGTH,
@@ -25,8 +25,9 @@ import {
 	type NotificationLink,
 } from "@shared/notification-center";
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
-import { CHAT_MEMBER_FANOUT_LIMIT } from "./chat-service";
+import { botDisplayName, CHAT_MEMBER_FANOUT_LIMIT } from "./chat-service";
 import { canReadNarrator, listNarratorAudience, type NarratorAclRow } from "./narrator-acl";
+import { resolveNarratorProjectId } from "./narrator-project";
 import {
 	type RecordNotificationInput,
 	recordNotifications as recordNotificationsImpl,
@@ -81,24 +82,25 @@ function guard(label: string, run: () => Promise<void>): void {
 	void work.finally(() => pendingFanouts.delete(work));
 }
 
-// ─── Chat DM fan-out ───
+// ─── Chat conversation fan-out ───
 
 export interface ChatMessageFanoutEvent {
 	roomId: string;
 	messageId: string;
 	seq: number;
 	senderUserId: string | null;
-	roomKind?: "dm" | "narrator";
+	roomKind?: ChatRoomKind;
 	narratorId?: string | null;
 }
 
 /**
- * Project a newly posted DM into notification-center rows for eligible members.
+ * Project a newly posted conversation message (a DM, or a bot writing to someone)
+ * into notification-center rows for eligible members.
  *
  * Eligibility (spec §5): member, not the sender, not muted, unread
- * (`seq > lastReadSeq`), and still able to read the room (DM membership is the
- * ACL). Soft-deleted bodies are skipped entirely — an empty-body "notification"
- * is noise. Narrator discussion rooms are out of the Phase-1 DM table.
+ * (`seq > lastReadSeq`), and still able to read the room (membership is the ACL in
+ * both kinds). Soft-deleted bodies are skipped entirely — an empty-body
+ * "notification" is noise. Narrator discussion rooms are out of the Phase-1 table.
  *
  * Unlike WS badges, viewers are NOT excluded: the notification center is an
  * event history, not a live badge.
@@ -112,6 +114,7 @@ export async function fanoutChatMessageNotifications(event: ChatMessageFanoutEve
 			seq: chatMessages.seq,
 			senderUserId: chatMessages.senderUserId,
 			senderGuestName: chatMessages.senderGuestName,
+			senderNarratorId: chatMessages.senderNarratorId,
 			deletedAt: chatMessages.deletedAt,
 			contentText: sql<string>`substr(${chatMessages.contentText}, 1, ${NOTIFICATION_PREVIEW_MAX_LENGTH * 4})`,
 		})
@@ -124,8 +127,8 @@ export async function fanoutChatMessageNotifications(event: ChatMessageFanoutEve
 		where: eq(chatRooms.id, event.roomId),
 		columns: { id: true, kind: true },
 	});
-	if (!room || room.kind !== "dm") return;
-	if (event.roomKind && event.roomKind !== "dm") return;
+	if (!room || !isConversationRoomKind(room.kind)) return;
+	if (event.roomKind && !isConversationRoomKind(event.roomKind)) return;
 
 	const members = await db
 		.select({
@@ -161,6 +164,12 @@ export async function fanoutChatMessageNotifications(event: ChatMessageFanoutEve
 			columns: { username: true },
 		});
 		if (sender?.username) title = sender.username;
+	} else if (message.senderNarratorId) {
+		const bot = await db.query.narrators.findFirst({
+			where: eq(narrators.id, message.senderNarratorId),
+			columns: { id: true, title: true, handle: true },
+		});
+		if (bot) title = botDisplayName(bot);
 	} else if (message.senderGuestName) {
 		title = message.senderGuestName;
 	}
@@ -298,7 +307,6 @@ export async function fanoutPermissionRequestNotifications(
 			writeAudience: true,
 			type: true,
 			aclRootNarratorId: true,
-			chapterId: true,
 			contextProjectId: true,
 		},
 	});
@@ -311,22 +319,13 @@ export async function fanoutPermissionRequestNotifications(
 		writeAudience: narrator.writeAudience,
 		type: narrator.type,
 		aclRootNarratorId: narrator.aclRootNarratorId,
-		chapterId: narrator.chapterId,
 		contextProjectId: narrator.contextProjectId,
 	};
 
 	const recipients = await resolvePermissionRecipients(aclRow);
 	if (recipients.length === 0) return;
 
-	const chapterId: string | null = narrator.chapterId ?? null;
-	let projectId: string | null = narrator.contextProjectId ?? null;
-	if (chapterId) {
-		const chapter = await db.query.chapters.findFirst({
-			where: eq(chapters.id, chapterId),
-			columns: { projectId: true },
-		});
-		projectId = chapter?.projectId ?? null;
-	}
+	const projectId = await resolveNarratorProjectId(narrator);
 
 	// Short summary: prefer a path column; never inputJson/outputJson.
 	const pathHint = toolCall.canonicalFilePath || toolCall.resolvedFilePath || null;
@@ -342,7 +341,6 @@ export async function fanoutPermissionRequestNotifications(
 		preview,
 		link: { type: "narrator" as const, narratorId: event.narratorId },
 		projectId,
-		chapterId,
 		narratorId: event.narratorId,
 	}));
 

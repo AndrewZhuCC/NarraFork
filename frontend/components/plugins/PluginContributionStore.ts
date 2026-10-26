@@ -39,25 +39,24 @@ function readString(value: unknown): string | undefined {
  * Read the surface allowlist from an untrusted snapshot.
  *
  * Unknown names are dropped rather than passed through: the host routes on these values,
- * and an unrecognized surface would silently never match anything anyway. An absent or
- * empty list is reported as `undefined` so callers can distinguish "server said nothing"
- * from "server said no surfaces".
+ * and an unrecognized surface would silently never match anything anyway. An absent list
+ * is reported as `undefined` ("server said nothing"), while a list is kept even when it is
+ * empty ("mounts nowhere") — that is what a view declaring only a surface the host no
+ * longer has arrives as, and it must not be offered on every surface instead.
  */
 const KNOWN_VIEW_SURFACES: readonly PluginViewSurface[] = [
 	"workspace",
 	"director",
 	"focus",
-	"graph",
 	"settings",
 	"provider-settings",
 ];
 
 function readSurfaces(value: unknown): PluginViewSurface[] | undefined {
 	if (!Array.isArray(value)) return undefined;
-	const surfaces = value.filter((item): item is PluginViewSurface =>
+	return value.filter((item): item is PluginViewSurface =>
 		(KNOWN_VIEW_SURFACES as readonly unknown[]).includes(item),
 	);
-	return surfaces.length > 0 ? surfaces : undefined;
 }
 
 function readAvailability(value: unknown): PluginContributionAvailability {

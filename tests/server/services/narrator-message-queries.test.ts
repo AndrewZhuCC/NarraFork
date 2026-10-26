@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
+import { decodeBlockFrame } from "@frontend/lib/block-protocol";
 import { TOOL_IO_BUDGETS } from "@shared/pretext-layout/tool-io-projection";
 import {
 	buildSubagentSummarySqlExpr,
@@ -7,7 +8,6 @@ import {
 } from "@shared/subagent-tool-summary";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import {
-	chapters,
 	narratorBlacklistCmds,
 	narratorBlacklistDirs,
 	narratorMessageRefs,
@@ -56,21 +56,11 @@ function seedBase(narratorId = "n1") {
 			updatedAt: ts(),
 		})
 		.run();
-	db.insert(chapters)
-		.values({
-			id: "ch1",
-			projectId: "p1",
-			title: "Chapter 1",
-			branch: "chapter/ch1",
-			baseBranch: "main",
-			createdAt: ts(),
-			updatedAt: ts(),
-		})
-		.run();
 	db.insert(narrators)
 		.values({
 			id: narratorId,
-			chapterId: "ch1",
+			contextProjectId: "p1",
+			traits: ["standalone"],
 			type: "primary",
 			inheritMode: "fresh",
 			createdAt: ts(),
@@ -203,7 +193,7 @@ function insertSubagentNarrator(params: {
 	db.insert(narrators)
 		.values({
 			id: params.id,
-			chapterId: "ch1",
+			contextProjectId: "p1",
 			type: "subagent",
 			subagentType: params.subagentType ?? "explore",
 			variant: `subagent:${params.subagentType ?? "explore"}`,
@@ -225,7 +215,7 @@ function insertForkNarrator(id = "n2") {
 	db.insert(narrators)
 		.values({
 			id,
-			chapterId: "ch1",
+			contextProjectId: "p1",
 			type: "primary",
 			inheritMode: "full",
 			parentNarratorId: "n1",
@@ -256,8 +246,9 @@ function captureNarratorEvents(narratorId = "n1") {
 			catchingUpNarrators: new Map(),
 			catchUpBuffers: new Map(),
 		},
+		// Frames as the client's listeners see them, decoded from message protocol v2.
 		send(payload: string) {
-			sent.push(JSON.parse(payload) as Record<string, unknown>);
+			sent.push(...decodeBlockFrame(JSON.parse(payload)));
 		},
 	} as never;
 	const connections = getNarratorConnections();
@@ -1914,7 +1905,7 @@ describe("narratorService message query regressions", () => {
 				catchUpBuffers: new Map(),
 			},
 			send(payload: string) {
-				sent.push(JSON.parse(payload) as { type?: string });
+				sent.push(...(decodeBlockFrame(JSON.parse(payload)) as Array<{ type?: string }>));
 			},
 		} as never;
 		const connections = getNarratorConnections();
@@ -1999,7 +1990,7 @@ describe("narratorService message query regressions", () => {
 				catchUpBuffers: new Map(),
 			},
 			send(payload: string) {
-				sent.push(JSON.parse(payload) as { type?: string });
+				sent.push(...(decodeBlockFrame(JSON.parse(payload)) as Array<{ type?: string }>));
 			},
 		} as never;
 		const connections = getNarratorConnections();
@@ -2179,7 +2170,7 @@ describe("narratorService message query regressions", () => {
 		db.insert(narrators)
 			.values({
 				id: "sub1",
-				chapterId: "ch1",
+				contextProjectId: "p1",
 				type: "subagent",
 				subagentType: "general",
 				variant: "subagent:general",
@@ -2261,7 +2252,7 @@ describe("narratorService message query regressions", () => {
 		db.insert(narrators)
 			.values({
 				id: "sub1",
-				chapterId: "ch1",
+				contextProjectId: "p1",
 				type: "subagent",
 				subagentType: "general",
 				variant: "subagent:general",
@@ -2311,7 +2302,7 @@ describe("narratorService message query regressions", () => {
 			.values([
 				{
 					id: "n2",
-					chapterId: "ch1",
+					contextProjectId: "p1",
 					type: "primary",
 					inheritMode: "fresh",
 					createdAt: ts(),
@@ -2319,7 +2310,7 @@ describe("narratorService message query regressions", () => {
 				},
 				{
 					id: "sub-foreign",
-					chapterId: "ch1",
+					contextProjectId: "p1",
 					type: "subagent",
 					subagentType: "general",
 					variant: "subagent:general",
@@ -2404,7 +2395,7 @@ describe("narratorService message query regressions", () => {
 		db.insert(narrators)
 			.values({
 				id: "n2",
-				chapterId: "ch1",
+				contextProjectId: "p1",
 				type: "primary",
 				inheritMode: "full",
 				createdAt: ts(),
@@ -2452,7 +2443,7 @@ describe("narratorService message query regressions", () => {
 		db.insert(narrators)
 			.values({
 				id: "n2",
-				chapterId: "ch1",
+				contextProjectId: "p1",
 				type: "primary",
 				inheritMode: "fresh",
 				createdAt: ts(),
@@ -2666,7 +2657,6 @@ describe("narratorService message query regressions", () => {
 
 		const child = await narratorService.forkNarrator("n1", null, {
 			inheritMode: "fresh",
-			standalone: true,
 		});
 
 		const [whitelistDir, blacklistDir, whitelistCmd, blacklistCmd] = await Promise.all([
@@ -2710,7 +2700,6 @@ describe("narratorService message query regressions", () => {
 		const marker = await seedActiveForkHistory();
 		const child = await narratorService.forkNarrator("n1", null, {
 			inheritMode: "full",
-			standalone: true,
 		});
 
 		const childRefs = await db
@@ -2793,7 +2782,6 @@ describe("narratorService message query regressions", () => {
 		const marker = await seedActiveForkHistory();
 		const child = await narratorService.forkNarrator("n1", null, {
 			inheritMode: "full",
-			standalone: true,
 		});
 
 		await narratorService.finalizeCompactingMessage(marker.id, "n1", "success summary", 12);
@@ -2813,7 +2801,6 @@ describe("narratorService message query regressions", () => {
 		const marker = await seedActiveForkHistory();
 		const child = await narratorService.forkNarrator("n1", null, {
 			inheritMode: "full",
-			standalone: true,
 		});
 
 		await narratorService.finalizeCompactingMessage(marker.id, "n1", "ignored", undefined, {
@@ -2837,7 +2824,6 @@ describe("narratorService message query regressions", () => {
 		const marker = await seedActiveForkHistory();
 		const forkPromise = narratorService.forkNarrator("n1", null, {
 			inheritMode: "full",
-			standalone: true,
 		});
 		const finalizePromise = narratorService.finalizeCompactingMessage(
 			marker.id,
@@ -2904,7 +2890,6 @@ describe("narratorService message query regressions", () => {
 
 		const child = await narratorService.forkNarrator("n1", null, {
 			inheritMode: "full",
-			standalone: true,
 		});
 		const childIds = (await narratorService.getMessages(child.id)).map(
 			(message: { id: string }) => message.id,
@@ -2916,7 +2901,6 @@ describe("narratorService message query regressions", () => {
 
 		const explicitChild = await narratorService.forkNarrator("n1", null, {
 			inheritMode: "full",
-			standalone: true,
 			forkMessageId: failedMarker.id,
 		});
 		const explicitIds = (await narratorService.getMessages(explicitChild.id)).map(
@@ -3196,7 +3180,7 @@ describe("dismissInterruptTaskGuardMessage", () => {
 		db.insert(narrators)
 			.values({
 				id: "n2",
-				chapterId: "ch1",
+				contextProjectId: "p1",
 				type: "primary",
 				inheritMode: "full",
 				createdAt: ts(),
@@ -3267,7 +3251,7 @@ describe("dismissInterruptTaskGuardMessage", () => {
 		db.insert(narrators)
 			.values({
 				id: "n2",
-				chapterId: "ch1",
+				contextProjectId: "p1",
 				type: "primary",
 				inheritMode: "fresh",
 				createdAt: ts(),
@@ -3336,7 +3320,7 @@ describe("dismissSubagentRecoveryMessage", () => {
 		db.insert(narrators)
 			.values({
 				id: "n2",
-				chapterId: "ch1",
+				contextProjectId: "p1",
 				type: "primary",
 				inheritMode: "full",
 				createdAt: ts(),
@@ -3402,7 +3386,7 @@ describe("dismissSubagentRecoveryMessage", () => {
 		db.insert(narrators)
 			.values({
 				id: "n2",
-				chapterId: "ch1",
+				contextProjectId: "p1",
 				type: "primary",
 				inheritMode: "fresh",
 				createdAt: ts(),

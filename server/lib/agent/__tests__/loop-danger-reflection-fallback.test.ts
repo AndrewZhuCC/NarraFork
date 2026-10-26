@@ -24,20 +24,13 @@ const realSessionStateModule = { ...(await import("@server/services/narrator-ses
 
 const provider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		params.onRequestStart?.();
 		const text = replies[requests++];
 		if (text === undefined) throw new Error("Reflection exceeded scripted request budget");
 		yield { text };
-	},
-	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
-	pushUserTurn: (history, content) => {
-		history.push({ role: "user", content });
-	},
-	pushAssistantTurn: (history, text, toolUses) => {
-		history.push({ role: "assistant", content: text, toolUses });
 	},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
@@ -222,7 +215,7 @@ describe("danger reflection text fallback uses an individual valid turn", () => 
 		replies = ["x".repeat(4500), tagged("confirm", "Untruncated second-turn reflection")];
 		const observed = await runReflectionLoop({
 			parentConfig: config(),
-			history: [],
+			rows: [],
 			prompt: "Check the pending danger gate",
 			reflectionLoop: {
 				allowedTools: ["DangerConfirm", "DangerCancel"],
@@ -243,7 +236,7 @@ describe("danger reflection text fallback uses an individual valid turn", () => 
 		replies = [tagged("confirm", "Text must not approve a permission rule")];
 		const observed = await runReflectionLoop({
 			parentConfig: config(),
-			history: [],
+			rows: [],
 			prompt: "Check a permission rule request",
 			maxTurns: 1,
 			reflectionLoop: {

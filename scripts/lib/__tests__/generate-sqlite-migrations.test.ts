@@ -25,7 +25,7 @@ import {
 import {
 	generatedModelHistoryTriggerSuffix,
 	MODEL_HISTORY_REVISION_CONTRACT,
-	renderModelHistoryRevisionSql,
+	modelHistoryRendererFingerprint,
 } from "../generated-model-history-triggers";
 import { modelHistorySnapshots, revisionMigrationSql } from "./model-history-migration-fixture";
 
@@ -175,7 +175,7 @@ test("revision schema and exact trigger suffix share one receipt-bound migration
 	expect(provenance.generated.rawDigest).toBe(digest(revisionMigrationSql));
 	expect(provenance.modelHistoryTriggers).toEqual({
 		contract: MODEL_HISTORY_REVISION_CONTRACT,
-		sqlDigest: digest(renderModelHistoryRevisionSql("sqlite")),
+		sqlDigest: digest(modelHistoryRendererFingerprint("sqlite")),
 	});
 	const tampered = structuredClone(provenance);
 	tampered.modelHistoryTriggers.sqlDigest = "0".repeat(64);

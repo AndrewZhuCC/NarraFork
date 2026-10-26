@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import { FILE_PANEL_PAGE_BYTES, MAX_FILE_PANEL_BYTES } from "@shared/file-reference";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
 import { act, useEffect } from "react";
@@ -39,6 +40,9 @@ const { FilePanelContent } = await import("./FilePanelContent");
 const i18n = i18next.createInstance();
 const globals = new Map<string, PropertyDescriptor | undefined>();
 const storage = new Map<string, string>();
+const client = new QueryClient({
+	defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+});
 let root: Root;
 let host: HTMLDivElement;
 let info: ReturnType<typeof spyOn<typeof fileReferenceApi, "info">>;
@@ -118,11 +122,13 @@ afterEach(async () => {
 async function render(props: Partial<FilePanelContentProps> = {}) {
 	await act(async () => {
 		root.render(
-			<MantineProvider>
-				<I18nextProvider i18n={i18n}>
-					<FilePanelContent filePath="/file.txt" narratorId="source" {...props} />
-				</I18nextProvider>
-			</MantineProvider>,
+			<QueryClientProvider client={client}>
+				<MantineProvider>
+					<I18nextProvider i18n={i18n}>
+						<FilePanelContent filePath="/file.txt" narratorId="source" {...props} />
+					</I18nextProvider>
+				</MantineProvider>
+			</QueryClientProvider>,
 		);
 	});
 }
@@ -151,18 +157,20 @@ test("restoring one thousand retained label descriptors probes metadata only for
 	}));
 	await act(async () =>
 		root.render(
-			<MantineProvider>
-				<I18nextProvider i18n={i18n}>
-					{tabs.map((tab) => (
-						<FilePanelContent
-							key={tab.path}
-							filePath={tab.path}
-							narratorId="source"
-							visible={tab.visible}
-						/>
-					))}
-				</I18nextProvider>
-			</MantineProvider>,
+			<QueryClientProvider client={client}>
+				<MantineProvider>
+					<I18nextProvider i18n={i18n}>
+						{tabs.map((tab) => (
+							<FilePanelContent
+								key={tab.path}
+								filePath={tab.path}
+								narratorId="source"
+								visible={tab.visible}
+							/>
+						))}
+					</I18nextProvider>
+				</MantineProvider>
+			</QueryClientProvider>,
 		),
 	);
 	expect(info).toHaveBeenCalledTimes(2);

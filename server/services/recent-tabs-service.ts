@@ -16,10 +16,9 @@ import {
 	type RecentTabsSection,
 	type RecentTabType,
 } from "@shared/recent-tabs";
-import { and, asc, eq, gt, inArray, isNull, ne, or } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNull, notInArray, or } from "drizzle-orm";
 import { db } from "../db";
 import {
-	chapters,
 	narrators,
 	userPreferences,
 	userRecentTabs,
@@ -246,7 +245,6 @@ function tabSection(type: RecentTabType): RecentTabsSection {
 
 function getTabNarratorId(tab: PersistedRecentTab): string | undefined {
 	if (tab.type === "narrator" || tab.type === "subagent") return tab.id;
-	if (tab.type === "chapter") return tab.narratorId;
 	return undefined;
 }
 
@@ -258,11 +256,10 @@ function normalizeLegacyTab(value: unknown): PersistedRecentTab | null {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
 	const raw = value as Record<string, unknown>;
 	const rawType = raw.type === "session" ? "narrator" : raw.type;
-	// "group" (chat-group) tabs are dropped: the feature was removed, so such a
-	// tab would render without a target route. The enum itself stays so historical
-	// rows still decode; they are filtered out on read (see readRows).
+	// "group" (chat-group) and "chapter" tabs are dropped: both features were removed,
+	// so such a tab would render without a target route. The enum itself stays so
+	// historical rows still decode; they are filtered out on read (see readRows).
 	if (
-		rawType !== "chapter" &&
 		rawType !== "narrator" &&
 		rawType !== "project" &&
 		rawType !== "workspace" &&
@@ -460,12 +457,12 @@ function rowToTab(row: RecentTabRow): PersistedRecentTab {
 }
 
 /**
- * Chat groups were removed, but historical `type = "group"` rows are still in the
- * table (the enum is kept so they decode). They have no route to open, so every
- * read path excludes them at the SQL level — inside the query, so cursor/hasMore
- * math on the paginated path stays consistent.
+ * Chat groups and chapters were removed, but historical `type = "group"` / `"chapter"`
+ * rows are still in the table (the enum is kept so they decode). They have no route to
+ * open, so every read path excludes them at the SQL level — inside the query, so
+ * cursor/hasMore math on the paginated path stays consistent.
  */
-const EXCLUDE_REMOVED_TAB_TYPES = ne(userRecentTabs.type, "group");
+const EXCLUDE_REMOVED_TAB_TYPES = notInArray(userRecentTabs.type, ["group", "chapter"]);
 
 function readRows(userId: string): RecentTabRow[] {
 	return db
@@ -1280,8 +1277,6 @@ export async function removeRecentTab(
 	// it: the panel row is the membership authority, and a closed tab that left
 	// the row behind would linger as a panel in every open view of that
 	// workspace (and be re-synced back by the membership projection).
-	// Chapter tabs carry a workspaceId only because their NARRATOR is a member —
-	// closing one must not evict the narrator's panel.
 	let removedMembership: { workspaceId: string; narratorId: string } | undefined;
 	const result = await mutate(userId, (tabs) => {
 		const key = `${type}:${id}`;
@@ -1295,7 +1290,7 @@ export async function removeRecentTab(
 			tabs.splice(index, 1);
 			if ((type === "narrator" || type === "subagent") && removed.workspaceId) {
 				removedMembership = { workspaceId: removed.workspaceId, narratorId: id };
-				// Release the narrator's OTHER tabs (its chapters) from the group too —
+				// Release the narrator's OTHER tabs from the group too —
 				// `removeWorkspacePanel`'s projection does the same for the reverse
 				// direction, and leaving them grouped would point at a workspace that
 				// no longer contains their narrator.
@@ -1926,14 +1921,14 @@ export async function syncNarratorTitleToRecentTabs(
  * Drop the recent tabs a user may no longer open, after losing access to a project.
  *
  * Recent tabs are persisted server-side, so revoking membership otherwise leaves the
- * removed member staring at tabs for that project's chapters and sessions, each of
+ * removed member staring at tabs for that project's sessions, each of
  * which 404s when clicked. The tab list is the one place where a stale entry survives
  * the authorization change.
  *
  * Deliberately re-checks the ACL per tab instead of matching on `projectId`:
- *   - project tabs carry the id directly, but chapter/narrator/subagent/group tabs do
- *     not, and reimplementing that resolution here would duplicate the ancestor chain;
- *   - a user removed from a project may still legitimately reach a chapter inside it
+ *   - project tabs carry the id directly, but narrator/subagent tabs do not, and
+ *     reimplementing that resolution here would duplicate the ancestor chain;
+ *   - a user removed from a project may still legitimately reach a session inside it
  *     (an explicit narrator grant, or a public project), and matching on the id alone
  *     would wrongly delete tabs that still work.
  *
@@ -1970,16 +1965,10 @@ export async function pruneUnreadableProjectTabs(userId: string, projectId: stri
 		let owningProject: string | null = null;
 		if (tab.type === "project") {
 			owningProject = tab.id;
-		} else if (tab.type === "chapter") {
-			const chapter = await db.query.chapters.findFirst({
-				where: eq(chapters.id, tab.id),
-				columns: { projectId: true },
-			});
-			owningProject = chapter?.projectId ?? null;
 		} else if (tab.type === "narrator" || tab.type === "subagent") {
 			const narrator = await db.query.narrators.findFirst({
 				where: eq(narrators.id, tab.id),
-				columns: { chapterId: true, contextProjectId: true },
+				columns: { id: true, contextProjectId: true },
 			});
 			owningProject = narrator ? await resolveNarratorProjectId(narrator) : null;
 		}
@@ -1993,7 +1982,7 @@ export async function pruneUnreadableProjectTabs(userId: string, projectId: stri
 
 /** Remove an entity only from users selected by the authoritative membership index. */
 export async function removeTabFromAllUsers(
-	tabType: "chapter" | "narrator" | "project",
+	tabType: "narrator" | "project",
 	tabId: string,
 ): Promise<void> {
 	for (const userId of await getRecentTabUserIds(tabType, tabId)) {

@@ -1,5 +1,6 @@
 import { count, inArray } from "drizzle-orm";
-import { chapters, narratorMessages, narrators, projects } from "../../../server/db/schema";
+import { narratorMessages, narrators, projects } from "../../../server/db/schema";
+import { narratorProjectIdText } from "../../../server/services/read/acl-sql";
 import { getTestDb } from "../../setup";
 
 type BenchFn = () => unknown | Promise<unknown>;
@@ -94,21 +95,10 @@ function seedMessages(db: ReturnType<typeof getTestDb>["db"]) {
 			updatedAt: NOW,
 		})
 		.run();
-	db.insert(chapters)
-		.values({
-			id: "bench-chapter",
-			projectId: "bench-project",
-			title: "Bench Chapter",
-			branch: "chapter/bench",
-			baseBranch: "main",
-			createdAt: NOW,
-			updatedAt: NOW,
-		})
-		.run();
 	db.insert(narrators)
 		.values({
 			id: "bench-search-narrator",
-			chapterId: "bench-chapter",
+			contextProjectId: "bench-project",
 			status: "idle",
 			type: "primary",
 			variant: "primary",
@@ -164,26 +154,22 @@ async function main() {
 
 		const legacyMessageSearch = sqlite.prepare(
 			`SELECT m.id, m.narrator_id, m.content_text, m.role as message_role, m.created_at,
-			  n.chapter_id, n.title as narrator_title, n.model,
-			  c.title as chapter_title, p.name as project_name,
+			  n.title as narrator_title, n.model, p.name as project_name,
 			  substr(m.content_text, 1, 240) as snippet
 			 FROM narrator_messages m
 			 JOIN narrators n ON n.id = m.narrator_id
-			 LEFT JOIN chapters c ON c.id = n.chapter_id
-			 LEFT JOIN projects p ON p.id = c.project_id
+			 LEFT JOIN projects p ON p.id = ${narratorProjectIdText("n")}
 			 WHERE m.content_text LIKE ?
 			 LIMIT ?`,
 		);
 		const previewMessageSearch = sqlite.prepare(
 			`SELECT m.id, m.narrator_id, substr(m.content_text, 1, 240) as content_preview,
 			  m.role as message_role, m.created_at,
-			  n.chapter_id, n.title as narrator_title, n.model,
-			  c.title as chapter_title, p.name as project_name,
+			  n.title as narrator_title, n.model, p.name as project_name,
 			  substr(m.content_text, 1, 240) as snippet
 			 FROM narrator_messages m
 			 JOIN narrators n ON n.id = m.narrator_id
-			 LEFT JOIN chapters c ON c.id = n.chapter_id
-			 LEFT JOIN projects p ON p.id = c.project_id
+			 LEFT JOIN projects p ON p.id = ${narratorProjectIdText("n")}
 			 WHERE m.content_text LIKE ?
 			 LIMIT ?`,
 		);

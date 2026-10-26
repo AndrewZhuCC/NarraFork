@@ -76,7 +76,6 @@ async function buildAnthropicHistoryForTest(rows: unknown[]) {
 				model: string,
 			) => Promise<{
 				history: unknown[];
-				trailingToolResults: unknown[];
 				trailingUserText?: string;
 			}>;
 		}

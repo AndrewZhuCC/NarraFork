@@ -73,11 +73,9 @@
  *   - generated code (`server/generated/`) — build output. `embedded-changelog.ts` embeds
  *     release notes that literally quote "bun:sqlite" in prose, which is a pure false positive.
  *
- * The PROJECT DATABASE is exempt by a different mechanism: it stays SQLite permanently, so its
- * files are registered like any other, with `sqliteOnly: true` (see `SQLITE_ONLY_MODULES`).
- * That is a claim the guard checks rather than a hole in the scan — and the distinction is
- * load-bearing: `<gitPath>/.narrafork/project.db` is a portable artifact users copy between
- * machines, so it is not migrating anywhere regardless of what the main database does.
+ * Modules that stay SQLite permanently are exempt by a different mechanism: they are
+ * registered like any other and additionally listed in `SQLITE_ONLY_MODULES`. That is a
+ * claim the guard checks rather than a hole in the scan.
  */
 
 import { describe, expect, it } from "bun:test";
@@ -357,44 +355,23 @@ const CAPABILITY_IDS: ReadonlySet<string> = new Set(CAPABILITIES.map((c) => c.id
  *
  * THE TEST FOR MEMBERSHIP: does a second backend REPLACE this file, or never call it at all?
  * ------------------------------------------------------------------------------------------
- * Three shapes are registered here, and they are not the same shape as a port adapter:
+ Two shapes are registered here, and they are not the same shape as a port adapter:
  *
- *   1. the PORTABLE ARCHIVE — `<gitPath>/.narrafork/project.db` and everything that opens it.
- *      Portability is the feature, so the file is SQLite regardless of what the main database
- *      becomes. A second backend still reads and writes these archives, through this same code.
- *   2. the SQLITE ENGINE ITSELF — the connection, migration replay, column patching, FTS5
+ *   1. the SQLITE ENGINE ITSELF — the connection, migration replay, column patching, FTS5
  *      setup, WAL/`.recover` repair, and the lifecycle/maintenance adapters that orchestrate
  *      them. A server-managed engine has no local file to `.recover`, no `application_id` to
  *      stamp and no `VACUUM`, so it answers `notApplicable` (see `backend/capability.ts`)
  *      rather than reimplementing any of it.
- *   3. LEGACY SQLITE DATA REPAIR — statements that exist only because SQLite files written by
+ *   2. LEGACY SQLITE DATA REPAIR — statements that exist only because SQLite files written by
  *      older builds are still in the field.
  *
  * What is deliberately NOT here: a MAIN-DATABASE adapter behind a port
- * (`services/search/sqlite-store.ts`, `services/project-archive/sqlite-main-store.ts`). Those
- * are registered like any other pending work, because a second backend supplies its own
+ * (`services/search/sqlite-store.ts`). Those are registered like any other pending work, because a second backend supplies its own
  * implementation of the same contract and the SQLite one stops being the answer. Marking them
  * as "staying" would say the port has nothing left to do, which is the opposite of true. The
  * last-but-one test in this file pins both directions of that distinction by name.
  */
 const SQLITE_ONLY_MODULES: ReadonlyMap<string, string> = new Map([
-	[
-		"server/lib/project-db.ts",
-		"per-project `<gitPath>/.narrafork/project.db` — a portable file users copy between machines",
-	],
-	["server/services/project-db-sync.ts", "writes the per-project SQLite file"],
-	[
-		"server/services/project-archive/archive-file.ts",
-		"opens a portable `project.db` archive read-only; the archive is SQLite whatever the main database is",
-	],
-	[
-		"server/services/project-archive/archive-writer.ts",
-		"prepares the `INSERT OR REPLACE` statements that write into a portable archive file",
-	],
-	[
-		"server/services/project-archive/export-rows.ts",
-		"drives the archive-side (SQLite) writer while reading the main database through the port",
-	],
 	[
 		"server/db/connection.ts",
 		"the SQLite connection chokepoint itself (PRAGMA set + real-database test guard)",
@@ -408,6 +385,10 @@ const SQLITE_ONLY_MODULES: ReadonlyMap<string, string> = new Map([
 		"the SQLite maintenance adapter: `PRAGMA wal_checkpoint`/`optimize`, freelist pages, `VACUUM`, `SQLITE_BUSY` classification — none of which a server-managed engine exposes",
 	],
 	["server/db/run-migrations.ts", "applies the SQLite migration SQL in `drizzle/`"],
+	[
+		"server/db/legacy-request-storage.ts",
+		"finishes SQLite migration 0207's deferred column drops and clears its retained dumps",
+	],
 	["server/db/migrate.ts", "the `bun run db:migrate` entry point: opens the file and applies SQL"],
 	["server/db/ensure-columns.ts", "patches columns on SQLite databases from older versions"],
 	[
@@ -471,6 +452,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/db/integrity-probe-worker.ts": ["driver", "pragma"],
 	"server/db/migrate-narrator-drafts.ts": ["driver"],
 	"server/db/migrate.ts": ["connectionModule"],
+	// Deferred half of SQLite migration 0207; rowid batches clear dumps in one ordered pass.
+	"server/db/legacy-request-storage.ts": ["driver", "pragma", "sqliteCatalog", "rowid"],
 	"server/db/run-migrations.ts": [
 		"driver",
 		"pragma",
@@ -495,7 +478,6 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/lib/db-worker/select-rows.ts": ["driver"],
 	"server/db/worker-read.ts": ["driver", "drizzleDialect"],
 	"server/services/search/sqlite-worker-runner.ts": ["connectionModule"],
-	"server/lib/project-db.ts": ["driver", "pragma"],
 	"server/lib/runtime-source.ts": ["json1"],
 	"server/routes/storage.ts": ["vacuum"],
 	"server/routes/user-preferences.ts": ["handle"],
@@ -503,6 +485,9 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// History/display ports also have PG implementations. Register the SQLite branches
 	// and Database types without claiming these main-database modules are SQLite-only.
 	"server/services/agent-runtime/model-history-revision.ts": ["driver", "sqliteCatalog"],
+	// The trigger renderer emits both dialects; these are its SQLite branch (tool-block phase
+	// and sync-queue triggers). The PG branch spells them `::jsonb` and `ON CONFLICT`.
+	"server/services/agent-runtime/model-history-revision-sql.ts": ["json1", "insertOr"],
 	"server/services/agent-runtime/model-history-source.ts": ["driver"],
 	"server/services/agent-runtime/model-history-query.ts": ["driver"],
 	"server/services/agent-runtime/model-history-worker.ts": ["driver", "pragma"],
@@ -545,7 +530,51 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/integration-authority-service.ts": ["errorCode"],
 	"server/services/narrator-messages.ts": ["handle", "json1", "glob"],
 	"server/services/narrator-panel-state.ts": ["json1"],
-	"server/services/narrator-persistence.ts": ["handle", "rowid", "indexHint", "json1"],
+	"server/services/narrator-persistence.ts": ["handle", "rowid", "indexHint"],
+	// Block storage is SQLite-only in P1 (PG envelopes stay legacy-format).
+	// The broken-call flag of a tool result is read in SQL so the result itself is not.
+	"server/services/narrator-block-sync.ts": [
+		"handle",
+		"sqliteCatalog",
+		"insertOr",
+		"rowid",
+		"json1",
+	],
+	// The block index job is SQLite-only like block storage: worker reads, rowid writes.
+	"server/services/narrator-block-index.ts": [
+		"handle",
+		"connectionModule",
+		"sqliteCatalog",
+		"rowid",
+	],
+	"server/services/narrator-epochs.ts": ["handle", "json1"],
+	// The block backfill is SQLite-only like block storage: rowid cursor, worker reads.
+	"server/services/narrator-block-backfill.ts": [
+		"handle",
+		"connectionModule",
+		"sqliteCatalog",
+		"rowid",
+		"insertOr",
+		"indexHint",
+	],
+	// Its reindex reads which blocks the block index already has, by rowid.
+	"server/lib/db-worker/block-backfill-query.ts": ["driver", "rowid", "sqliteCatalog", "fts5"],
+	// Operations addressed by block id resolve to element ranges from block rows.
+	"server/services/narrator-block-targets.ts": ["handle", "json1"],
+	// Message protocol v2 (§8): a page's envelopes read their block rows' layouts.
+	"server/services/narrator-block-page.ts": ["handle", "json1"],
+	// Scans that find envelopes through block rows (SQLite-only, like block storage).
+	"server/services/narrator-block-scans.ts": ["handle", "indexHint"],
+	// Main-thread Drizzle readers' bodies from block rows (SQLite-only, like block storage).
+	"server/services/narrator-body-reads.ts": ["handle", "json1"],
+	// The central body reader: selects block-format bodies and assembles them from rows.
+	"server/lib/narrator-bodies.ts": ["driver", "sqliteCatalog"],
+	// Readers that assemble block-format bodies from their rows (SQLite-only, like block
+	// storage): exports, the session interchange, and the body length they measure in SQL.
+	"server/lib/narrator-body-length.ts": ["json1"],
+	"server/services/narrator-export.ts": ["handle"],
+	"server/services/session-interchange/export.ts": ["handle"],
+	"server/services/narrator-turns.ts": ["handle", "sqliteCatalog"],
 	"server/services/narrator-refs-backfill.ts": ["blobFn"],
 	"server/services/narrator-service.ts": ["blobFn"],
 	"server/services/narrator-session.ts": ["handle", "rowid"],
@@ -554,18 +583,6 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/notification-center-service.ts": ["sessionFn"],
 	"server/services/oauth-grant-service.ts": ["errorCode"],
 	"server/services/parent-injection-queue.ts": ["json1"],
-	// The archive seam. Three files below are SQLite-only (the portable FILE), one is not:
-	// `sqlite-main-store.ts` is the MAIN database behind `ProjectArchiveMainStore`, so a second
-	// backend replaces it. `store.ts` — the module that picks the implementation — has no
-	// capability of its own and correctly does not appear here.
-	"server/services/project-archive/archive-file.ts": ["driver", "pragma"],
-	"server/services/project-archive/archive-writer.ts": ["driver", "pragma", "insertOr"],
-	"server/services/project-archive/export-rows.ts": ["driver"],
-	"server/services/project-archive/sqlite-main-store.ts": ["insertOr"],
-	"server/services/project-archive/worker-sqlite-store.ts": ["driver", "pragma"],
-	// `insertOr` left for `project-archive/archive-writer.ts`; the export's own SQLite reads and
-	// PRAGMA work on the portable file stay.
-	"server/services/project-db-sync.ts": ["driver", "connectionModule", "pragma", "json1"],
 	"server/services/revert-history-commit.ts": [
 		"driver",
 		"nativeClient",
@@ -584,7 +601,6 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"pragma",
 		"json1",
 	],
-	"server/services/revert-planner-local-access.ts": ["json1"],
 	"server/services/revert-planner-service.ts": ["nativeClient"],
 	"server/services/revert-selection-service.ts": [
 		"driver",
@@ -614,17 +630,12 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/tool-continuation-service.ts": ["json1"],
 	"server/services/tool-edit-preview.ts": ["json1"],
 	"server/services/usage-history-service.ts": ["connectionModule"],
-	"server/services/workspace-execution-owner.ts": ["nativeClient", "drizzleDialect"],
-	"server/services/workspace-metadata-retry.ts": ["errorCode"],
-	"server/services/workspace-modification-view.ts": ["rowid"],
+	"server/services/workspace-modification-view.ts": ["json1", "rowid"],
 	// New main-database read/write surfaces remain migration inventory, NOT permanent
-	// SQLite-only exemptions. Mixed archive workers also support PG main stores; only
-	// their portable archive file uses SQLite. Fixture detach uses a private memory DB,
-	// not the main database, but stays explicitly registered rather than widening the scan.
+	// SQLite-only exemptions.
 	"server/lib/disk-safety.ts": ["driver", "errorCode"],
 	"server/services/context-composition-history.ts": ["driver"],
 	"server/services/file-change-diagnostics.ts": ["errorCode"],
-	"server/services/local-session-detach/store.ts": ["driver"],
 	"server/services/narrator-context-composition.ts": ["driver", "handle"],
 	"server/services/narrator-permission.ts": ["json1"],
 	"server/services/narrator-question-history.ts": [
@@ -634,16 +645,7 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"indexHint",
 	],
 	"server/services/narrator-question-service.ts": ["rowid", "json1"],
-	"server/services/project-archive/legacy-import-worker.ts": [
-		"driver",
-		"connectionModule",
-		"pragma",
-		"sqliteCatalog",
-	],
-	"server/services/project-archive/legacy-sync-worker.ts": ["driver", "pragma", "insertOr"],
-	"server/services/project-import.ts": ["connectionModule"],
 	"server/services/tool-input-stream-source.ts": ["driver", "pragma"],
-	"server/services/worktree-lifecycle-guard.ts": ["json1"],
 	"server/services/worktree-resource-metadata-store.ts": ["drizzleDialect"],
 	"shared/subagent-tool-summary.ts": ["json1"],
 };
@@ -1270,19 +1272,6 @@ describe("SQLite dialect inventory guard", () => {
 			expect(registered).toContain(file);
 		}
 
-		// The portable archive is permanently SQLite — a file users copy between machines. Its
-		// modules must be marked as such rather than read as pending work. A second backend
-		// still reads and writes these archives through this same code.
-		for (const file of [
-			"server/lib/project-db.ts",
-			"server/services/project-db-sync.ts",
-			"server/services/project-archive/archive-file.ts",
-			"server/services/project-archive/archive-writer.ts",
-			"server/services/project-archive/export-rows.ts",
-		]) {
-			expect(SQLITE_ONLY_MODULES.has(file), `${file} writes/reads the portable archive`).toBe(true);
-		}
-
 		// The SQLite engine adapters behind `server/db/backend/`. A server-managed engine has no
 		// local file to `.recover` and no `VACUUM`; it answers `notApplicable` rather than
 		// inheriting a stub, so these are the floor and not migration work.
@@ -1291,20 +1280,15 @@ describe("SQLite dialect inventory guard", () => {
 	});
 
 	it("main-database port adapters are pending work, not the SQLite floor", () => {
-		// The other half of the distinction above, and the one that decays silently. These two
+		// The other half of the distinction above, and the one that decays silently. These
 		// files are SQLite implementations of a port whose whole purpose is that a second backend
 		// supplies a DIFFERENT implementation of the same contract. Marking them SQLite-only
-		// would read as "the port has nothing left to do", which is exactly backwards — and the
-		// mistake is easy to make, because they sit in the same directories as files that ARE the
-		// floor (`sqlite-main-store.ts` next to `archive-file.ts`).
+		// would read as "the port has nothing left to do", which is exactly backwards.
 		//
 		// The test is on the SQLITE_ONLY_MODULES membership rather than on the capability lists,
 		// because the capabilities will legitimately change as the port matures while the
 		// classification must not.
-		for (const file of [
-			"server/services/search/sqlite-store.ts",
-			"server/services/project-archive/sqlite-main-store.ts",
-		]) {
+		for (const file of ["server/services/search/sqlite-store.ts"]) {
 			expect(DIALECT_INVENTORY[file], `${file} must be registered`).toBeDefined();
 			expect(
 				SQLITE_ONLY_MODULES.has(file),

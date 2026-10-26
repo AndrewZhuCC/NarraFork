@@ -23,13 +23,6 @@ import { editorDocumentApi } from "../../../lib/api/editor-documents";
 import { fileReferenceApi } from "../../../lib/api/file-references";
 import * as fileDownload from "../../../lib/file-download";
 import en from "../../../locales/en/narrator.json";
-import { createDetachedPanelDockValue } from "../../graph/dock/detached-panel-context";
-import {
-	makePanelEntry,
-	parseDetachedNodes,
-	serializeDetachedNodes,
-} from "../../graph/dock/detached-panels";
-import { readPanelSubject } from "../../graph/dock/tab-detach";
 import {
 	FileReferenceScopeProvider,
 	type FileReferenceScopeValue,
@@ -393,6 +386,14 @@ test("Tab quotes only a live saved source selection and leaves ordinary editor k
 		expectedHash: source.hash,
 	});
 	expect(currentSelection()).toBeNull();
+	expect(model.selected).toEqual({
+		startLineNumber: selection.endLineNumber,
+		startColumn: selection.endColumn,
+		endLineNumber: selection.endLineNumber,
+		endColumn: selection.endColumn,
+	});
+	expect((await pressTab()).defaultPrevented).toBe(false);
+	expect(addReference).toHaveBeenCalledTimes(1);
 	await act(async () => model.edit("unsaved source"));
 	await act(async () => model.select(selection));
 	expect((await pressTab()).defaultPrevented).toBe(false);
@@ -831,7 +832,7 @@ test("old narrator publication cannot update or clear the new narrator's selecti
 });
 
 for (const surface of ["focus", "workspace"] as const)
-	for (const lifecycle of ["live", "restored", "detached"] as const)
+	for (const lifecycle of ["live", "restored"] as const)
 		test(`${surface} ${lifecycle} child file reads/writes as child while publishing selection to host`, async () => {
 			const filePath = "/work/b/a.txt";
 			create.mockImplementation(async (narratorId, input) => {
@@ -928,18 +929,6 @@ for (const surface of ["focus", "workspace"] as const)
 						(surface === "focus" ? stripIdentityFromLayout : stripNavigationFromLayout)(layout),
 					),
 				).panels.file.params;
-			} else if (lifecycle === "detached") {
-				const subject = readPanelSubject(params);
-				if (!subject?.resourceId) throw new Error("Missing drag resource");
-				const entry = makePanelEntry("file", subject.resourceId);
-				const nodes = parseDetachedNodes(
-					serializeDetachedNodes([
-						{ id: "detached", x: 0, y: 0, w: 480, h: 360, pendingPanels: [entry] },
-					]),
-				);
-				const restored = nodes[0]?.pendingPanels?.[0];
-				if (!restored?.filePath) throw new Error("Missing detached file");
-				params = { ...restored, panelType: "file", filePath: restored.filePath };
 			}
 			const hostSelections = mock((_next: FileReferenceEditorSelection | null) => {});
 			const addReference = mock((_reference: unknown) => {});
@@ -949,15 +938,7 @@ for (const surface of ["focus", "workspace"] as const)
 				setFileReferenceSelection: hostSelections,
 				addFileReference: addReference,
 			} as unknown as NarratorDockContextValue;
-			const dock =
-				lifecycle === "detached"
-					? createDetachedPanelDockValue({
-							narratorId: "parent",
-							chapterId: "chapter",
-							sourceDock: hostDock,
-							apiRef,
-						})
-					: hostDock;
+			const dock = hostDock;
 			const props = {
 				params,
 				api: {

@@ -99,6 +99,14 @@ export class TestEditorModel {
 	textFocused = true;
 	hasTextFocus = () => this.textFocused;
 	getSelection = () => this.selected;
+	setPosition = ({ lineNumber, column }: { lineNumber: number; column: number }) => {
+		this.select({
+			startLineNumber: lineNumber,
+			startColumn: column,
+			endLineNumber: lineNumber,
+			endColumn: column,
+		});
+	};
 	focus = () => {};
 	getEditor = () => this as unknown as editor.IStandaloneCodeEditor;
 }

@@ -119,7 +119,7 @@ export function resolveRenderExtra(spec: {
 			// Height-neutral: the header row is a fixed single line either way.
 			if ("speakerId" in data) extra.speakerId = data.speakerId;
 			// Where the speaker row navigates to (a child session, a knowledge entry, a
-			// Dynamic Spec file, a chapter). ONE tagged value rather than a field per kind,
+			// Dynamic Spec file). ONE tagged value rather than a field per kind,
 			// so the destinations stay mutually exclusive — see `injection-target.ts`.
 			// Kept separate from `speakerId`, which is the identicon seed and is set even
 			// for speakers with nowhere to go. Height-neutral: the header row is one fixed
@@ -428,11 +428,10 @@ export function renderElement(
 			return (
 				<RenderReviewCard
 					measured={m as never}
-					// Header chrome (verdict badge / revision marker / action label) is
-					// height-neutral: the measure pass reserved a constant header row, so this
-					// only decides what is painted in it.
+					// Header chrome (verdict badge / revision marker) is height-neutral: the
+					// measure pass reserved a constant header row, so this only decides what
+					// is painted in it.
 					data={extra.data as never}
-					actions={extra.reviewFeedbackActions as never}
 					truncatedLabel={extra.truncatedLabel as string | undefined}
 				/>
 			);
@@ -444,6 +443,7 @@ export function renderElement(
 					labels={extra.labels as never}
 					pending={extra.askInPassingPending as AskInPassingPendingInteraction | undefined}
 					onOpen={extra.onOpenAskInPassingTarget as (() => void) | undefined}
+					quote={(extra.data as { quoteText?: string } | undefined)?.quoteText}
 				/>
 			);
 		case "subagent-recovery":

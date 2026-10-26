@@ -184,6 +184,7 @@ drizzle-postgres/meta/_generation_pending.json
 !scripts/smoke-file-navigation-fixture.tsx
 !scripts/smoke-editor-real-io-fixture.tsx
 !scripts/smoke-editor-raw-fixture.tsx
+!scripts/smoke-editor-query-client.ts
 !scripts/build-editor-test-helper.ts
 !scripts/smoke-editor-windows-native.ts
 .tmp-narrafork-home.*

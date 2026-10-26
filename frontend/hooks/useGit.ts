@@ -330,7 +330,6 @@ export function gitWorkspaceTarget(narratorId: string, workspace?: GitWorkspace)
 		repositoryKey: workspace.repositoryKey,
 		canWrite: workspace.capabilities.write,
 		rootPath: workspace.rootPath,
-		chapterId: workspace.chapterId,
 	};
 }
 
@@ -353,7 +352,6 @@ function workspaceSubscriptions(qc: QueryClient) {
 	let subscriptions = gitWorkspaceSubscriptions.get(qc);
 	if (!subscriptions) {
 		subscriptions = new GitWorkspaceSubscriptions(qc, narratorWSManager, undefined, (target) => {
-			if (typeof target === "string") return;
 			blockGitSummary(qc, target.narratorId);
 			void qc.cancelQueries({ queryKey: ["gitWorkspace", target.narratorId] });
 			qc.setQueriesData<GitWorkspace>(
@@ -375,17 +373,13 @@ export function useGitWorkspaceSubscription(
 	view: GitWorkspaceView = "details",
 ) {
 	const subscriptions = workspaceSubscriptions(useQueryClient());
-	const chapterId = typeof target === "string" ? target : target?.chapterId;
-	const narratorId = typeof target === "string" ? undefined : target?.narratorId;
+	const narratorId = target?.narratorId;
 	const workspaceKey = gitTargetKey(target);
 	useSyncExternalStore(subscriptions.watch, subscriptions.getRevision, subscriptions.getRevision);
 	useEffect(() => {
-		if (!workspaceKey) return;
-		return subscriptions.subscribe(
-			narratorId ? { narratorId, workspaceKey, chapterId, canWrite: false } : workspaceKey,
-			view,
-		);
-	}, [subscriptions, chapterId, narratorId, workspaceKey, view]);
+		if (!workspaceKey || !narratorId) return;
+		return subscriptions.subscribe({ narratorId, workspaceKey, canWrite: false }, view);
+	}, [subscriptions, narratorId, workspaceKey, view]);
 	return subscriptions;
 }
 
@@ -557,7 +551,6 @@ async function readWorkspace<T>(
 			failure?.data?.code === "GIT_LINE_STATS_UNSUPPORTED";
 		if (
 			target &&
-			typeof target !== "string" &&
 			!unsupportedOperation &&
 			([401, 403, 409].includes(failure?.status) || (reprobeUnavailable && failure?.status === 503))
 		) {
@@ -853,23 +846,10 @@ export function invalidateWorkspaceQueries(
 	const workspaces = qc
 		.getQueriesData<GitWorkspace>({ queryKey: ["gitWorkspace"] })
 		.map(([, workspace]) => workspace);
-	const chapterId = typeof target === "string" ? target : target.chapterId;
-	const repositoryKey =
-		typeof target === "string"
-			? workspaces.find((workspace) => workspace?.chapterId === target)?.repositoryKey
-			: target.repositoryKey;
-	if (chapterId) {
-		keys.add(chapterId);
-		qc.invalidateQueries({ queryKey: ["chapterGitStatus", chapterId] });
-	}
+	const repositoryKey = target.repositoryKey;
 	for (const workspace of workspaces) {
-		if (
-			workspace?.workspaceKey &&
-			((repositoryKey && workspace.repositoryKey === repositoryKey) ||
-				(chapterId && workspace.chapterId === chapterId))
-		) {
+		if (workspace?.workspaceKey && repositoryKey && workspace.repositoryKey === repositoryKey) {
 			keys.add(workspace.workspaceKey);
-			if (workspace.chapterId) keys.add(workspace.chapterId);
 		}
 	}
 	for (const key of keys) {
@@ -883,8 +863,7 @@ export function invalidateWorkspaceQueries(
 		}
 	}
 	// Re-probe after success AND failure: remote writes may have completed before disconnecting.
-	if (typeof target !== "string")
-		qc.invalidateQueries({ queryKey: ["gitWorkspace", target.narratorId] });
+	qc.invalidateQueries({ queryKey: ["gitWorkspace", target.narratorId] });
 }
 
 /**
@@ -897,15 +876,12 @@ export function invalidateWorkspaceQueries(
 export function invalidateGitStatusPushQueries(
 	qc: ReturnType<typeof useQueryClient>,
 	narratorId: string,
-	chapterId: string | null,
 ): void {
 	const keys = new Set<string>();
-	if (chapterId) keys.add(chapterId);
 	for (const [, workspace] of qc.getQueriesData<GitWorkspace>({
 		queryKey: ["gitWorkspace", narratorId],
 	})) {
 		if (workspace?.workspaceKey) keys.add(workspace.workspaceKey);
-		if (workspace?.chapterId) keys.add(workspace.chapterId);
 	}
 	for (const key of keys) {
 		for (const prefix of GIT_LIVE_FACT_QUERIES) {
@@ -1037,7 +1013,6 @@ export function useGitBadgeRefresh() {
 					queryKey: [prefix],
 					predicate: (query) => !gitWorkspaceSubscriptions.get(qc)?.owns(String(query.queryKey[1])),
 				});
-			void qc.invalidateQueries({ queryKey: ["chapterGitStatus"] });
 		};
 		const unobserve = observePageLifecycle({ onForeground: refresh });
 		const offConnection = narratorWSManager.onConnectionChange((connected, isReconnect) => {
@@ -1050,10 +1025,19 @@ export function useGitBadgeRefresh() {
 	}, [qc]);
 }
 
-export function useGitModifications(target: GitTarget | undefined | null) {
+/** Git change events invalidate this sooner; the window only absorbs repeated hovers. */
+const GIT_FILE_ATTRIBUTION_STALE_MS = 10_000;
+
+/**
+ * One file's attribution, read only while its hover card is open. Mount it inside the
+ * open card: unmounting the last observer aborts the request through `signal`, without
+ * cancelling another open card that shares the key (index and worktree rows do).
+ * A failure stays local to the card: 503 does not re-probe the whole workspace.
+ */
+export function useGitFileModifications(target: GitTarget | undefined | null, filePath: string) {
 	const qc = useQueryClient();
 	return useQuery<WorkspaceModificationView>({
-		queryKey: ["gitModifications", gitTargetKey(target), "uncommitted"],
+		queryKey: ["gitModifications", gitTargetKey(target), "uncommitted", "byFile", filePath],
 		queryFn: ({ signal }) =>
 			readWorkspace(
 				qc,
@@ -1061,15 +1045,14 @@ export function useGitModifications(target: GitTarget | undefined | null) {
 				() =>
 					api.getGitModifications(
 						target as GitTarget,
-						{
-							scope: "uncommitted",
-							projection: "byFile",
-						},
+						{ scope: "uncommitted", projection: "byFile", filePath },
 						signal,
 					) as Promise<WorkspaceModificationView>,
+				false,
 			),
 		enabled: !!target,
 		retry: false,
+		staleTime: GIT_FILE_ATTRIBUTION_STALE_MS,
 		gcTime: GIT_QUERY_GC_TIME_MS,
 	});
 }
@@ -1122,7 +1105,7 @@ export function useGitDiff(
 }
 
 // Commit objects are immutable, but the route granting access is not. Keep the
-// workspace prefix for invalidation, and scope previews to their narrator/chapter.
+// workspace prefix for invalidation, and scope previews to their narrator.
 export function useGitCommitDetail(target: GitTarget | undefined | null, sha: string | null) {
 	const qc = useQueryClient();
 	return useQuery<GitCommitDetail>({
@@ -1165,14 +1148,13 @@ export function useGitCommitDiff(
 	});
 }
 
-function useGitMutation<T, R>(target: GitTarget, run: (value: T) => Promise<R>, graph = false) {
+function useGitMutation<T, R>(target: GitTarget, run: (value: T) => Promise<R>) {
 	const qc = useQueryClient();
 	return useMutation({
 		mutationFn: run,
 		retry: false,
 		onSettled: () => {
 			invalidateWorkspaceQueries(qc, target, false);
-			if (graph) qc.invalidateQueries({ queryKey: ["narraFlow"] });
 		},
 	});
 }
@@ -1188,7 +1170,7 @@ export function useGitUnstage(target: GitTarget) {
 	);
 }
 export function useGitCommit(target: GitTarget) {
-	return useGitMutation(target, (message: string) => api.gitCommit(target, message), true);
+	return useGitMutation(target, (message: string) => api.gitCommit(target, message));
 }
 export function useGitDiscard(target: GitTarget) {
 	return useGitMutation(target, (body: { files?: string[]; all?: boolean }) =>
@@ -1201,11 +1183,8 @@ export function useGitStash(target: GitTarget) {
 	);
 }
 export function useGitReset(target: GitTarget) {
-	return useGitMutation(
-		target,
-		(params: { target: string; mode: "soft" | "hard" }) =>
-			api.gitReset(target, params.target, params.mode),
-		true,
+	return useGitMutation(target, (params: { target: string; mode: "soft" | "hard" }) =>
+		api.gitReset(target, params.target, params.mode),
 	);
 }
 export function useGitAiCommitMessage(target: GitTarget) {

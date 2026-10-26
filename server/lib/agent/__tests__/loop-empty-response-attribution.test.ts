@@ -34,12 +34,21 @@ let providerScenario:
 	| "reasoning_then_truncated_tool_input"
 	| "broken_anthropic_single"
 	| "broken_anthropic_mixed"
-	| "ws_error_response" = "error_then_usage_only";
+	| "ws_error_response"
+	| "tool_then_quiet" = "error_then_usage_only";
+/** What `tool_then_quiet` answers once its tool has run. */
+let quietTail:
+	| { usage: { promptTokens: number; completionTokens: number } }
+	| { stopReason: string } = { usage: { promptTokens: 900, completionTokens: 0 } };
+/** The call `tool_then_quiet` makes first; a stand-in replaces any real tool by that name. */
+let quietCall: { name: string; input: string } = { name: "__QuietFinishTest", input: "{}" };
 let providerAttempts = 0;
 let wsBaseUrl = "";
-/** `content` (user-side turn text) seen by each provider.chat() call, in order. */
+/**
+ * The input each provider.chat() call ends with, in order: its `content`, or (for a
+ * request projected from the loop's transcript) the trailing input row's text.
+ */
 let sentContents: string[] = [];
-let sentToolResults: unknown[][] = [];
 let sentHistories: unknown[][] = [];
 const RECOVERY_TOOL = "__BrokenInputRecoveryTest";
 const anthropicFormatter = new AnthropicProvider({
@@ -56,11 +65,17 @@ function usesAnthropicRecovery(): boolean {
 
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	// The Anthropic recovery cases use the real second stage; the rest only need the
+	// rows' text in order.
+	buildHistory: async (rows, model, narratorId) =>
+		usesAnthropicRecovery()
+			? anthropicFormatter.buildHistory(rows, model, narratorId)
+			: { history: rows.map((row) => ({ role: row.role, text: row.contentText ?? "" })) },
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		providerAttempts++;
-		sentContents.push(params.content ?? "");
+		const tail = params.history.at(-1) as { role?: string; text?: string } | undefined;
+		sentContents.push(params.content || (tail?.role === "user" ? (tail.text ?? "") : ""));
 		if (providerScenario === "local_failure") {
 			throw new ApiError(400, "Local request assembly failed", {
 				schema: "narrafork.error-diagnostics.v1",
@@ -72,7 +87,6 @@ const testProvider: ProviderAdapter = {
 		params.onRequestStart?.();
 
 		if (usesAnthropicRecovery()) {
-			sentToolResults.push(structuredClone(params.toolResults ?? []));
 			sentHistories.push(structuredClone(params.history));
 			if (providerAttempts === 1) {
 				yield {
@@ -142,6 +156,22 @@ const testProvider: ProviderAdapter = {
 			return;
 		}
 
+		if (providerScenario === "tool_then_quiet") {
+			if (providerAttempts === 1) {
+				yield {
+					toolUseChunk: {
+						toolUseId: "tu-quiet",
+						name: quietCall.name,
+						input: quietCall.input,
+						stop: true,
+					},
+				};
+				return;
+			}
+			yield quietTail;
+			return;
+		}
+
 		if (providerScenario === "usage_only_forever") {
 			yield { usage: { promptTokens: 900, completionTokens: 0 } };
 			return;
@@ -176,16 +206,6 @@ const testProvider: ProviderAdapter = {
 			yield { text: "using a skeleton instead" };
 			return;
 		}
-	},
-	formatToolResult: (toolUseId, output, isError) =>
-		usesAnthropicRecovery()
-			? anthropicFormatter.formatToolResult(toolUseId, output, isError)
-			: { toolUseId, output, isError },
-	pushUserTurn: (...args) => {
-		if (usesAnthropicRecovery()) anthropicFormatter.pushUserTurn(...args);
-	},
-	pushAssistantTurn: (...args) => {
-		if (usesAnthropicRecovery()) anthropicFormatter.pushAssistantTurn(...args);
 	},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
@@ -231,7 +251,7 @@ function makeConfig(signal: AbortSignal, overrides: Partial<AgentConfig> = {}): 
 async function runLoop(overrides: Partial<AgentConfig> = {}): Promise<AgentEvent[]> {
 	const ac = new AbortController();
 	const events: AgentEvent[] = [];
-	for await (const event of agentLoop(makeConfig(ac.signal, overrides), "go", [])) {
+	for await (const event of agentLoop(makeConfig(ac.signal, overrides), "go", { rows: [] })) {
 		events.push(event);
 	}
 	return events;
@@ -245,7 +265,6 @@ describe("Anthropic broken tool recovery", () => {
 		providerScenario = scenario;
 		providerAttempts = 0;
 		sentContents = [];
-		sentToolResults = [];
 		sentHistories = [];
 		const execute = mock(async () => ({ output: "valid result" }));
 		toolRegistry.register({
@@ -260,20 +279,30 @@ describe("Anthropic broken tool recovery", () => {
 			expect(
 				events.some((event) => event.type === "assistant_message" && event.text === "recovered"),
 			).toBe(true);
-			expect(sentToolResults[1]).toEqual(
-				scenario === "broken_anthropic_mixed"
-					? [{ tool_use_id: "valid-call", content: "valid result", is_error: undefined }]
+			// The follow-up is the real Anthropic projection of the loop's rows: the valid
+			// call keeps its native result, the broken call and its result are gone.
+			const followUp = sentHistories[1] as Array<{ content: unknown }>;
+			const results = followUp.flatMap((message) =>
+				Array.isArray(message.content)
+					? (message.content as Array<Record<string, unknown>>).filter(
+							(block) => block.type === "tool_result",
+						)
 					: [],
 			);
-			expect(JSON.stringify(sentHistories[1])).not.toContain("broken-call");
+			expect(results).toEqual(
+				scenario === "broken_anthropic_mixed"
+					? [expect.objectContaining({ tool_use_id: "valid-call", content: "valid result" })]
+					: [],
+			);
+			expect(JSON.stringify(followUp)).not.toContain("broken-call");
 			if (scenario === "broken_anthropic_mixed") {
-				expect(JSON.stringify(sentHistories[1])).toContain("valid-call");
+				expect(JSON.stringify(followUp)).toContain("valid-call");
 				expect(execute).toHaveBeenCalledTimes(1);
 			} else {
 				expect(execute).not.toHaveBeenCalled();
 			}
-			expect(sentContents[1]).toContain("invalid or missing input");
-			expect(sentContents[1]).not.toContain("output was cut off by the token limit");
+			expect(JSON.stringify(followUp)).toContain("invalid or missing input");
+			expect(JSON.stringify(followUp)).not.toContain("output was cut off by the token limit");
 		} finally {
 			toolRegistry.unregister(RECOVERY_TOOL);
 		}
@@ -518,5 +547,73 @@ describe("空响应细分归因", () => {
 		expect(followUp).toContain("Write");
 		expect(followUp).toContain("SPLICE_1");
 		expect(followUp).toContain("10,000");
+	});
+});
+
+describe("an empty reply after handing work off is a finish", () => {
+	async function quietRun(
+		overrides: Partial<AgentConfig>,
+		tail: typeof quietTail,
+		call: typeof quietCall = { name: "__QuietFinishTest", input: "{}" },
+	) {
+		providerScenario = "tool_then_quiet";
+		providerAttempts = 0;
+		quietTail = tail;
+		quietCall = call;
+		const real = toolRegistry.get(call.name);
+		if (real) toolRegistry.unregister(call.name);
+		toolRegistry.register({
+			name: call.name,
+			description: "Stand-in tool",
+			parameters: z.object({}).passthrough(),
+			execute: async () => ({ output: "Started." }),
+		});
+		try {
+			return await runLoop({ maxTurns: 4, ...overrides });
+		} finally {
+			toolRegistry.unregister(call.name);
+			if (real) toolRegistry.register(real);
+		}
+	}
+	const usageOnly = { usage: { promptTokens: 900, completionTokens: 0 } };
+	const lastType = (events: AgentEvent[]) => events.at(-1)?.type;
+
+	test("a bot with nothing left to say after any tool round is done", async () => {
+		const events = await quietRun({ bot: true }, usageOnly);
+		expect(lastType(events)).toBe("done");
+		expect(events.some((event) => event.type === "retrying")).toBe(false);
+		expect(providerAttempts).toBe(2);
+	});
+
+	test("so is one that stops normally without text", async () => {
+		expect(lastType(await quietRun({ bot: true }, { stopReason: "stop" }))).toBe("done");
+	});
+
+	test.each([
+		["Send", '{"id":"parent","message":"done"}'],
+		["Agent", '{"prompt":"look into it"}'],
+		["Bash", '{"command":"bun test","run_in_background":true}'],
+	])("an ordinary narrator that handed work off with %s is done", async (name, input) => {
+		expect(lastType(await quietRun({}, usageOnly, { name, input }))).toBe("done");
+	});
+
+	test("a foreground command is not a hand-off", async () => {
+		const call = { name: "Bash", input: '{"command":"ls"}' };
+		expect(lastType(await quietRun({}, usageOnly, call))).toBe("invalid_state");
+	});
+
+	test("an ordinary narrator after other tools still reports the empty reply", async () => {
+		expect(lastType(await quietRun({}, usageOnly))).toBe("invalid_state");
+	});
+
+	test("a refusal is still reported after a hand-off", async () => {
+		const events = await quietRun({ bot: true }, { stopReason: "content_filter" });
+		expect(lastType(events)).toBe("invalid_state");
+	});
+
+	test("an empty first reply has handed nothing off", async () => {
+		providerScenario = "usage_only_forever";
+		providerAttempts = 0;
+		expect(lastType(await runLoop({ bot: true }))).toBe("invalid_state");
 	});
 });

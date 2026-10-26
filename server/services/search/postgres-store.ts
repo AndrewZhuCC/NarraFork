@@ -28,31 +28,39 @@
  * (whose header says a second backend writes its own equivalents). The SQL below is plain
  * PostgreSQL executed through a structural executor (`unsafe(text, params)`), so the store
  * is testable against any client and the dialect guard sees no SQLite surface here. The
- * ACL gate SQL is DERIVED from the shared fragments in `narrator-acl` / `project-acl` —
- * the same source the SQLite store uses, so the gate cannot drift between backends. Those
- * modules currently import the SQLite `db` handle transitively; untangling that is the
- * startup-wiring batch's job, not this one's (see the module header of `backend.ts`).
+ * ACL gate SQL is DERIVED from the shared fragment in `narrator-acl` — the same source the
+ * SQLite store uses, so the gate cannot drift between backends. That module currently
+ * imports the SQLite `db` handle transitively; untangling that is the startup-wiring
+ * batch's job, not this one's (see the module header of `backend.ts`).
  */
 
 import type { PgExecutor } from "../../db/pg-fts";
 import { AppError, ValidationError } from "../../lib/errors";
 import { narratorReadableSqlFragment } from "../narrator-acl";
-import { projectReadableSqlFragment } from "../project-acl";
+import { narratorProjectIdText } from "../read/acl-sql";
 import type { SearchStore } from "./port";
+import { globalQueryTerms } from "./query";
+import { filterSql, messageScopeSql, narratorScopeSql } from "./scope";
 import {
-	type ChapterSearchRow,
 	type EntitySearchQuery,
 	GLOBAL_SNIPPET,
+	groupSessionAggregates,
 	KNOWLEDGE_SNIPPET,
 	type KnowledgeDraftSearchQuery,
 	type KnowledgeSearchQuery,
 	type KnowledgeSearchRow,
+	latestHitCount,
 	type MessageSearchRow,
 	type NarratorSearchRow,
+	orderSessionAggregates,
 	PREVIEW_CHARS,
 	RECALL_SNIPPET,
 	type RecallMessageRow,
 	type RecallSearchQuery,
+	type SessionAggregateQuery,
+	type SessionAggregateRow,
+	type SessionHitDetailsQuery,
+	type SessionHitsQuery,
 	type ShadowedEntryQuery,
 	type SnippetFormat,
 	TIMELINE_SNIPPET,
@@ -79,21 +87,35 @@ class Params {
 type Row = Record<string, unknown>;
 
 /**
- * The ACL gate clauses, derived from the same shared fragments the SQLite store uses.
+ * The ACL gate clause, derived from the same shared fragment the SQLite store uses.
  *
- * The fragments use `?` placeholders (they are shared with `sqlite.prepare`); this store
+ * The fragment uses `?` placeholders (it is shared with `sqlite.prepare`); this store
  * renumbers them to positional `$n` at query-build time via {@link gateClause}. The SQL
  * itself (EXISTS / CASE WHEN / IN-lists of literals) is standard and runs unchanged on
  * PostgreSQL.
  */
 const NARRATOR_GATE_SQL = narratorReadableSqlFragment(false, "n")?.sql ?? "1 = 1";
-const PROJECT_GATE_SQL = projectReadableSqlFragment(false, "p")?.sql ?? "1 = 1";
 
 /** Splice a `?`-style fragment into the query, binding the user id once per placeholder. */
 function gateClause(fragment: string, userId: string, params: Params): string {
 	const parts = fragment.split("?");
 	let out = parts[0] ?? "";
 	for (const part of parts.slice(1)) out += params.add(userId) + part;
+	return out;
+}
+
+/** Splice a shared filter predicate in, binding its values at its `?` placeholders. */
+function filterClause(
+	filters: EntitySearchQuery["filters"],
+	target: Parameters<typeof filterSql>[1],
+	params: Params,
+): string {
+	const bound = filterSql(filters, target);
+	const parts = bound.sql.split("?");
+	let out = parts[0] ?? "";
+	parts.slice(1).forEach((part, i) => {
+		out += params.add(bound.values[i]) + part;
+	});
 	return out;
 }
 
@@ -118,11 +140,19 @@ function escapedContains(text: string): string {
 	return `%${text.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
 }
 
-/** `(col ILIKE $p OR …)` for one phrase needle, or the single-column form. */
-function phraseClause(columns: readonly string[], text: string, params: Params): string {
-	const p = params.add(rawContains(text));
-	const cols = columns.map((c) => `${c} ILIKE ${p}`);
-	return cols.length === 1 ? (cols[0] as string) : `(${cols.join(" OR ")})`;
+/** Global search's terms, the same split the SQLite store uses (see `globalQueryTerms`). */
+function globalTerms(text: string): string[] {
+	const { indexed, short } = globalQueryTerms(text);
+	return [...indexed, ...short];
+}
+
+/**
+ * Global search's match: every term, anywhere in any of the columns. `ILIKE` checks short
+ * terms as well as long ones, so this backend needs no index/filter split.
+ */
+function globalClause(columns: readonly string[], text: string, params: Params): string {
+	const terms = globalTerms(text);
+	return `(${termsClause(columns, terms.length > 0 ? terms : [text], "and", params)})`;
 }
 
 /**
@@ -237,17 +267,16 @@ function markSnippet(
 // Column lists (same selection as the SQLite store, so rows map identically)
 // ─────────────────────────────────────────────────────────────────────────────
 
-const CHAPTER_COLUMNS = `c.id, c.title, c.description, c.status, c.role, c.created_at, c.updated_at,
-		  p.name AS project_name`;
+/** The project name shown on a hit; it gates nothing (see the SQLite store's PROJECT_JOIN). */
+const PROJECT_JOIN = `LEFT JOIN projects p ON p.id = ${narratorProjectIdText("n")}`;
 
 const MESSAGE_COLUMNS = `m.id, m.narrator_id, substr(m.content_text, 1, ${PREVIEW_CHARS}) AS content_preview,
 		  m.role AS message_role, m.created_at,
-		  n.chapter_id, n.title AS narrator_title, n.model,
-		  c.title AS chapter_title, p.name AS project_name`;
+		  n.title AS narrator_title, n.model, p.name AS project_name`;
 
-const NARRATOR_COLUMNS = `n.id, n.title, n.chapter_id, n.status, n.model, n.message_count,
-		  n.last_message_at, n.created_at, n.updated_at,
-		  c.title AS chapter_title, p.name AS project_name`;
+const NARRATOR_COLUMNS = `n.id, n.title, n.type, n.subagent_type, p.id AS project_id,
+		  n.status, n.model, n.message_count,
+		  n.last_message_at, n.created_at, n.updated_at, p.name AS project_name`;
 
 const KNOWLEDGE_ENTRY_COLUMNS = `e.id, e.collection_id, e.title, e.slug, e.tags_json, e.status,
 		  e.created_at, e.updated_at`;
@@ -371,6 +400,59 @@ function toKnowledgeRow(row: Row, fromDraft: boolean, snippet: string): Knowledg
  * any object with that shape. All state is per-query — there is no prepared-statement
  * cache to scope, because a networked driver prepares server-side.
  */
+// ─────────────────────────────────────────────────────────────────────────────
+// Session search
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * `WITH per_msg AS (…)`: one row per matching message, gated, scoped and filtered — the same
+ * relation the SQLite store builds. There is no block index on this backend, so only the
+ * message text matches, exactly as in `searchMessages`.
+ */
+function sessionHitsCte(query: EntitySearchQuery, params: Params, extra = ""): string {
+	const gate = query.viewer.isAdmin
+		? ""
+		: `AND ${gateClause(NARRATOR_GATE_SQL, query.viewer.userId, params)}`;
+	const scope = `${messageScopeSql(query.scope)} ${filterClause(query.filters, "message", params)}`;
+	if (query.strategy === "index") {
+		const where = globalClause(["f.content_text"], query.text, params);
+		const rank = rankSql(["f.content_text"], params.add(query.text));
+		return `WITH per_msg AS (
+			SELECT m.id, m.narrator_id, m.created_at, ${rank} AS r, NULL::text AS block_id
+			 FROM search_narrator_messages f
+			 JOIN narrator_messages m ON m.id = f.id
+			 JOIN narrators n ON n.id = m.narrator_id
+			 WHERE ${where} ${gate} ${scope} ${extra}
+		)`;
+	}
+	const contains = globalClause(["m.content_text"], query.text, params);
+	return `WITH per_msg AS (
+		SELECT m.id, m.narrator_id, m.created_at, NULL::double precision AS r, NULL::text AS block_id
+		 FROM narrator_messages m
+		 JOIN narrators n ON n.id = m.narrator_id
+		 WHERE ${contains} ${gate} ${scope} ${extra}
+	)`;
+}
+
+/** Ceiling on the hits one details read returns, as on SQLite. */
+const MAX_HIT_DETAILS = 500;
+
+/** A session hit row. This backend has no block index, so the excerpt is the text's own. */
+function toHitRow(row: Row, rank: number | null): MessageSearchRow {
+	return {
+		id: strOr(row, "id", ""),
+		narratorId: str(row, "narrator_id"),
+		narratorTitle: str(row, "narrator_title"),
+		projectName: str(row, "project_name"),
+		model: str(row, "model"),
+		messageRole: str(row, "message_role"),
+		createdAt: str(row, "created_at"),
+		snippet: str(row, "snippet") ?? "",
+		preview: str(row, "content_preview") ?? "",
+		rank,
+	};
+}
+
 export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 	const run = async (text: string, params: Params): Promise<Row[]> =>
 		client.unsafe(text, params.list);
@@ -378,82 +460,41 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 	return {
 		backend: "postgres",
 
-		async searchChapters(query: EntitySearchQuery): Promise<ChapterSearchRow[]> {
-			const params = new Params();
-			const gate = query.viewer.isAdmin
-				? ""
-				: `AND ${gateClause(PROJECT_GATE_SQL, query.viewer.userId, params)}`;
-			let rows: Row[];
-			if (query.strategy === "index") {
-				const where = phraseClause(["f.title", "f.description"], query.text, params);
-				const snippet = snippetSql("f.description", [query.text], GLOBAL_SNIPPET, params);
-				const rank = rankSql(["f.title", "f.description"], params.add(query.text));
-				rows = await run(
-					`SELECT ${CHAPTER_COLUMNS}, ${snippet} AS snippet, ${rank} AS rank_score
-					 FROM search_chapters f
-					 JOIN chapters c ON c.id = f.id
-					 JOIN projects p ON p.id = c.project_id
-					 WHERE ${where} ${gate}
-					 ORDER BY ${query.sort === "time" ? "COALESCE(c.updated_at, c.created_at) DESC, c.id ASC" : "rank_score"} LIMIT ${params.add(query.limit)}`,
-					params,
-				);
-			} else {
-				const needle = params.add(rawContains(query.text));
-				rows = await run(
-					`SELECT ${CHAPTER_COLUMNS},
-						substr(COALESCE(c.description, c.title, ''), 1, ${PREVIEW_CHARS}) AS snippet
-					 FROM chapters c
-					 JOIN projects p ON p.id = c.project_id
-					 WHERE (c.title ILIKE ${needle} OR c.description ILIKE ${needle}) ${gate}
-					 ${query.sort === "time" ? "ORDER BY COALESCE(c.updated_at, c.created_at) DESC, c.id ASC" : ""} LIMIT ${params.add(query.limit)}`,
-					params,
-				);
-			}
-			return rows.map((row) => ({
-				id: strOr(row, "id", ""),
-				title: str(row, "title"),
-				description: str(row, "description"),
-				status: str(row, "status"),
-				role: str(row, "role"),
-				projectName: str(row, "project_name"),
-				createdAt: str(row, "created_at"),
-				updatedAt: str(row, "updated_at"),
-				snippet: str(row, "snippet") ?? "",
-				rank: rankOf(row, query.strategy),
-			}));
-		},
-
 		async searchMessages(query: EntitySearchQuery): Promise<MessageSearchRow[]> {
 			const params = new Params();
 			const gate = query.viewer.isAdmin
 				? ""
 				: `AND ${gateClause(NARRATOR_GATE_SQL, query.viewer.userId, params)}`;
+			const scope = `${messageScopeSql(query.scope)} ${filterClause(query.filters, "message", params)}`;
 			let rows: Row[];
 			if (query.strategy === "index") {
-				const where = phraseClause(["f.content_text"], query.text, params);
-				const snippet = snippetSql("f.content_text", [query.text], GLOBAL_SNIPPET, params);
+				const where = globalClause(["f.content_text"], query.text, params);
+				const snippet = snippetSql(
+					"f.content_text",
+					globalTerms(query.text),
+					GLOBAL_SNIPPET,
+					params,
+				);
 				const rank = rankSql(["f.content_text"], params.add(query.text));
 				rows = await run(
 					`SELECT ${MESSAGE_COLUMNS}, ${snippet} AS snippet, ${rank} AS rank_score
 					 FROM search_narrator_messages f
 					 JOIN narrator_messages m ON m.id = f.id
 					 JOIN narrators n ON n.id = m.narrator_id
-					 LEFT JOIN chapters c ON c.id = n.chapter_id
-					 LEFT JOIN projects p ON p.id = c.project_id
-					 WHERE ${where} ${gate}
+					 ${PROJECT_JOIN}
+					 WHERE ${where} ${gate} ${scope}
 					 ORDER BY ${query.sort === "time" ? "m.created_at DESC, m.id ASC" : "rank_score"} LIMIT ${params.add(query.limit)}`,
 					params,
 				);
 			} else {
-				const needle = params.add(rawContains(query.text));
+				const contains = globalClause(["m.content_text"], query.text, params);
 				rows = await run(
 					`SELECT ${MESSAGE_COLUMNS},
 						substr(m.content_text, 1, ${PREVIEW_CHARS}) AS snippet
 					 FROM narrator_messages m
 					 JOIN narrators n ON n.id = m.narrator_id
-					 LEFT JOIN chapters c ON c.id = n.chapter_id
-					 LEFT JOIN projects p ON p.id = c.project_id
-					 WHERE m.content_text ILIKE ${needle} ${gate}
+					 ${PROJECT_JOIN}
+					 WHERE ${contains} ${gate} ${scope}
 					 ${query.sort === "time" ? "ORDER BY m.created_at DESC, m.id ASC" : ""} LIMIT ${params.add(query.limit)}`,
 					params,
 				);
@@ -462,8 +503,6 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 				id: strOr(row, "id", ""),
 				narratorId: str(row, "narrator_id"),
 				narratorTitle: str(row, "narrator_title"),
-				chapterId: str(row, "chapter_id"),
-				chapterTitle: str(row, "chapter_title"),
 				projectName: str(row, "project_name"),
 				model: str(row, "model"),
 				messageRole: str(row, "message_role"),
@@ -479,31 +518,30 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 			const gate = query.viewer.isAdmin
 				? ""
 				: `AND ${gateClause(NARRATOR_GATE_SQL, query.viewer.userId, params)}`;
+			const scope = `${narratorScopeSql(query.scope)} ${filterClause(query.filters, "narrator", params)}`;
 			let rows: Row[];
 			if (query.strategy === "index") {
-				const where = phraseClause(["f.title"], query.text, params);
-				const snippet = snippetSql("f.title", [query.text], GLOBAL_SNIPPET, params);
+				const where = globalClause(["f.title"], query.text, params);
+				const snippet = snippetSql("f.title", globalTerms(query.text), GLOBAL_SNIPPET, params);
 				const rank = rankSql(["f.title"], params.add(query.text));
 				rows = await run(
 					`SELECT ${NARRATOR_COLUMNS}, ${snippet} AS snippet, ${rank} AS rank_score
 					 FROM search_narrators f
 					 JOIN narrators n ON n.id = f.id
-					 LEFT JOIN chapters c ON c.id = n.chapter_id
-					 LEFT JOIN projects p ON p.id = c.project_id
-					 WHERE ${where} ${gate}
+					 ${PROJECT_JOIN}
+					 WHERE ${where} ${gate} ${scope}
 					 ORDER BY ${query.sort === "time" ? "COALESCE(n.updated_at, n.created_at, n.last_message_at) DESC, n.id ASC" : "rank_score"} LIMIT ${params.add(query.limit)}`,
 					params,
 				);
 			} else {
 				// No snippet column on this path, exactly like SQLite: the caller falls back
 				// to the title, the only text this search matches against.
-				const needle = params.add(rawContains(query.text));
+				const contains = globalClause(["n.title"], query.text, params);
 				rows = await run(
 					`SELECT ${NARRATOR_COLUMNS}
 					 FROM narrators n
-					 LEFT JOIN chapters c ON c.id = n.chapter_id
-					 LEFT JOIN projects p ON p.id = c.project_id
-					 WHERE n.title ILIKE ${needle} ${gate}
+					 ${PROJECT_JOIN}
+					 WHERE ${contains} ${gate} ${scope}
 					 ${query.sort === "time" ? "ORDER BY COALESCE(n.updated_at, n.created_at, n.last_message_at) DESC, n.id ASC" : ""} LIMIT ${params.add(query.limit)}`,
 					params,
 				);
@@ -511,8 +549,9 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 			return rows.map((row) => ({
 				id: strOr(row, "id", ""),
 				title: str(row, "title"),
-				chapterId: str(row, "chapter_id"),
-				chapterTitle: str(row, "chapter_title"),
+				type: str(row, "type"),
+				subagentType: str(row, "subagent_type"),
+				projectId: str(row, "project_id"),
 				projectName: str(row, "project_name"),
 				status: str(row, "status"),
 				model: str(row, "model"),
@@ -522,6 +561,107 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 				snippet: str(row, "snippet") ?? "",
 				rank: rankOf(row, query.strategy),
 			}));
+		},
+
+		async searchSessionAggregates(query: SessionAggregateQuery): Promise<SessionAggregateRow[]> {
+			const params = new Params();
+			const cte = sessionHitsCte(query, params);
+			const latest = latestHitCount(query);
+			// The SQLite store's single pass: counts per narrator plus the newest few hits.
+			const rows = await run(
+				`${cte}, ranked AS (
+					SELECT id, narrator_id, created_at, block_id,
+						  ROW_NUMBER() OVER (PARTITION BY narrator_id ORDER BY created_at DESC, id ASC) AS rn,
+						  COUNT(*) OVER (PARTITION BY narrator_id) AS hit_count,
+						  MIN(r) OVER (PARTITION BY narrator_id) AS best_rank,
+						  MAX(created_at) OVER (PARTITION BY narrator_id) AS last_hit_at
+					 FROM per_msg
+				)
+				SELECT ranked.narrator_id, ranked.best_rank, ranked.hit_count, ranked.last_hit_at,
+					  ranked.rn, ranked.id AS hit_id, ranked.block_id AS hit_block_id,
+					  ranked.created_at AS hit_created_at,
+					  n.title, n.type, n.subagent_type, n.status, n.last_message_at,
+					  n.created_at, n.updated_at, p.id AS project_id, p.name AS project_name
+				 FROM ranked
+				 JOIN narrators n ON n.id = ranked.narrator_id
+				 ${PROJECT_JOIN}
+				 WHERE ranked.rn <= ${params.add(Math.max(1, latest))}
+				 ORDER BY ranked.narrator_id ASC, ranked.rn ASC`,
+				params,
+			);
+			return orderSessionAggregates(
+				groupSessionAggregates(rows, latest, (row) => ({
+					narratorId: strOr(row, "narrator_id", ""),
+					bestRank: rankOf({ rank_score: row.best_rank }, query.strategy),
+					hitCount: Number(row.hit_count) || 0,
+					lastHitAt: str(row, "last_hit_at"),
+					title: str(row, "title"),
+					type: str(row, "type"),
+					subagentType: str(row, "subagent_type"),
+					status: str(row, "status"),
+					projectId: str(row, "project_id"),
+					projectName: str(row, "project_name"),
+					lastMessageAt: str(row, "last_message_at"),
+					createdAt: str(row, "created_at"),
+					updatedAt: str(row, "updated_at"),
+					latestHits: [],
+				})),
+				query.sort,
+				query.limit,
+			);
+		},
+
+		async searchSessionHitDetails(query: SessionHitDetailsQuery): Promise<MessageSearchRow[]> {
+			const refs = query.refs.slice(0, MAX_HIT_DETAILS);
+			if (refs.length === 0) return [];
+			const params = new Params();
+			const values = refs
+				.map((ref, ord) => `(${params.add(ref.id)}::text, ${params.add(ord)}::int)`)
+				.join(", ");
+			const snippet = snippetSql("m.content_text", globalTerms(query.text), GLOBAL_SNIPPET, params);
+			const rows = await run(
+				`WITH refs(id, ord) AS (VALUES ${values})
+				SELECT ${MESSAGE_COLUMNS}, ${snippet} AS snippet
+				 FROM refs
+				 JOIN narrator_messages m ON m.id = refs.id
+				 JOIN narrators n ON n.id = m.narrator_id
+				 ${PROJECT_JOIN}
+				 ORDER BY refs.ord`,
+				params,
+			);
+			return rows.map((row) => toHitRow(row, null));
+		},
+
+		async searchSessionHits(query: SessionHitsQuery): Promise<MessageSearchRow[]> {
+			const ids = query.narratorIds.filter((id) => NARRATOR_ID_PATTERN.test(id));
+			if (ids.length === 0) return [];
+			const params = new Params();
+			const cte = sessionHitsCte(
+				query,
+				params,
+				`AND m.narrator_id IN (${ids.map((id) => params.add(id)).join(", ")})`,
+			);
+			const order =
+				query.sort === "time"
+					? "created_at DESC, id ASC"
+					: "r IS NULL, r ASC, created_at DESC, id ASC";
+			const snippet = snippetSql("m.content_text", globalTerms(query.text), GLOBAL_SNIPPET, params);
+			const offset = Math.max(0, Math.trunc(query.offset ?? 0));
+			const rows = await run(
+				`${cte}, ranked AS (
+					SELECT per_msg.*, ROW_NUMBER() OVER (PARTITION BY narrator_id ORDER BY ${order}) AS rn
+					 FROM per_msg
+				)
+				SELECT ${MESSAGE_COLUMNS}, ranked.r AS rank_score, ${snippet} AS snippet
+				 FROM ranked
+				 JOIN narrator_messages m ON m.id = ranked.id
+				 JOIN narrators n ON n.id = m.narrator_id
+				 ${PROJECT_JOIN}
+				 WHERE ranked.rn > ${params.add(offset)} AND ranked.rn <= ${params.add(offset + query.perSession)}
+				 ORDER BY ranked.narrator_id ASC, ranked.rn ASC`,
+				params,
+			);
+			return rows.map((row) => toHitRow(row, rankOf(row, query.strategy)));
 		},
 
 		async searchTimeline(query: TimelineSearchQuery): Promise<TimelineSearchRow[]> {
@@ -552,14 +692,14 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 					createdAt: strOr(row, "created_at", ""),
 				}));
 			}
-			const needle = params.add(rawContains(query.text));
+			const contains = globalClause(["m.content_text"], query.text, params);
 			rows = await run(
 				`SELECT ${TIMELINE_COLUMNS},
 					substr(m.content_text, 1, ${PREVIEW_CHARS}) AS snippet
 				 FROM narrator_message_refs r
 				 JOIN narrator_messages m ON m.id = r.message_id
 				 WHERE ${scopeSql} AND r.segment_compact_id IS NULL
-				   AND m.content_text ILIKE ${needle}
+				   AND ${contains}
 				 ORDER BY r.seq DESC
 				 LIMIT ${params.add(query.limit)}`,
 				params,
@@ -593,7 +733,7 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 				const snippet = snippetSql("f.content_text", terms, RECALL_SNIPPET, params);
 				rows = await run(
 					`SELECT m.id, ${narratorIdColumn}, m.role, m.created_at,
-						n.title AS narrator_title, n.chapter_id,
+						n.title AS narrator_title,
 						${snippet} AS snippet
 					 FROM search_narrator_messages f
 					 JOIN narrator_messages m ON m.id = f.id
@@ -607,20 +747,20 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 					messageId: strOr(row, "id", ""),
 					narratorId: strOr(row, "narrator_id", ""),
 					narratorTitle: str(row, "narrator_title"),
-					chapterId: str(row, "chapter_id"),
 					role: strOr(row, "role", ""),
 					createdAt: strOr(row, "created_at", ""),
 					snippet: markSnippet(str(row, "snippet"), terms, RECALL_SNIPPET),
 				}));
 			}
-			const needle = params.add(rawContains(query.text));
+			const preview = params.add(query.previewChars);
+			const contains = globalClause(["m.content_text"], query.text, params);
 			rows = await run(
 				`SELECT m.id, ${narratorIdColumn}, m.role, m.created_at,
-					n.title AS narrator_title, n.chapter_id,
-					substr(m.content_text, 1, ${params.add(query.previewChars)}) AS snippet
+					n.title AS narrator_title,
+					substr(m.content_text, 1, ${preview}) AS snippet
 				 FROM narrator_messages m
 				 ${source}
-				 WHERE m.content_text ILIKE ${needle}${scopeFilter}${timeSuffix}
+				 WHERE ${contains}${scopeFilter}${timeSuffix}
 				 ORDER BY m.created_at DESC
 				 LIMIT ${params.add(query.limit)}`,
 				params,
@@ -629,7 +769,6 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 				messageId: strOr(row, "id", ""),
 				narratorId: strOr(row, "narrator_id", ""),
 				narratorTitle: str(row, "narrator_title"),
-				chapterId: str(row, "chapter_id"),
 				role: strOr(row, "role", ""),
 				createdAt: strOr(row, "created_at", ""),
 				snippet: str(row, "snippet") ?? "",

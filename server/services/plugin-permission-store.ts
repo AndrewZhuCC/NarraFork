@@ -8,6 +8,7 @@ import { getNarraforkPath } from "@server/lib/narrafork-home";
 import { pluginIdSchema } from "@server/lib/plugins/manifest";
 import {
 	capabilitySchema,
+	isRetiredPermission,
 	type PermissionGrant,
 	type PermissionScope,
 	permissionGrantSchema,
@@ -340,6 +341,10 @@ function grantsFingerprint(grants: readonly PermissionGrantInput[]): string {
 	return JSON.stringify(grants.map((grant) => grantFingerprint(grant)).sort());
 }
 
+function isRetiredRecord(value: unknown): boolean {
+	return isRecord(value) && isRetiredPermission(value);
+}
+
 function parseStoredGrant(
 	value: unknown,
 	pluginId: string,
@@ -468,9 +473,11 @@ function parseInstallation(
 	}
 	if (!isIsoDate(value.updatedAt))
 		throw new ValidationError("Stored plugin permission timestamp is invalid");
-	const grants = value.grants.map((grant) =>
-		parseStoredGrant(grant, pluginId, installationId, limits),
-	);
+	// Records naming a retired capability or scope (chapters) are dropped rather than
+	// rejected: a rejection here resets the whole file, wiping every other grant with it.
+	const grants = value.grants
+		.filter((grant) => !isRetiredRecord(grant))
+		.map((grant) => parseStoredGrant(grant, pluginId, installationId, limits));
 	if (new Set(grants.map((grant) => grant.grantId)).size !== grants.length) {
 		throw new ValidationError("Stored plugin permission grant ids must be unique");
 	}
@@ -478,7 +485,9 @@ function parseInstallation(
 	if (rawPending.length > limits.maxGrantsPerInstallation) {
 		throw new ValidationError("Stored plugin pending requests list is invalid");
 	}
-	const pendingRequests = rawPending.map((raw) => parsePendingRequest(raw));
+	const pendingRequests = rawPending
+		.filter((raw) => !isRetiredRecord(raw))
+		.map((raw) => parsePendingRequest(raw));
 	if (new Set(pendingRequests.map((r) => r.requestId)).size !== pendingRequests.length) {
 		throw new ValidationError("Stored plugin pending request ids must be unique");
 	}
@@ -487,7 +496,9 @@ function parseInstallation(
 	if (rawDenials.length > limits.maxGrantsPerInstallation) {
 		throw new ValidationError("Stored plugin permanent denials list is invalid");
 	}
-	const permanentDenials = rawDenials.map((raw) => parsePermanentDenial(raw));
+	const permanentDenials = rawDenials
+		.filter((raw) => !isRetiredRecord(raw))
+		.map((raw) => parsePermanentDenial(raw));
 	if (
 		new Set(permanentDenials.map((d) => permissionPairKey(d.capability, d.scope))).size !==
 		permanentDenials.length
@@ -939,12 +950,14 @@ export class PluginPermissionStore {
 		if (summary.capabilities.length === 0) {
 			return this.ensureInstallation(pluginId, installationId);
 		}
-		const grants: PermissionGrantInput[] = summary.capabilities.map((capability) => ({
-			capability: capability as PermissionGrant["capability"],
-			scope: { type: "global" },
-			grantId: `legacy-${pluginId}-${capability}`.slice(0, 256),
-			grantedBy: "legacy-state",
-		}));
+		const grants: PermissionGrantInput[] = summary.capabilities
+			.filter((capability) => !isRetiredPermission({ capability }))
+			.map((capability) => ({
+				capability: capability as PermissionGrant["capability"],
+				scope: { type: "global" },
+				grantId: `legacy-${pluginId}-${capability}`.slice(0, 256),
+				grantedBy: "legacy-state",
+			}));
 		const result = await this.replace(pluginId, installationId, grants, {
 			expectedRevision: current.revision,
 			targetRevision: Math.max(summary.revision, current.revision + 1),

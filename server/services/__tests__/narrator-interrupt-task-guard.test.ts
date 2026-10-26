@@ -51,7 +51,7 @@ let releaseChat: (() => void) | null = null;
 const providerCalls: string[] = [];
 const testProvider = {
 	formatTools: () => [],
-	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
+	buildHistory: async () => ({ history: [] }),
 	injectSystemPrompt: () => {},
 	async *chat(params: { content: string; onRequestStart?: () => void; signal?: AbortSignal }) {
 		providerCalls.push(params.content);
@@ -77,13 +77,6 @@ const testProvider = {
 		}
 		yield { text: "turn ran" };
 	},
-	formatToolResult: (toolUseId: string, output: string, isError: boolean) => ({
-		toolUseId,
-		output,
-		isError,
-	}),
-	pushUserTurn: () => {},
-	pushAssistantTurn: () => {},
 	generate: async () => "",
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",

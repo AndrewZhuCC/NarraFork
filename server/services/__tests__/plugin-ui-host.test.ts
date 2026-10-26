@@ -236,7 +236,7 @@ describe("PluginUiHost", () => {
 				principalId: "user-1",
 				userRole: "user",
 				request: request("subscribe", "events.subscribe", {
-					topics: ["narrafork.chapter.created"],
+					topics: ["narrafork.narrator.lifecycle"],
 					// The gateway requires a verifiable authority revision; this
 					// unit test focuses on the UI→gateway schema mapping, so it
 					// supplies the revision explicitly instead of provisioning a
@@ -287,7 +287,7 @@ describe("PluginUiHost", () => {
 				principalId: "user-1",
 				userRole: "user",
 				request: request("subscribe", "events.subscribe", {
-					topics: ["narrafork.chapter.created"],
+					topics: ["narrafork.narrator.lifecycle"],
 					mode: "live",
 					grantRevision: 1,
 					delivery: {
@@ -352,7 +352,7 @@ describe("PluginUiHost", () => {
 			principalId: "user-1",
 			userRole: "user",
 			request: request("subscribe-owned", "events.subscribe", {
-				topics: ["narrafork.chapter.created"],
+				topics: ["narrafork.narrator.lifecycle"],
 			}),
 		});
 		expect(subscribed).toMatchObject({ result: { subscriptionId: "subscription-1" } });
@@ -403,7 +403,7 @@ describe("PluginUiHost", () => {
 			principalId: "user-1",
 			userRole: "user",
 			request: request("subscribe-race", "events.subscribe", {
-				topics: ["narrafork.chapter.created"],
+				topics: ["narrafork.narrator.lifecycle"],
 			}),
 		});
 		await started;
@@ -465,7 +465,7 @@ describe("PluginUiHost", () => {
 			principalId: "user-1",
 			userRole: "user",
 			request: request("subscribe-timeout-race", "events.subscribe", {
-				topics: ["narrafork.chapter.created"],
+				topics: ["narrafork.narrator.lifecycle"],
 			}),
 		});
 		await started;
@@ -526,7 +526,7 @@ describe("PluginUiHost", () => {
 			principalId: "user-1",
 			userRole: "user",
 			request: request("subscribe-cancel-race", "events.subscribe", {
-				topics: ["narrafork.chapter.created"],
+				topics: ["narrafork.narrator.lifecycle"],
 			}),
 			signal: controller.signal,
 		});
@@ -583,7 +583,7 @@ describe("PluginUiHost", () => {
 			principalId: "user-1",
 			userRole: "user",
 			request: request("subscribe-timeout-revoke-race", "events.subscribe", {
-				topics: ["narrafork.chapter.created"],
+				topics: ["narrafork.narrator.lifecycle"],
 			}),
 		});
 		await started;

@@ -59,15 +59,12 @@ import {
 } from "./chat-composer-draft";
 import { buildForwardText } from "./chat-forward-text";
 import { CHAT_HEADER_HEIGHT } from "./chat-header";
+import { CHAT_ATTACHMENTS_PER_MESSAGE_MAX, CHAT_MESSAGE_MAX_CHARS } from "./chat-limits";
 
-/** Server-side cap, mirrored so the composer can show the remaining budget. */
-const CHAT_MESSAGE_MAX_CHARS = 8_000;
-/** Mirror of `CHAT_ATTACHMENTS_PER_MESSAGE_MAX` (server). */
-const CHAT_ATTACHMENTS_PER_MESSAGE_MAX = 10;
 /**
  * Mirror of `CHAT_ATTACHMENTS_UNAVAILABLE_CODE` (server/lib/chat-attachments.ts).
  *
- * Mirrored, like the two above, because that module imports `node:path` and the
+ * Mirrored, like the limits in chat-limits.ts, because that module imports `node:path` and the
  * server data directory at module scope and cannot be bundled for the browser.
  */
 const CHAT_ATTACHMENTS_UNAVAILABLE_CODE = "CHAT_ATTACHMENTS_UNAVAILABLE";
@@ -92,6 +89,16 @@ export interface ChatRoomViewProps {
 	title?: string;
 	/** Optional extra controls in the header (e.g. the dock's close button). */
 	headerActions?: React.ReactNode;
+	/**
+	 * Why this reader cannot post, shown in place of the composer — a bot room whose
+	 * bot they may watch but not drive. The server enforces the same rule regardless.
+	 */
+	readOnlyReason?: string;
+	/**
+	 * Replaces the plain composer (a bot room uses the narrator one). The room keeps
+	 * the reply strip, so the composer is handed the target and told when it is spent.
+	 */
+	renderComposer?: (reply: { replyTo: ChatMessage | null; onSent: () => void }) => React.ReactNode;
 }
 
 export function ChatRoomView({
@@ -100,6 +107,8 @@ export function ChatRoomView({
 	narratorId,
 	title,
 	headerActions,
+	readOnlyReason,
+	renderComposer,
 }: ChatRoomViewProps) {
 	const { t } = useTranslation("chat");
 	const { data: currentUser } = useCurrentUser();
@@ -557,7 +566,7 @@ export function ChatRoomView({
 						onVisibleSeq={markRead}
 						selectedIds={selectedIds}
 						onToggleSelect={toggleSelect}
-						onReply={setReplyTo}
+						onReply={readOnlyReason ? undefined : setReplyTo}
 						onDelete={handleDelete}
 					/>
 				) : null}
@@ -643,66 +652,84 @@ export function ChatRoomView({
 				</Group>
 			) : null}
 
-			<ChatComposerAttachments items={pending} onRemove={handleRemovePending} />
-
-			<Group
-				gap="xs"
-				align="flex-end"
-				p="sm"
-				wrap="nowrap"
-				style={{ flexShrink: 0, borderTop: "1px solid var(--mantine-color-default-border)" }}
-			>
-				{/*
-				 * `accept` is deliberately unset: the server owns the admissibility rule
-				 * (image magic bytes, or the shared text/code extension allowlist), and a
-				 * narrower client filter would silently hide files the server accepts.
-				 */}
-				<FileButton onChange={handlePickFiles} multiple>
-					{(props) => (
-						<Tooltip label={t("attachFiles")}>
-							<ActionIcon
-								{...props}
-								variant="subtle"
-								color="gray"
-								size="lg"
-								disabled={pending.length >= CHAT_ATTACHMENTS_PER_MESSAGE_MAX}
-							>
-								<IconPaperclip size={18} />
-							</ActionIcon>
-						</Tooltip>
-					)}
-				</FileButton>
-				<Textarea
-					value={draft}
-					onChange={(event) => setDraft(event.currentTarget.value.slice(0, CHAT_MESSAGE_MAX_CHARS))}
-					placeholder={t("composerPlaceholder")}
-					autosize
-					minRows={1}
-					maxRows={6}
-					style={{ flex: 1 }}
-					onPaste={handlePaste}
-					onKeyDown={(event) => {
-						// Enter sends, Shift+Enter breaks the line. The IME guard matters for
-						// CJK input: committing a candidate fires Enter with
-						// `isComposing` true, which would otherwise send a half-typed line.
-						if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
-							event.preventDefault();
-							handleSend();
-						}
-					}}
-				/>
-				<Button
-					onClick={handleSend}
-					loading={sendMessage.isPending}
-					// Enabled for an attachment-only message, and blocked while an upload is
-					// still running — sending then would claim only the finished ids and drop
-					// the rest without telling anyone.
-					disabled={(!draft.trim() && readyAttachmentIds.length === 0) || hasUploadsInFlight}
-					leftSection={<IconSend size={14} />}
+			{readOnlyReason ? (
+				<Text
+					size="xs"
+					c="dimmed"
+					p="sm"
+					ta="center"
+					style={{ flexShrink: 0, borderTop: "1px solid var(--mantine-color-default-border)" }}
 				>
-					{t("send")}
-				</Button>
-			</Group>
+					{readOnlyReason}
+				</Text>
+			) : renderComposer ? (
+				renderComposer({ replyTo, onSent: () => setReplyTo(null) })
+			) : (
+				<>
+					<ChatComposerAttachments items={pending} onRemove={handleRemovePending} />
+
+					<Group
+						gap="xs"
+						align="flex-end"
+						p="sm"
+						wrap="nowrap"
+						style={{ flexShrink: 0, borderTop: "1px solid var(--mantine-color-default-border)" }}
+					>
+						{/*
+						 * `accept` is deliberately unset: the server owns the admissibility rule
+						 * (image magic bytes, or the shared text/code extension allowlist), and a
+						 * narrower client filter would silently hide files the server accepts.
+						 */}
+						<FileButton onChange={handlePickFiles} multiple>
+							{(props) => (
+								<Tooltip label={t("attachFiles")}>
+									<ActionIcon
+										{...props}
+										variant="subtle"
+										color="gray"
+										size="lg"
+										disabled={pending.length >= CHAT_ATTACHMENTS_PER_MESSAGE_MAX}
+									>
+										<IconPaperclip size={18} />
+									</ActionIcon>
+								</Tooltip>
+							)}
+						</FileButton>
+						<Textarea
+							value={draft}
+							onChange={(event) =>
+								setDraft(event.currentTarget.value.slice(0, CHAT_MESSAGE_MAX_CHARS))
+							}
+							placeholder={t("composerPlaceholder")}
+							autosize
+							minRows={1}
+							maxRows={6}
+							style={{ flex: 1 }}
+							onPaste={handlePaste}
+							onKeyDown={(event) => {
+								// Enter sends, Shift+Enter breaks the line. The IME guard matters for
+								// CJK input: committing a candidate fires Enter with
+								// `isComposing` true, which would otherwise send a half-typed line.
+								if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+									event.preventDefault();
+									handleSend();
+								}
+							}}
+						/>
+						<Button
+							onClick={handleSend}
+							loading={sendMessage.isPending}
+							// Enabled for an attachment-only message, and blocked while an upload is
+							// still running — sending then would claim only the finished ids and drop
+							// the rest without telling anyone.
+							disabled={(!draft.trim() && readyAttachmentIds.length === 0) || hasUploadsInFlight}
+							leftSection={<IconSend size={14} />}
+						>
+							{t("send")}
+						</Button>
+					</Group>
+				</>
+			)}
 
 			<Modal
 				opened={summaryPreview !== null}

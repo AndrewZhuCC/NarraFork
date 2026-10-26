@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
-import { db } from "../db";
+import { db, sqlite } from "../db";
 import {
 	fileAttributions,
 	narratorMessages,
@@ -937,5 +937,211 @@ describe("M4 actor identity and honest observation coverage", () => {
 		});
 		expect(offsetBoundary).toEqual(utcBoundary);
 		expect(offsetBoundary.byFile.map((group) => group.filePath)).toEqual(["b.ts"]);
+	});
+});
+
+describe("scoped per-path history", () => {
+	const scopedKeys: string[] = [];
+	afterEach(async () => {
+		for (const workspacePath of scopedKeys.splice(0))
+			await db.delete(fileAttributions).where(eq(fileAttributions.workspacePath, workspacePath));
+	});
+
+	/** A recorded cwd below the Git root: rows store paths relative to that cwd. */
+	function subdirScope(ws: string, prefix: string) {
+		const workspacePath = `${normalizeWorkspacePath(ws)}/${prefix}`;
+		scopedKeys.push(workspacePath);
+		return { workspacePath, prefix };
+	}
+
+	async function seedScoped(
+		rows: Array<{ workspacePath: string; filePath: string; changedAt: string }>,
+	): Promise<string[]> {
+		const ids = rows.map(() => generateId());
+		for (let offset = 0; offset < rows.length; offset += 100) {
+			await db.insert(fileAttributions).values(
+				rows.slice(offset, offset + 100).map((row, index) => ({
+					id: ids[offset + index] as string,
+					deviceId: "local",
+					action: "external" as const,
+					...row,
+				})),
+			);
+		}
+		return ids;
+	}
+
+	test("every cwd spelling and rename source merges under one newest-first window", async () => {
+		const ws = makeWorkspace("nf-view-scoped-merge-");
+		const scopes = Array.from({ length: 32 }, (_, i) => subdirScope(ws, `d${i}`));
+		// Ties on changedAt across spellings must fall back to rowid, i.e. insertion order.
+		const seeded: Array<{ workspacePath: string; filePath: string; changedAt: string }> = [];
+		scopes.forEach((scope, i) => {
+			const second = String(i % 7).padStart(2, "0");
+			seeded.push({
+				workspacePath: scope.workspacePath,
+				filePath: "../src/new.ts",
+				changedAt: `2026-03-01T00:00:${second}.000Z`,
+			});
+			seeded.push({
+				workspacePath: scope.workspacePath,
+				filePath: "../src/old.ts",
+				changedAt: `2026-03-01T00:00:${second}.000Z`,
+			});
+		});
+		const ids = await seedScoped(seeded);
+		// Baseline: newest first, insertion order breaking ties (rowid DESC).
+		const baseline = seeded
+			.map((row, index) => ({ ...row, id: ids[index] as string, index }))
+			.sort((a, b) => b.changedAt.localeCompare(a.changedAt) || b.index - a.index);
+
+		const view = await getWorkspaceModificationView(ws, {
+			additionalScopes: scopes,
+			filePaths: ["src/new.ts", "src/old.ts"],
+			pathAliases: new Map([["src/old.ts", "src/new.ts"]]),
+			projection: "byFile",
+		});
+
+		expect(view.byFile).toHaveLength(1);
+		const group = view.byFile[0];
+		expect(group?.filePath).toBe("src/new.ts");
+		// Each recorded path keeps its own ten-row window before the rename merges them.
+		expect(group?.changeCount).toBe(20);
+		expect(group?.recentEvents.map((event) => event.id)).toEqual(
+			baseline.slice(0, 5).map((row) => row.id),
+		);
+		expect(group?.completeness.fileHistoryComplete).toBe(false);
+		expect(view.hasMore).toBe(true);
+	});
+
+	test("a path whose spellings span query batches keeps the global newest ten", async () => {
+		const ws = makeWorkspace("nf-view-scoped-batches-");
+		const scopes = Array.from({ length: 32 }, (_, i) => subdirScope(ws, `d${i}`));
+		const filePaths = Array.from({ length: 30 }, (_, i) => `p${i}.ts`);
+		const seeded: Array<{ workspacePath: string; filePath: string; changedAt: string }> = [];
+		// 32 spellings x 30 paths = 960 targets; p28 (targets 896-927) straddles the 909 boundary.
+		scopes.forEach((scope, i) => {
+			seeded.push({
+				workspacePath: scope.workspacePath,
+				filePath: "../p28.ts",
+				changedAt: new Date(Date.UTC(2026, 2, 1, 0, i)).toISOString(),
+			});
+		});
+		const ids = await seedScoped(seeded);
+
+		const view = await getWorkspaceModificationView(ws, {
+			additionalScopes: scopes,
+			filePaths,
+			projection: "byFile",
+		});
+
+		const group = view.byFile.find((entry) => entry.filePath === "p28.ts");
+		expect(group?.changeCount).toBe(10);
+		expect(group?.recentEvents.map((event) => event.id)).toEqual(ids.slice(-5).reverse());
+		expect(group?.completeness.fileHistoryComplete).toBe(false);
+		expect(view.byFile.map((entry) => entry.filePath)).toEqual(["p28.ts"]);
+	});
+
+	test("SQL text stays the same size however many path x cwd targets are queried", async () => {
+		const ws = makeWorkspace("nf-view-scoped-sql-size-");
+		const scopes = Array.from({ length: 32 }, (_, i) => subdirScope(ws, `d${i}`));
+		await seedScoped(
+			scopes.map((scope) => ({
+				workspacePath: scope.workspacePath,
+				filePath: "../p0.ts",
+				changedAt: "2026-03-01T00:00:00Z",
+			})),
+		);
+
+		// A UNION ALL branch per (path, cwd) pair reached 414 KiB and timed out in production.
+		const longestAttributionStatement = async (filePaths: string[]) => {
+			const lengths: number[] = [];
+			const prepare = sqlite.prepare.bind(sqlite);
+			const query = sqlite.query.bind(sqlite);
+			const record = (text: string) => {
+				if (text.includes("file_attributions")) lengths.push(Buffer.byteLength(text));
+			};
+			sqlite.prepare = ((text: string, ...rest: unknown[]) => {
+				record(text);
+				return (prepare as (...args: unknown[]) => unknown)(text, ...rest);
+			}) as typeof sqlite.prepare;
+			sqlite.query = ((text: string) => {
+				record(text);
+				return query(text);
+			}) as typeof sqlite.query;
+			try {
+				await getWorkspaceModificationView(ws, {
+					additionalScopes: scopes,
+					filePaths,
+					projection: "byFile",
+				});
+			} finally {
+				sqlite.prepare = prepare;
+				sqlite.query = query;
+			}
+			expect(lengths.length).toBeGreaterThan(0);
+			return Math.max(...lengths);
+		};
+
+		const one = await longestAttributionStatement(["p0.ts"]);
+		const many = await longestAttributionStatement(
+			Array.from({ length: 30 }, (_, i) => `p${i}.ts`),
+		);
+		expect(many).toBe(one);
+		expect(many).toBeLessThan(8 * 1024);
+	});
+
+	test("cwd spellings without stored rows cannot crowd out the ones that hold history", async () => {
+		const ws = makeWorkspace("nf-view-scoped-prune-");
+		const empty = Array.from({ length: 40 }, (_, i) => subdirScope(ws, `empty${i}`));
+		const real = subdirScope(ws, "real");
+		const [id] = await seedScoped([
+			{ workspacePath: real.workspacePath, filePath: "a.ts", changedAt: "2026-03-01T00:00:00Z" },
+		]);
+
+		const view = await getWorkspaceModificationView(ws, {
+			additionalScopes: [...empty, real],
+			filePaths: ["real/a.ts"],
+		});
+
+		expect(view.byFile[0]?.recentEvents.map((event) => event.id)).toEqual([id as string]);
+		expect(view.byFile[0]?.completeness.fileHistoryComplete).toBe(true);
+		expect(view.hasMore).toBe(false);
+	});
+
+	test("more stored spellings than the cap are disclosed as incomplete", async () => {
+		const ws = makeWorkspace("nf-view-scoped-cap-");
+		const scopes = Array.from({ length: 33 }, (_, i) => subdirScope(ws, `d${i}`));
+		await seedScoped(
+			scopes.map((scope) => ({
+				workspacePath: scope.workspacePath,
+				filePath: "other.ts",
+				changedAt: "2026-03-01T00:00:00Z",
+			})),
+		);
+		await record({ workspacePath: ws, filePath: "a.ts", narratorId: null, action: "external" });
+
+		const view = await getWorkspaceModificationView(ws, {
+			additionalScopes: scopes,
+			filePaths: ["a.ts"],
+		});
+
+		expect(view.hasMore).toBe(true);
+		expect(view.byFile[0]?.completeness.fileHistoryComplete).toBe(false);
+		expect(view.byFile[0]?.hasDeletedActor).toBeNull();
+	});
+
+	test("a truncated scope discovery never reports a file history as complete", async () => {
+		const ws = makeWorkspace("nf-view-scoped-truncated-");
+		await record({ workspacePath: ws, filePath: "a.ts", narratorId: null, action: "write" });
+
+		const view = await getWorkspaceModificationView(ws, {
+			additionalScopesTruncated: true,
+			filePaths: ["a.ts"],
+		});
+
+		expect(view.hasMore).toBe(true);
+		expect(view.byFile[0]?.completeness.fileHistoryComplete).toBe(false);
+		expect(view.byFile[0]?.hasExternalChange).toBeNull();
 	});
 });
