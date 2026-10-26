@@ -179,6 +179,25 @@ function onData(id: string, buffer: BufferManager, data: string | Uint8Array) {
 }
 
 /**
+ * Build a buffer whose parser answers the queries it is asked.
+ *
+ * The headless xterm holds the cursor state and sees the exact byte stream, so
+ * it is the single, authoritative responder for DA / DSR-CPR (`CSI 6n`) /
+ * DECRPM / OSC colour queries. Without it, atuin, codex and reedline block on
+ * "where is the cursor" until their own timeout fires.
+ *
+ * Replies go straight to the runtime rather than through `terminalService.write`
+ * so a detached or exited terminal is a silent no-op instead of a warning.
+ */
+function createBufferManager(terminalId: string, cols?: number, rows?: number): BufferManager {
+	return new BufferManager(terminalId, cols, rows, {
+		onReply: (data) => {
+			activeTerminals.get(terminalId)?.runtime.write(data);
+		},
+	});
+}
+
+/**
  * Monitor a dtach attach process. When it exits:
  * - If the dtach socket is still alive, save buffer and remove from activeTerminals
  *   (lazy re-attach will happen when a client subscribes via ensureAttached).
@@ -287,7 +306,7 @@ export const terminalService = {
 		// All remote authorization/capability checks above must finish before any terminal side effect.
 		const id = generateId();
 		const now = new Date().toISOString();
-		const buffer = new BufferManager(id);
+		const buffer = createBufferManager(id);
 		buffer.startPeriodicFlush();
 		// Remote terminals run on a device PTY; dtach (local detach) does not apply.
 		const useRemote = !!deviceId;
@@ -448,7 +467,7 @@ export const terminalService = {
 				await dtachService.killSession(terminalId);
 			}
 			// Clean up buffer file
-			const buf = new BufferManager(terminalId);
+			const buf = createBufferManager(terminalId);
 			await buf.deleteFromDisk();
 		}
 
@@ -528,7 +547,7 @@ export const terminalService = {
 		if (existing) assertLegacyRuntimeOwner(existing);
 		await dtachService.killSession(terminalId);
 		// Clean up buffer file if any
-		const buf = new BufferManager(terminalId);
+		const buf = createBufferManager(terminalId);
 		await buf.deleteFromDisk();
 	},
 
@@ -576,7 +595,7 @@ export const terminalService = {
 		if (!(await dtachService.isAvailable())) return false;
 		if (!(await dtachService.isSocketAlive(terminalId))) return false;
 
-		const buffer = new BufferManager(terminalId);
+		const buffer = createBufferManager(terminalId);
 		await buffer.loadFromDisk();
 		buffer.startPeriodicFlush();
 
@@ -659,7 +678,7 @@ export const terminalService = {
 			return { data: contents, cols: active.buffer.cols, rows: active.buffer.rows };
 		}
 		// Try loading from disk (detached terminal)
-		const buf = new BufferManager(terminalId);
+		const buf = createBufferManager(terminalId);
 		if (await buf.loadFromDisk()) {
 			const contents = await buf.getContents();
 			await this.getById(terminalId);
@@ -704,7 +723,7 @@ export const terminalService = {
 			if (terminal.worktreeResourceId != null) continue;
 			if (terminal.dtachSocket && (await dtachService.isSocketAlive(terminal.id))) {
 				// Re-attach to the dtach session
-				const buffer = new BufferManager(terminal.id);
+				const buffer = createBufferManager(terminal.id);
 				await buffer.loadFromDisk();
 				buffer.startPeriodicFlush();
 
@@ -767,7 +786,7 @@ export const terminalService = {
 						})
 						.where(eq(terminals.id, terminalId));
 
-					const buffer = new BufferManager(terminalId);
+					const buffer = createBufferManager(terminalId);
 					await buffer.loadFromDisk();
 					buffer.startPeriodicFlush();
 

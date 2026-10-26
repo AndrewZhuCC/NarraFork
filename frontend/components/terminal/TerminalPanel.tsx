@@ -140,10 +140,13 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 		const modsRef = useRef(mods);
 		modsRef.current = mods;
 
-		// Flag to suppress terminal response sequences from being sent back as input.
-		// When term.write() processes PTY output, xterm.js may synchronously fire
-		// onData with response sequences (DA, color queries, DECRPM, etc.).
-		// We set this flag during write() to distinguish those from real user input.
+		// Invariant: the server-side headless buffer (server/terminal/buffer-manager.ts)
+		// is the ONLY responder to terminal queries (DA, DSR/CPR, DECRPM, OSC color).
+		// xterm.js answers them synchronously inside term.write(), which would be a
+		// second reply the shell then reads as typed input — so this flag mutes the
+		// browser side for the duration of every write(). It must equally cover the
+		// replay paths (scrollback snapshot, pre-ready pending data): answering a
+		// query buried in history would inject stray characters into the shell.
 		const writingRef = useRef(false);
 		const outputBufferRef = useRef<string[]>([]);
 		const outputBufferCharsRef = useRef(0);
@@ -466,10 +469,12 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 			});
 
 			term.onData((data) => {
-				// During term.write() (PTY output processing), xterm.js may
-				// synchronously fire onData with terminal response sequences
-				// (DA, DSR, DECRPM, OSC color replies, etc.). These must not be
-				// sent back to the PTY or they appear as garbled text.
+				// xterm.js fires onData synchronously from inside term.write() with
+				// its reply to DA / DSR / DECRPM / OSC queries. Those answers are
+				// already given by the server-side headless buffer, so sending this
+				// copy to the PTY would be a duplicate reply the shell reads as
+				// garbled input. Never remove this without also removing the
+				// server-side responder.
 				if (writingRef.current) return;
 
 				const m = modsRef.current;
