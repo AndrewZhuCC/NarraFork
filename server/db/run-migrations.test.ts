@@ -665,6 +665,52 @@ describe("hash-based migration self-heal", () => {
 		return folder;
 	}
 
+	test.each([
+		100, 300,
+	])("duplicate SQL hash anchors only its recorded occurrence (%d)", (recordedAt) => {
+		const folder = mkdtempSync(join(tmpdir(), "nf-duplicate-migration-"));
+		try {
+			mkdirSync(join(folder, "meta"));
+			const repeatedSql = "CREATE TABLE stamp_marker (id integer);";
+			const tags = ["0000_first", "0001_retire", "0002_repeated"];
+			writeFileSync(
+				join(folder, "meta/_journal.json"),
+				JSON.stringify({
+					version: "7",
+					dialect: "sqlite",
+					entries: tags.map((tag, idx) => ({
+						idx,
+						version: "6",
+						when: (idx + 1) * 100,
+						tag,
+						breakpoints: true,
+					})),
+				}),
+			);
+			writeFileSync(join(folder, `${tags[0]}.sql`), repeatedSql);
+			writeFileSync(join(folder, `${tags[1]}.sql`), "DROP TABLE legacy;");
+			writeFileSync(join(folder, `${tags[2]}.sql`), repeatedSql);
+			sqlite = new Database(":memory:");
+			sqlite.exec(`${repeatedSql} CREATE TABLE legacy (value text); INSERT INTO legacy VALUES ('preserved');
+				CREATE TABLE __drizzle_migrations (hash text NOT NULL, created_at numeric);`);
+			sqlite.run("INSERT INTO __drizzle_migrations (hash, created_at) VALUES (?, ?)", [
+				createHash("sha256").update(repeatedSql).digest("hex"),
+				recordedAt,
+			]);
+			applyPendingMigrationsByHash(sqlite, folder);
+			expect(tableExists(sqlite, "legacy")).toBe(recordedAt === 300);
+			if (recordedAt === 300) {
+				expect(sqlite.query("SELECT value FROM legacy").get()).toEqual({ value: "preserved" });
+			}
+			expect(tableExists(sqlite, "stamp_marker")).toBe(true);
+			const count = hashCount(sqlite);
+			applyPendingMigrationsByHash(sqlite, folder);
+			expect(hashCount(sqlite)).toBe(count);
+		} finally {
+			rmSync(folder, { recursive: true, force: true });
+		}
+	});
+
 	test("recognizes a ledger written from CRLF migration files (Windows checkout)", async () => {
 		// The reported incident: a database migrated from a CRLF checkout recorded every hash over
 		// CRLF text. An LF build then saw nothing as applied, replayed the whole journal and failed

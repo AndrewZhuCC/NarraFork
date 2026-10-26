@@ -974,11 +974,23 @@ export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder:
 		)
 	`);
 
-	const appliedHashes = new Set(
-		(sqlite.prepare("SELECT hash FROM __drizzle_migrations").all() as Array<{ hash: string }>).map(
-			(row) => row.hash,
-		),
-	);
+	const appliedRows = sqlite
+		.prepare("SELECT hash, created_at FROM __drizzle_migrations")
+		.all() as Array<{
+		hash: string;
+		created_at: number;
+	}>;
+	const appliedHashes = new Set(appliedRows.map((row) => row.hash));
+	const hashesByTimestamp = new Map<number, Set<string>>();
+	for (const row of appliedRows) {
+		const timestamp = Number(row.created_at);
+		let hashes = hashesByTimestamp.get(timestamp);
+		if (!hashes) {
+			hashes = new Set();
+			hashesByTimestamp.set(timestamp, hashes);
+		}
+		hashes.add(row.hash);
+	}
 
 	// readMigrationFiles returns entries in journal order, with `sql` already split on
 	// `--> statement-breakpoint` and `hash`/`folderMillis` matching what Drizzle records.
@@ -990,8 +1002,19 @@ export function applyPendingMigrationsByHash(sqlite: Database, migrationsFolder:
 	// already happened, so replaying the DROP would destroy live data.
 	const applied = migrations.map((migration) => isRecordedMigration(appliedHashes, migration));
 	let lastAppliedIndex = -1;
-	for (let i = 0; i < migrations.length; i++) {
-		if (applied[i]) lastAppliedIndex = i;
+	const seenHashes = new Set<string>();
+	for (const [i, migration] of migrations.entries()) {
+		// Repeated SQL proves only its first occurrence. A later identical migration
+		// advances the watermark only if its own timestamp is recorded in the ledger.
+		const atTimestamp = hashesByTimestamp.get(migration.folderMillis);
+		if (
+			applied[i] &&
+			(!seenHashes.has(migration.hash) ||
+				(atTimestamp && isRecordedMigration(atTimestamp, migration)))
+		) {
+			lastAppliedIndex = i;
+		}
+		seenHashes.add(migration.hash);
 	}
 
 	const pending = migrations
