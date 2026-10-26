@@ -822,14 +822,14 @@ describe("Send exact delivery receipts", () => {
 
 	test("a wake that cannot start leaves the Send queued and never labels later human text", async () => {
 		// The recipient's last stop was the user's interrupt: an agent message alone does
-		// not restart it, so the message stays queued for the next eligible turn.
+		// not restart it, so the message stays queued and the sender is told it is blocked.
 		sqlite
 			.prepare(
 				"UPDATE narrators SET status = 'idle', cwd = ?, last_stop_reason = 'user_interrupt' WHERE id = 'child'",
 			)
 			.run(process.env.HOME ?? ".");
 		const result = await send();
-		expect(result.targets[0].status).toBe("queued");
+		expect(result.targets[0]).toMatchObject({ status: "blocked", blockedReason: "user_interrupt" });
 		expect(runStarts).toHaveLength(0);
 		expect(await agentQueued()).toHaveLength(1);
 		const human = await narratorService.persistSubagentUserMessage(

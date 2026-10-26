@@ -1,3 +1,4 @@
+import { runtimePolicyForContext } from "@server/services/agent-runtime/policy";
 import { cleanAssistantText } from "@shared/citations";
 import { z } from "zod/v4";
 import type { AgentConfig, ToolContext, ToolDefinition, ToolResult } from "../types";
@@ -10,7 +11,19 @@ const USER_TARGET_DESCRIPTION =
 	"Bot only — your voice to people: the username of the person to message (the name in " +
 	"their sender marker). Delivers `message` into your chat with them, the only text of yours " +
 	"they ever see (Markdown renders, up to 32,000 characters). Use it alone: no agent " +
-	"targets or doInterrupt.";
+	"targets, replyTo, doInterrupt, resume or model.";
+
+const RESUME_DESCRIPTION =
+	"Direct child subagents only: restart a target whose last turn ended with an error. Agent " +
+	"messages alone never restart such a subagent (Send then reports status `blocked` and the " +
+	"message stays queued); set resume=true to deliver this message and start it again. " +
+	"It cannot override a stop the user made.";
+
+const MODEL_DESCRIPTION =
+	"Direct child subagents only: switch each target's model before delivering this message " +
+	'(use "parent" to follow your own model again). Subject to the same allowed subagent model ' +
+	"pool as the Agent call; a running subagent switches at its next model request. Combine with " +
+	"resume=true to retry a subagent that failed on its previous model.";
 
 function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 	const properties: Record<string, unknown> = {
@@ -42,6 +55,12 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 			type: "boolean",
 		},
 	};
+
+	const policy = runtimePolicyForContext(config);
+	if (policy.capabilities.spawnAgent) {
+		properties.resume = { description: RESUME_DESCRIPTION, type: "boolean" };
+		properties.model = { description: MODEL_DESCRIPTION, type: "string" };
+	}
 
 	// Only a bot speaks to people, so only a bot is offered the person target. An
 	// unassembled config (no runtime, as with the policy ceiling) sees the full schema.
@@ -103,6 +122,8 @@ export const sendTool: ToolDefinition = {
 				"Interrupt an active foreground child subagent after queuing the message. Use only " +
 					"for an urgent correction that requires stopping current work, never for status polling.",
 			),
+		resume: z.boolean().optional().describe(RESUME_DESCRIPTION),
+		model: z.string().optional().describe(MODEL_DESCRIPTION),
 	}),
 	get rawJsonSchema() {
 		return buildRawJsonSchema();
@@ -119,6 +140,8 @@ export const sendTool: ToolDefinition = {
 			message?: string;
 			user?: string;
 			doInterrupt?: boolean;
+			resume?: boolean;
+			model?: string;
 		};
 		if (raw.user !== undefined) return sendToUser(raw, ctx);
 		if (!raw.message?.trim()) {
@@ -140,6 +163,8 @@ export const sendTool: ToolDefinition = {
 				names: raw.names,
 				message: raw.message,
 				doInterrupt: raw.doInterrupt,
+				resume: raw.resume,
+				model: raw.model,
 				toolUseId: ctx.currentToolUseId,
 				toolCallBinding: ctx.toolCallBinding,
 				signal: ctx.signal,
@@ -209,11 +234,19 @@ async function sendToUser(
 		name?: string;
 		names?: string[];
 		doInterrupt?: boolean;
+		resume?: boolean;
+		model?: string;
 	},
 	ctx: ToolContext,
 ): Promise<ToolResult> {
 	if (raw.id || raw.ids?.length || raw.name || raw.names?.length) {
 		return { output: "Send error: `user` cannot be combined with agent targets.", isError: true };
+	}
+	if (raw.resume || raw.model !== undefined) {
+		return {
+			output: "Send error: `user` cannot be combined with resume or model.",
+			isError: true,
+		};
 	}
 	if (raw.doInterrupt) {
 		return {

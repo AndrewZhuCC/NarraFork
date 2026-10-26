@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import { resolve } from "node:path";
+import type { PendingAgentMessagesPage } from "@shared/agent-inbox";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import { type ComposerDocument, composerQuoteBlock } from "@shared/composer-document";
 import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
@@ -3387,6 +3388,52 @@ narratorRoutes.delete("/:id/buffer/:mid", async (c) => {
 		),
 	);
 	await broadcastBufferQueue(id);
+	return c.json({ ok: true });
+});
+
+// Queued agent messages (Send/team traffic) — previews only, for the recipient page.
+narratorRoutes.get("/:id/inbox/agent-messages", async (c) => {
+	const id = c.req.param("id");
+	const [{ listPendingAgentMessages, blockingStopReason }, narrator] = await Promise.all([
+		import("../services/agent-runtime/inbox"),
+		narratorService.getById(id),
+	]);
+	const pending = await listPendingAgentMessages(id);
+	const running =
+		narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id);
+	return c.json({
+		...pending,
+		running,
+		blockedReason:
+			!running && narrator.status === "idle" ? blockingStopReason(narrator.lastStopReason) : null,
+	} satisfies PendingAgentMessagesPage);
+});
+
+// Explicit user resume: lets queued agent messages restart a failed or user-stopped session.
+narratorRoutes.post("/:id/inbox/resume", async (c) => {
+	const id = c.req.param("id");
+	const narrator = await narratorService.getById(id);
+	if (narrator.status === "archived") throw new ValidationError("Narrator is archived");
+	const { wakeInboxIfEligible, notifyAgentInboxChanged } = await import(
+		"../services/agent-runtime/inbox"
+	);
+	const locale = await getUserLanguage(c.get("user").sub);
+	const resumed = await wakeInboxIfEligible(id, locale, {
+		resumeStopped: ["error", "user_interrupt"],
+	});
+	notifyAgentInboxChanged(id);
+	return c.json({ ok: true, resumed });
+});
+
+narratorRoutes.delete("/:id/inbox/agent-messages/:mid", async (c) => {
+	const id = c.req.param("id");
+	const mid = c.req.param("mid");
+	const { discardPendingAgentMessage, notifyAgentInboxChanged } = await import(
+		"../services/agent-runtime/inbox"
+	);
+	if (!(await discardPendingAgentMessage(id, mid, "Discarded by user")))
+		throw new NotFoundError("Queued agent message", mid);
+	notifyAgentInboxChanged(id);
 	return c.json({ ok: true });
 });
 
