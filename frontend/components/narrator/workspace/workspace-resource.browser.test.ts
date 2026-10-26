@@ -1291,6 +1291,16 @@ for (const director of [false, true]) {
 				await page.click(opener);
 				await page.waitForSelector(titleSelector(id));
 				await page.click(pinSelector(id));
+				// Pinning is committed asynchronously by Dockview. DOM attachment and two RAFs do not
+				// prove that Escape will see a fixed grid panel rather than a closable floating one.
+				await page.waitForFunction(
+					(value) => {
+						const snapshot = (window as unknown as FixtureWindow).fixture.snapshot();
+						return snapshot.panels.some((panel) => panel.id === value && panel.location === "grid");
+					},
+					{},
+					id,
+				);
 				await settle(page);
 				await page.focus(bodySelector(id));
 				await page.keyboard.press("Escape");
