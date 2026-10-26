@@ -285,6 +285,73 @@ describe("measureMessageBubble — user", () => {
 		expect(chips.displayWidth).toBeLessThanOrEqual(320);
 	});
 
+	it("shows file reference comments without duplicate locator rows or generated tokens", async () => {
+		const { composerDocumentText } = await import("@shared/composer-document");
+		const { measureMessageBubble } = await import("./measure-message-bubble");
+		const reference = {
+			id: "file-quoted",
+			deviceId: "local",
+			path: "/workspace/quote-sample.ts",
+			label: "quote-sample.ts",
+			selection: { startLineNumber: 13, startColumn: 7, endLineNumber: 13, endColumn: 34 },
+			expectedHash: "a".repeat(64),
+		};
+		for (const body of ["", "follow-up", "literal #file:quote-sample.ts:13-13"]) {
+			const projection = composerDocumentText({
+				version: 1,
+				paragraphs: [
+					{
+						children: [
+							{
+								type: "quote",
+								id: "message-quote",
+								label: "source",
+								text: "original",
+								anchor: "m:source",
+								comment: "message note",
+							},
+							{ type: "fileReference", id: reference.id, reference, comment: "file note" },
+							{ type: "text", text: body },
+						],
+					},
+				],
+				assets: [],
+			});
+			const input = {
+				role: "user" as const,
+				text: projection.text,
+				attachments: [
+					{ type: "file_reference", reference: projection.fileReferences[0] },
+					{ type: "text_file", filename: "other.txt", size: 4 },
+				],
+			};
+			const original = JSON.stringify(input);
+			const measured = measureMessageBubble(input, 390);
+			expect(
+				measured.blocks.map((block) => (block.kind === "fixed" ? block.tag : block.kind)),
+			).toEqual(["user-text-file", "user-quote-chips", ...(body ? ["code"] : [])]);
+			const chips = measured.blocks.find(
+				(block) => block.kind === "fixed" && block.tag === "user-quote-chips",
+			);
+			if (chips?.kind !== "fixed") throw new Error("Missing quote chips");
+			expect(chips.data?.quotes).toMatchObject([
+				{ anchor: "m:source", comment: "message note" },
+				{
+					anchor: `f:${reference.id}`,
+					comment: "file note",
+					reference: projection.fileReferences[0],
+				},
+			]);
+			if (body) {
+				const renderedBody = measured.blocks.find((block) => block.kind === "code");
+				const plainBody = measureMessageBubble({ role: "user", text: body }, 390).blocks[0];
+				if (renderedBody?.kind !== "code" || plainBody?.kind !== "code")
+					throw new Error("Missing body");
+				expect(renderedBody.prepared).toBe(plainBody.prepared);
+			}
+			expect(JSON.stringify(input)).toBe(original);
+		}
+	});
 	it("preserves comments and immutable file targets in stacked and inline quote layouts", async () => {
 		const { measureMessageBubble } = await import("./measure-message-bubble");
 		const { serializeComposerQuotes } = await import("../../composer/composer-quotes");

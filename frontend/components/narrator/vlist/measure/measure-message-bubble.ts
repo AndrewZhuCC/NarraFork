@@ -22,7 +22,7 @@ import {
 	prepareRichInline,
 	type RichInlineItem,
 } from "@chenglou/pretext/rich-inline";
-import { unescapeComposerText } from "@shared/composer-document";
+import { composerFileReferenceToken, unescapeComposerText } from "@shared/composer-document";
 import type { FileReference } from "@shared/file-reference";
 import { fileReferenceLabel } from "@shared/file-reference-display";
 import { fitImageBox, readImageIntrinsicSize } from "@shared/pretext-layout/image-fit";
@@ -542,12 +542,39 @@ interface UserBodyLayout {
 }
 
 function userBodyLayout(input: MeasureMessageInput): UserBodyLayout {
-	const attachments = input.attachments ?? [];
-	const prefix = parseComposerQuotePrefix(input.text);
+	let text = input.text;
+	let attachments = input.attachments ?? [];
+	const references = attachments.filter(
+		(attachment) => attachment.type === "file_reference" && attachment.reference,
+	);
+	if (input.bodyFormat !== "markdown" && references.length) {
+		const quoteAnchors = new Set(
+			parseComposerSegments(text).flatMap((segment) =>
+				segment.type === "quote" && segment.quote.anchor ? [segment.quote.anchor] : [],
+			),
+		);
+		// The quote chip keeps the original locator; do not render it again as an attachment row.
+		attachments = attachments.filter(
+			(attachment) =>
+				attachment.type !== "file_reference" || !quoteAnchors.has(`f:${attachment.reference?.id}`),
+		);
+		// Remove only generated markers at their captured UTF-16 ranges, from the end.
+		// A matching literal in the user's typed body must remain visible.
+		for (const attachment of references.sort(
+			(a, b) => (b.reference?.inputRange?.[0] ?? -1) - (a.reference?.inputRange?.[0] ?? -1),
+		)) {
+			const reference = attachment.reference;
+			const range = reference?.inputRange;
+			if (reference && range && text.slice(...range) === composerFileReferenceToken(reference)) {
+				text = text.slice(0, range[0]) + text.slice(range[1]);
+			}
+		}
+	}
+	const prefix = parseComposerQuotePrefix(text);
 	const legacy: UserBodyLayout = {
 		leadingAttachments: [...attachments],
 		leadingQuotes: prefix.quotes,
-		body: input.text.slice(prefix.prefixLength),
+		body: text.slice(prefix.prefixLength),
 		inline: null,
 		trailingQuotes: [],
 		trailingAttachments: [],
@@ -557,7 +584,7 @@ function userBodyLayout(input: MeasureMessageInput): UserBodyLayout {
 	legacy.body = unescapeComposerText(legacy.body);
 	const images = attachments.filter((attachment) => attachment.type === "image");
 	const files = attachments.filter((attachment) => attachment.type === "text_file");
-	const segments = parseComposerSegments(input.text, {
+	const segments = parseComposerSegments(text, {
 		images: images.map((attachment) => attachment.filename ?? ""),
 		files: files.map((attachment) => attachment.filename ?? ""),
 	});
