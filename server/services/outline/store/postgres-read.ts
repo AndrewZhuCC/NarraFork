@@ -45,7 +45,7 @@ import {
 	type OutlineLinkRow,
 	type OutlineVersionRow,
 } from "./port";
-import type { OutlineReadPort, OutlineSearchRow } from "./read-port";
+import { OUTLINE_PAGE_HEAD_CHARS, type OutlineReadPort, type OutlineSearchRow } from "./read-port";
 
 /** Version keys per statement (two bound parameters each). */
 const VERSION_KEY_CHUNK = 250;
@@ -381,6 +381,58 @@ export function createPostgresOutlineReads(db: BunSQLDatabase): OutlineReadPort 
 				for (const row of rows) out.push(toLink(row));
 			}
 			return out;
+		},
+
+		async listSpacePages(spaceId, { after, limit }) {
+			const b = outlineBlocks;
+			const orderKey = sql`${b.orderKey} COLLATE "C"`;
+			const id = byIdBytewise(b.id);
+			const rows = await db
+				.select({
+					id: b.id,
+					sid: b.sid,
+					orderKey: b.orderKey,
+					alias: b.alias,
+					contentHead: sql<string>`substring(${b.content} from 1 for ${sql.raw(String(OUTLINE_PAGE_HEAD_CHARS))})`,
+					hasTask: sql<boolean>`${b.taskJson} IS NOT NULL`,
+				})
+				.from(b)
+				.where(
+					and(
+						eq(b.spaceId, spaceId),
+						isNull(b.parentId),
+						eq(b.deleted, false),
+						after
+							? sql`(${orderKey} > ${after.orderKey}
+								OR (${b.orderKey} = ${after.orderKey} AND ${id} > ${after.id}))`
+							: undefined,
+					),
+				)
+				.orderBy(orderKey, id)
+				.limit(limit);
+			return rows.map(({ hasTask, ...row }) => ({ ...row, isTask: Boolean(hasTask) }));
+		},
+
+		async listBlockHistory(blockId, { before, limit }) {
+			const v = outlineBlockVersions;
+			return await db
+				.select({
+					fromSeq: v.fromSeq,
+					toSeq: v.toSeq,
+					commitId: v.commitId,
+					pageId: v.pageId,
+					changeFlags: v.changeFlags,
+					deleted: v.deleted,
+				})
+				.from(v)
+				.where(
+					and(
+						eq(v.blockId, blockId),
+						before === undefined || before === null ? undefined : lt(v.fromSeq, before),
+					),
+				)
+				.orderBy(desc(v.fromSeq))
+				.limit(limit);
 		},
 	};
 }

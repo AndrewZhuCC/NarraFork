@@ -786,6 +786,8 @@
 	"jumpTargetUnavailable": "That message is no longer in this conversation's history.",
 	"jumpTargetTooFar": "That message is too far back to jump to. Scroll up to load more history, then try again.",
 	"archiveNarrator": "Archive",
+	"openOutline": "Outline space",
+	"outlineNotCreated": "This session has no outline yet. Someone who can work in the session creates it by opening it.",
 	"archiveFailed": "Could not archive the session. Please try again.",
 	"permissionMode": "Permission Mode",
 	"permissionModesUnavailable": "Permission modes unavailable",
