@@ -1,4 +1,5 @@
 import { afterAll, describe, expect, it } from "bun:test";
+import { formatLocaleDateTime } from "@frontend/lib/intl-format";
 import en from "@frontend/locales/en/narrator.json";
 import zh from "@frontend/locales/zh-CN/narrator.json";
 import { MantineProvider } from "@mantine/core";
@@ -262,7 +263,7 @@ describe("subagent file-change rendering", () => {
 		expect(legacy?.textContent).toBe("· approximate");
 		const title = legacy?.getAttribute("title") ?? "";
 		expect(title).toContain("not linked to this exact run");
-		expect(title).toContain(`Time window: ${new Date(startedAt).toLocaleString()} → …`);
+		expect(title).toContain(`Time window: ${formatLocaleDateTime(startedAt)} → …`);
 		// Ids are diagnostics, not reader-facing text.
 		expect(root.textContent).not.toContain("parent-call");
 		expect(title).not.toContain("parent-call");

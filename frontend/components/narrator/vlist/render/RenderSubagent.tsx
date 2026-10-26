@@ -24,6 +24,7 @@
  * template.
  */
 
+import { formatLocaleDateTime } from "@frontend/lib/intl-format";
 import {
 	Badge,
 	Box,
@@ -241,8 +242,7 @@ function legacyAttributionTitle(
 	scope: SubagentFileChangesData["scope"],
 	labels: ResolvedSubagentLabels,
 ): string {
-	const time = (iso: string | null | undefined) =>
-		iso && !Number.isNaN(Date.parse(iso)) ? new Date(iso).toLocaleString() : "…";
+	const time = (iso: string | null | undefined) => (iso && formatLocaleDateTime(iso)) || "…";
 	if (!scope?.startedAt && !scope?.completedAt) return labels.fileChangeLegacy;
 	return `${labels.fileChangeLegacy}\n${labels.fileChangeWindow}: ${time(scope.startedAt)} → ${time(scope.completedAt)}`;
 }
