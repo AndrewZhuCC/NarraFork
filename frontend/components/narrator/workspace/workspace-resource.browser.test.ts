@@ -381,6 +381,50 @@ browserTest(
 );
 
 browserTest(
+	"Messages: commit geometry observation precedes CSS parking and passive effects",
+	async () => {
+		await withFixture(
+			async (page) => {
+				await expectReadyDocuments(page, ["source-a", "source-b", "source-c"]);
+				await page.evaluate(() => {
+					const fixture = (window as unknown as FixtureWindow).fixture;
+					fixture.parkAfterNextMessageCommit("commit-tab");
+					fixture.addMessageTab("commit-tab", "narrator-commit");
+					fixture.nativeDockviewApi().getPanel("commit-tab")?.api.setActive();
+				});
+				await expectReadyDocuments(page, ["commit-tab"]);
+				await settle(page);
+				const parked = await messageState(page);
+				expect(parked.parkedCommits).toHaveLength(1);
+				expect(parked.parkedCommits[0]?.panelId).toBe("commit-tab");
+				expect(parked.parkedCommits[0]?.width).toBeGreaterThan(0);
+				expect(parked.parkedCommits[0]?.height).toBeGreaterThan(0);
+				expect(parked.documents.find((entry) => entry.panelId === "commit-tab")).toMatchObject({
+					status: "ready",
+					width: 0,
+					height: 0,
+					messageIds: ["narrator-commit-message-0", "narrator-commit-message-1"],
+					clearedAfterReady: 0,
+					zeroSizeAdoptions: 0,
+				});
+				await page.evaluate(() => {
+					(window as unknown as FixtureWindow).fixture.parkMessageViewport("commit-tab", false);
+				});
+				await settle(page);
+				const shown = await expectReadyDocuments(page, ["commit-tab"]);
+				expectBuiltDocument(shown, "commit-tab", "narrator-commit");
+				expect(shown.requests).toEqual(parked.requests);
+			},
+			1440,
+			900,
+			3,
+			true,
+		);
+	},
+	20_000,
+);
+
+browserTest(
 	"Messages: hidden always-rendered tab cannot adopt zero-size document; reveal loads once and re-reveal retains it",
 	async () => {
 		await withFixture(
