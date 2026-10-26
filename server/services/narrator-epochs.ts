@@ -112,7 +112,8 @@ export async function toolLoadingEpochOf(
 	const visible = latestToolLoadingEpoch(messages);
 	if (visible) return visible;
 	if (activeDatabaseBackend === "sqlite") return compactToolLoadingEpoch(narratorId);
-	// PG stores envelope JSON directly. Project only the epoch, never the large summary.
+	// PG stores the authoritative body in content_json, so block reads do not apply.
+	// Project only the compact epoch, never the potentially large summary beside it.
 	const [row] = await db
 		.select({ epoch: sql<unknown>`(${narratorMessages.contentJson}::jsonb)->0->'epoch'` })
 		.from(narratorMessageRefs)
