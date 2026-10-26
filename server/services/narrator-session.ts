@@ -34,6 +34,7 @@ import {
 import type { ReasoningEffort } from "../lib/agent";
 import { diagnosticsFromError } from "../lib/agent/error-diagnostics";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
+import { forgetModelTraceRequest } from "../lib/agent/modeltrace-request";
 import { projectMessageSenderText } from "../lib/agent/sender-projection";
 import { toolRegistry } from "../lib/agent/tool-registry";
 import {
@@ -168,6 +169,7 @@ import {
 	formatBackgroundCompletionNotifications,
 } from "./bg-completion-queue";
 import { gitService } from "./git-service";
+import { cancelModelTrace } from "./modeltrace-service";
 import { isFormerChapterSessionWithoutDirectory, resolveNarratorSessionCwd } from "./narrator-cwd";
 import { optionalToolDescription, reconcileEpoch } from "./narrator-epochs";
 import {
@@ -7758,6 +7760,7 @@ export function interruptNarrator(narratorId: string): boolean {
 		.set({ lastStopReason: "user_interrupt" })
 		.where(eq(narrators.id, narratorId))
 		.run();
+	if (cancelModelTrace(narratorId)) return true;
 	const active = activeNarrators.get(narratorId);
 	const recovery = interruptPlannedUpdateRecovery(narratorId);
 	if (!active && !recovery.interrupted) return false;
@@ -7783,6 +7786,8 @@ export function interruptNarrator(narratorId: string): boolean {
 
 /** Gracefully close a narrator. */
 export function closeNarrator(narratorId: string): void {
+	cancelModelTrace(narratorId);
+	forgetModelTraceRequest(narratorId);
 	const active = activeNarrators.get(narratorId);
 	if (!active) return;
 	active.alive = false;
