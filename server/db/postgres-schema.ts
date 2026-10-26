@@ -2071,6 +2071,7 @@ export const apiRequests = pgTable(
 		provider: text("provider"),
 		credentialId: text("credential_id"),
 		model: text("model"),
+		tokenAccountingVersion: integer("token_accounting_version"),
 		inputTokens: integer("input_tokens").notNull().default(0),
 		outputTokens: integer("output_tokens").notNull().default(0),
 		cachedInputTokens: integer("cached_input_tokens").notNull().default(0),
@@ -2098,6 +2099,9 @@ export const apiRequests = pgTable(
 		index("idx_api_requests_provider").on(table.provider, table.createdAt),
 		index("idx_api_requests_kind").on(table.kind, table.createdAt),
 		index("idx_api_requests_created").on(table.createdAt, table.id),
+		index("idx_api_requests_token_accounting_pending")
+			.on(table.createdAt, table.id)
+			.where(sql.raw('"token_accounting_version" IS NULL')),
 		index("idx_api_requests_user_created").on(table.userId, table.createdAt, table.id),
 		index("idx_api_requests_recording").on(table.recordingRequestId),
 		index("idx_api_requests_credential").on(table.credentialId, table.createdAt),
@@ -3890,7 +3894,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 126,
-  "columnCount": 1675,
+  "columnCount": 1676,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -15452,6 +15456,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "tokenAccountingVersion",
+          "name": "token_accounting_version",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "inputTokens",
           "name": "input_tokens",
           "kind": "integer",
@@ -15687,6 +15700,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "id"
           ],
           "unique": false
+        },
+        {
+          "name": "idx_api_requests_token_accounting_pending",
+          "columns": [
+            "createdAt",
+            "id"
+          ],
+          "unique": false,
+          "predicate": "\"token_accounting_version\" IS NULL"
         },
         {
           "name": "idx_api_requests_user_created",

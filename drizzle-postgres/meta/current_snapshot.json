@@ -1,6 +1,6 @@
 {
-  "id": "738f075a-db1e-4d17-ab16-032656d87253",
-  "prevId": "91f6f10c-d8bb-4405-b309-5266d0e4d545",
+  "id": "4079ddee-70fe-4250-a6f9-614a7270d6ae",
+  "prevId": "738f075a-db1e-4d17-ab16-032656d87253",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -538,6 +538,12 @@
           "primaryKey": false,
           "notNull": false
         },
+        "token_accounting_version": {
+          "name": "token_accounting_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
         "input_tokens": {
           "name": "input_tokens",
           "type": "integer",
@@ -762,6 +768,28 @@
             }
           ],
           "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_api_requests_token_accounting_pending": {
+          "name": "idx_api_requests_token_accounting_pending",
+          "columns": [
+            {
+              "expression": "created_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"token_accounting_version\" IS NULL",
           "concurrently": false,
           "method": "btree",
           "with": {}
