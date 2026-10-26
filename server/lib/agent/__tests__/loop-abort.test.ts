@@ -548,7 +548,7 @@ describe("agentLoop abort result draining", () => {
 		);
 		expect(toolResults.map((event) => event.toolUseId)).toEqual(["tu_stop_1", "tu_stop_2"]);
 		expect(toolResults.map((event) => event.isError)).toEqual([false, true]);
-		expect(toolResults[1]?.metadata).toEqual({ skippedForSoftStop: true });
+		expect(toolResults[1]?.metadata).toEqual({ skippedForPassEnd: true });
 		expect(events.at(-1)).toEqual({ type: "turn_complete", turnIndex: 0 });
 	});
 
@@ -582,9 +582,9 @@ describe("agentLoop abort result draining", () => {
 		expect(toolResults.map((event) => event.toolUseId)).toEqual(["tu_stop_1", "tu_stop_2"]);
 		// The already-started tool keeps its real success result…
 		expect(toolResults[0]?.isError).toBe(false);
-		expect(toolResults[0]?.metadata?.skippedForSoftStop).toBeUndefined();
+		expect(toolResults[0]?.metadata?.skippedForPassEnd).toBeUndefined();
 		// …while the one that never ran is explicitly reported as skipped.
-		expect(toolResults[1]?.metadata).toEqual({ skippedForSoftStop: true });
+		expect(toolResults[1]?.metadata).toEqual({ skippedForPassEnd: true });
 	});
 
 	test("after-tools 阶段到达的 soft-stop 会阻止下一轮模型请求", async () => {
@@ -646,7 +646,7 @@ describe("agentLoop abort result draining", () => {
 			"tu_read_2",
 			"tu_stop_3",
 		]);
-		expect(toolResults.at(-1)?.metadata).toEqual({ skippedForSoftStop: true });
+		expect(toolResults.at(-1)?.metadata).toEqual({ skippedForPassEnd: true });
 		expect(events.at(-1)).toEqual({ type: "turn_complete", turnIndex: 0 });
 	});
 
@@ -690,7 +690,7 @@ describe("agentLoop abort result draining", () => {
 		);
 		expect(toolResults.find((event) => event.toolUseId === "tu_edit_must_skip")).toMatchObject({
 			isError: true,
-			metadata: { skippedForSoftStop: true },
+			metadata: { skippedForPassEnd: true },
 		});
 		expect(toolResults.map((event) => event.toolUseId)).toEqual([
 			"tu_write_before_stop",
@@ -698,10 +698,10 @@ describe("agentLoop abort result draining", () => {
 			"tu_read_must_skip",
 		]);
 		expect(toolResults[0]).toMatchObject({ isError: false, output: "write:first.txt" });
-		expect(toolResults[0]?.metadata?.skippedForSoftStop).toBeUndefined();
+		expect(toolResults[0]?.metadata?.skippedForPassEnd).toBeUndefined();
 		expect(toolResults[2]).toMatchObject({
 			isError: true,
-			metadata: { skippedForSoftStop: true },
+			metadata: { skippedForPassEnd: true },
 		});
 		expect(events.at(-1)).toEqual({ type: "turn_complete", turnIndex: 0 });
 	});
@@ -865,7 +865,7 @@ describe("agentLoop abort result draining", () => {
 						expect(results[2]).toMatchObject({ isError: true, durationMs: 0 });
 						expect(events.at(-1)).toEqual({ type: "error", message: "Aborted" });
 					} else {
-						expect(results[2]?.metadata).toEqual({ skippedForSoftStop: true });
+						expect(results[2]?.metadata).toEqual({ skippedForPassEnd: true });
 						expect(events.at(-1)).toEqual({ type: "turn_complete", turnIndex: 0 });
 					}
 				} finally {
