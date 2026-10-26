@@ -153,6 +153,7 @@ import { FragmentGap, LineFragments } from "./line-fragments";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { type InlinePermissionLabels, RenderInlinePermission } from "./RenderPermission";
 import { type ReflectionNoticeLabels, RenderReflectionNotice } from "./RenderReflectionNotice";
+import { ROW_BUTTON_CLASS, ROW_FLEX_CLASS, rowFlexStyle } from "./row-chrome";
 import { ShareFilePreview } from "./ShareFilePreview";
 import { readExactDisplayBox, VListImage } from "./vlist-image";
 
@@ -509,15 +510,15 @@ function ToolHeaderRow({
 	const statusMark = resolveToolRowStatusMark(status, { reflectionStatus, queuedBehindUpstream });
 	const running = isRunningStatus(status);
 	return (
-		<Group
+		// biome-ignore lint/a11y/noStaticElementInteractions: role/tabIndex/keyboard handler are set together whenever the row is togglable
+		// biome-ignore lint/a11y/useAriaPropsSupportedByRole: aria-expanded is only emitted alongside role="button"
+		<div
 			data-nf-card-header
+			className={ROW_FLEX_CLASS}
 			// The header doubles as the card's selectable surface: Ctrl/Cmd/Shift+Click
 			// must reach the row's selection wrapper (which ignores role="button"
 			// targets) instead of being treated as an interactive island.
 			{...{ [TOOL_HEADER_SELECT_ATTR]: "" }}
-			gap={HEADER_CELL_GAP}
-			wrap="nowrap"
-			align="center"
 			// A keyboard and a screen reader cannot use a bare `onClick` on a div. That
 			// matters most for a DRILLED-IN trace row: its summary line (which did carry
 			// these attributes) is not painted, so this header is the ONLY control that
@@ -527,6 +528,7 @@ function ToolHeaderRow({
 			tabIndex={onToggle ? 0 : undefined}
 			aria-expanded={onToggle ? opened : undefined}
 			style={{
+				...rowFlexStyle(HEADER_CELL_GAP),
 				height: headerRowHeight(),
 				cursor: onToggle ? "pointer" : "default",
 				userSelect: "none",
@@ -701,7 +703,7 @@ function ToolHeaderRow({
 			>
 				{opened ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
 			</span>
-		</Group>
+		</div>
 	);
 }
 
@@ -1158,9 +1160,10 @@ export function ToolTimingArea({
 			: merged.title;
 
 	const trigger = (
-		<UnstyledButton
+		<button
 			ref={triggerRef}
 			type="button"
+			className={ROW_BUTTON_CLASS}
 			aria-label={ariaLabel}
 			onFocus={breakdownMount.ensure}
 			style={{
@@ -1201,7 +1204,7 @@ export function ToolTimingArea({
 			}}
 		>
 			{text}
-		</UnstyledButton>
+		</button>
 	);
 
 	const withBreakdown = showBreakdown ? (
