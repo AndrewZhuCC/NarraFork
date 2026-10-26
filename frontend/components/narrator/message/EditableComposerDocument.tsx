@@ -346,6 +346,13 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 	return (
 		<Box
 			ref={fullscreenBoxRef}
+			onDrop={(event) => {
+				// Drops on chips/controls bypass ProseMirror; claim them so the panel's
+				// drop zone does not import them into the outer composer.
+				if (event.defaultPrevented || !event.dataTransfer.types.includes("Files")) return;
+				event.preventDefault();
+				void addFiles(Array.from(event.dataTransfer.files));
+			}}
 			style={
 				fullscreen
 					? {

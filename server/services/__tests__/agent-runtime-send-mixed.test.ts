@@ -29,8 +29,6 @@ const { getExecutionOwner, setRunHold, tryClaimExecution } = await import(
 	"../agent-runtime/ownership"
 );
 const { activeNarrators } = await import("../narrator-session-state");
-const { registerAgentReplyWait, clearPendingAgentReplyWaits, getPendingAgentReplyCount } =
-	await import("../agent-reply-waiter");
 const { sendTool } = await import("../../lib/agent/tools/send");
 const { compileDelegationCeiling } = await import("../custom-subagent-service");
 const ceiling = await compileDelegationCeiling("general");
@@ -55,7 +53,6 @@ const time = "2026-09-09T00:00:00.000Z";
 let serial = 0;
 beforeEach(() => {
 	broadcasts.length = 0;
-	clearPendingAgentReplyWaits();
 	for (const id of ids) {
 		setRunHold(id, undefined);
 		getExecutionOwner(id)?.release();
@@ -88,7 +85,6 @@ beforeEach(() => {
 	tryClaimExecution("parent-root", "run");
 });
 afterAll(() => {
-	clearPendingAgentReplyWaits();
 	for (const id of ids) {
 		setRunHold(id, undefined);
 		getExecutionOwner(id)?.release();
@@ -252,94 +248,7 @@ test("doInterrupt is ignored for a taken-over child: queued, user's turn untouch
 	expect(result.output).toContain("doInterrupt was ignored");
 });
 
-test("explicit replyTo mixed fanout rejects the entire call without settling waiter or enqueue", async () => {
-	const wait = registerAgentReplyWait({
-		requesterId: "parent-root",
-		responderId: "sender-child",
-		scope: { type: "parent-child", id: "parent-root\u0000sender-child" },
-	});
-	const result = await sendSubagentMessageDetailed({ ...input(), replyTo: wait.requestId });
-	expect(result.targets.every((target) => target.status === "failed")).toBe(true);
-	expect(getPendingAgentReplyCount("parent-root", "sender-child", wait.scope)).toBe(1);
-	expect(rows()).toHaveLength(0);
-	wait.cancel();
-});
-
-test.each([
-	"parent",
-	"sibling",
-])("implicit %s reply mixed with ordinary target has zero delivery side effects", async (replyTarget) => {
-	const requesterId = replyTarget === "parent" ? "parent-root" : "sibling-a";
-	const wait = registerAgentReplyWait({
-		requesterId,
-		responderId: "sender-child",
-		scope:
-			replyTarget === "parent"
-				? { type: "parent-child", id: "parent-root\u0000sender-child" }
-				: { type: "team", id: "parent-root" },
-	});
-	const result = await sendSubagentMessageDetailed(input());
-	expect(result.targets.every((target) => target.status === "failed")).toBe(true);
-	expect(getPendingAgentReplyCount(requesterId, "sender-child", wait.scope)).toBe(1);
-	expect(rows()).toHaveLength(0);
-	wait.cancel();
-});
-
-test("later implicit ambiguity rejects the complete batch before the earlier unique waiter settles", async () => {
-	const parentWait = registerAgentReplyWait({
-		requesterId: "parent-root",
-		responderId: "sender-child",
-		scope: { type: "parent-child", id: "parent-root\u0000sender-child" },
-	});
-	const siblingFirst = registerAgentReplyWait({
-		requesterId: "sibling-a",
-		responderId: "sender-child",
-		scope: { type: "team", id: "parent-root" },
-	});
-	const siblingSecond = registerAgentReplyWait({
-		requesterId: "sibling-a",
-		responderId: "sender-child",
-		scope: { type: "team", id: "parent-root" },
-	});
-	const result = await sendSubagentMessageDetailed(input());
-	expect(result.targets.map((target) => [target.id, target.status])).toEqual([
-		["parent-root", "failed"],
-		["sibling-a", "failed"],
-	]);
-	expect(result.output).toContain("Multiple Send reply requests");
-	expect(getPendingAgentReplyCount("parent-root", "sender-child", parentWait.scope)).toBe(1);
-	expect(getPendingAgentReplyCount("sibling-a", "sender-child", siblingFirst.scope)).toBe(2);
-	expect(rows()).toHaveLength(0);
-	siblingSecond.cancel();
-	const retried = await sendSubagentMessageDetailed(input());
-	expect(retried.targets.map((target) => [target.id, target.status])).toEqual([
-		["parent-root", "completed"],
-		["sibling-a", "completed"],
-	]);
-	expect((await parentWait.promise).status).toBe("replied");
-	expect((await siblingFirst.promise).status).toBe("replied");
-	expect(retried.output).toContain(parentWait.requestId);
-	expect(retried.output).toContain(siblingFirst.requestId);
-	expect(rows()).toHaveLength(0);
-});
-
-test("single parent reply still settles the independent waiter without mailbox entry", async () => {
-	const wait = registerAgentReplyWait({
-		requesterId: "parent-root",
-		responderId: "sender-child",
-		scope: { type: "parent-child", id: "parent-root\u0000sender-child" },
-	});
-	const result = await sendSubagentMessageDetailed({
-		...input("sender-child", ["parent", "main"]),
-		replyTo: wait.requestId,
-	});
-	expect(result.targets[0]?.status).toBe("completed");
-	expect((await wait.promise).status).toBe("replied");
-	expect(rows()).toHaveLength(0);
-});
-
-test("child await/interrupt and primary foreign interrupt fail whole-call before enqueue", async () => {
-	await expect(sendSubagentMessageDetailed({ ...input(), shouldAwait: true })).rejects.toThrow();
+test("child interrupt and primary foreign interrupt fail whole-call before enqueue", async () => {
 	await expect(sendSubagentMessageDetailed({ ...input(), doInterrupt: true })).rejects.toThrow();
 	await expect(
 		sendSubagentMessageDetailed({
@@ -398,20 +307,6 @@ test("retry after one archived recipient becomes eligible preserves previous suc
 	expect(rows("sibling-a")).toHaveLength(1);
 });
 
-test("a valid reply target plus unauthorized selector cannot settle the reply early", async () => {
-	const wait = registerAgentReplyWait({
-		requesterId: "parent-root",
-		responderId: "sender-child",
-		scope: { type: "parent-child", id: "parent-root\u0000sender-child" },
-	});
-	await expect(
-		sendSubagentMessageDetailed(input("sender-child", ["parent", "foreign-child"])),
-	).rejects.toThrow();
-	expect(getPendingAgentReplyCount("parent-root", "sender-child", wait.scope)).toBe(1);
-	expect(rows()).toHaveLength(0);
-	wait.cancel();
-});
-
 test("parent aliases cannot be captured by a sibling title", async () => {
 	db.update(narrators).set({ title: "parent" }).where(eq(narrators.id, "sibling-b")).run();
 	const result = await sendSubagentMessageDetailed(input("sender-child", ["parent", "sibling-b"]));
@@ -458,18 +353,6 @@ test("Send to an error-stopped child reports blocked, keeps the message and tell
 	expect((await inbox.listPendingAgentMessages("sibling-a")).messages).toEqual([
 		expect.objectContaining({ preview: "same report", truncated: false }),
 	]);
-});
-
-test("Send await to a blocked child fails the reply wait instead of hanging", async () => {
-	stopTarget("error");
-	const result = await sendSubagentMessageDetailed({
-		...input("parent-root", ["sibling-a"]),
-		shouldAwait: true,
-		timeoutMs: 60_000,
-	});
-	expect(result.targets[0]?.status).toBe("failed");
-	expect(result.output).toContain("NOT running");
-	expect(rows("sibling-a").map((row) => row.state)).toEqual(["queued"]);
 });
 
 test("resume=true restarts an error-stopped child through the explicit override only", async () => {

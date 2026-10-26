@@ -2029,7 +2029,14 @@ export async function runAgentLoopUnlocked(
 						typeof payload.tool_name === "string" ? payload.tool_name : undefined,
 					);
 				},
+				// Host stops skip every call that has not started yet.
 				shouldStop: () => {
+					if (active._workspacePassInvalidated || active._workspaceInstallFailed) return true;
+					// An approved plan ends this pass; nothing after ExitPlanMode may start.
+					return !!active._planApprovedContinue;
+				},
+				// Queued user input never skips a call: the step's tools all run first.
+				shouldYieldToInput: () => {
 					// Cancellation is irreversible even when the queued guidance has since
 					// been removed/downgraded. Record the actual pass interruption using
 					// its captured signals, independently of whether input remains. This
@@ -2037,9 +2044,6 @@ export async function runAgentLoopUnlocked(
 					if (config.guidanceSignal?.aborted || config.urgentGuidanceSignal?.aborted) {
 						active._bufferSoftStopTaken = true;
 					}
-					if (active._workspacePassInvalidated || active._workspaceInstallFailed) return true;
-					// An approved plan ends this pass; nothing after ExitPlanMode may start.
-					if (active._planApprovedContinue) return true;
 					const decision = evaluateSoftStopRequest({
 						feedbackSoftStop: active._feedbackSoftStop,
 						bufferSoftStop: active._bufferSoftStop,

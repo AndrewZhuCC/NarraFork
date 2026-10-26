@@ -1384,6 +1384,7 @@ export async function runReflectionLoop(
 			onCompletedToolCount: undefined,
 			silentToolCallThreshold: -1,
 			shouldStop: () => observed.decisionSucceeded === true,
+			shouldYieldToInput: undefined,
 			guidanceSignal: undefined,
 			urgentGuidanceSignal: undefined,
 			onToolExecutionInvoking: (toolUse) => {
@@ -3369,7 +3370,7 @@ async function* agentLoopInMetadataSnapshot(
 		if (guidanceSignal?.aborted) {
 			// FIFO guidance may intentionally enter a pass already stopped. Consume the
 			// host flag and preserve pending input without activating provider/preflight IO.
-			config.shouldStop?.();
+			config.shouldYieldToInput?.();
 			yield { type: "turn_complete", turnIndex };
 			return;
 		}
@@ -3568,21 +3569,28 @@ async function* agentLoopInMetadataSnapshot(
 			 */
 			let gracefulStopRequested = false;
 			/**
-			 * Consume a pending soft-stop request at most once per turn.
+			 * Consume a pending host stop request at most once per turn.
 			 *
 			 * Every boundary asks through here, so the grant is spent exactly once no
 			 * matter which phase observes it first. Asking again after a grant would
 			 * return the *next* request's answer (usually false) and silently resurrect
-			 * the turn the caller already agreed to end.
+			 * the turn the caller already agreed to end. A host stop skips the calls that
+			 * have not started yet.
 			 */
 			const observeSoftStopForTurn = (): boolean => {
-				if (!gracefulStopRequested && guidanceSignal?.aborted) {
-					// Consume the host's one-shot flag too, so the next pass is not stopped again.
-					config.shouldStop?.();
-					gracefulStopRequested = true;
-				}
 				if (!gracefulStopRequested && config.shouldStop?.()) gracefulStopRequested = true;
 				return gracefulStopRequested;
+			};
+			/** Same one-shot contract for queued user input, which never skips a call. */
+			let inputStopRequested = false;
+			const observeInputStopForTurn = (): boolean => {
+				if (!inputStopRequested && guidanceSignal?.aborted) {
+					// Consume the host's one-shot flag too, so the next pass is not stopped again.
+					config.shouldYieldToInput?.();
+					inputStopRequested = true;
+				}
+				if (!inputStopRequested && config.shouldYieldToInput?.()) inputStopRequested = true;
+				return inputStopRequested;
 			};
 			// Map of tool executions started during streaming (toolUseId → Promise)
 			const earlyExecMap = new Map<string, Promise<ToolExecResult>>();
@@ -3598,48 +3606,23 @@ async function* agentLoopInMetadataSnapshot(
 			const startToolExecution = (tu: AgentToolUse): Promise<ToolExecResult> => {
 				const existing = earlyExecMap.get(tu.toolUseId);
 				if (existing) return existing;
-				const preparationAbort = new AbortController();
-				const onGuidance = () =>
-					preparationAbort.abort(new Error("Stopped for immediate guidance"));
-				const removeGuidance = () => guidanceSignal?.removeEventListener("abort", onGuidance);
-				if (guidanceSignal?.aborted) onGuidance();
-				else guidanceSignal?.addEventListener("abort", onGuidance, { once: true });
-				const preparationSignal = AbortSignal.any([toolSignal, preparationAbort.signal]);
+				// Queued guidance never cancels a produced call, not even while it waits for
+				// permission: only the run's own signal and urgent input cancel preparation.
 				const invocationConfig = new Proxy(toolConfig, {
 					get(target, key, receiver) {
-						if (key === "signal") return preparationSignal;
 						if (key === "permissionHandler") {
 							return ((name, input, id, options) =>
 								target.permissionHandler(name, input, id, {
 									...options,
-									signal: preparationSignal,
+									signal: toolSignal,
 								})) satisfies AgentConfig["permissionHandler"];
-						}
-						if (key === "onToolExecutionInvoking") {
-							return (tool: AgentToolUse) => {
-								// No await between this synchronous boundary and tool.execute.
-								preparationSignal.throwIfAborted();
-								removeGuidance();
-								target.onToolExecutionInvoking?.(tool);
-							};
 						}
 						return Reflect.get(target, key, receiver);
 					},
 				});
 				const execution = settleToolExecutionResult(
 					executeToolAfterReflections(tu, invocationConfig, requestRows(), locale),
-				)
-					.then((result) =>
-						preparationAbort.signal.aborted
-							? {
-									...result,
-									output: getToolMessage("skippedForSoftStop", locale),
-									isError: true,
-									metadata: { ...result.metadata, skippedForSoftStop: true },
-								}
-							: result,
-					)
-					.finally(removeGuidance);
+				);
 				earlyExecMap.set(tu.toolUseId, execution);
 				void execution.then((result) => {
 					settledResults.set(tu.toolUseId, result);
@@ -4636,9 +4619,9 @@ async function* agentLoopInMetadataSnapshot(
 				let attemptStreamedContent = false;
 				const guidanceCutsNow = () =>
 					config.urgentGuidanceSignal?.aborted === true || !attemptStreamedContent;
+				// Calls already complete keep their eager start; the turn ends after its tools.
 				const onGuidanceAbort = () => {
-					observeSoftStopForTurn();
-					streamExecutionOpen = false;
+					observeInputStopForTurn();
 					if (guidanceCutsNow()) attemptAbort.abort(guidanceStop);
 				};
 				// Urgent guidance can follow live guidance whose combined signal already fired.
@@ -6008,7 +5991,7 @@ async function* agentLoopInMetadataSnapshot(
 						continue;
 					}
 					if (guidanceSignal?.aborted) {
-						observeSoftStopForTurn();
+						observeInputStopForTurn();
 						// Guidance is not a transport fault. Finalize this partial turn below,
 						// without replay/retry or cancelling tools whose bodies already began.
 						break;
@@ -6452,7 +6435,7 @@ async function* agentLoopInMetadataSnapshot(
 				}
 
 				if (guidanceSignal?.aborted) {
-					observeSoftStopForTurn();
+					observeInputStopForTurn();
 					break;
 				}
 				if (firstTokenTimeoutTriggered) {
@@ -7193,15 +7176,21 @@ async function* agentLoopInMetadataSnapshot(
 			// Tool execution may remain paused behind phase two without holding the response fence.
 			responseActivity.release();
 
-			if (guidanceSignal?.aborted) {
-				observeSoftStopForTurn();
+			// Guidance ends the turn here only when nothing remains to run, or when urgent
+			// input has already cancelled tool IO. Otherwise every produced call executes
+			// below and the step boundary ends the turn: a complete call is never skipped.
+			if (
+				guidanceSignal?.aborted &&
+				(toolUses.length === 0 || config.urgentGuidanceSignal?.aborted === true)
+			) {
+				observeInputStopForTurn();
 				yield* drainStartedEarlyToolResults();
 				if (config.signal.aborted) {
 					yield { type: "error", message: "Aborted" };
 					return;
 				}
 				// Still-running detached calls retain their real pending rows. Do not fabricate
-				// skipped results or replay their incomplete pairs into model-facing history.
+				// results or replay their incomplete pairs into model-facing history.
 				const guidanceTools = toolUses.filter((tu) => !detachedToolResults.has(tu.toolUseId));
 				for (const tu of guidanceTools) {
 					if (yieldedToolResults.has(tu.toolUseId)) continue;
@@ -7209,11 +7198,11 @@ async function* agentLoopInMetadataSnapshot(
 					yield toolResultEvent(
 						tu,
 						settledResults.get(tu.toolUseId) ?? {
-							output: getToolMessage("skippedForSoftStop", locale),
+							output: getToolMessage("cancelledForInterrupt", locale),
 							isError: true,
 							durationMs: 0,
 							completedAt: Date.now(),
-							metadata: { skippedForSoftStop: true },
+							metadata: { cancelledForInterrupt: true },
 						},
 					);
 				}
@@ -7319,7 +7308,7 @@ async function* agentLoopInMetadataSnapshot(
 						yield* drainEarlyToolResultsAfterAbort();
 						if (config.signal.aborted) yield { type: "error", message: "Aborted" };
 						else {
-							observeSoftStopForTurn();
+							observeInputStopForTurn();
 							yield { type: "turn_complete", turnIndex };
 						}
 						return;
@@ -7414,7 +7403,7 @@ async function* agentLoopInMetadataSnapshot(
 							yield* drainEarlyToolResultsAfterAbort();
 							if (config.signal.aborted) yield { type: "error", message: "Aborted" };
 							else {
-								observeSoftStopForTurn();
+								observeInputStopForTurn();
 								yield { type: "turn_complete", turnIndex };
 							}
 							return;
@@ -7464,11 +7453,12 @@ async function* agentLoopInMetadataSnapshot(
 					}
 				}
 
-				// Check after every serial tool and complete parallel-safe group. Once a soft
+				// Check after every serial tool and complete parallel-safe group. Once a host
 				// stop is observed, never start another tool: only await promises that were
 				// already registered in earlyExecMap and mark every other remaining call skipped.
+				// Queued user input is not a host stop; it waits for the step boundary below.
 				if (observeSoftStopForTurn()) {
-					const skippedOutput = getToolMessage("skippedForSoftStop", locale);
+					const skippedOutput = getToolMessage("skippedForPassEnd", locale);
 					let fatalOutput: string | undefined;
 					for (const remainingTool of toolUses.slice(toolIndex)) {
 						const earlyPromise = earlyExecMap.get(remainingTool.toolUseId);
@@ -7485,7 +7475,7 @@ async function* agentLoopInMetadataSnapshot(
 									isError: true,
 									durationMs: 0,
 									completedAt: Date.now(),
-									metadata: { skippedForSoftStop: true },
+									metadata: { skippedForPassEnd: true },
 								};
 							}
 							continue;
@@ -7496,7 +7486,7 @@ async function* agentLoopInMetadataSnapshot(
 							yield* drainEarlyToolResultsAfterAbort();
 							if (config.signal.aborted) yield { type: "error", message: "Aborted" };
 							else {
-								observeSoftStopForTurn();
+								observeInputStopForTurn();
 								yield { type: "turn_complete", turnIndex };
 							}
 							return;
@@ -7551,9 +7541,10 @@ async function* agentLoopInMetadataSnapshot(
 			await flushLoopInjections();
 			await collectAfterToolsInjections();
 
-			// Close the small race between the final group boundary and the next provider
-			// request: direct user feedback may arrive while after-tools injections are drained.
-			if (observeSoftStopForTurn()) {
+			// Every call of the step has run: queued user input takes the next turn. This also
+			// closes the race with feedback arriving while after-tools injections are drained.
+			const hostStop = observeSoftStopForTurn();
+			if (observeInputStopForTurn() || hostStop) {
 				yield { type: "turn_complete", turnIndex };
 				return;
 			}
