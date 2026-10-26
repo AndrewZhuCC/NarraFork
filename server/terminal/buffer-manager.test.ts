@@ -88,6 +88,30 @@ describe("BufferManager parser replies", () => {
 		expect(replies).toEqual([]);
 	});
 
+	test("answers a live query after a muted snapshot", async () => {
+		const replies: string[] = [];
+		const { buffer, terminalId } = makeBuffer((data) => replies.push(data));
+
+		await mkdir(buffersDir, { recursive: true });
+		await writeFile(
+			join(buffersDir, `${terminalId}.buf`),
+			JSON.stringify({
+				version: 3,
+				serialized: Buffer.from("\x1b[6n").toString("base64"),
+				cols: 80,
+				rows: 24,
+				mouseMode: { x10: false, buttonEvent: false, anyEvent: false, sgr: false },
+			}),
+		);
+
+		expect(await buffer.loadFromDisk()).toBe(true);
+		buffer.append("ab");
+		buffer.append("\x1b[6n");
+		await buffer.flush();
+
+		expect(replies).toEqual(["\x1b[1;3R"]);
+	});
+
 	test("stays silent after dispose", async () => {
 		const replies: string[] = [];
 		const { buffer } = makeBuffer((data) => replies.push(data));

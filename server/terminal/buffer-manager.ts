@@ -51,9 +51,9 @@ interface BufferFileV3 {
 /**
  * Bytes the VT parser must send back to the program it is emulating.
  *
- * Not every escape sequence a program sends is purely visual: DA1, DSR
- * (`CSI 6n`, the cursor position report), DECRPM and the OSC colour queries
- * all expect an answer on stdin. A program that asks and waits — atuin's
+ * Not every escape sequence a program sends is purely visual: DA, DSR
+ * (`CSI 6n`, the cursor position report), DECRPM and DECRQSS all expect an
+ * answer on stdin. A program that asks and waits — atuin's
  * inline search UI, codex CLI, nushell/reedline — blocks until its own
  * timeout expires (crossterm waits ~2s) and then reports
  * "The cursor position could not be read within a normal duration".
@@ -280,10 +280,22 @@ export class BufferManager {
 	private replay(content: string): Promise<void> {
 		this.replaying = true;
 		return new Promise<void>((resolve) => {
-			this.xterm.write(content, () => {
+			try {
+				this.xterm.write(content, () => {
+					this.replaying = false;
+					resolve();
+				});
+			} catch (err) {
+				// A throw here used to leave `replaying` set, so every later
+				// query on this terminal stayed silent. Unmute and let the
+				// write chain continue.
 				this.replaying = false;
+				logger.debug("Dropped terminal snapshot replay", {
+					terminalId: this.terminalId,
+					error: String(err),
+				});
 				resolve();
-			});
+			}
 		});
 	}
 

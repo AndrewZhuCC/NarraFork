@@ -25,6 +25,7 @@ import { Z } from "../../lib/z-index";
 import { SelectionPopover } from "../common/SelectionPopover";
 import { setupOsc52Handler } from "./osc52-handler";
 import { type Modifiers, TerminalAuxKeys } from "./TerminalAuxKeys";
+import { isHeadlessTerminalReply } from "./terminal-reply";
 import { getTerminalTheme } from "./terminal-theme";
 
 export const TERM_BG = "#1a1b26"; // Default fallback, actual bg comes from theme
@@ -140,13 +141,11 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 		const modsRef = useRef(mods);
 		modsRef.current = mods;
 
-		// Invariant: the server-side headless buffer (server/terminal/buffer-manager.ts)
-		// is the ONLY responder to terminal queries (DA, DSR/CPR, DECRPM, OSC color).
-		// xterm.js answers them synchronously inside term.write(), which would be a
-		// second reply the shell then reads as typed input — so this flag mutes the
-		// browser side for the duration of every write(). It must equally cover the
-		// replay paths (scrollback snapshot, pre-ready pending data): answering a
-		// query buried in history would inject stray characters into the shell.
+		// xterm.js 5.5 parses the first write after user input synchronously and
+		// every other write on a later turn. This flag only covers that synchronous
+		// parse. Async DA / DSR / DECRPM / DECRQSS replies are dropped by shape in
+		// onData (`isHeadlessTerminalReply`); the server headless buffer already
+		// answered them. OSC color and focus reports are not in that set.
 		const writingRef = useRef(false);
 		const outputBufferRef = useRef<string[]>([]);
 		const outputBufferCharsRef = useRef(0);
@@ -469,13 +468,10 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 			});
 
 			term.onData((data) => {
-				// xterm.js fires onData synchronously from inside term.write() with
-				// its reply to DA / DSR / DECRPM / OSC queries. Those answers are
-				// already given by the server-side headless buffer, so sending this
-				// copy to the PTY would be a duplicate reply the shell reads as
-				// garbled input. Never remove this without also removing the
-				// server-side responder.
-				if (writingRef.current) return;
+				// Sync parse (flag) and async parse (shape) both produce replies the
+				// server buffer already wrote to the PTY. A second copy is read by
+				// the shell as typed input.
+				if (writingRef.current || isHeadlessTerminalReply(data)) return;
 
 				const m = modsRef.current;
 				let out = data;
