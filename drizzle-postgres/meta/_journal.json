@@ -302,6 +302,13 @@
 			"when": 1792828249880,
 			"tag": "0042_block_index_queue",
 			"breakpoints": true
+		},
+		{
+			"idx": 43,
+			"version": "7",
+			"when": 1792983700483,
+			"tag": "0043_token_accounting_version",
+			"breakpoints": true
 		}
   ]
 }

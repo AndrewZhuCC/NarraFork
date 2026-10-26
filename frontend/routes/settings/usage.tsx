@@ -1,3 +1,4 @@
+import { TokenRecalculationPanel } from "@frontend/components/usage-history/TokenRecalculationPanel";
 import { UsageBreakdownChart } from "@frontend/components/usage-history/UsageBreakdownChart";
 import { UsageHistoryChart } from "@frontend/components/usage-history/UsageHistoryChart";
 import { UsageHistoryTable } from "@frontend/components/usage-history/UsageHistoryTable";
@@ -330,6 +331,8 @@ function SettingsUsagePage() {
 						{t("usageHistoryRefresh")}
 					</Button>
 				</Group>
+
+				<TokenRecalculationPanel />
 
 				{/* Shared filters */}
 				<Stack gap="xs">
