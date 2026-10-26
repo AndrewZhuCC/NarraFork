@@ -315,6 +315,23 @@ export function createPostgresOutlineReads(db: BunSQLDatabase): OutlineReadPort 
 			return out;
 		},
 
+		async listAliasRange(spaceId, range, limit) {
+			const rows = await db
+				.select({ alias: outlineBlocks.alias })
+				.from(outlineBlocks)
+				.where(
+					and(
+						eq(outlineBlocks.spaceId, spaceId),
+						sql`${outlineBlocks.alias} COLLATE "C" >= ${range.from}`,
+						sql`${outlineBlocks.alias} COLLATE "C" < ${range.to}`,
+						sql`${outlineBlocks.deleted} = false`,
+					),
+				)
+				.orderBy(byIdBytewise(outlineBlocks.alias))
+				.limit(limit);
+			return rows.map((row) => row.alias as string);
+		},
+
 		async searchBlocks(query) {
 			const out: OutlineSearchRow[] = [];
 			const terms = [...query.indexed, ...query.short];

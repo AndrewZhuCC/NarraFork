@@ -59,6 +59,9 @@ function revert(ctx: OutlineContractContext, commitId: string) {
 	return revertCommit({ commitId, actor: ACTOR, responsibleUserId: null }, { store: ctx.store });
 }
 
+/** The id of the first result of a write. */
+const a0 = (result: OutlineWriteResult) => result.results[0]?.blockId as string;
+
 /** The id of the second result of a write. */
 const a = (result: OutlineWriteResult) => result.results[1]?.blockId as string;
 
@@ -201,6 +204,31 @@ function checkRevert(
 }
 
 export const OUTLINE_READ_CONTRACT: ContractCase[] = [
+	{
+		name: "aliases: a byte-order range of the live aliases of one space",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			const other = await personalSpace(ctx);
+			const aliases = ["Q1", "Q10", "Q2", "Qa", "Q", "R1", "q5", "Q9z", "问1", "问12"];
+			await write(
+				ctx,
+				space,
+				aliases.map((alias) => ({ op: "insert" as const, parent: null, content: alias, alias })),
+			);
+			await write(ctx, other, [{ op: "insert", parent: null, content: "x", alias: "Q3" }]);
+			const deleted = await write(ctx, space, [
+				{ op: "insert", parent: null, content: "gone", alias: "Q4" },
+			]);
+			await write(ctx, space, [{ op: "delete", block: { id: a0(deleted) } }]);
+			const range = (prefix: string, limit = 50) =>
+				ctx.store.listAliasRange(space.id, { from: `${prefix}0`, to: `${prefix}:` }, limit);
+			expect(await range("Q")).toEqual(["Q1", "Q10", "Q2", "Q9z"]);
+			expect(await range("Q", 2)).toEqual(["Q1", "Q10"]);
+			expect(await range("问")).toEqual(["问1", "问12"]);
+			expect(await range("R")).toEqual(["R1"]);
+			expect(await range("Z")).toEqual([]);
+		},
+	},
 	{
 		name: "as-of reads: every seq of random histories reads as the model",
 		async run(ctx) {
