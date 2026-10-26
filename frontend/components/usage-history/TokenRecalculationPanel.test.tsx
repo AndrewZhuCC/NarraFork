@@ -120,7 +120,7 @@ async function flush() {
 	});
 }
 
-async function renderPanel() {
+async function renderPanel(open = true) {
 	await act(async () => {
 		root.render(
 			<I18nextProvider i18n={testI18n}>
@@ -135,10 +135,16 @@ async function renderPanel() {
 		);
 	});
 	await flush();
+	if (
+		open &&
+		[...document.body.querySelectorAll("button")].some((node) => node.textContent === strings.open)
+	) {
+		await click(strings.open);
+	}
 }
 
 function button(label: string): HTMLButtonElement {
-	const result = [...container.querySelectorAll("button")].find(
+	const result = [...document.body.querySelectorAll("button")].find(
 		(node) => node.textContent === label,
 	);
 	if (!result) throw new Error(`Missing button: ${label}`);
@@ -154,18 +160,18 @@ describe("historical token recalculation panel", () => {
 	test("does not render or fetch admin operations for ordinary users", async () => {
 		client.setQueryData(["auth", "me"], { id: "user-1", role: "user" });
 		await renderPanel();
-		expect(container.textContent).not.toContain(strings.title);
-		expect(container.querySelectorAll("button")).toHaveLength(0);
+		expect(document.body.textContent).not.toContain(strings.title);
+		expect(document.body.querySelectorAll("button")).toHaveLength(0);
 		expect(getSpy).not.toHaveBeenCalled();
 		expect(startSpy).not.toHaveBeenCalled();
 	});
 
 	test("warns about ambiguous old values and confirms the entire scope exactly once", async () => {
 		await renderPanel();
-		expect(container.textContent).toContain(strings.warning);
-		expect(container.textContent).toContain(strings.scope);
-		expect(container.textContent).toContain(strings.skipNote);
-		expect(container.textContent).toContain(strings.allHistory);
+		expect(document.body.textContent).toContain(strings.warning);
+		expect(document.body.textContent).toContain(strings.scope);
+		expect(document.body.textContent).toContain(strings.skipNote);
+		expect(document.body.textContent).toContain(strings.allHistory);
 		getSpy.mockResolvedValue({ job: runningJob });
 		await click(strings.start);
 		expect(confirm).toHaveBeenCalledTimes(1);
@@ -174,7 +180,7 @@ describe("historical token recalculation panel", () => {
 		expect(markup).toContain(strings.allHistory);
 		expect(markup).toContain(strings.warning);
 		expect(startSpy).toHaveBeenCalledWith({});
-		expect(container.textContent).toContain(strings.status.running);
+		expect(document.body.textContent).toContain(strings.status.running);
 		expect(button(strings.start).disabled).toBe(true);
 	});
 
@@ -188,16 +194,16 @@ describe("historical token recalculation panel", () => {
 	test("shows counters, cancels a running job, and refreshes partial history changes", async () => {
 		getSpy.mockResolvedValue({ job: runningJob });
 		await renderPanel();
-		expect(container.textContent).toContain("Processed: 8");
-		expect(container.textContent).toContain("Changed: 6");
-		expect(container.textContent).toContain("Skipped this run: 2");
-		expect(container.textContent).toContain("Responses fallback: 1");
+		expect(document.body.textContent).toContain("Processed: 8");
+		expect(document.body.textContent).toContain("Changed: 6");
+		expect(document.body.textContent).toContain("Skipped this run: 2");
+		expect(document.body.textContent).toContain("Responses fallback: 1");
 		client.setQueryData(["usage-history", "stats", {}], { inputTokens: 100 });
 		getSpy.mockResolvedValue({ job: { ...runningJob, status: "cancelled" } });
 		await click(strings.cancel);
 		expect(cancelSpy).toHaveBeenCalledWith("job-1");
 		expect(confirm).not.toHaveBeenCalled();
-		expect(container.textContent).toContain(strings.status.cancelled);
+		expect(document.body.textContent).toContain(strings.status.cancelled);
 		expect(client.getQueryState(["usage-history", "stats", {}])?.isInvalidated).toBe(true);
 	});
 
@@ -211,13 +217,13 @@ describe("historical token recalculation panel", () => {
 				});
 			});
 			await flush();
-			expect(container.textContent).toContain(strings.status[status]);
+			expect(document.body.textContent).toContain(strings.status[status]);
 		}
 		expect(invalidate.mock.calls).toEqual([
 			[{ queryKey: ["usage-history"] }],
 			[{ queryKey: ["usage-history"] }],
 		]);
-		expect(container.textContent).toContain("Worker stopped");
+		expect(document.body.textContent).toContain("Worker stopped");
 		await flush();
 		expect(invalidate).toHaveBeenCalledTimes(2);
 		invalidate.mockRestore();
@@ -226,7 +232,7 @@ describe("historical token recalculation panel", () => {
 	test("blocks starting when status cannot load and permits an explicit retry", async () => {
 		getSpy.mockRejectedValue(new Error("offline"));
 		await renderPanel();
-		expect(container.textContent).toContain(strings.loadFailed);
+		expect(document.body.textContent).toContain(strings.loadFailed);
 		expect(button(strings.start).disabled).toBe(true);
 		getSpy.mockResolvedValue({ job: null });
 		await click(strings.retry);
@@ -238,9 +244,9 @@ describe("historical token recalculation panel", () => {
 		startSpy.mockRejectedValue(new Error("Response lost"));
 		getSpy.mockResolvedValue({ job: runningJob });
 		await click(strings.start);
-		expect(container.textContent).toContain(strings.operationFailed);
-		expect(container.textContent).toContain("Response lost");
-		expect(container.textContent).toContain(strings.status.running);
+		expect(document.body.textContent).toContain(strings.operationFailed);
+		expect(document.body.textContent).toContain("Response lost");
+		expect(document.body.textContent).toContain(strings.status.running);
 		expect(button(strings.start).disabled).toBe(true);
 	});
 
@@ -268,7 +274,7 @@ describe("historical token recalculation panel", () => {
 		cancelSpy.mockResolvedValue({ job: runningJob });
 		await renderPanel();
 		await click(strings.cancel);
-		expect(container.textContent).toContain(strings.cancelling);
+		expect(document.body.textContent).toContain(strings.cancelling);
 		expect(button(strings.cancelling).disabled).toBe(true);
 		await click(strings.cancelling);
 		expect(cancelSpy).toHaveBeenCalledTimes(1);
@@ -277,7 +283,7 @@ describe("historical token recalculation panel", () => {
 			await client.refetchQueries({ queryKey: TOKEN_RECALCULATION_QUERY_KEY });
 		});
 		await flush();
-		expect(container.textContent).toContain(strings.status.cancelled);
+		expect(document.body.textContent).toContain(strings.status.cancelled);
 	});
 
 	test("a failed cancellation stays visible and can be retried", async () => {
@@ -285,8 +291,8 @@ describe("historical token recalculation panel", () => {
 		cancelSpy.mockRejectedValue(new Error("Cancellation unavailable"));
 		await renderPanel();
 		await click(strings.cancel);
-		expect(container.textContent).toContain("Cancellation unavailable");
-		expect(container.textContent).toContain(strings.status.running);
+		expect(document.body.textContent).toContain("Cancellation unavailable");
+		expect(document.body.textContent).toContain(strings.status.running);
 		expect(button(strings.cancel).disabled).toBe(false);
 	});
 
@@ -298,5 +304,42 @@ describe("historical token recalculation panel", () => {
 		expect(Object.keys(zhLocale.tokenRecalculation.status).sort()).toEqual(
 			Object.keys(strings.status).sort(),
 		);
+	});
+});
+
+describe("on-demand recalculation window", () => {
+	test("only shows the small entry button until opened, even with a previous completed job", async () => {
+		client.setQueryData(TOKEN_RECALCULATION_QUERY_KEY, {
+			job: { ...runningJob, status: "completed" },
+		});
+		await renderPanel(false);
+		expect(document.body.querySelectorAll("button")).toHaveLength(1);
+		expect(button(strings.open)).toBeDefined();
+		expect(document.body.textContent).not.toContain(strings.warning);
+		expect(document.body.textContent).not.toContain(strings.status.completed);
+		expect(getSpy).not.toHaveBeenCalled();
+	});
+
+	test("closing stops observing without cancelling the job, reopening fetches its result", async () => {
+		getSpy.mockResolvedValue({ job: runningJob });
+		await renderPanel();
+		expect(document.body.textContent).toContain(strings.status.running);
+		const close = document.body.querySelector<HTMLButtonElement>(
+			`button[aria-label="${strings.close}"]`,
+		);
+		expect(close).not.toBeNull();
+		await act(async () => close?.click());
+		await flush();
+		expect(document.body.textContent).not.toContain(strings.warning);
+		expect(document.body.textContent).not.toContain(strings.status.running);
+		expect(cancelSpy).not.toHaveBeenCalled();
+		expect(
+			client.getQueryCache().find({ queryKey: TOKEN_RECALCULATION_QUERY_KEY })?.getObserversCount(),
+		).toBe(0);
+		getSpy.mockResolvedValue({ job: { ...runningJob, status: "completed", processed: 10 } });
+		await click(strings.open);
+		expect(document.body.textContent).toContain(strings.status.completed);
+		expect(document.body.textContent).toContain("Processed: 10");
+		expect(startSpy).not.toHaveBeenCalled();
 	});
 });

@@ -318,21 +318,22 @@ function SettingsUsagePage() {
 				{/* Header */}
 				<Group justify="space-between">
 					<Title order={isMobile ? 3 : 2}>{t("usageHistoryTitle")}</Title>
-					<Button
-						size={isMobile ? "sm" : "md"}
-						leftSection={<IconRefresh size={isMobile ? 14 : 16} />}
-						variant="light"
-						onClick={() => {
-							refetchList();
-							refetchStats();
-							refetchTimeSeries();
-						}}
-					>
-						{t("usageHistoryRefresh")}
-					</Button>
+					<Group gap="xs">
+						<TokenRecalculationPanel />
+						<Button
+							size={isMobile ? "sm" : "md"}
+							leftSection={<IconRefresh size={isMobile ? 14 : 16} />}
+							variant="light"
+							onClick={() => {
+								refetchList();
+								refetchStats();
+								refetchTimeSeries();
+							}}
+						>
+							{t("usageHistoryRefresh")}
+						</Button>
+					</Group>
 				</Group>
-
-				<TokenRecalculationPanel />
 
 				{/* Shared filters */}
 				<Stack gap="xs">

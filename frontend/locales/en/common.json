@@ -1,5 +1,8 @@
 {
 	"tokenRecalculation": {
+		"open": "Historical token recalculation",
+		"close": "Close recalculation window",
+		"backgroundNote": "Closing this window does not cancel the background task. Reopen it to see progress and results.",
 		"title": "Recalculate historical input tokens · Administrator",
 		"warningTitle": "Historical data cannot reliably identify normalization",
 		"warning": "Old records have no normalization version: already-normalized and unnormalized values cannot be reliably distinguished. Recalculating already-correct records may change them incorrectly. Prefer a known affected date range; leave both dates empty only if you intend to process all history.",

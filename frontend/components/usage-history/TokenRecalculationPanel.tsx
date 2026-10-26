@@ -4,7 +4,7 @@ import {
 	TOKEN_RECALCULATION_QUERY_KEY,
 	tokenRecalculationApi,
 } from "@frontend/lib/token-recalculation-api";
-import { Alert, Badge, Button, Group, Loader, Paper, SimpleGrid, Stack, Text } from "@mantine/core";
+import { Alert, Badge, Button, Group, Loader, Modal, SimpleGrid, Stack, Text } from "@mantine/core";
 import { DatePickerInput } from "@mantine/dates";
 import { IconAlertTriangle } from "@tabler/icons-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -13,7 +13,25 @@ import { useTranslation } from "react-i18next";
 
 export function TokenRecalculationPanel() {
 	const { data: user } = useCurrentUser();
-	return user?.role === "admin" ? <AdminTokenRecalculationPanel /> : null;
+	const { t } = useTranslation("common", { keyPrefix: "tokenRecalculation" });
+	const [opened, setOpened] = useState(false);
+	if (user?.role !== "admin") return null;
+	return (
+		<>
+			<Button variant="subtle" size="xs" color="gray" onClick={() => setOpened(true)}>
+				{t("open")}
+			</Button>
+			<Modal
+				opened={opened}
+				onClose={() => setOpened(false)}
+				title={t("title")}
+				size="lg"
+				closeButtonProps={{ "aria-label": t("close") }}
+			>
+				{opened && <AdminTokenRecalculationPanel />}
+			</Modal>
+		</>
+	);
 }
 
 function AdminTokenRecalculationPanel() {
@@ -113,107 +131,107 @@ function AdminTokenRecalculationPanel() {
 	}
 
 	return (
-		<Paper withBorder p="md">
-			<Stack gap="sm">
-				<Text fw={600}>{t("title")}</Text>
-				<Alert color="orange" icon={<IconAlertTriangle size={18} />} title={t("warningTitle")}>
-					<Stack gap="xs">
-						<Text size="sm">{t("warning")}</Text>
-						<Text size="sm">{t("scope")}</Text>
-						<Text size="sm">{t("skipNote")}</Text>
-					</Stack>
-				</Alert>
-				<Text size="sm" c="dimmed">
-					{t("rangeHelp")}
-				</Text>
-				<Group align="flex-end">
-					<DatePickerInput
-						label={t("startDate")}
-						placeholder={t("earliest")}
-						value={startDate}
-						onChange={setStartDate}
-						maxDate={endDate ?? undefined}
-						clearable
-						disabled={busy || running}
-					/>
-					<DatePickerInput
-						label={t("endDate")}
-						placeholder={t("latest")}
-						value={endDate}
-						onChange={setEndDate}
-						minDate={startDate ?? undefined}
-						error={invalidRange ? t("invalidRange") : undefined}
-						clearable
-						disabled={busy || running}
-					/>
-					<Button
-						color="orange"
-						variant="light"
-						onClick={() => void start()}
-						loading={busy && !running}
-						disabled={running || invalidRange || !query.data || query.isError}
-					>
-						{t("start")}
+		<Stack gap="sm">
+			<Text size="sm" c="dimmed">
+				{t("backgroundNote")}
+			</Text>
+			<Alert color="orange" icon={<IconAlertTriangle size={18} />} title={t("warningTitle")}>
+				<Stack gap="xs">
+					<Text size="sm">{t("warning")}</Text>
+					<Text size="sm">{t("scope")}</Text>
+					<Text size="sm">{t("skipNote")}</Text>
+				</Stack>
+			</Alert>
+			<Text size="sm" c="dimmed">
+				{t("rangeHelp")}
+			</Text>
+			<Group align="flex-end">
+				<DatePickerInput
+					label={t("startDate")}
+					placeholder={t("earliest")}
+					value={startDate}
+					onChange={setStartDate}
+					maxDate={endDate ?? undefined}
+					clearable
+					disabled={busy || running}
+				/>
+				<DatePickerInput
+					label={t("endDate")}
+					placeholder={t("latest")}
+					value={endDate}
+					onChange={setEndDate}
+					minDate={startDate ?? undefined}
+					error={invalidRange ? t("invalidRange") : undefined}
+					clearable
+					disabled={busy || running}
+				/>
+				<Button
+					color="orange"
+					variant="light"
+					onClick={() => void start()}
+					loading={busy && !running}
+					disabled={running || invalidRange || !query.data || query.isError}
+				>
+					{t("start")}
+				</Button>
+			</Group>
+			<Text size="sm" fw={500}>
+				{rangeLabel(startDate, endDate)}
+			</Text>
+			{query.isPending && <Text size="sm">{t("loading")}</Text>}
+			{query.isError && (
+				<Alert color="red" title={t("loadFailed")}>
+					<Button size="xs" variant="light" onClick={() => void query.refetch()} disabled={busy}>
+						{t("retry")}
 					</Button>
-				</Group>
-				<Text size="sm" fw={500}>
-					{rangeLabel(startDate, endDate)}
-				</Text>
-				{query.isPending && <Text size="sm">{t("loading")}</Text>}
-				{query.isError && (
-					<Alert color="red" title={t("loadFailed")}>
-						<Button size="xs" variant="light" onClick={() => void query.refetch()} disabled={busy}>
-							{t("retry")}
-						</Button>
-					</Alert>
-				)}
-				{operationError && (
-					<Alert color="red" title={t("operationFailed")}>
-						{operationError}
-					</Alert>
-				)}
-				{job && (
-					<Stack gap="xs" aria-live="polite" aria-atomic="true">
-						<Group>
-							{running && <Loader size="xs" />}
-							<Badge
-								color={
-									job.status === "failed" ? "red" : job.status === "completed" ? "green" : "blue"
-								}
+				</Alert>
+			)}
+			{operationError && (
+				<Alert color="red" title={t("operationFailed")}>
+					{operationError}
+				</Alert>
+			)}
+			{job && (
+				<Stack gap="xs" aria-live="polite" aria-atomic="true">
+					<Group>
+						{running && <Loader size="xs" />}
+						<Badge
+							color={
+								job.status === "failed" ? "red" : job.status === "completed" ? "green" : "blue"
+							}
+						>
+							{t(`status.${job.status}`)}
+						</Badge>
+						<Text size="sm">{rangeLabel(job.startDate, job.endDate)}</Text>
+						{running && (
+							<Button
+								size="xs"
+								variant="light"
+								color="red"
+								onClick={() => void cancel()}
+								loading={busy}
+								disabled={cancelRequestedId === job.id}
 							>
-								{t(`status.${job.status}`)}
-							</Badge>
-							<Text size="sm">{rangeLabel(job.startDate, job.endDate)}</Text>
-							{running && (
-								<Button
-									size="xs"
-									variant="light"
-									color="red"
-									onClick={() => void cancel()}
-									loading={busy}
-									disabled={cancelRequestedId === job.id}
-								>
-									{t(cancelRequestedId === job.id ? "cancelling" : "cancel")}
-								</Button>
-							)}
-						</Group>
-						<SimpleGrid cols={{ base: 2, sm: 3, lg: 6 }}>
-							{(["scanned", "processed", "changed", "skipped", "fallback"] as const).map((key) => (
-								<Text size="sm" key={key}>
-									{t(`counts.${key}`, { count: job[key] })}
-								</Text>
-							))}
-						</SimpleGrid>
-						<Text size="xs" c="dimmed">
-							{t("countsHelp")}
-						</Text>
-						<Text size="xs" c="dimmed">
-							{t("cancelNote")}
-						</Text>
-						{job.error && <Alert color="red">{job.error}</Alert>}
-					</Stack>
-				)}
-			</Stack>
-		</Paper>
+								{t(cancelRequestedId === job.id ? "cancelling" : "cancel")}
+							</Button>
+						)}
+					</Group>
+					<SimpleGrid cols={{ base: 2, sm: 3, lg: 6 }}>
+						{(["scanned", "processed", "changed", "skipped", "fallback"] as const).map((key) => (
+							<Text size="sm" key={key}>
+								{t(`counts.${key}`, { count: job[key] })}
+							</Text>
+						))}
+					</SimpleGrid>
+					<Text size="xs" c="dimmed">
+						{t("countsHelp")}
+					</Text>
+					<Text size="xs" c="dimmed">
+						{t("cancelNote")}
+					</Text>
+					{job.error && <Alert color="red">{job.error}</Alert>}
+				</Stack>
+			)}
+		</Stack>
 	);
 }
