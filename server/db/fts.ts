@@ -258,7 +258,7 @@ function repopulateKnowledgeDraftsFts(sqlite: Database, hasKnowledgeEntries: boo
 const RETIRED_FTS_TRIGGERS = ["chapters_fts_insert", "chapters_fts_update", "chapters_fts_delete"];
 const RETIRED_FTS_TABLES = ["chapters_fts"];
 
-function dropRetiredFtsObjects(sqlite: Database): void {
+export function dropRetiredFtsObjects(sqlite: Database): void {
 	const names = [...RETIRED_FTS_TRIGGERS, ...RETIRED_FTS_TABLES];
 	const present = sqlite
 		.prepare(

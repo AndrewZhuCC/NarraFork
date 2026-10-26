@@ -39,6 +39,7 @@ describe("validate-local-upgrade", () => {
 				["m098", "n098", "user", content, endedAt]);
 			db.run("INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq) VALUES (?, ?, ?, ?)",
 				["r098", "n098", "m098", 7]);
+			db.exec("CREATE VIRTUAL TABLE chapters_fts USING fts5(title, description, content='chapters', content_rowid='rowid', tokenize='trigram')");
 			db.close();
 			writeFileSync(journalPath, JSON.stringify(journal));
 			const validation = join(root, "validation.db");

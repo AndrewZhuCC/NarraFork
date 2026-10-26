@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import { readMigrationFiles } from "drizzle-orm/migrator";
 import { applySqliteDataBackfills } from "../server/db/data-backfills";
 import { ensureColumns } from "../server/db/ensure-columns";
+import { dropRetiredFtsObjects } from "../server/db/fts";
 import { runMigrations } from "../server/db/run-migrations";
 
 const ALLOWED_TARGET_TAGS = new Set([
@@ -85,6 +86,7 @@ const MERGE_098_TAGS = [
 const MERGE_098_TARGETS = new Set(MERGE_098_TAGS.slice(-2));
 const MERGE_098_REMOVED_TABLES = [
 	"chapter_commits", "chapter_edges", "chapters", "exploration_groups", "merge_sessions", "review_conclusions",
+	"chapters_fts", "chapters_fts_data", "chapters_fts_idx", "chapters_fts_docsize", "chapters_fts_config",
 ];
 const MERGE_098_NEW_TABLES = [
 	"narrator_block_assets", "narrator_block_sync_queue", "narrator_blocks",
@@ -706,6 +708,7 @@ async function main() {
 		}
 
 		await runUpgrade(db);
+		if (merge098Chain) dropRetiredFtsObjects(db);
 		assertIntegrity(db);
 		const applied = new Set(ledger(db));
 		if (!pending.every((migration) => applied.has(migration.hash))) {
