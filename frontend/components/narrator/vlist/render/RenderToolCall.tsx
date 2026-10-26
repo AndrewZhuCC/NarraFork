@@ -1,3 +1,4 @@
+import { useSharedComputedColorScheme } from "@frontend/hooks/useSharedComputedColorScheme";
 /**
  * RenderToolCall.tsx — Render copy for the ToolCallCard (batch-2 P10).
  *
@@ -55,7 +56,6 @@ import {
 	ThemeIcon,
 	Tooltip,
 	UnstyledButton,
-	useComputedColorScheme,
 } from "@mantine/core";
 import {
 	CARD_SHIMMER_CLASS,
@@ -1554,7 +1554,7 @@ function HighlightedBody({ text, lang }: { text: string; lang: string | undefine
  * `TokenFlowText`, so the exactness check and the plain-text fallback apply identically.
  */
 function CustomHighlightedBody({ text, kind }: { text: string; kind: "struct-view" }) {
-	const dark = useComputedColorScheme("dark") !== "light";
+	const dark = useSharedComputedColorScheme("dark") !== "light";
 	// Synchronous: unlike Shiki there is no grammar or WASM to fetch, so there is nothing
 	// to cache and no pending state to render around.
 	const tokens = useMemo(
