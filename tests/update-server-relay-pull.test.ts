@@ -756,6 +756,82 @@ for (const corrupt of [false, true]) {
 	});
 }
 
+// GitHub repository slugs are case-insensitive, but the relay carries the slug as the
+// publisher spelled it. `GITHUB_REPOSITORY` keeps the repository's own casing, so a
+// mixed-case repository signed a tools manifest that the operator-configured lowercase
+// slug then had to accept. Only the payload side was lowercased before comparison, so
+// every tools import failed with a bare IMPORT_FAILED and the mirror silently served no
+// executor/helpers binaries at all.
+test("relay commits tools for a mixed-case repository slug", async () => {
+	const ctx = await setup();
+	try {
+		const mixed = "Fixture-Owner/Fork-Product";
+		const payload = executorPayload("a".repeat(40));
+		const binary = Buffer.alloc(128, 7);
+		const manifest = JSON.parse(payload.assets[0].content);
+		for (const entry of Object.values(manifest.manifest.platforms) as { sha256: string }[])
+			entry.sha256 = hash(binary);
+		const content = JSON.stringify(manifest);
+		const binaries = EXECUTOR_PLATFORMS.map((entry) => ({
+			kind: "executor-binary",
+			version: "1.2.0",
+			platform: entry,
+			name: executorPublishedFilename("1.2.0", entry),
+			size: binary.length,
+			sha256: hash(binary),
+		}));
+		const producer = new MirrorRelayStage(
+			{ kind: "executor", repository: mixed, tag: payload.tag },
+			{
+				config: ctx.settings.webdav,
+				signingKey: key,
+				client: ctx.client,
+				now: () => new Date(ctx.clock.now),
+				jobId: "mixed-case-repository",
+			},
+			signal(),
+		);
+		// Every platform shares one object here, so a single PUT backs all six identities.
+		await producer.uploadObject(binaries[0], binary);
+		await producer.preparePayload(
+			{
+				...payload,
+				repository: mixed,
+				binaries,
+				assets: [
+					{
+						...payload.assets[0],
+						content,
+						size: Buffer.byteLength(content),
+						sha256: hash(Buffer.from(content)),
+					},
+					payload.assets[1],
+				],
+			},
+			1024 * 1024,
+		);
+		await producer.publish(async () => {});
+
+		let committed = 0;
+		for (let i = 0; i < 3; i++) committed += (await ctx.puller.pollOnce()).committed;
+		expect(ctx.events.filter((event) => event.code !== "DISCOVERY_FAILED")).toEqual([
+			expect.objectContaining({ code: "COMMITTED", kind: "executor" }),
+		]);
+		expect(committed).toBe(1);
+		// Stored metadata is canonical, so the direct-upload read path finds it too.
+		expect(await (await ctx.app.request(`${root}/tools/executor/${payload.tag}`)).json()).toEqual(
+			expect.objectContaining({ repository: mixed.toLowerCase(), binaries }),
+		);
+		const response = await ctx.app.request(
+			`${root}/tools/executor/${payload.tag}/assets/${binaries[0].name}`,
+		);
+		expect(response.status).toBe(200);
+		expect(Buffer.from(await response.arrayBuffer()).equals(binary)).toBe(true);
+	} finally {
+		await ctx.close();
+	}
+});
+
 test("actual tools same-tag conflict becomes terminal CONFLICT instead of re-downloading forever", async () => {
 	const ctx = await setup();
 	try {
