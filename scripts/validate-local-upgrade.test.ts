@@ -14,6 +14,61 @@ function sha256(path: string): string {
 }
 
 describe("validate-local-upgrade", () => {
+	test("validates the reviewed 0.9.8 chain and preserves local turn and effort values", async () => {
+		const root = mkdtempSync(join(tmpdir(), "nf-upgrade-098-"));
+		try {
+			const migrations = join(root, "drizzle");
+			cpSync(join(ROOT, "drizzle"), migrations, { recursive: true });
+			const journalPath = join(migrations, "meta/_journal.json");
+			const journal = JSON.parse(readFileSync(journalPath, "utf8"));
+			const boundary = journal.entries.findIndex((entry: { tag: string }) => entry.tag === "0213_block_storage");
+			if (boundary < 0) throw new Error("Missing 0.9.8 migration boundary");
+			writeFileSync(journalPath, JSON.stringify({ ...journal, entries: journal.entries.slice(0, boundary) }));
+			const original = join(root, "backup.db");
+			const db = new Database(original);
+			db.exec("PRAGMA foreign_keys=ON");
+			applyPendingMigrationsByHash(db, migrations);
+			await applySqliteDataBackfills(db);
+			const endedAt = "2026-10-26T00:00:00Z";
+			db.run("INSERT INTO narrators (id, title, created_at, updated_at, next_seq, turn_ended_at) VALUES (?, ?, ?, ?, ?, ?)",
+				["n098", "preserved", endedAt, endedAt, 8, endedAt]);
+			db.run("INSERT INTO scheduled_tasks (id, name, cron_expr, prompt, created_at, updated_at, reasoning_effort) VALUES (?, ?, ?, ?, ?, ?, ?)",
+				["s098", "preserved", "0 9 * * *", "preserved", endedAt, endedAt, "max"]);
+			const content = JSON.stringify([{ type: "text", text: "原始消息 preserved" }]);
+			db.run("INSERT INTO narrator_messages (id, narrator_id, role, content_json, created_at) VALUES (?, ?, ?, ?, ?)",
+				["m098", "n098", "user", content, endedAt]);
+			db.run("INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq) VALUES (?, ?, ?, ?)",
+				["r098", "n098", "m098", 7]);
+			db.close();
+			writeFileSync(journalPath, JSON.stringify(journal));
+			const validation = join(root, "validation.db");
+			cpSync(original, validation);
+			const online = join(root, "online.db");
+			writeFileSync(online, "must not be opened");
+			const backupHash = sha256(original);
+			const child = Bun.spawnSync({
+				cmd: [process.execPath, join(ROOT, "scripts/validate-local-upgrade.ts"),
+					"--database", validation, "--migrations", migrations, "--online-database", online,
+					"--backup-original", original, "--backup-sha256", backupHash,
+					"--source-sha256", "b".repeat(64), "--commit", "c".repeat(40), "--version", "0.9.8"],
+				cwd: root,
+				env: { ...process.env, NARRAFORK_HOME: join(root, "home"), HOME: join(root, "home"), NARRAFORK_ALLOW_MULTIPLE: "1", NARRAFORK_LOG_LEVEL: "error" },
+				stdout: "pipe", stderr: "pipe", timeout: 60_000,
+			});
+			if (child.exitCode !== 0) throw new Error(new TextDecoder().decode(child.stderr).slice(-6000));
+			const report = JSON.parse(new TextDecoder().decode(child.stdout));
+			expect(report.status).toBe("ok");
+			expect(Object.values(report.checks).every((value) => value === true)).toBe(true);
+			expect(sha256(original)).toBe(backupHash);
+			const after = new Database(validation, { readonly: true });
+			expect(after.query("SELECT turn_ended_at FROM narrators WHERE id='n098'").get()).toEqual({ turn_ended_at: endedAt });
+			expect(after.query("SELECT reasoning_effort FROM scheduled_tasks WHERE id='s098'").get()).toEqual({ reasoning_effort: "max" });
+			expect(after.query("SELECT content_json FROM narrator_messages WHERE id='m098'").get()).toEqual({ content_json: content });
+			after.close();
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
 	test("validates migration 0013 on an isolated fixture copy", async () => {
 		const root = mkdtempSync(join(tmpdir(), "nf-local-upgrade-validator-"));
 		try {

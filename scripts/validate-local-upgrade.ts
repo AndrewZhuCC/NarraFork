@@ -18,6 +18,8 @@ const ALLOWED_TARGET_TAGS = new Set([
 	"0204_merge_selfuse_092",
 	"0205_merge_upstream_093",
 	"0212_file_write_redesign",
+	"0225_high_baron_zemo",
+	"0226_merge_selfuse_098",
 ]);
 const JOURNAL_TAIL_TAGS = new Set([
 	"0013_omniscient_dormammu",
@@ -29,6 +31,8 @@ const JOURNAL_TAIL_TAGS = new Set([
 	"0204_merge_selfuse_092",
 	"0205_merge_upstream_093",
 	"0212_file_write_redesign",
+	"0225_high_baron_zemo",
+	"0226_merge_selfuse_098",
 ]);
 const MAX_REPORT_BYTES = 64 * 1024;
 const MERGE_090_NEW_TABLES = ["user_git_identities", "narrator_git_identity_bindings"];
@@ -71,6 +75,50 @@ const MERGE_095_ADDED_COLUMNS: Record<string, string[]> = {
 	file_change_effects: ["disk_outcome"],
 	revert_operation_files: [],
 };
+const MERGE_098_TAGS = [
+	"0213_block_storage", "0214_block_backfill", "0215_legacy_body_index",
+	"0216_block_state_writes", "0217_bot_rooms", "0218_retire_narrative_line",
+	"0219_project_index", "0220_hard_sabretooth", "0221_cloudy_kree",
+	"0222_clean_thunderbolts", "0223_overconfident_shockwave",
+	"0224_auth_sessions", "0225_high_baron_zemo", "0226_merge_selfuse_098",
+];
+const MERGE_098_TARGETS = new Set(MERGE_098_TAGS.slice(-2));
+const MERGE_098_REMOVED_TABLES = [
+	"chapter_commits", "chapter_edges", "chapters", "exploration_groups", "merge_sessions", "review_conclusions",
+];
+const MERGE_098_NEW_TABLES = [
+	"narrator_block_assets", "narrator_block_sync_queue", "narrator_blocks",
+	"narrator_text_snapshots", "narrator_turns", "narrator_block_backfill",
+	"narrator_block_diagnostics", "narrator_project_links", "auth_sessions", "narrator_block_index_queue",
+];
+const MERGE_098_REBUILT_TABLES = [
+	"container_instances", "gateway_session_mappings", "narrators", "port_allocations",
+	"scheduled_tasks", "terminal_view_state", "terminals", "volume_snapshot_applications",
+	"volume_snapshots", "file_attributions",
+];
+// Exclude only reviewed additions and retired chapter fields from before/after digests.
+// The local turn_ended_at and reasoning_effort columns remain included and must keep their values.
+const MERGE_098_CHANGED_COLUMNS: Record<string, string[]> = {
+	narrators: ["chapter_id"],
+	scheduled_tasks: ["chapter_id"],
+	container_instances: ["chapter_id"],
+	gateway_session_mappings: ["chapter_id"],
+	port_allocations: ["chapter_id"],
+	terminal_view_state: ["chapter_id"],
+	terminals: ["chapter_id", "graph_height", "graph_opened", "graph_width", "graph_x", "graph_y"],
+	volume_snapshot_applications: ["chapter_id"],
+	volume_snapshots: ["source_chapter_id"],
+	notifications: ["chapter_id"],
+	projects: ["copy_files", "flow_mode", "proxy_domain", "startup_script", "root_key"],
+	chat_messages: ["sender_narrator_id", "reply_to_sender_narrator_id"],
+	narrator_messages: [
+		"body_format", "turn_id", "author_narrator_id", "cause_block_id", "provider_response_id",
+		"body_bytes", "state_revision", "body_rows_only", "blocks_content_hash",
+	],
+	narrator_tool_calls: ["block_id", "is_internal"],
+	file_attributions: [],
+};
+
 const LEGACY_GIT_IDENTITY_FILTER = `u.git_username IS NOT NULL AND trim(u.git_username) <> ''
 	AND u.git_email IS NOT NULL AND trim(u.git_email) <> ''
 	AND instr(u.git_username, '<') = 0 AND instr(u.git_username, '>') = 0
@@ -218,6 +266,14 @@ function affectedSummary(
 	targetTag: string,
 	excludeNew: boolean,
 ): Record<string, unknown> {
+	if (MERGE_098_TARGETS.has(targetTag)) {
+		return Object.fromEntries(
+			Object.entries(MERGE_098_CHANGED_COLUMNS).map(([table, changed]) => [
+				table,
+				tableDigest(db, table, excludeNew ? new Set(changed) : new Set(), table === "port_allocations" ? "port" : "id"),
+			]),
+		);
+	}
 	if (targetTag === "0212_file_write_redesign") {
 		return Object.fromEntries(
 			Object.entries(MERGE_095_ADDED_COLUMNS).map(([table, added]) => [
@@ -373,6 +429,33 @@ function narratorRefsIndexShape(db: Database) {
 }
 
 function schemaShape(db: Database, targetTag?: string): Record<string, unknown> {
+	if (targetTag && MERGE_098_TARGETS.has(targetTag)) {
+		const shape: Record<string, unknown> = {};
+		for (const table of [...MERGE_098_NEW_TABLES, ...MERGE_098_REBUILT_TABLES]) {
+			shape[table] = tableSchemaShape(db, table);
+		}
+		for (const [table, names] of Object.entries(MERGE_098_CHANGED_COLUMNS)) {
+			for (const name of names) shape[`${table}.${name}`] = columnShape(db, table, name);
+		}
+		for (const table of MERGE_098_REMOVED_TABLES) {
+			if (tableExists(db, table)) throw new Error(`Removed table still exists: ${table}`);
+		}
+		for (const name of [
+			"idx_messages_author", "idx_messages_legacy_body", "idx_messages_rows_only",
+			"idx_toolcalls_block", "idx_chat_rooms_narrator_id", "idx_chat_rooms_narrator",
+			"idx_chat_messages_sender_narrator", "uq_projects_root_key",
+		]) {
+			const index = db.query("SELECT sql FROM sqlite_master WHERE type='index' AND name=?").get(name);
+			if (!index) throw new Error(`Missing index: ${name}`);
+			shape[name] = index;
+		}
+		for (const [table, from] of [["narrator_tool_calls", "block_id"], ["chat_messages", "sender_narrator_id"]]) {
+			shape[`${table}.${from}.fk`] = (db.query(`PRAGMA foreign_key_list(${quoteIdentifier(table)})`).all() as Array<Record<string, unknown>>)
+				.filter((key) => key.from === from).map(({ id: _id, ...key }) => key);
+		}
+		shape.historyTriggers = db.query("SELECT name, sql FROM sqlite_master WHERE type='trigger' AND name LIKE 'model_history_v3_%' ORDER BY name").all();
+		return shape;
+	}
 	const shape: Record<string, unknown> = {
 		fileChangeScopeRecoveries: tableSchemaShape(db, "file_change_scope_recoveries"),
 		workspaceWriteLeases: tableSchemaShape(db, "workspace_write_leases"),
@@ -581,16 +664,21 @@ async function main() {
 		const merge092Chain = canonical(pending.map((migration) => migration.tag)) === canonical(MERGE_092_TAGS);
 		const merge095Chain =
 			canonical(pending.map((migration) => migration.tag)) === canonical(MERGE_095_TAGS);
+		// 0226 can share an already-applied local migration hash; both complete tails are reviewed.
+		const merge098Chain = [MERGE_098_TAGS, MERGE_098_TAGS.slice(0, -1)].some(
+			(chain) => canonical(pending.map((migration) => migration.tag)) === canonical(chain),
+		);
 		const merge083Pair =
 			pending.length === 2 &&
 			pending[0].tag === "0016_high_shiva" &&
 			target?.tag === "0017_merge_opensource_083";
 		if (
-			(!merge083Pair && !merge092Chain && !merge095Chain && pending.length !== 1) ||
+			(!merge083Pair && !merge092Chain && !merge095Chain && !merge098Chain && pending.length !== 1) ||
 			!target?.tag ||
 			!ALLOWED_TARGET_TAGS.has(target.tag) ||
 			(target.tag === "0204_merge_selfuse_092" && !merge092Chain) ||
-			(target.tag === "0212_file_write_redesign" && !merge095Chain)
+			(target.tag === "0212_file_write_redesign" && !merge095Chain) ||
+			(MERGE_098_TARGETS.has(target.tag) && !merge098Chain)
 		) {
 			throw new Error(
 				"Validation requires a reviewed migration, pair, or complete migration chain",
@@ -624,7 +712,7 @@ async function main() {
 			throw new Error("Target migration hash was not applied");
 		}
 		const expectedCounts = { ...beforeCounts };
-		const newTables =
+		const newTables = merge098Chain ? MERGE_098_NEW_TABLES :
 			target.tag === "0012_curved_bloodstorm"
 				? ["file_change_scope_recoveries"]
 				: target.tag === "0013_omniscient_dormammu"
@@ -638,6 +726,7 @@ async function main() {
 								: target.tag === "0204_merge_selfuse_092" ? MERGE_092_NEW_TABLES
 									: target.tag === "0205_merge_upstream_093" ? MERGE_093_NEW_TABLES : [];
 		for (const table of newTables) if (!(table in expectedCounts)) expectedCounts[table] = 0;
+		if (merge098Chain) for (const table of MERGE_098_REMOVED_TABLES) delete expectedCounts[table];
 		if (target.tag === "0205_merge_upstream_093") {
 			for (const table of MERGE_093_REMOVED_TABLES) delete expectedCounts[table];
 			expectedCounts.narrator_message_context_stats = beforeCounts.narrator_messages ?? 0;
@@ -665,8 +754,12 @@ async function main() {
 				.get();
 			if (missingIdentity) throw new Error("Legacy Git identity was not preserved");
 		}
-		if (canonical(rowCounts(db)) !== canonical(expectedCounts)) {
-			throw new Error("Existing table row counts changed");
+		const actualCounts = rowCounts(db);
+		if (canonical(actualCounts) !== canonical(expectedCounts)) {
+			const changed = Object.keys({ ...expectedCounts, ...actualCounts })
+				.filter((table) => expectedCounts[table] !== actualCounts[table])
+				.map((table) => ({ table, expected: expectedCounts[table], actual: actualCounts[table] }));
+			throw new Error(`Existing table row counts changed: ${JSON.stringify(changed).slice(0, 4096)}`);
 		}
 		const afterAffected = affectedForUpgrade(true);
 		if (canonical(afterAffected) !== canonical(beforeAffected)) {

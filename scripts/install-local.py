@@ -20,6 +20,7 @@ import plistlib
 import re
 import shutil
 import sqlite3
+import ssl
 import subprocess
 import sys
 import time
@@ -38,6 +39,13 @@ def digest(path):
 DEFAULT_LAUNCHD_LABEL = 'dev.narrafork.server'
 LAUNCHD_LABEL_PATTERN = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}')
 HEALTH_READ_LIMIT = 65536
+MERGE_098_TAGS = [
+    '0213_block_storage', '0214_block_backfill', '0215_legacy_body_index',
+    '0216_block_state_writes', '0217_bot_rooms', '0218_retire_narrative_line',
+    '0219_project_index', '0220_hard_sabretooth', '0221_cloudy_kree',
+    '0222_clean_thunderbolts', '0223_overconfident_shockwave',
+    '0224_auth_sessions', '0225_high_baron_zemo', '0226_merge_selfuse_098',
+]
 
 
 def health_url(settings_path):
@@ -55,7 +63,12 @@ def health_url(settings_path):
 
 def read_health(url):
     """Running server identity over loopback: no proxy, no credentials, default TLS verification."""
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    context = ssl.create_default_context()
+    local_ca = Path.home() / '.narrafork/tls/ca.pem'
+    if url.startswith('https://') and local_ca.is_file():
+        context.load_verify_locations(cafile=str(local_ca))
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                        urllib.request.HTTPSHandler(context=context))
     with opener.open(url, timeout=10) as response:
         body = response.read(HEALTH_READ_LIMIT + 1)
     assert len(body) <= HEALTH_READ_LIMIT, 'Health response exceeded 64 KiB'
@@ -237,8 +250,9 @@ def main():
              '0198_broken_viper', '0199_sudden_richard_fisk', '0200_faithful_major_mapleleaf',
              '0201_mute_white_tiger', '0202_personal_knowledge_injection',
              '0203_magical_speed_demon', '0204_merge_selfuse_092'],
-        ), ('Validation requires a reviewed migration or the complete 0196–0204 chain',
-            [entry['tag'] for entry in pending])
+        ) or [entry['tag'] for entry in pending] in (MERGE_098_TAGS, MERGE_098_TAGS[:-1]), \
+            ('Validation requires a reviewed migration or complete migration chain',
+             [entry['tag'] for entry in pending])
         validation_db = backup / 'narrafork.validation.db'
         shutil.copy2(backup_db, validation_db)
         assert digest(validation_db) == backup_sha256
