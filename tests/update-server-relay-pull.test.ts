@@ -559,12 +559,16 @@ for (const mode of ["stop", "deadline", "storage-deadline"] as const) {
 		let hangingPath = "";
 		let cancelled = false;
 		const entered = Promise.withResolvers<void>();
+		const reading = Promise.withResolvers<void>();
 		const ctx = await setup((request) => {
 			if (request.method !== "GET" || new URL(request.url).pathname !== hangingPath) return null;
 			return new Response(
 				new ReadableStream<Uint8Array>({
 					start(controller) {
 						controller.enqueue(new Uint8Array([1, 2, 3]));
+					},
+					pull() {
+						reading.resolve();
 					},
 					cancel() {
 						cancelled = true;
@@ -579,15 +583,21 @@ for (const mode of ["stop", "deadline", "storage-deadline"] as const) {
 			if (!patch) throw new Error("Expected patch");
 			hangingPath = staged.assetPath(patch.sha256);
 			const originalTimeout = AbortSignal.timeout.bind(AbortSignal);
-			const deadline = spyOn(AbortSignal, "timeout").mockImplementation((ms) =>
-				originalTimeout(mode === "deadline" && ms === 25 * 60_000 ? 150 : ms),
-			);
+			const jobDeadline = new AbortController();
+			const deadline = spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
+				// Trigger the job cancellation only after the hanging stream has arrived. A real 150ms
+				// timeout races CI scheduling and can expire before the fixture reaches its checkpoint.
+				if (ms === 25 * 60_000) return jobDeadline.signal;
+				return originalTimeout(ms);
+			});
 			const originalSave = ctx.storage.saveVerifiedFile.bind(ctx.storage);
 			const saving = spyOn(ctx.storage, "saveVerifiedFile").mockImplementation(
 				(path, stream, options) => {
 					const work = originalSave(path, stream, {
 						...options,
-						timeoutMs: mode === "storage-deadline" ? options.timeoutMs / 6000 : options.timeoutMs,
+						// Keep the native storage timer and TimeoutError semantics, but allow enough time for
+						// the fixture to observe the blocked read before expiry on a loaded CI runner.
+						timeoutMs: mode === "storage-deadline" ? 1_000 : options.timeoutMs,
 					});
 					if (options.sha256 === patch.sha256) entered.resolve();
 					return work;
@@ -600,7 +610,12 @@ for (const mode of ["stop", "deadline", "storage-deadline"] as const) {
 				});
 				const work = short.pollOnce();
 				await entered.promise;
+				// Admission can complete asynchronously. Wait until writeStream is actually blocked in
+				// reader.read(), so cancellation exercises the hanging-body path rather than setup/admission.
+				await reading.promise;
+				const expired = () => new DOMException("The operation timed out.", "TimeoutError");
 				if (mode === "stop") await short.stop();
+				else if (mode === "deadline") jobDeadline.abort(expired());
 				const result = await work;
 				expect(result.committed).toBe(0);
 				if (mode !== "stop") expect(result.failed).toBe(1);
