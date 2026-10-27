@@ -309,8 +309,12 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 
 	/** A person's view state of a page, or null when they never wrote one. */
 	getViewState(userId: string, pageBlockId: string): Promise<OutlineViewStateRow | null>;
-	/** Insert or replace a person's view state of a page. */
-	putViewState(row: OutlineViewStateRow): Promise<void>;
+	/**
+	 * Insert or replace a person's view state of a page, then keep only their `keepPerUser` most
+	 * recently written pages (the rest are deleted in one statement bounded by that number: the
+	 * person never has more than `keepPerUser + 1` rows).
+	 */
+	putViewState(row: OutlineViewStateRow, keepPerUser: number): Promise<void>;
 }
 
 /** Ids per `IN (…)` list, well under every engine's bound-parameter limit. */

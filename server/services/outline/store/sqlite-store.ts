@@ -14,7 +14,7 @@
  * `errno`) and cross the port as `WriteConflictError`.
  */
 import { WriteConflictError } from "@server/db/backend/write-port";
-import { and, asc, eq, gt, inArray, isNull, type SQL, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, notInArray, type SQL, sql } from "drizzle-orm";
 import { db } from "../../../db";
 import {
 	outlineBlocks,
@@ -600,23 +600,42 @@ export const sqliteOutlineStore: OutlineStore = {
 		return row ? toViewState(row) : null;
 	},
 
-	async putViewState(row) {
+	async putViewState(row, keepPerUser) {
 		await withDbRetry(
 			async () =>
-				db
-					.insert(outlineViewState)
-					.values({
-						userId: row.userId,
-						pageBlockId: row.pageBlockId,
-						collapsedJson: row.collapsed,
-						layout: row.layout,
-						updatedAt: row.updatedAt,
-					})
-					.onConflictDoUpdate({
-						target: [outlineViewState.userId, outlineViewState.pageBlockId],
-						set: { collapsedJson: row.collapsed, layout: row.layout, updatedAt: row.updatedAt },
-					})
-					.run(),
+				db.transaction((tx) => {
+					tx.insert(outlineViewState)
+						.values({
+							userId: row.userId,
+							pageBlockId: row.pageBlockId,
+							collapsedJson: row.collapsed,
+							layout: row.layout,
+							updatedAt: row.updatedAt,
+						})
+						.onConflictDoUpdate({
+							target: [outlineViewState.userId, outlineViewState.pageBlockId],
+							set: { collapsedJson: row.collapsed, layout: row.layout, updatedAt: row.updatedAt },
+						})
+						.run();
+					// The person's oldest pages beyond the cap: their rows are found by the primary
+					// key's prefix, at most `keepPerUser + 1` of them.
+					tx.delete(outlineViewState)
+						.where(
+							and(
+								eq(outlineViewState.userId, row.userId),
+								notInArray(
+									outlineViewState.pageBlockId,
+									tx
+										.select({ id: outlineViewState.pageBlockId })
+										.from(outlineViewState)
+										.where(eq(outlineViewState.userId, row.userId))
+										.orderBy(desc(outlineViewState.updatedAt), desc(outlineViewState.pageBlockId))
+										.limit(keepPerUser),
+								),
+							),
+						)
+						.run();
+				}),
 			{ label: "outline.putViewState", maxRetries: 3 },
 		);
 	},

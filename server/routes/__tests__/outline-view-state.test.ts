@@ -8,8 +8,11 @@
  *  - read access is enough (a reader folds the page they may only read); a page in a space the
  *    person cannot read, a block that is not a page, a deleted page and an unknown id are all
  *    the same 404, and nothing is written;
- *  - the body is bounded: too many ids, an overlong id, an unknown direction and a body over
- *    the byte limit are refused; duplicate ids are kept once;
+ *  - the body is bounded: too many ids, an overlong id, an id that is not a block id (free
+ *    text), an unknown direction and a body over the byte limit are refused; duplicate ids are
+ *    kept once; ids that are not live blocks of the page (another page's, a deleted block's,
+ *    made up) are dropped;
+ *  - two surfaces or tabs of one person writing the same page: the last write wins;
  *  - with `outline.enabled` off the routes are a plain 404.
  *
  * ISOLATION: the isolated database from `tests/preload.ts`.
@@ -87,6 +90,8 @@ let carol: string;
 let pageId: string;
 let childId: string;
 let deletedPageId: string;
+let grandchildId: string;
+let otherChildId: string;
 
 beforeEach(() => {
 	settings.outline.enabled = true;
@@ -124,13 +129,17 @@ beforeAll(async () => {
 			{ op: "insert", tempId: "c", parent: { tempId: "p" }, content: "Child" },
 			{ op: "insert", tempId: "g", parent: { tempId: "c" }, content: "Grandchild" },
 			{ op: "insert", tempId: "d", parent: null, content: "Gone" },
+			{ op: "insert", tempId: "o", parent: null, content: "Other page" },
+			{ op: "insert", tempId: "oc", parent: { tempId: "o" }, content: "Other child" },
 		],
 		actor: { kind: "human", id: alice },
 		responsibleUserId: alice,
 	});
 	pageId = written.results[0]?.blockId as string;
 	childId = written.results[1]?.blockId as string;
+	grandchildId = written.results[2]?.blockId as string;
 	deletedPageId = written.results[3]?.blockId as string;
+	otherChildId = written.results[5]?.blockId as string;
 	await writeOutline({
 		spaceId: space.id,
 		ops: [{ op: "delete", block: { id: deletedPageId } }],
@@ -169,9 +178,12 @@ describe("outline view state", () => {
 			layout: "right",
 			updatedAt: null,
 		});
-		const bobPut = await call(bob, "PUT", pageId, { collapsed: ["x1", "x2"], layout: "right" });
+		const bobPut = await call(bob, "PUT", pageId, {
+			collapsed: [grandchildId, childId],
+			layout: "right",
+		});
 		expect(bobPut.status).toBe(200);
-		expect((await call(bob, "GET", pageId)).body.collapsed).toEqual(["x1", "x2"]);
+		expect((await call(bob, "GET", pageId)).body.collapsed).toEqual([grandchildId, childId]);
 		expect((await call(alice, "GET", pageId)).body).toMatchObject({
 			collapsed: [childId],
 			layout: "down",
@@ -187,7 +199,7 @@ describe("outline view state", () => {
 		] as const) {
 			const read = await call(who, "GET", id);
 			expect(read.status).toBe(404);
-			const write = await call(who, "PUT", id, { collapsed: ["a"], layout: "down" });
+			const write = await call(who, "PUT", id, { collapsed: [childId], layout: "down" });
 			expect(write.status).toBe(404);
 			expect(await outlineStore.getViewState(who, id)).toBeNull();
 		}
@@ -215,13 +227,44 @@ describe("outline view state", () => {
 		});
 		const big = await call(alice, "PUT", pageId, huge);
 		expect(big.status).toBe(413);
-		// The most ids allowed fit within the byte limit.
+		// Free text is not an id.
+		for (const bad of ["has space", "长 id", "a/b", "short", "<script>x</script>"]) {
+			expect({
+				bad,
+				status: (await call(alice, "PUT", pageId, { collapsed: [bad], layout: "right" })).status,
+			}).toEqual({ bad, status: 400 });
+		}
+		// The most ids allowed fit within the byte limit; ids that are no blocks of the page are
+		// dropped, so nothing of them is stored.
 		const most = Array.from({ length: OUTLINE_VIEW_STATE_LIMITS.maxCollapsed }, () =>
 			"y".repeat(OUTLINE_VIEW_STATE_LIMITS.maxIdChars - 5),
 		).map((id, i) => `${id}${String(i).padStart(5, "0")}`);
-		const ok = await call(alice, "PUT", pageId, { collapsed: most, layout: "right" });
+		const ok = await call(alice, "PUT", pageId, {
+			collapsed: [...most.slice(1), childId],
+			layout: "right",
+		});
 		expect(ok.status).toBe(200);
-		expect(ok.body.collapsed).toHaveLength(OUTLINE_VIEW_STATE_LIMITS.maxCollapsed);
+		expect(ok.body.collapsed).toEqual([childId]);
+		expect((await outlineStore.getViewState(alice, pageId))?.collapsed).toEqual([childId]);
+	});
+
+	test("only live blocks of the page are kept", async () => {
+		const put = await call(alice, "PUT", pageId, {
+			collapsed: [otherChildId, childId, deletedPageId, pageId, grandchildId, generateId()],
+			layout: "down",
+		});
+		expect(put.status).toBe(200);
+		// Another page's block, a deleted page and a made-up id go; the page and its blocks stay.
+		expect(put.body.collapsed).toEqual([childId, pageId, grandchildId]);
+	});
+
+	test("two surfaces or tabs writing the same page: the last write wins", async () => {
+		await call(alice, "PUT", pageId, { collapsed: [childId], layout: "down" });
+		await call(alice, "PUT", pageId, { collapsed: [grandchildId], layout: "right" });
+		expect((await call(alice, "GET", pageId)).body).toMatchObject({
+			collapsed: [grandchildId],
+			layout: "right",
+		});
 	});
 
 	test("with the outline off the routes are a plain 404", async () => {

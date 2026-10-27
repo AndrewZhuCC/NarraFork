@@ -1705,7 +1705,7 @@ export const OUTLINE_STORE_CONTRACT: ContractCase[] = [
 				layout: "down" as const,
 				updatedAt: NOW,
 			};
-			await ctx.store.putViewState(row);
+			await ctx.store.putViewState(row, 500);
 			expect(await ctx.store.getViewState(me, one)).toEqual(row);
 			// Replaced, not merged.
 			const later = {
@@ -1714,18 +1714,40 @@ export const OUTLINE_STORE_CONTRACT: ContractCase[] = [
 				layout: "right" as const,
 				updatedAt: "2026-10-27T00:00:00.000Z",
 			};
-			await ctx.store.putViewState(later);
+			await ctx.store.putViewState(later, 500);
 			expect(await ctx.store.getViewState(me, one)).toEqual(later);
 			// Per person and per page.
 			expect(await ctx.store.getViewState(other, one)).toBeNull();
 			expect(await ctx.store.getViewState(me, two)).toBeNull();
-			await ctx.store.putViewState({ ...row, userId: other, collapsed: [] });
+			await ctx.store.putViewState({ ...row, userId: other, collapsed: [] }, 500);
 			expect((await ctx.store.getViewState(other, one))?.collapsed).toEqual([]);
 			expect((await ctx.store.getViewState(me, one))?.collapsed).toEqual(["c"]);
 			// A large list round-trips.
 			const many = Array.from({ length: 2000 }, (_, i) => `block-${i}`);
-			await ctx.store.putViewState({ ...row, pageBlockId: two, collapsed: many });
+			await ctx.store.putViewState({ ...row, pageBlockId: two, collapsed: many }, 500);
 			expect((await ctx.store.getViewState(me, two))?.collapsed).toEqual(many);
+			// At most `keepPerUser` pages per person: a write drops their least recently written
+			// pages, never another person's.
+			const more = await write(ctx, space, [
+				{ op: "insert", parent: null, content: "view page three" },
+				{ op: "insert", parent: null, content: "view page four" },
+			]);
+			const [three, four] = more.results.map((x) => x.blockId) as [string, string];
+			const at = (n: number) => `2026-10-28T00:00:0${n}.000Z`;
+			await ctx.store.putViewState({ ...row, pageBlockId: one, updatedAt: at(1) }, 3);
+			await ctx.store.putViewState({ ...row, pageBlockId: two, updatedAt: at(2) }, 3);
+			await ctx.store.putViewState({ ...row, pageBlockId: three, updatedAt: at(3) }, 3);
+			expect(await ctx.store.getViewState(me, one)).not.toBeNull();
+			await ctx.store.putViewState({ ...row, pageBlockId: four, updatedAt: at(4) }, 3);
+			expect(await ctx.store.getViewState(me, one)).toBeNull();
+			for (const p of [two, three, four])
+				expect(await ctx.store.getViewState(me, p)).not.toBeNull();
+			// Rewriting an old page makes it the newest: the next oldest goes.
+			await ctx.store.putViewState({ ...row, pageBlockId: two, updatedAt: at(5) }, 2);
+			expect(await ctx.store.getViewState(me, three)).toBeNull();
+			expect(await ctx.store.getViewState(me, two)).not.toBeNull();
+			expect(await ctx.store.getViewState(me, four)).not.toBeNull();
+			expect(await ctx.store.getViewState(other, one)).not.toBeNull();
 		},
 	},
 	{

@@ -281,11 +281,19 @@ export const OUTLINE_VIEW_STATE_LIMITS = {
 	maxCollapsed: 2000,
 	/** Characters of one block id. */
 	maxIdChars: 64,
+	/**
+	 * Pages one person keeps a view state for: writing another drops the least recently written
+	 * (one bounded statement per write).
+	 */
+	maxPagesPerUser: 500,
 	/** Bytes of a PUT body. */
 	maxBodyBytes: 160 * 1024,
 	/** The client waits this long after the last change before writing. */
 	writeDebounceMs: 800,
 } as const;
+
+/** A block id as servers and clients make them (`generateId`, the live editor's ids). */
+export const OUTLINE_BLOCK_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 
 /** One person's view state of one page; defaults when they never changed it. */
 export interface OutlineViewStateResponse {
