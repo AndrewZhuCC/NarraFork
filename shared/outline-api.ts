@@ -267,3 +267,36 @@ export interface OutlineResolveResponse {
 	/** Set for a commit: show the page as of this seq. */
 	asOf?: number;
 }
+
+/** The mind map's direction (design §6.10): rightward (the default) or downward. */
+export type OutlineMapLayout = "right" | "down";
+
+/**
+ * Limits of `GET/PUT /api/outline/view-state/:pageId`: one person's folding and mind-map
+ * direction of one page (design §7.1 `outline_view_state`). Folding is personal and never part
+ * of the block model; a page shows at most `maxCollapsed` blocks per view (design §7.2), so more
+ * folded ids than that are never needed.
+ */
+export const OUTLINE_VIEW_STATE_LIMITS = {
+	maxCollapsed: 2000,
+	/** Characters of one block id. */
+	maxIdChars: 64,
+	/** Bytes of a PUT body. */
+	maxBodyBytes: 160 * 1024,
+	/** The client waits this long after the last change before writing. */
+	writeDebounceMs: 800,
+} as const;
+
+/** One person's view state of one page; defaults when they never changed it. */
+export interface OutlineViewStateResponse {
+	pageId: string;
+	collapsed: string[];
+	layout: OutlineMapLayout;
+	/** When it was last written; null for the defaults. */
+	updatedAt: string | null;
+}
+
+export interface OutlineViewStatePutRequest {
+	collapsed: string[];
+	layout: OutlineMapLayout;
+}

@@ -1687,6 +1687,48 @@ export const OUTLINE_STORE_CONTRACT: ContractCase[] = [
 		},
 	},
 	{
+		name: "view state: one row per person and page, replaced by a write, gone with the page",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			const r = await write(ctx, space, [
+				{ op: "insert", parent: null, content: "view page one" },
+				{ op: "insert", parent: null, content: "view page two" },
+			]);
+			const [one, two] = r.results.map((x) => x.blockId) as [string, string];
+			const me = await ctx.seedUser();
+			const other = await ctx.seedUser();
+			expect(await ctx.store.getViewState(me, one)).toBeNull();
+			const row = {
+				userId: me,
+				pageBlockId: one,
+				collapsed: ["a", "b", "长 id"],
+				layout: "down" as const,
+				updatedAt: NOW,
+			};
+			await ctx.store.putViewState(row);
+			expect(await ctx.store.getViewState(me, one)).toEqual(row);
+			// Replaced, not merged.
+			const later = {
+				...row,
+				collapsed: ["c"],
+				layout: "right" as const,
+				updatedAt: "2026-10-27T00:00:00.000Z",
+			};
+			await ctx.store.putViewState(later);
+			expect(await ctx.store.getViewState(me, one)).toEqual(later);
+			// Per person and per page.
+			expect(await ctx.store.getViewState(other, one)).toBeNull();
+			expect(await ctx.store.getViewState(me, two)).toBeNull();
+			await ctx.store.putViewState({ ...row, userId: other, collapsed: [] });
+			expect((await ctx.store.getViewState(other, one))?.collapsed).toEqual([]);
+			expect((await ctx.store.getViewState(me, one))?.collapsed).toEqual(["c"]);
+			// A large list round-trips.
+			const many = Array.from({ length: 2000 }, (_, i) => `block-${i}`);
+			await ctx.store.putViewState({ ...row, pageBlockId: two, collapsed: many });
+			expect((await ctx.store.getViewState(me, two))?.collapsed).toEqual(many);
+		},
+	},
+	{
 		name: "randomized: every seq's tree rebuilt from versions equals the model",
 		async run(ctx) {
 			for (const seed of [1, 2, 3]) await randomizedHistory(ctx, seed);

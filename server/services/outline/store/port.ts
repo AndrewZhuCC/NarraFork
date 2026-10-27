@@ -134,6 +134,18 @@ export interface OutlineLiveUpdateRow {
 	createdAt: string;
 }
 
+/**
+ * One person's view state of one page (`outline_view_state`, design §7.1): folded blocks and the
+ * mind map's direction. Personal and outside history: never versioned, never part of a commit.
+ */
+export interface OutlineViewStateRow {
+	userId: string;
+	pageBlockId: string;
+	collapsed: string[];
+	layout: "right" | "down";
+	updatedAt: string;
+}
+
 /** The space a project, a user or a narrator owns. */
 export type OutlineSpaceScope =
 	| { kind: "project"; projectId: string }
@@ -291,6 +303,14 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 		after?: { pageBlockId: string; epoch: number };
 		limit: number;
 	}): Promise<Array<{ pageBlockId: string; epoch: number }>>;
+
+	// ── view state (`services/outline/view-state.ts`) ───────────────────────────────────
+	// One row per person and page, read and written by primary key: one small statement each.
+
+	/** A person's view state of a page, or null when they never wrote one. */
+	getViewState(userId: string, pageBlockId: string): Promise<OutlineViewStateRow | null>;
+	/** Insert or replace a person's view state of a page. */
+	putViewState(row: OutlineViewStateRow): Promise<void>;
 }
 
 /** Ids per `IN (…)` list, well under every engine's bound-parameter limit. */

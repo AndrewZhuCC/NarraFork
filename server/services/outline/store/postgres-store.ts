@@ -25,6 +25,7 @@ import {
 	outlineLinks,
 	outlineLiveUpdates,
 	outlineSpaces,
+	outlineViewState,
 } from "@server/db/postgres-schema";
 import type { OutlineTaskJson } from "@server/db/schema";
 import { generateId } from "@server/lib/id";
@@ -50,6 +51,7 @@ import {
 	OutlineStaleWriteError,
 	type OutlineStore,
 	type OutlineVersionRow,
+	type OutlineViewStateRow,
 } from "./port";
 import { createPostgresOutlineReads } from "./postgres-read";
 
@@ -122,6 +124,21 @@ function toLiveUpdate(row: LiveUpdateSelect): OutlineLiveUpdateRow {
 
 /** Rows per multi-row INSERT of the live log (7 columns each). */
 const LIVE_INSERT_CHUNK = 50;
+
+type ViewStateSelect = typeof outlineViewState.$inferSelect;
+
+function toViewState(row: ViewStateSelect): OutlineViewStateRow {
+	const collapsed = row.collapsedJson;
+	return {
+		userId: row.userId,
+		pageBlockId: row.pageBlockId,
+		collapsed: Array.isArray(collapsed)
+			? collapsed.filter((id): id is string => typeof id === "string")
+			: [],
+		layout: row.layout === "down" ? "down" : "right",
+		updatedAt: row.updatedAt,
+	};
+}
 
 /** Append live log rows; one transaction so a chunked append lands whole. */
 async function appendLiveSection(
@@ -587,6 +604,38 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 				.groupBy(outlineLiveUpdates.pageBlockId, outlineLiveUpdates.epoch)
 				.orderBy(sql`${outlineLiveUpdates.pageBlockId} COLLATE "C"`, asc(outlineLiveUpdates.epoch))
 				.limit(options.limit);
+		},
+
+		async getViewState(userId, pageBlockId) {
+			const rows = await db
+				.select()
+				.from(outlineViewState)
+				.where(
+					and(eq(outlineViewState.userId, userId), eq(outlineViewState.pageBlockId, pageBlockId)),
+				)
+				.limit(1);
+			const row = rows[0];
+			return row ? toViewState(row) : null;
+		},
+
+		async putViewState(row) {
+			await withPgRetry(
+				() =>
+					db
+						.insert(outlineViewState)
+						.values({
+							userId: row.userId,
+							pageBlockId: row.pageBlockId,
+							collapsedJson: row.collapsed,
+							layout: row.layout,
+							updatedAt: row.updatedAt,
+						})
+						.onConflictDoUpdate({
+							target: [outlineViewState.userId, outlineViewState.pageBlockId],
+							set: { collapsedJson: row.collapsed, layout: row.layout, updatedAt: row.updatedAt },
+						}),
+				{ label: "outline.putViewState" },
+			);
 		},
 
 		async applyCommit(plan) {
