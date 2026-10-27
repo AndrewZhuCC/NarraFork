@@ -1032,6 +1032,17 @@ test("a live selected message is quoted once with Tab, not Alt+Q or modified Tab
 		await page.waitForFunction(() =>
 			document.activeElement?.hasAttribute("data-quote-comment-editor"),
 		);
+		// The main editor is also the popover anchor, but clicking its editable area must dismiss it.
+		const point = await page.$eval('[contenteditable="true"]', (editor) => {
+			const rect = editor.getBoundingClientRect();
+			return { x: rect.right - 6, y: rect.bottom - 5 };
+		});
+		await page.mouse.click(point.x, point.y);
+		await settle(page);
+		expect(await page.$("[data-quote-comment-editor]")).toBeNull();
+		expect(
+			await page.evaluate(() => document.activeElement?.matches('[contenteditable="true"]')),
+		).toBe(true);
 		await page.keyboard.press("Tab");
 		await settle(page);
 		expect(nodeCount((await snapshot(page)).document, "quote")).toBe(1);

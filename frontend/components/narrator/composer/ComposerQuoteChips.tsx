@@ -188,7 +188,15 @@ export function ComposerQuoteComment({
 			returnFocus={false}
 		>
 			<Popover.Target>
-				<Box style={{ minWidth: 0 }}>{children}</Box>
+				<Box
+					style={{ minWidth: 0 }}
+					onPointerDownCapture={(event) => {
+						const editable = (event.target as Element).closest("[contenteditable]");
+						if (quote && editable?.getAttribute("contenteditable") === "true") onClose();
+					}}
+				>
+					{children}
+				</Box>
 			</Popover.Target>
 			{quote && (
 				<Popover.Dropdown p="xs" role="dialog" aria-label={t("quote.editComment")}>
