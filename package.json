@@ -57,7 +57,7 @@
 		"i18next": "^25.10.10",
 		"i18next-browser-languagedetector": "^8.2.1",
 		"iconv-lite": "^0.7.2",
-		"katex": "^0.16.45",
+		"katex": "^0.18.2",
 		"lang-map": "^0.4.0",
 		"linkedom": "^0.18.12",
 		"marked": "^18.0.7",
@@ -83,7 +83,7 @@
 		"tldts": "6.1.86",
 		"tree-sitter-bash": "0.25.0",
 		"tweetnacl": "^0.14.5",
-		"undici": "6.24.1",
+		"undici": "6.29.1",
 		"web-tree-sitter": "0.25.10",
 		"ws": "^8.20.0",
 		"zod": "^4.3.6"
@@ -155,6 +155,10 @@
 		"@parcel/watcher",
 		"tree-sitter-bash"
 	],
+	"overrides": {
+		"katex": "0.18.2",
+		"undici": "6.29.1"
+	},
 	"patchedDependencies": {
 		"@cypress/request-promise@5.0.0": "patches/@cypress%2Frequest-promise@5.0.0.patch"
 	}
