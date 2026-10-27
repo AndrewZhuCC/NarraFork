@@ -11,7 +11,12 @@
  *   - A session opens in its space's lane on the first join, and closes (committing everything)
  *     {@link OUTLINE_LIVE_TIMING.idleCloseMs} after the last participant left, when the outline
  *     is switched off, and at shutdown.
- *   - Limits: {@link OUTLINE_LIVE_LIMITS} per socket, page and process.
+ *   - Limits: {@link OUTLINE_LIVE_LIMITS} per socket, page and process; joins per socket are
+ *     rate-limited ({@link OUTLINE_LIVE_SOCKET_BOUNDS}); a participant's frames waiting in the
+ *     lane are bounded in bytes; frames of viewers and of refused participants are answered
+ *     without being queued.
+ *   - A session ended by a close, or recovered after a crash, leaves for each client how far its
+ *     changes reached the page (`recovered`), so a client resuming it does not replay them.
  */
 import { eventBus, type NarraForkEvent } from "@server/lib/event-bus";
 import { hotOnce, hotSafe } from "@server/lib/hot-safe";
@@ -19,6 +24,7 @@ import { logger } from "@server/lib/logger";
 import { subscribeSettingsChanges } from "@server/lib/settings";
 import {
 	encodeLiveFrame,
+	isLiveHandle,
 	LIVE_FRAME,
 	type LiveCloseCode,
 	type LiveFrame,
@@ -27,12 +33,13 @@ import {
 	OUTLINE_LIVE_LIMITS,
 } from "@shared/outline-live-protocol";
 import { canReadSpace, canWriteSpace } from "../access";
+import { OutlineBusyError } from "../errors";
 import { isOutlineEnabled } from "../feature";
 import { setOutlineLiveBarrier } from "../live-barrier";
 import { outlineStore } from "../store";
 import type { OutlineSpaceRow } from "../store/port";
 import { holdsLane, isOwnLiveWrite, SpaceLane } from "./lane";
-import { replayAllLiveEpochs, replayLiveEpoch } from "./replay";
+import { type RecoveredChange, replayAllLiveEpochs, replayLiveEpochDetailed } from "./replay";
 import {
 	type CommittedEvent,
 	LivePage,
@@ -45,6 +52,23 @@ interface Binding {
 	page: LivePage;
 	participant: Participant;
 }
+
+export const OUTLINE_LIVE_SOCKET_BOUNDS = {
+	/** Joins a socket may make in a burst… */
+	joinBurst: 20,
+	/** …refilled at this many per second. */
+	joinsPerSecond: 2,
+	/**
+	 * Bytes of one participant's frames waiting in the lane. A client stops at
+	 * `maxPendingBytes` unacknowledged, so only a misbehaving one gets here; it is dismissed.
+	 */
+	queuedBytes: 2 * OUTLINE_LIVE_LIMITS.maxPendingBytes,
+	/** How long `recovered` keeps an ended session's client positions, and for how many. */
+	recoveredMs: 30 * 60_000,
+	recoveredSessions: 1_000,
+	/** Leftover epochs one open replays at most (the rest wait for the startup job). */
+	replayPerOpen: 64,
+} as const;
 
 type ReauthFilter = (space: OutlineSpaceRow, socket: LiveSocket) => boolean;
 
@@ -60,7 +84,62 @@ const state = hotSafe("narrafork.outlineLive.state", () => ({
 	reauthTimer: undefined as ReturnType<typeof setTimeout> | undefined,
 	accessEpoch: 0,
 	replayDone: null as Promise<unknown> | null,
+	/** `${pageId}:${epoch}` of an ended session → client key → highest transaction in the page. */
+	recovered: new Map<string, { at: number; keys: Map<string, number> }>(),
+	/** Epochs whose log cannot be read, so opens do not read them again (an operator's job). */
+	unreadable: new Set<string>(),
+	/** Join tokens per socket. */
+	joinBudget: new WeakMap<LiveSocket, { tokens: number; at: number }>(),
+	warned: 0,
 }));
+
+function rememberRecovered(pageId: string, epoch: number, keys: Map<string, number>): void {
+	if (keys.size === 0) return;
+	const now = Date.now();
+	for (const [key, entry] of state.recovered) {
+		if (now - entry.at <= OUTLINE_LIVE_SOCKET_BOUNDS.recoveredMs) break;
+		state.recovered.delete(key);
+	}
+	state.recovered.set(`${pageId}:${epoch}`, { at: now, keys });
+	while (state.recovered.size > OUTLINE_LIVE_SOCKET_BOUNDS.recoveredSessions) {
+		const oldest = state.recovered.keys().next().value;
+		if (oldest === undefined) break;
+		state.recovered.delete(oldest);
+	}
+}
+
+/** Of a client's earlier session of a page (now gone), the transactions in the page. */
+function recoveredTx(pageId: string, head: LiveJoinHead): number | undefined {
+	const epoch = head.resume?.epoch;
+	if (epoch === undefined) return undefined;
+	const entry = state.recovered.get(`${pageId}:${epoch}`);
+	if (!entry || Date.now() - entry.at > OUTLINE_LIVE_SOCKET_BOUNDS.recoveredMs) return undefined;
+	return entry.keys.get(head.key);
+}
+
+/** A rate-limited warning (a misbehaving client must not flood the log). */
+function warnRarely(message: string, fields: Record<string, unknown>): void {
+	if (Date.now() - state.warned < 60_000) return;
+	state.warned = Date.now();
+	logger.warn(message, fields);
+}
+
+function takeJoinToken(socket: LiveSocket): boolean {
+	const now = Date.now();
+	const b = state.joinBudget.get(socket) ?? {
+		tokens: OUTLINE_LIVE_SOCKET_BOUNDS.joinBurst,
+		at: now,
+	};
+	b.tokens = Math.min(
+		OUTLINE_LIVE_SOCKET_BOUNDS.joinBurst,
+		b.tokens + ((now - b.at) / 1000) * OUTLINE_LIVE_SOCKET_BOUNDS.joinsPerSecond,
+	);
+	b.at = now;
+	state.joinBudget.set(socket, b);
+	if (b.tokens < 1) return false;
+	b.tokens -= 1;
+	return true;
+}
 
 function sessionsOf(spaceId: string): LivePage[] {
 	return [...state.sessions.values()].filter((s) => s.spaceId === spaceId);
@@ -113,11 +192,19 @@ function onCommitted(event: Extract<NarraForkEvent, { type: "outline:committed" 
 // The barrier (`live-barrier.ts`)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * A write from outside waits for the space's lane and goes after the live text is committed.
+ * When that commit fails the write is refused (busy, try again): written now, it would not see
+ * the people's changes (an agent's stale read would pass, its text would merge into
+ * uncommitted text).
+ */
 async function runBehindBarrier<T>(spaceId: string, fn: () => Promise<T>): Promise<T> {
 	const lane = state.lanes.get(spaceId);
 	if (!lane) return await fn();
 	return await lane.run(async () => {
-		for (const session of sessionsOf(spaceId)) await session.flushContent();
+		for (const session of sessionsOf(spaceId)) {
+			if (!(await session.flushContent())) throw new OutlineBusyError(spaceId, 1);
+		}
 		return await fn();
 	});
 }
@@ -128,8 +215,13 @@ setOutlineLiveBarrier({ run: runBehindBarrier, holds: holdsLane });
 // Joining and leaving
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Tell a socket a join failed. Never throws. */
 function sendClosed(socket: LiveSocket, handle: number, code: LiveCloseCode): void {
-	socket.send(encodeLiveFrame({ kind: LIVE_FRAME.closed, handle, head: { code } }));
+	try {
+		socket.send(encodeLiveFrame({ kind: LIVE_FRAME.closed, handle, head: { code } }));
+	} catch {
+		// Nothing to tell a socket that cannot take a frame.
+	}
 }
 
 async function authorize(
@@ -163,7 +255,12 @@ function validJoinHead(head: unknown): LiveJoinHead | null {
 	return h as LiveJoinHead;
 }
 
-/** Open the session of a page, replaying any log a previous session left. In the lane. */
+/**
+ * Open the session of a page, replaying any log a previous session left. In the lane. A log
+ * whose text cannot be committed is taken over by the new session (people see the text and it
+ * is committed with theirs); a log that cannot be read is left for an operator. Neither keeps
+ * the page from being edited.
+ */
 async function openSession(
 	pageId: string,
 	space: OutlineSpaceRow,
@@ -171,24 +268,41 @@ async function openSession(
 	const existing = state.sessions.get(pageId);
 	if (existing && !existing.closed) return existing;
 	if (state.sessions.size >= OUTLINE_LIVE_LIMITS.livePages) return { refused: "unavailable" };
-	// What an earlier session of this page left uncommitted goes in first.
-	for (const e of await outlineStore.listLiveEpochs({
-		after: { pageBlockId: pageId, epoch: 0 },
-		limit: 8,
-	})) {
-		if (e.pageBlockId !== pageId) break;
-		if ((await replayLiveEpoch(pageId, e.epoch)) === "kept") return { refused: "unavailable" };
+	const adopted: Array<{ epoch: number; changes: RecoveredChange[] }> = [];
+	let after = { pageBlockId: pageId, epoch: 0 };
+	for (let replayed = 0; replayed < OUTLINE_LIVE_SOCKET_BOUNDS.replayPerOpen; ) {
+		const epochs = await outlineStore.listLiveEpochs({ after, limit: 8 });
+		const mine = epochs.filter((e) => e.pageBlockId === pageId);
+		for (const e of mine) {
+			after = e;
+			replayed++;
+			const tag = `${pageId}:${e.epoch}`;
+			if (state.unreadable.has(tag)) continue;
+			const r = await replayLiveEpochDetailed(pageId, e.epoch);
+			rememberRecovered(pageId, e.epoch, r.keys);
+			if (r.outcome !== "kept") continue;
+			if (r.changes) adopted.push({ epoch: e.epoch, changes: r.changes });
+			else state.unreadable.add(tag);
+		}
+		if (mine.length < 8) break;
 	}
 	const lane = laneFor(space.id);
 	const opened = await LivePage.open(
 		pageId,
 		space.id,
 		(task) => void lane.run(task),
-		(page) => void lane.run(() => closeSession(page, "ended", true)),
+		(page, code, idle) => void lane.run(() => closeSession(page, code, idle)),
 	);
 	if ("refused" in opened) return opened;
 	state.sessions.set(pageId, opened);
 	state.spaces.set(space.id, space);
+	if (adopted.length > 0) {
+		for (const a of adopted) opened.adoptRecovered(a.changes);
+		// Once this session's log holds the text, the old one can go.
+		if (await opened.persistNow()) {
+			for (const a of adopted) await outlineStore.deleteLiveUpdates(pageId, a.epoch);
+		}
+	}
 	return opened;
 }
 
@@ -201,6 +315,7 @@ async function closeSession(page: LivePage, code: LiveCloseCode, idle = false): 
 			if (binding.page === page) bindings.delete(handle);
 	}
 	await page.close(code);
+	rememberRecovered(page.pageId, page.epoch, page.durableKeys(page.closedClean));
 	if (state.sessions.get(page.pageId) === page) state.sessions.delete(page.pageId);
 	retireLane(page.spaceId);
 }
@@ -208,9 +323,15 @@ async function closeSession(page: LivePage, code: LiveCloseCode, idle = false): 
 /** A `join` frame. */
 export async function joinLive(socket: LiveSocket, frame: LiveFrame): Promise<void> {
 	const handle = frame.handle;
+	// A handle no frame can carry cannot be answered either: ignored.
+	if (!isLiveHandle(handle)) {
+		warnRarely("Outline live join with an invalid handle ignored", { handle });
+		return;
+	}
 	const head = validJoinHead(frame.head);
 	if (!head || handle === 0) return sendClosed(socket, handle, "unavailable");
 	if (!isOutlineEnabled()) return sendClosed(socket, handle, "unavailable");
+	if (!takeJoinToken(socket)) return sendClosed(socket, handle, "unavailable");
 	let bindings = state.sockets.get(socket);
 	// Joining again on a handle (a resync, a resume) replaces what was there.
 	const previous = bindings?.get(handle);
@@ -232,18 +353,37 @@ export async function joinLive(socket: LiveSocket, frame: LiveFrame): Promise<vo
 	joining.add(handle);
 	try {
 		let verdict: Awaited<ReturnType<typeof authorize>> = null;
+		let checked = 0;
 		for (;;) {
-			const epoch = state.accessEpoch;
+			checked = state.accessEpoch;
 			verdict = await authorize(socket, head.page);
-			if (epoch === state.accessEpoch) break;
+			if (checked === state.accessEpoch) break;
 		}
 		if (!verdict) return sendClosed(socket, handle, "access_denied");
-		const { space, canWrite } = verdict;
+		const space = verdict.space;
+		let canWrite = verdict.canWrite;
 		const result = await laneFor(space.id).run(async () => {
 			if (!isOutlineEnabled()) return { refused: "unavailable" as LiveCloseCode };
+			// Access changed while the join waited for the lane: ask again (the re-check of
+			// joined participants never saw this one).
+			while (checked !== state.accessEpoch) {
+				checked = state.accessEpoch;
+				const again = await authorize(socket, head.page);
+				if (!again || again.space.id !== space.id)
+					return { refused: "access_denied" as LiveCloseCode };
+				canWrite = again.canWrite;
+			}
+			if (socket.closed) return { refused: "ended" as LiveCloseCode };
 			const page = await openSession(head.page, space);
 			if ("refused" in page) return page;
-			const joined = page.join(socket, handle, head, frame.body, head.mode === "edit" && canWrite);
+			const joined = page.join(
+				socket,
+				handle,
+				head,
+				frame.body,
+				head.mode === "edit" && canWrite,
+				recoveredTx(head.page, head),
+			);
 			if ("refused" in joined) return joined;
 			return { page, participant: joined };
 		});
@@ -286,16 +426,35 @@ export function handleLiveFrame(socket: LiveSocket, frame: LiveFrame): void {
 			state.sockets.get(socket)?.delete(frame.handle);
 			void laneFor(page.spaceId).run(() => page.leave(participant));
 			break;
-		case LIVE_FRAME.update: {
+		case LIVE_FRAME.update:
+		case LIVE_FRAME.tx: {
+			// Refused participants' frames are dropped and viewers' answered, without queueing.
+			if (participant.blocked) break;
+			if (!participant.canWrite) {
+				page.refuseFrame(participant, frame.n);
+				break;
+			}
+			const size = frame.body.length + 256;
+			if (participant.queuedBytes + size > OUTLINE_LIVE_SOCKET_BOUNDS.queuedBytes) {
+				warnRarely("Outline live participant queued too much; dismissed", {
+					pageId: page.pageId,
+					bytes: participant.queuedBytes,
+				});
+				state.sockets.get(socket)?.delete(frame.handle);
+				void laneFor(page.spaceId).run(() => page.dismiss(participant, "unavailable"));
+				break;
+			}
+			participant.queuedBytes += size;
 			// The socket's buffer may be reused once this returns.
 			const body = frame.body.slice();
-			void laneFor(page.spaceId).run(() => page.handleUpdate(participant, frame.n, body));
-			break;
-		}
-		case LIVE_FRAME.tx: {
-			const body = frame.body.slice();
 			const head = frame.head;
-			void laneFor(page.spaceId).run(() => page.handleTx(participant, frame.n, head, body));
+			const n = frame.n;
+			const kind = frame.kind;
+			void laneFor(page.spaceId).run(async () => {
+				participant.queuedBytes -= size;
+				if (kind === LIVE_FRAME.update) page.handleUpdate(participant, n, body);
+				else await page.handleTx(participant, n, head, body);
+			});
 			break;
 		}
 		case LIVE_FRAME.selection:
@@ -342,7 +501,9 @@ async function reauthorize(): Promise<void> {
 			if (!verdict) {
 				const principal = { userId: socket.userId, isAdmin: socket.isAdmin };
 				verdict = (async () => {
-					const fresh = (await outlineStore.getSpace(space.id)) ?? space;
+					const fresh = await outlineStore.getSpace(space.id);
+					// A space that is gone can be read by nobody.
+					if (!fresh) return { read: false, write: false };
 					const read = await canReadSpace(principal, fresh);
 					return { read, write: read && (await canWriteSpace(principal, fresh)) };
 				})().catch((error) => {
@@ -403,7 +564,7 @@ export async function closeAllLiveSessions(code: LiveCloseCode): Promise<void> {
 	);
 }
 
-/** Write every session's pending log rows now (shutdown, before the database closes). */
+/** Write every session's pending log rows now (shutdown, before anything slower). */
 export async function persistAllLiveSessions(): Promise<void> {
 	await Promise.all([...state.sessions.values()].map((page) => page.persistNow()));
 }
@@ -417,13 +578,22 @@ export function startLiveReplay(): Promise<unknown> {
 		(pageId, epoch) => state.sessions.get(pageId)?.epoch === epoch,
 		async (pageId, epoch) => {
 			const page = await outlineStore.getBlock(pageId);
-			const run = () => replayLiveEpoch(pageId, epoch);
-			// Behind the space's lane when it has one, so it cannot race a session's commits.
-			const lane = page ? state.lanes.get(page.spaceId) : undefined;
-			if (!lane) return await run();
-			return await lane.run(async () =>
-				state.sessions.get(pageId) ? ("empty" as const) : await run(),
-			);
+			const run = async () => {
+				const r = await replayLiveEpochDetailed(pageId, epoch);
+				rememberRecovered(pageId, epoch, r.keys);
+				return r.outcome;
+			};
+			if (!page) return await run();
+			// Always in the space's lane: a join opening the page replays in it too, so the two
+			// never replay one epoch at once. An open session took the log over already.
+			const lane = laneFor(page.spaceId);
+			try {
+				return await lane.run(async () =>
+					state.sessions.get(pageId) ? ("empty" as const) : await run(),
+				);
+			} finally {
+				retireLane(page.spaceId);
+			}
 		},
 	)
 		.then((result) => {

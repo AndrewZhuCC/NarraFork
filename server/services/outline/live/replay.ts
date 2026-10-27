@@ -3,11 +3,14 @@
  * failed final commit): the text people typed is committed, then the log is dropped.
  *
  * An epoch's log is a document snapshot, increments, and sync rows (what the database held for
- * a block when the session changed it, see `LivePage.persistStep`). Replay rebuilds the final
+ * a block when the session changed it, commits the session was about to write, and how far each
+ * client's changes reached the log; see `LivePage.persistStep`). Replay rebuilds the final
  * document and, for every live block of the page, merges three ways: from the last synced
  * content (or the snapshot's text), to the final text, onto what the database holds now. So a
  * commit the session never logged (an outside write in the last moments) is kept, and only
- * what people typed and nobody committed is written, as their own commits.
+ * what people typed and nobody committed is written, as their own commits. A block whose last
+ * logged intent was never resolved and whose content equals it was committed by the session
+ * just before it ended: it is left as it is (merging it again would repeat the text).
  *
  * Runs at startup as a background job over every epoch left in `outline_live_updates`, and
  * before a session opens on a page that still has one. Bounded: at most
@@ -21,10 +24,16 @@ import * as Y from "yjs";
 import { OUTLINE_LIMITS } from "../model";
 import { outlineStore } from "../store";
 import type { OutlineLiveUpdateRow } from "../store/port";
-import { type OutlineCanonicalContent, type OutlineOp, writeOutline } from "../write";
+import type { OutlineCanonicalContent, OutlineOp } from "../write";
 import { asOwnLiveWrite } from "./lane";
-import { normalizeLiveTexts } from "./normalize";
-import { type ContentPlan, contentOps, fitBody, LIVE_SYNC_ACTOR } from "./session";
+import {
+	type ContentPlan,
+	contentOps,
+	fitBody,
+	LIVE_SYNC_ACTOR,
+	OUTLINE_LIVE_HOOKS,
+	planChunks,
+} from "./session";
 
 export const OUTLINE_LIVE_REPLAY = {
 	/** Rows read per query. */
@@ -40,6 +49,24 @@ export const OUTLINE_LIVE_REPLAY = {
 } as const;
 
 export type ReplayOutcome = "committed" | "empty" | "kept";
+
+/** Text a replay found uncommitted: the block, the text it should have, who typed it last. */
+export interface RecoveredChange {
+	id: string;
+	text: string;
+	actor: string | null;
+}
+
+export interface ReplayResult {
+	outcome: ReplayOutcome;
+	/** Per client key of the ended session: its highest transaction now in the page. */
+	keys: Map<string, number>;
+	/**
+	 * When the log was read but its text could not be committed (`kept`): what it holds, for a
+	 * new session to take over. Absent when the log could not be read at all.
+	 */
+	changes?: RecoveredChange[];
+}
 
 const decoder = new TextDecoder();
 
@@ -68,15 +95,26 @@ async function readEpoch(pageId: string, epoch: number): Promise<OutlineLiveUpda
  * not be replayed (too large, unreadable, the commit failed): the rows stay.
  */
 export async function replayLiveEpoch(pageId: string, epoch: number): Promise<ReplayOutcome> {
+	return (await replayLiveEpochDetailed(pageId, epoch)).outcome;
+}
+
+/** {@link replayLiveEpoch}, with what a new session of the page needs from it. */
+export async function replayLiveEpochDetailed(
+	pageId: string,
+	epoch: number,
+): Promise<ReplayResult> {
+	const keys = new Map<string, number>();
 	const rows = await readEpoch(pageId, epoch);
 	if (!rows) {
 		logger.warn("Outline live log too large to replay; kept", { pageId, epoch });
-		return "kept";
+		return { outcome: "kept", keys };
 	}
-	if (rows.length === 0) return "empty";
+	if (rows.length === 0) return { outcome: "empty", keys };
 	const doc = new Y.Doc();
 	const texts = doc.getMap<Y.Text>("texts");
 	const base = new Map<string, string>();
+	/** Intents not resolved by a later sync row or cancel: block → content to be committed. */
+	const intents = new Map<string, string>();
 	const lastActor = new Map<string, string>();
 	texts.observeDeep((events, txn) => {
 		const actor = txn.origin as OutlineLiveUpdateRow | null;
@@ -95,8 +133,21 @@ export async function replayLiveEpoch(pageId: string, epoch: number): Promise<Re
 		for (const row of rows) {
 			const data = Buffer.from(row.updateB64, "base64");
 			if (row.actorId === LIVE_SYNC_ACTOR) {
-				const parsed = JSON.parse(decoder.decode(data)) as { b?: Record<string, string> };
-				for (const [id, content] of Object.entries(parsed.b ?? {})) base.set(id, content);
+				const parsed = JSON.parse(decoder.decode(data)) as {
+					b?: Record<string, string>;
+					i?: Record<string, string>;
+					x?: string[];
+					k?: Record<string, number>;
+				};
+				for (const [id, content] of Object.entries(parsed.i ?? {})) intents.set(id, content);
+				for (const [id, content] of Object.entries(parsed.b ?? {})) {
+					base.set(id, content);
+					intents.delete(id);
+				}
+				for (const id of parsed.x ?? []) intents.delete(id);
+				for (const [key, tx] of Object.entries(parsed.k ?? {})) {
+					if (Number.isSafeInteger(tx) && tx > (keys.get(key) ?? 0)) keys.set(key, tx);
+				}
 				continue;
 			}
 			Y.applyUpdate(doc, data, row);
@@ -110,14 +161,14 @@ export async function replayLiveEpoch(pageId: string, epoch: number): Promise<Re
 	} catch (error) {
 		logger.warn("Outline live log unreadable; kept", { pageId, epoch, error: String(error) });
 		doc.destroy();
-		return "kept";
+		return { outcome: "kept", keys };
 	}
 
 	const page = await outlineStore.getBlock(pageId);
 	if (!page || page.deleted) {
 		doc.destroy();
 		await outlineStore.deleteLiveUpdates(pageId, epoch);
-		return "empty";
+		return { outcome: "empty", keys };
 	}
 	const { blocks } = await outlineStore.listPageBlocks(pageId, OUTLINE_LIMITS.maxPageBlocks);
 	const changes: Array<{ id: string; text: string; actor: string | null }> = [];
@@ -125,6 +176,9 @@ export async function replayLiveEpoch(pageId: string, epoch: number): Promise<Re
 		const t = texts.get(b.id);
 		if (!(t instanceof Y.Text)) continue;
 		const final = t.toString();
+		// The session committed this just before it ended, and logged nothing after.
+		const intent = intents.get(b.id);
+		if (intent !== undefined && intent === b.content) continue;
 		const from = base.get(b.id) ?? b.content;
 		if (final === from) continue;
 		const merged = merge3(from, final, b.content, { lenient: true });
@@ -134,10 +188,10 @@ export async function replayLiveEpoch(pageId: string, epoch: number): Promise<Re
 	doc.destroy();
 	if (changes.length > 0) {
 		const committed = await commitChanges(page.spaceId, changes, blocks);
-		if (!committed) return "kept";
+		if (!committed) return { outcome: "kept", keys, changes };
 	}
 	await outlineStore.deleteLiveUpdates(pageId, epoch);
-	return changes.length > 0 ? "committed" : "empty";
+	return { outcome: changes.length > 0 ? "committed" : "empty", keys };
 }
 
 async function commitChanges(
@@ -149,9 +203,9 @@ async function commitChanges(
 	// A text past the per-block limit keeps what fits; the log is the only other copy of the
 	// rest, so it becomes the block's next siblings rather than being dropped.
 	const cut = changes.map((c) => fitBody(c.text));
-	let normalized: Awaited<ReturnType<typeof normalizeLiveTexts>>;
+	let normalized: Awaited<ReturnType<typeof OUTLINE_LIVE_HOOKS.normalize>>;
 	try {
-		normalized = await normalizeLiveTexts(cut.flat());
+		normalized = await OUTLINE_LIVE_HOOKS.normalize(cut.flat());
 	} catch (error) {
 		logger.warn("Outline live replay could not normalize", { error: String(error) });
 		return false;
@@ -172,24 +226,28 @@ async function commitChanges(
 	for (const [actor, list] of byActor) {
 		const ops: OutlineOp[] = [];
 		const canonical: Array<OutlineCanonicalContent | undefined> = [];
+		const groups: Array<[number, number]> = [];
 		for (const plan of list) {
 			const b = current.get(plan.id);
+			const start = ops.length;
 			if (b) contentOps(plan, b.content, b.parentId, ops, canonical);
+			groups.push([start, ops.length]);
 		}
 		if (ops.length === 0) continue;
 		try {
-			// Split chains are short and written with their block; plain updates chunk freely.
-			for (let start = 0; start < ops.length; start += OUTLINE_LIMITS.maxOps) {
+			// One block's operations stay in one transaction when they fit (the limits on
+			// operations and content bytes per transaction).
+			for (const [start, end] of planChunks(ops, groups)) {
 				await asOwnLiveWrite(() =>
-					writeOutline(
+					OUTLINE_LIVE_HOOKS.write(
 						{
 							spaceId,
-							ops: ops.slice(start, start + OUTLINE_LIMITS.maxOps),
+							ops: ops.slice(start, end),
 							actor: actor ? { kind: "human", id: actor } : { kind: "system", id: "outline-live" },
 							responsibleUserId: actor,
 							summary: "live edit (recovered)",
 						},
-						{ canonical: canonical.slice(start, start + OUTLINE_LIMITS.maxOps) },
+						{ canonical: canonical.slice(start, end) },
 					),
 				);
 			}

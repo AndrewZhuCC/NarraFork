@@ -876,7 +876,9 @@ export class LiveClient {
 	}
 
 	private onReset(head: LiveJoinedHead, body: Uint8Array): void {
-		const replay = this.ready ? this.pending : [];
+		// Of the session this client resumed (gone now), what reached the page is not replayed.
+		const dur = head.dur ?? 0;
+		const replay = this.ready ? this.pending.filter((tx) => tx.n > dur) : [];
 		const first = !this.ready;
 		// Everything local goes: a fresh document from the snapshot (a refused change must not
 		// linger in it), then this client's unacknowledged changes are replayed on top.
@@ -932,10 +934,12 @@ export class LiveClient {
 	}
 
 	private onResumed(head: LiveJoinedHead, body: Uint8Array): void {
-		// What the server already processed of ours is done; the rest goes again.
-		this.pending = this.pending.filter((tx) => tx.n > head.tx);
-		for (const tx of this.pending) tx.sent = false;
-		this.ackedTx = Math.max(this.ackedTx, head.tx);
+		// What reached the server's log is done; what it processed is not sent again but kept
+		// until acknowledged (a crash before the log has it must not lose it); the rest goes again.
+		const durable = Math.min(head.dur ?? head.tx, head.tx);
+		this.pending = this.pending.filter((tx) => tx.n > durable);
+		for (const tx of this.pending) tx.sent = tx.n <= head.tx;
+		this.ackedTx = Math.max(this.ackedTx, durable);
 		if (head.blocks) this.confirmed = storeFromSnapshot(this.pageId, head.blocks);
 		else for (const c of head.ops ?? []) this.applyCommit(c);
 		this.applyRemoteY(body);

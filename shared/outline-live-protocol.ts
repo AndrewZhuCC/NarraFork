@@ -28,6 +28,12 @@
 
 export const OUTLINE_LIVE_MAGIC = 0xb1;
 
+/**
+ * The largest handle (a page session on one socket). Frames with a larger one do not decode, so
+ * nothing past the decoder ever holds a handle a reply could not carry.
+ */
+export const OUTLINE_LIVE_MAX_HANDLE = 255;
+
 export const LIVE_FRAME = {
 	/** C→S: join a page. Head {@link LiveJoinHead}; body: the client's state vector on resume. */
 	join: 0x01,
@@ -174,6 +180,12 @@ export interface LiveJoinedHead {
 	peers: LivePeerWire[];
 	/** Cursors of the peers now. */
 	cur?: Array<[pno: number, sel: LiveSelWire | null]>;
+	/**
+	 * Reset after the session the client resumed is gone (closed, or recovered after a crash):
+	 * the client's transactions of that session up to this number are already in the page, so
+	 * the client does not replay them.
+	 */
+	dur?: number;
 }
 
 export interface LiveTxHead {
@@ -278,19 +290,34 @@ function writeVaruint(out: Uint8Array, at: number, n: number): number {
 	return i;
 }
 
-/** Encode a frame. `head` is JSON-serialized when present. */
+/** Whether a handle is one a frame can carry (0 only answers a malformed join). */
+export function isLiveHandle(handle: number): boolean {
+	return Number.isInteger(handle) && handle >= 0 && handle <= OUTLINE_LIVE_MAX_HANDLE;
+}
+
+/** A head serialized once, for frames that differ only in their handle. */
+export function encodeLiveHead(head: unknown): Uint8Array {
+	return encoder.encode(JSON.stringify(head));
+}
+
+/**
+ * Encode a frame. `head` is JSON-serialized when present; `rawHead` is a head already
+ * serialized with {@link encodeLiveHead}.
+ */
 export function encodeLiveFrame(frame: {
 	kind: number;
 	handle: number;
 	n?: number;
 	head?: unknown;
+	rawHead?: Uint8Array;
 	body?: Uint8Array;
 }): Uint8Array {
 	const n = frame.n ?? 0;
 	if (!Number.isSafeInteger(n) || n < 0) throw new Error(`invalid live frame number ${n}`);
-	if (!Number.isInteger(frame.handle) || frame.handle < 0 || frame.handle > 0xffff)
-		throw new Error(`invalid live frame handle ${frame.handle}`);
-	const head = frame.head === undefined ? EMPTY : encoder.encode(JSON.stringify(frame.head));
+	if (!isLiveHandle(frame.handle)) throw new Error(`invalid live frame handle ${frame.handle}`);
+	const head =
+		frame.rawHead ??
+		(frame.head === undefined ? EMPTY : encoder.encode(JSON.stringify(frame.head)));
 	const body = frame.body ?? EMPTY;
 	const size =
 		2 +
@@ -345,6 +372,7 @@ export function decodeLiveFrame(bytes: Uint8Array, maxHeadBytes?: number): LiveF
 	const n = read();
 	const headLength = read();
 	if (handle === null || n === null || headLength === null) return null;
+	if (!isLiveHandle(handle)) return null;
 	if (headLength > limit || at + headLength > bytes.length) return null;
 	let head: unknown = null;
 	if (headLength > 0) {

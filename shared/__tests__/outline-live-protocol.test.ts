@@ -2,13 +2,16 @@ import { describe, expect, test } from "bun:test";
 import {
 	decodeLiveFrame,
 	encodeLiveFrame,
+	encodeLiveHead,
 	isLiveFrame,
+	isLiveHandle,
 	isLiveTaskChar,
 	LIVE_FRAME,
 	LIVE_STATUS_OF_TASK,
 	LIVE_TASK_OF_STATUS,
 	OUTLINE_LIVE_LIMITS,
 	OUTLINE_LIVE_MAGIC,
+	OUTLINE_LIVE_MAX_HANDLE,
 } from "../outline-live-protocol";
 
 describe("live frames", () => {
@@ -16,7 +19,7 @@ describe("live frames", () => {
 		const body = new Uint8Array([1, 2, 3, 250]);
 		const bytes = encodeLiveFrame({
 			kind: LIVE_FRAME.update,
-			handle: 300,
+			handle: 200,
 			n: 2 ** 40,
 			head: { a: [1, "x"] },
 			body,
@@ -26,7 +29,7 @@ describe("live frames", () => {
 		const frame = decodeLiveFrame(bytes);
 		expect(frame).toMatchObject({
 			kind: LIVE_FRAME.update,
-			handle: 300,
+			handle: 200,
 			n: 2 ** 40,
 			head: { a: [1, "x"] },
 		});
@@ -57,6 +60,30 @@ describe("live frames", () => {
 			),
 		).toBeNull();
 		expect(() => encodeLiveFrame({ kind: 1, handle: -1 })).toThrow();
+	});
+
+	test("handles stay in the range a reply can carry", () => {
+		expect(() =>
+			encodeLiveFrame({ kind: LIVE_FRAME.join, handle: OUTLINE_LIVE_MAX_HANDLE + 1 }),
+		).toThrow();
+		const ok = encodeLiveFrame({ kind: LIVE_FRAME.join, handle: OUTLINE_LIVE_MAX_HANDLE });
+		expect(decodeLiveFrame(ok)?.handle).toBe(OUTLINE_LIVE_MAX_HANDLE);
+		// A larger handle written by hand (varuint 70000) does not decode.
+		const forged = new Uint8Array([OUTLINE_LIVE_MAGIC, LIVE_FRAME.join, 0xf0, 0xa2, 0x04, 0, 0]);
+		expect(decodeLiveFrame(forged)).toBeNull();
+		expect(isLiveHandle(0)).toBe(true);
+		expect(isLiveHandle(1.5)).toBe(false);
+	});
+
+	test("a head serialized once is the same frame", () => {
+		const head = { peers: [[1, "u", "n", "#000", "e"]] };
+		const a = encodeLiveFrame({ kind: LIVE_FRAME.presence, handle: 7, head });
+		const b = encodeLiveFrame({
+			kind: LIVE_FRAME.presence,
+			handle: 7,
+			rawHead: encodeLiveHead(head),
+		});
+		expect([...b]).toEqual([...a]);
 	});
 
 	test("head limits by direction: a client frame's head is small, a snapshot's may be large", () => {

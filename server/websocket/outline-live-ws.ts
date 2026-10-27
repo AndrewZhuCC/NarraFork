@@ -9,7 +9,7 @@
  *
  * Anonymous public-share sockets have no person behind them and never reach a session.
  */
-import { decodeLiveFrame, OUTLINE_LIVE_LIMITS } from "@shared/outline-live-protocol";
+import { decodeLiveFrame, LIVE_FRAME, OUTLINE_LIVE_LIMITS } from "@shared/outline-live-protocol";
 import { logger } from "../lib/logger";
 import {
 	drainLiveSocket,
@@ -99,12 +99,41 @@ function socketOf(ws: OutlineLiveWS): NarratorLiveSocket {
 	return socket;
 }
 
+let oversizeLoggedAt = 0;
+
+/** Selection frames: small, and at most this many a second per socket (the rest dropped). */
+const SELECTION_MAX_BYTES = 16 * 1024;
+const SELECTIONS_PER_SECOND = 40;
+const selectionBudget = new WeakMap<OutlineLiveWS, { tokens: number; at: number }>();
+
+function takeSelectionToken(ws: OutlineLiveWS): boolean {
+	const now = Date.now();
+	const b = selectionBudget.get(ws) ?? { tokens: SELECTIONS_PER_SECOND, at: now };
+	b.tokens = Math.min(
+		SELECTIONS_PER_SECOND,
+		b.tokens + ((now - b.at) / 1000) * SELECTIONS_PER_SECOND,
+	);
+	b.at = now;
+	selectionBudget.set(ws, b);
+	if (b.tokens < 1) return false;
+	b.tokens -= 1;
+	return true;
+}
+
 /** A binary outline live frame from a narrator socket. */
 export function handleOutlineLiveBinary(ws: OutlineLiveWS, bytes: Uint8Array): void {
 	if (!ws.data.userId || ws.data.publicShare) return;
 	if (bytes.byteLength > OUTLINE_LIVE_LIMITS.maxClientFrameBytes) {
-		logger.warn("Outline live frame too large; dropped", { bytes: bytes.byteLength });
+		// A client can send these as fast as it likes: one line a minute.
+		if (Date.now() - oversizeLoggedAt > 60_000) {
+			oversizeLoggedAt = Date.now();
+			logger.warn("Outline live frame too large; dropped", { bytes: bytes.byteLength });
+		}
 		return;
+	}
+	// Cursor moves are last-wins: excess ones are dropped before their JSON is even read.
+	if (bytes[1] === LIVE_FRAME.selection) {
+		if (bytes.byteLength > SELECTION_MAX_BYTES || !takeSelectionToken(ws)) return;
 	}
 	const frame = decodeLiveFrame(bytes, OUTLINE_LIVE_LIMITS.maxHeadBytes);
 	if (!frame || frame.kind >= 0x80) return;

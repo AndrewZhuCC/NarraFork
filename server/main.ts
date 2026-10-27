@@ -1976,7 +1976,17 @@ async function performGracefulShutdown(
 			tracker.markDrainComplete();
 		}
 
-		// Outline pages being edited live: commit their text and log, end the sessions.
+		// Outline pages being edited live: log what arrived (fast: a slow commit must not lose
+		// it), then commit their text, end the sessions.
+		await shutdownStep(
+			tracker,
+			"outlineLive.persist",
+			async () => {
+				const live = await import("./services/outline/live/registry");
+				await live.persistAllLiveSessions();
+			},
+			2_000,
+		);
 		await shutdownStep(
 			tracker,
 			"outlineLive.close",
