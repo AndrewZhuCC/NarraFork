@@ -13,7 +13,7 @@
  */
 import "@mantine/core/styles.css";
 import { MantineProvider } from "@mantine/core";
-import { decodeLiveFrame, type LiveFrame } from "@shared/outline-live-protocol";
+import { decodeLiveFrame, LIVE_FRAME, type LiveFrame } from "@shared/outline-live-protocol";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
 	type AnyRouter,
@@ -62,6 +62,8 @@ await instance
 class SocketTransport implements LiveTransport {
 	connected = false;
 	held = false;
+	/** Tests: answer the next join with this refusal instead of the server's snapshot. */
+	refuseNextJoin: string | null = null;
 	private ws: WebSocket;
 	private readonly frameListeners = new Set<(frame: LiveFrame) => void>();
 	private readonly connListeners = new Set<(connected: boolean) => void>();
@@ -82,8 +84,18 @@ class SocketTransport implements LiveTransport {
 		};
 		this.ws.onmessage = (event) => {
 			if (typeof event.data === "string") return;
-			const frame = decodeLiveFrame(new Uint8Array(event.data as ArrayBuffer));
+			let frame = decodeLiveFrame(new Uint8Array(event.data as ArrayBuffer));
 			if (!frame) return;
+			if (this.refuseNextJoin && frame.kind === LIVE_FRAME.joined) {
+				frame = {
+					kind: LIVE_FRAME.closed,
+					handle: frame.handle,
+					n: 0,
+					head: { code: this.refuseNextJoin },
+					body: new Uint8Array(0),
+				};
+				this.refuseNextJoin = null;
+			}
 			if (this.held) this.inQueue.push(frame);
 			else for (const l of this.frameListeners) l(frame);
 		};

@@ -1184,6 +1184,125 @@ for (const host of HOSTS) {
 	}, 90_000);
 }
 
+test("page: read-only first — a block typed in is deleted before the snapshot: the notice restores the text", async () => {
+	const p1 = await seed("RO deleted start");
+	const p2 = await seedWords("Rk");
+	const a = await openHost(h, "page", p1.pageId);
+	const b = await openBob(h, p2.pageId);
+	await a.call((f, x) => f.caret(x as never, 0), p1.id("T1"));
+	await a.call((f) => f.net().hold(true));
+	const q2 = p2.id("Rk2");
+	const q2b = p2.id("Rk2b");
+	await switchTo(a, "Rk2 第二", q2);
+	await until(
+		a,
+		"shown from the read",
+		`(f) => f.shownFrom() === "seed" && f.focusShown(${JSON.stringify(q2)})`,
+	);
+	const end = (await a.call((f, x) => f.text(x as never), q2b)).length;
+	await a.call((f, x, o) => f.caret(x as never, o as never), q2b, end);
+	await a.page.keyboard.type(" 我的字");
+	// Bob deletes it (live) before Alice's snapshot.
+	await b.call((f, x) => f.deleteBlock(x as never), q2b);
+	await settle(b);
+	await a.call((f) => f.net().hold(false));
+	await until(a, "live", `(f) => f.shownFrom() === "live"`);
+	await settle(a, b);
+	const notice = await a.page.waitForSelector("[data-testid=outline-deleted-notice]", {
+		timeout: 5000,
+	});
+	expect(await notice?.evaluate((el) => el.textContent ?? "")).toContain("while connecting");
+	// Nothing was written on its own; Restore adds the text back under the same parent.
+	expect(serverOutline(p2.pageId)).not.toContain("我的字");
+	await a.page.evaluate(() => {
+		const button = [
+			...document.querySelectorAll("[data-testid=outline-deleted-notice] button"),
+		].find((el) => el.textContent?.trim() === "Restore") as HTMLButtonElement | undefined;
+		button?.click();
+	});
+	await settle(a, b);
+	const kids = await a.call((f, x) => f.kids(x as never), q2);
+	expect(kids).toHaveLength(2);
+	expect(serverText(p2.pageId, kids[1] as string)).toBe("Rk2b 子 我的字");
+	expect(await b.call((f, x) => f.text(x as never), kids[1] as string)).toBe("Rk2b 子 我的字");
+	expect(a.errors).toEqual([]);
+}, 90_000);
+
+test("page: read-only first — a page over the live limits takes no typing on its read, then shows read only", async () => {
+	const p1 = await seed("RO large start");
+	const lines = Array.from({ length: 2001 }, (_, i) => (i === 0 ? "Rl0 大页首块" : `Rl${i} 块`));
+	const big = await seedPage(h, "Rl 大页", lines);
+	const first = big.ids[0] as string;
+	const a = await openHost(h, "page", p1.pageId);
+	await a.call((f, x) => f.caret(x as never, 0), p1.id("T1"));
+	await a.call((f) => f.net().hold(true));
+	await switchTo(a, "Rl0 大页首块", first);
+	await until(
+		a,
+		"shown from the read",
+		`(f) => f.shownFrom() === "seed" && f.focusShown(${JSON.stringify(first)})`,
+	);
+	// Not editable while it connects: typing changes nothing.
+	expect(await a.call((f) => f.surface().client.editable)).toBe(false);
+	await a.page.keyboard.type("xyz");
+	expect(await a.call((f, x) => f.text(x as never), first)).toBe("Rl0 大页首块");
+	await a.call((f) => f.net().hold(false));
+	// Refused (too large): the read-only view with its notice, no unsaved text.
+	await a.page.waitForFunction(
+		() => document.body.textContent?.includes("too large to edit live") === true,
+		{ timeout: 10_000 },
+	);
+	expect(await a.page.$("[data-testid=outline-unsaved-notice]")).toBeNull();
+	expect(a.errors).toEqual([]);
+}, 90_000);
+
+test("page: read-only first — refused after typing (access gone): the typing stays to copy, then read only", async () => {
+	const p1 = await seed("RO refused start");
+	const p2 = await seedWords("Rm");
+	const a = await openHost(h, "page", p1.pageId);
+	await a.call((f, x) => f.caret(x as never, 0), p1.id("T1"));
+	await a.call((f) => {
+		f.net().hold(true);
+		f.net().refuseNextJoin = "access_denied";
+	});
+	const q2 = p2.id("Rm2");
+	const q2b = p2.id("Rm2b");
+	await switchTo(a, "Rm2 第二", q2);
+	await until(
+		a,
+		"shown from the read",
+		`(f) => f.shownFrom() === "seed" && f.focusShown(${JSON.stringify(q2)})`,
+	);
+	const end = (await a.call((f, x) => f.text(x as never), q2b)).length;
+	await a.call((f, x, o) => f.caret(x as never, o as never), q2b, end);
+	await a.page.keyboard.type(" 没存上");
+	await a.call((f) => f.net().hold(false));
+	// The editor stays, with what was typed and a copy action; nothing reached the page.
+	const notice = await a.page.waitForSelector("[data-testid=outline-unsaved-notice]", {
+		timeout: 10_000,
+	});
+	expect(await a.page.$eval("[data-testid=outline-unsaved-text]", (el) => el.textContent)).toBe(
+		"Rm2b 子 没存上",
+	);
+	expect(await notice?.evaluate((el) => el.textContent ?? "")).toContain("Copy text");
+	expect(await a.call((f, x) => f.text(x as never), q2b)).toBe("Rm2b 子 没存上");
+	expect(serverText(p2.pageId, q2b) ?? "").not.toContain("没存上");
+	// Dismissed: the read-only view.
+	await a.page.evaluate(() => {
+		const button = [
+			...document.querySelectorAll("[data-testid=outline-unsaved-notice] button"),
+		].find((el) => el.textContent?.trim() === "Dismiss") as HTMLButtonElement | undefined;
+		button?.click();
+	});
+	await a.page.waitForFunction(
+		() =>
+			!document.querySelector("[data-testid=outline-unsaved-notice]") &&
+			!document.querySelector("[data-testid=outline-editor]"),
+		{ timeout: 10_000 },
+	);
+	expect(a.errors).toEqual([]);
+}, 90_000);
+
 test("panel: a panel hidden before its page turned live leaves the session at once", async () => {
 	const p1 = await seed("RO hide start");
 	const p3 = await seedWords("Rh");
