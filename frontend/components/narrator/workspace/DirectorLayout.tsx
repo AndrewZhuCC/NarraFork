@@ -24,11 +24,15 @@ import {
 	useRef,
 	useState,
 } from "react";
+import { OutlineOpenerProvider } from "../../../lib/outline-opener";
+import { normalizeOutlinePanelState, type OutlinePanelState } from "../../../lib/outline-panel";
+import { OutlineHostProvider } from "../../outline/outline-host";
 import { type PluginDockPanelHostApi, PluginDockPanelView } from "../../plugins/PluginDockPanel";
 import { PluginUiSurfaceProvider } from "../../plugins/PluginUiSurfaceContext";
 import type { PluginDockPanelParams } from "../../plugins/protocol";
 import { WebviewPanel } from "../browser/WebviewPanel";
 import { NarratorDockContext } from "../dock/NarratorDockContext";
+import { outlineParamsPatch } from "../dock/outline-dock";
 import { NarratorPanel } from "../NarratorPanel";
 import { usePanelCompact } from "../panels/shared";
 import type { WebviewLeafConfig } from "../split-tree";
@@ -44,7 +48,72 @@ import {
 	previewScaleForWidth,
 	resolvePrimaryLeaf,
 } from "./director-constants";
-import { useWorkspaceNarratorDockValue } from "./workspace-dock";
+import type { WorkspaceOutlineMemberParams, WorkspacePanelParams } from "./panel-types";
+import {
+	useWorkspaceDock,
+	useWorkspaceId,
+	useWorkspaceNarratorDockValue,
+	useWorkspaceOutlineOpener,
+} from "./workspace-dock";
+import { useOutlineMemberActions } from "./workspace-outline";
+
+const OutlinePanelContent = lazy(() =>
+	import("../../outline/OutlinePanelContent").then((m) => ({ default: m.OutlinePanelContent })),
+);
+
+/**
+ * An outline member as a Director cell: the same content as its grid panel, its navigation
+ * written back to the (hidden) grid panel's params, which also persists its place to its row.
+ */
+function DirectorOutlinePanel({
+	leaf,
+	onUpdateParams,
+	onSetPanelTitle,
+}: {
+	leaf: DirectorLeaf & { params: WorkspaceOutlineMemberParams };
+	onUpdateParams: (leafId: string, params: WorkspacePanelParams) => void;
+	onSetPanelTitle: (leafId: string, title: string) => void;
+}) {
+	const store = useWorkspaceDock();
+	const workspaceId = useWorkspaceId();
+	const container = useMemo(
+		() => ({
+			get panels() {
+				return store?.apiRef.current?.panels ?? [];
+			},
+		}),
+		[store],
+	);
+	const actions = useOutlineMemberActions(workspaceId, container);
+	const state = useMemo(() => normalizeOutlinePanelState(leaf.params), [leaf.params]);
+	const onChange = useCallback(
+		(next: OutlinePanelState) => {
+			onUpdateParams(leaf.id, {
+				...leaf.params,
+				...outlineParamsPatch(next),
+			} as WorkspacePanelParams);
+			if (next.title && next.title !== leaf.title) onSetPanelTitle(leaf.id, next.title);
+		},
+		[leaf.id, leaf.params, leaf.title, onUpdateParams, onSetPanelTitle],
+	);
+	return (
+		<NarratorDockContext.Provider value={null}>
+			<OutlineOpenerProvider value={actions.opener}>
+				<OutlineHostProvider openSession={actions.openSession}>
+					<Suspense fallback={null}>
+						<OutlinePanelContent
+							state={state}
+							onChange={onChange}
+							onOpenNew={(next) => {
+								if (!actions.opener?.open(next, { newPanel: true })) onChange(next);
+							}}
+						/>
+					</Suspense>
+				</OutlineHostProvider>
+			</OutlineOpenerProvider>
+		</NarratorDockContext.Provider>
+	);
+}
 
 const WorkspaceTerminalPanel = lazy(() =>
 	import("../../terminal/WorkspaceTerminalPanel").then((m) => ({
@@ -73,8 +142,11 @@ export interface DirectorLayoutProps {
 	onClosePanel: (leafId: string) => void;
 	/** Persist an edited webview config back onto the dockview panel params. */
 	onUpdateWebviewConfig: (leafId: string, config: WebviewLeafConfig) => void;
-	/** Persist plugin-owned view state back onto the dockview panel params. */
-	onUpdatePluginParams: (leafId: string, params: PluginDockPanelParams) => void;
+	/**
+	 * Persist panel-owned state back onto the dockview panel params: a plugin's view state, an
+	 * outline member's place.
+	 */
+	onUpdatePluginParams: (leafId: string, params: WorkspacePanelParams) => void;
 	/** Keep the hidden Dockview panel title in sync with host-local panel.setTitle. */
 	onSetPanelTitle: (leafId: string, title: string) => void;
 }
@@ -91,7 +163,7 @@ function DirectorPluginPanel({
 	isPrimary: boolean;
 	onClose?: () => void;
 	onActivate: (leafId: string) => void;
-	onUpdatePluginParams: (leafId: string, params: PluginDockPanelParams) => void;
+	onUpdatePluginParams: (leafId: string, params: WorkspacePanelParams) => void;
 	onSetPanelTitle: (leafId: string, title: string) => void;
 }) {
 	const hostApi = useMemo<PluginDockPanelHostApi>(
@@ -134,7 +206,7 @@ function DirectorPanelContent({
 		messageId?: string,
 	) => void;
 	onUpdateWebviewConfig: (leafId: string, config: WebviewLeafConfig) => void;
-	onUpdatePluginParams: (leafId: string, params: PluginDockPanelParams) => void;
+	onUpdatePluginParams: (leafId: string, params: WorkspacePanelParams) => void;
 	onSetPanelTitle: (leafId: string, title: string) => void;
 }) {
 	const params = leaf.params;
@@ -142,6 +214,11 @@ function DirectorPanelContent({
 	// Only the live primary participates in the narrator/resource bridge. Previews
 	// retain their lightweight behaviour and cannot publish over the primary.
 	const dockValue = useWorkspaceNarratorDockValue(
+		isPrimary ? narratorId : "",
+		isPrimary ? leaf.id : undefined,
+	);
+	// Outline places the primary session opens are resources of its cluster, as on the grid.
+	const outlineOpener = useWorkspaceOutlineOpener(
 		isPrimary ? narratorId : "",
 		isPrimary ? leaf.id : undefined,
 	);
@@ -176,6 +253,16 @@ function DirectorPanelContent({
 		);
 	}
 
+	if (params.panelType === "outline") {
+		return (
+			<DirectorOutlinePanel
+				leaf={leaf as DirectorLeaf & { params: WorkspaceOutlineMemberParams }}
+				onUpdateParams={onUpdatePluginParams}
+				onSetPanelTitle={onSetPanelTitle}
+			/>
+		);
+	}
+
 	if (params.panelType === "plugin") {
 		return (
 			<DirectorPluginPanel
@@ -194,19 +281,21 @@ function DirectorPanelContent({
 	// Narrator. Secondary panels render as lightweight previews.
 	return (
 		<NarratorDockContext.Provider value={isPrimary ? dockValue : null}>
-			<Box style={{ height: "100%", overflow: "hidden" }}>
-				<NarratorPanel
-					key={narratorId}
-					narratorId={narratorId}
-					compact={compact}
-					onClose={onClose}
-					onViewSubagentSession={(subagentNarratorId, messageId) =>
-						onViewSubagentSession(narratorId, subagentNarratorId, messageId)
-					}
-					workspacePreview={!isPrimary}
-					suppressAutoFocusOnPromote={suppressAutoFocusOnPromote}
-				/>
-			</Box>
+			<OutlineOpenerProvider value={outlineOpener}>
+				<Box style={{ height: "100%", overflow: "hidden" }}>
+					<NarratorPanel
+						key={narratorId}
+						narratorId={narratorId}
+						compact={compact}
+						onClose={onClose}
+						onViewSubagentSession={(subagentNarratorId, messageId) =>
+							onViewSubagentSession(narratorId, subagentNarratorId, messageId)
+						}
+						workspacePreview={!isPrimary}
+						suppressAutoFocusOnPromote={suppressAutoFocusOnPromote}
+					/>
+				</Box>
+			</OutlineOpenerProvider>
 		</NarratorDockContext.Provider>
 	);
 }
@@ -245,7 +334,7 @@ function DirectorLeafHost({
 		messageId?: string,
 	) => void;
 	onUpdateWebviewConfig: (leafId: string, config: WebviewLeafConfig) => void;
-	onUpdatePluginParams: (leafId: string, params: PluginDockPanelParams) => void;
+	onUpdatePluginParams: (leafId: string, params: WorkspacePanelParams) => void;
 	onSetPanelTitle: (leafId: string, title: string) => void;
 }) {
 	const { ref, compact } = usePanelCompact();

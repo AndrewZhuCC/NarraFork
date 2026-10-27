@@ -77,6 +77,28 @@ export interface OutlineSurfaceProps {
 	 * window). `panel`: it fills its container and scrolls inside it; drawers stay inside.
 	 */
 	layout?: "page" | "panel";
+	/**
+	 * Told what is shown once it has loaded (and again when it changes): a dock panel names its
+	 * tab after it and remembers the page it is on.
+	 */
+	onLoaded?: (info: OutlineSurfaceLoaded) => void;
+	/** The host's own controls, at the end of the toolbar (open beside, discuss in a session). */
+	actions?: React.ReactNode;
+}
+
+/** What a surface shows, reported by `onLoaded`. */
+export interface OutlineSurfaceLoaded {
+	spaceId: string;
+	spaceKey: string;
+	pageId: string;
+	/** The focused block (the page itself when the page is shown). */
+	rootId: string;
+	/** `key/sid` of the focused block. */
+	address: string;
+	/** Title of the focused block (or its short id when it has none). */
+	title: string;
+	/** Whether the person may edit the space. */
+	canWrite: boolean;
 }
 
 export function OutlineSurface(props: OutlineSurfaceProps) {
@@ -97,6 +119,8 @@ function SurfaceBody({
 	onNavigate,
 	compact: compactProp,
 	layout = "page",
+	onLoaded,
+	actions,
 }: OutlineSurfaceProps) {
 	const { t } = useTranslation("outline");
 	const mode: OutlineViewMode = viewMode ?? "facts";
@@ -175,6 +199,21 @@ function SurfaceBody({
 	useEffect(() => {
 		if (missing && asOf === undefined) forgetOutlineRecent(blockId);
 	}, [missing, asOf, blockId]);
+	const loadedSpaceKey = view?.space.key;
+	const loadedCanWrite = view?.space.canWrite === true;
+	const rootSid = root?.sid;
+	useEffect(() => {
+		if (!onLoaded || !pageId || !loadedSpaceKey || !rootSid) return;
+		onLoaded({
+			spaceId,
+			spaceKey: loadedSpaceKey,
+			pageId,
+			rootId: blockId,
+			address: `${loadedSpaceKey}/${rootSid}`,
+			title: rootTitle,
+			canWrite: loadedCanWrite,
+		});
+	}, [onLoaded, spaceId, blockId, pageId, loadedSpaceKey, rootSid, rootTitle, loadedCanWrite]);
 
 	let content: React.ReactNode;
 	let drawer: React.ReactNode = null;
@@ -251,6 +290,7 @@ function SurfaceBody({
 								<IconLayoutSidebarRight size={18} />
 							</ActionIcon>
 						</Tooltip>
+						{actions}
 					</Group>
 				</div>
 
