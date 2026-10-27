@@ -22,7 +22,10 @@
  * Focus belongs to the host (the route's URL, a dock panel's params): the surface animates a
  * focus change at once and tells the host (`onFocus`); the host's answer comes back as the same
  * focus (`focusFromHost`) and is recognised; any other focus from the host (back, forward, a
- * breadcrumb) is animated as it arrives.
+ * breadcrumb) is animated as it arrives. A host may show only the last of several quick changes
+ * (one render for a focus and its return: its focus never seems to change), so the host also says
+ * what it shows after each render (`hostShows`): once that is the newest focus told, nothing told
+ * is still on its way, and the next focus from the host is the host's own.
  *
  * No React and no document listeners: the toolbar is React (`OutlineEditor`), keys belong to the
  * editors and the map's stage.
@@ -119,8 +122,8 @@ export class EditSurface {
 	private readonly tracker = new TransitionTracker();
 	/** Timings of the last switch (tests). */
 	parts: Record<string, number> = {};
-	/** Focus ids told to the host whose echo has not come back yet. */
-	private echo: string[] = [];
+	/** Focus changes for the host whose echo has not come back yet (`sent`: told already). */
+	private echo: Array<{ id: string; sent: boolean }> = [];
 	private restoring = false;
 	private destroyed = false;
 	/** What was measured ahead: nothing yet, the seeded page (HTTP read), the live page. */
@@ -1049,7 +1052,8 @@ export class EditSurface {
 		// it (and seeds it); the focus moves when it arrives.
 		if (parent && !this.client.visible.alive(parent) && this.client.provisional) {
 			this.pendingFocus = parent;
-			this.notifyHost(parent);
+			// Not an echo to wait for: the host's answer moves the focus (when the parent is here).
+			this.notifyHost({ id: parent, sent: false });
 			return;
 		}
 		this.focusBlock(parent ?? this.pageId);
@@ -1057,7 +1061,7 @@ export class EditSurface {
 
 	/** The host's focus (a navigation): animate unless it is the echo of one made here. */
 	focusFromHost(id: string): void {
-		const at = this.echo.indexOf(id);
+		const at = this.echo.findIndex((e) => e.id === id);
 		if (at >= 0) {
 			this.echo.splice(0, at + 1);
 			return;
@@ -1089,9 +1093,10 @@ export class EditSurface {
 		noteFocusVisit(id);
 		st.emit("focus");
 		if (opts.notify !== false) {
-			this.echo.push(id);
+			const told = { id, sent: false };
+			this.echo.push(told);
 			if (this.echo.length > 20) this.echo.splice(0, this.echo.length - 20);
-			this.notifyHost(id);
+			this.notifyHost(told);
 		}
 		return true;
 	}
@@ -1100,12 +1105,23 @@ export class EditSurface {
 	 * Tell the host after the frame with the new focus is painted: what the host does with it (a
 	 * route change, reading the block for the toolbar) does not hold up that frame.
 	 */
-	private notifyHost(id: string): void {
+	private notifyHost(told: { id: string; sent: boolean }): void {
 		requestAnimationFrame(() => {
 			setTimeout(() => {
-				if (!this.destroyed) this.opts.onFocus(id);
+				if (this.destroyed) return;
+				told.sent = true;
+				this.opts.onFocus(told.id);
 			}, 0);
 		});
+	}
+
+	/**
+	 * What the host shows after a render. The newest focus told, and told already: the host has
+	 * caught up (whether it showed the ones before or not), so nothing is on its way any more.
+	 */
+	hostShows(id: string): void {
+		const newest = this.echo[this.echo.length - 1];
+		if (newest?.sent && newest.id === id) this.echo = [];
 	}
 
 	private zoomOutline(

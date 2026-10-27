@@ -91,6 +91,7 @@ import {
 	seedLiveSession,
 } from "./editor/OutlineEditor";
 import { liveTransport } from "./editor/transport";
+import { UnsavedTextsNotice } from "./editor/UnsavedTextsNotice";
 import classes from "./Outline.module.css";
 import { OutlineBlockBody } from "./OutlineBlockBody";
 import { OutlineBlockTree, OutlineTaskIcon } from "./OutlineBlockTree";
@@ -599,6 +600,8 @@ function SurfaceBody({
 							/>
 						) : (
 							<>
+								{/* Typing of this tab that did not reach the page (the editor shows it live). */}
+								<UnsavedTextsNotice pageId={view.pageId} />
 								<Group gap={6} wrap="nowrap" align="flex-start" mb="xs">
 									{root.task && <OutlineTaskIcon status={root.task.status} />}
 									<Title order={3} className={classes.rootTitle}>

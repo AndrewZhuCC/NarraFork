@@ -35,12 +35,11 @@ import type { LiveCloseCode } from "@shared/outline-live-protocol";
 import { IconArrowDown, IconArrowRight, IconArrowsMaximize, IconSearch } from "@tabler/icons-react";
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { copyTextToClipboard } from "../../../lib/clipboard";
 import { EditSurface } from "../edit-surface";
 import { mapText } from "../mindmap/mindmap";
 import type { OutlineViewState } from "../view-state";
 import { chromeText } from "./chrome";
-import type { LiveClient, LiveTransport, UnsavedText } from "./live-client";
+import type { LiveClient, LiveTransport } from "./live-client";
 import {
 	acquireLiveSession,
 	liveSessionClient,
@@ -50,6 +49,7 @@ import {
 } from "./live-sessions";
 import { readCanGoLive, seedBlocksOf } from "./seed";
 import { liveTransport } from "./transport";
+import { UnsavedTextsNotice } from "./UnsavedTextsNotice";
 import type { OutlineLens, OutlineRefusal, OutlineView } from "./view";
 import "./editor.css";
 import "../mindmap/mindmap.css";
@@ -129,41 +129,6 @@ function afterNextPaint(run: () => void): void {
 	};
 	requestAnimationFrame(() => setTimeout(go, 0));
 	setTimeout(go, 100);
-}
-
-/** Typing of the read-only-first window that could not be saved: shown with a copy action. */
-function UnsavedNotice({ unsaved, onDismiss }: { unsaved: UnsavedText; onDismiss: () => void }) {
-	const { t } = useTranslation("outline");
-	const all = unsaved.texts.map((x) => x.text).join("\n\n");
-	return (
-		<Alert color="red" variant="light" py={6} data-testid="outline-unsaved-notice">
-			<Text size="sm" mb={4}>
-				{t(unsaved.reason === "read_only" ? "editor.unsavedReadOnly" : "editor.unsavedRefused", {
-					count: unsaved.texts.length,
-				})}
-			</Text>
-			<pre className="nf-outline-unsaved" data-testid="outline-unsaved-text">
-				{all}
-			</pre>
-			<Group gap="xs" wrap="wrap" mt={4}>
-				<Button
-					size="compact-xs"
-					variant="light"
-					onClick={() => {
-						void copyTextToClipboard(all).then(
-							() => notifications.show({ message: t("editor.unsavedCopied") }),
-							() => undefined,
-						);
-					}}
-				>
-					{t("editor.copyUnsaved")}
-				</Button>
-				<Button size="compact-xs" variant="subtle" onClick={onDismiss}>
-					{t("editor.dismiss")}
-				</Button>
-			</Group>
-		</Alert>
-	);
 }
 
 /** Why a page shows read only instead of the live editor. */
@@ -252,13 +217,12 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 				const s = surfaceRef.current;
 				if (s) for (const v of [s.pageView, s.focusView]) v?.refreshEditable();
 			}
-			// Refused with typing of the read on hand: the editor stays to show it (copy, then
-			// dismiss); the read-only view follows the dismissal.
-			if (event === "closed" && client.closeCode && client.closeCode !== "ended" && !client.unsaved)
+			// Typing it could not save is in the unsaved-text store: the read-only view shows it too.
+			if (event === "closed" && client.closeCode && client.closeCode !== "ended")
 				callbacks.current.onUnavailable(client.closeCode);
 			if (event !== "sync") rerender();
 		});
-		if (client.status === "closed" && client.closeCode && !client.unsaved)
+		if (client.status === "closed" && client.closeCode)
 			callbacks.current.onUnavailable(client.closeCode);
 		// A page shown from its read stays (what was typed is kept for when it goes live); one with
 		// nothing to show falls back to the read-only view.
@@ -353,6 +317,10 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 	useEffect(() => {
 		surfaceRef.current?.focusFromHost(focusId);
 	}, [focusId]);
+	// After every render: what the host shows (a focus and its return may render as no change).
+	useEffect(() => {
+		surfaceRef.current?.hostShows(focusId);
+	});
 
 	useEffect(() => {
 		surfaceRef.current?.setLens(lens);
@@ -489,29 +457,27 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 					)}
 				</Group>
 			</Group>
-			{client.unsaved && (
-				<UnsavedNotice
-					unsaved={client.unsaved}
-					onDismiss={() => {
-						const code = client.closeCode;
-						client.dismissUnsaved();
-						if (client.status === "closed" && code && code !== "ended")
-							callbacks.current.onUnavailable(code);
-					}}
-				/>
-			)}
+			<UnsavedTextsNotice pageId={pageId} client={client} />
 			{deleted && (
 				<Alert color="yellow" variant="light" py={6} data-testid="outline-deleted-notice">
 					<Group gap="xs" wrap="wrap">
 						<Text size="sm">
-							{deleted.whileConnecting
-								? t("editor.deletedWhileConnecting")
-								: deleted.by
-									? t("editor.deletedBy", { name: deleted.by })
-									: t("editor.deletedBySomeone")}
+							{deleted.by
+								? t("editor.deletedBy", { name: deleted.by })
+								: t("editor.deletedBySomeone")}
 						</Text>
 						{client.editable && (
-							<Button size="compact-xs" variant="light" onClick={() => client.restoreDeleted()}>
+							<Button
+								size="compact-xs"
+								variant="light"
+								onClick={() => {
+									if (!client.restoreDeleted())
+										notifications.show({
+											color: "yellow",
+											message: t("editor.restoreNotPossible"),
+										});
+								}}
+							>
 								{t("editor.restore")}
 							</Button>
 						)}

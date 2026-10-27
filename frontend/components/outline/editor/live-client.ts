@@ -56,7 +56,13 @@ import {
 	OUTLINE_LIVE_LIMITS,
 } from "@shared/outline-live-protocol";
 import * as Y from "yjs";
-import { type BlockRec, type ClientOp, Store, wireOp } from "./store";
+import { type BlockRec, type ClientOp, keyBetweenLoose, Store, wireOp } from "./store";
+import {
+	dropUnsavedText,
+	keepUnsavedTexts,
+	type UnsavedEntry,
+	type UnsavedReason,
+} from "./unsaved-texts";
 
 /** Origin of the editor's own text changes (tracked by the undo manager). */
 export const LOCAL = { origin: "local" };
@@ -191,22 +197,6 @@ export interface DeletedNotice {
 	/** The deleted subtree roots that restoring brings back, parents first. */
 	restore: ClientOp[];
 	by: string;
-	/**
-	 * Typed into while the page was shown from its read (connecting), deleted (or moved away)
-	 * before the snapshot: restoring adds what was typed back as new blocks.
-	 */
-	whileConnecting?: boolean;
-}
-
-/**
- * What was typed while the page was shown from its read and could not be saved: the page refused
- * the session (too large, no access), or the person may no longer write. Kept for the person to
- * copy; nothing of it was sent.
- */
-export interface UnsavedText {
-	reason: "refused" | "read_only";
-	/** Per block, its text as typed (the last version). */
-	texts: Array<{ blockId: string; text: string }>;
 }
 
 export type ClientEvent =
@@ -216,8 +206,7 @@ export type ClientEvent =
 	| "deleted"
 	| "rejected"
 	| "readonly"
-	| "closed"
-	| "unsaved";
+	| "closed";
 
 let idCounter = 0;
 
@@ -275,8 +264,6 @@ export class LiveClient {
 	 */
 	seeded = false;
 	deleted: DeletedNotice | null = null;
-	/** Typing of the read-only-first window that could not be saved (see {@link UnsavedText}). */
-	unsaved: UnsavedText | null = null;
 	readonly key = randomId(16);
 	me = 0;
 	epoch = 0;
@@ -314,6 +301,8 @@ export class LiveClient {
 	private readonly seedTexts = new Map<string, string>();
 	/** The reads so far allow typing while connecting (the page is within the live limits). */
 	private seedTyping = true;
+	/** Restores of unsaved text on their way: transaction → store entry (dropped when acked). */
+	private readonly restoring = new Map<number, string>();
 	/**
 	 * Set by the page (a browser): runs the upgrade of a seeded page after the seed was painted.
 	 * Without it (tests driving the client) the snapshot is taken at once.
@@ -389,8 +378,19 @@ export class LiveClient {
 
 	dispose(): void {
 		if (this.disposed) return;
-		this.disposed = true;
 		this.flushTyping();
+		// Typing the page has not taken is kept for the person (the unsaved-text store), never
+		// disposed with the client. Live, what was sent reaches the page before the leave below
+		// (same socket): only what could not be sent is kept. Otherwise (offline, refused, closed)
+		// whatever is not acknowledged: what was applied but not stored may be gone with a restart.
+		const connected = this.status === "live" || this.status === "stalled";
+		this.keepUnsaved(
+			"not_sent",
+			connected
+				? this.pending.filter((tx) => !tx.sent)
+				: [...this.awaiting, ...this.pending].sort((x, y) => x.n - y.n),
+		);
+		this.disposed = true;
 		for (const off of this.off.splice(0)) off();
 		for (const t of [this.typingTimer, this.presenceTimer, this.retryTimer]) if (t) clearTimeout(t);
 		if (this.handle !== null) {
@@ -529,6 +529,13 @@ export class LiveClient {
 		if (this.disposed) return;
 		if (this.handle === null) this.handle = this.transport.allocateHandle();
 		if (this.handle === null) {
+			// No room on the socket: closed for good, like a refusal.
+			this.keepUnsaved(this.provisional ? "refused" : "not_sent", [
+				...this.awaiting,
+				...this.pending,
+			]);
+			this.pending = [];
+			this.awaiting = [];
 			this.closeCode = "unavailable";
 			this.setStatus("closed");
 			this.emit("closed");
@@ -840,8 +847,7 @@ export class LiveClient {
 	}
 
 	/** Whether an operation still fits the visible structure. */
-	private validLocally(op: ClientOp | LiveOp): boolean {
-		const v = this.visible;
+	private validLocally(op: ClientOp | LiveOp, v: Store = this.visible): boolean {
 		switch (op.t) {
 			case "i":
 				return v.inPage(op.p) && !v.alive(op.id);
@@ -1036,6 +1042,7 @@ export class LiveClient {
 		this.awaiting = kept.filter((tx) => tx.n <= applied);
 		const rest = kept.filter((tx) => tx.n > applied);
 		this.ackedTx = Math.max(this.ackedTx, dur);
+		this.settleRestores(applied);
 		if (head.mode === "resume" && this.ready && !this.resetting) {
 			this.stats.resumes++;
 			this.onResumed(head, body, rest);
@@ -1097,6 +1104,10 @@ export class LiveClient {
 	/** Re-apply transactions the server never took onto the rebuilt state, as new ones. */
 	private replayPending(txs: readonly PendingTx[]): void {
 		for (const tx of txs) {
+			// A restore of unsaved text goes again as a new transaction (or not at all: its entry
+			// stays).
+			const restoring = this.restoring.get(tx.n);
+			this.restoring.delete(tx.n);
 			const ops: ClientOp[] = [];
 			const bodies = new Map<string, { before: string; after: string }>();
 			const created = new Set<string>();
@@ -1121,8 +1132,18 @@ export class LiveClient {
 				if (change) bodies.set(id, change);
 			}
 			this.enqueue(ops, bodies, ops.length > 0);
+			if (restoring && ops.length > 0) this.restoring.set(this.n, restoring);
 		}
 		this.flushTyping();
+	}
+
+	/** Restores of unsaved text the page took (up to transaction `upTo`): their entries are done. */
+	private settleRestores(upTo: number): void {
+		for (const [n, entry] of this.restoring) {
+			if (n > upTo) continue;
+			this.restoring.delete(n);
+			dropUnsavedText(entry);
+		}
 	}
 
 	private onResumed(head: LiveJoinedHead, body: Uint8Array, rest: PendingTx[]): void {
@@ -1151,6 +1172,7 @@ export class LiveClient {
 			const done = this.pending.filter((tx) => tx.n <= ack);
 			this.pending = this.pending.filter((tx) => tx.n > ack);
 			this.ackedTx = Math.max(this.ackedTx, ack);
+			this.settleRestores(ack);
 			for (const tx of done) {
 				const a = acks.get(tx.n);
 				if (!a) continue;
@@ -1173,14 +1195,18 @@ export class LiveClient {
 	private onReject(n: number, code: string | undefined): void {
 		this.stats.rejects++;
 		this.log.push(`transaction ${n} refused: ${code ?? "?"}`);
-		// Acknowledged ones were answered before the refusal; the refused one is dropped; the
-		// server ignores the rest until this client joins again, and they are replayed then.
-		this.pending = this.pending.filter((tx) => tx.n !== n);
+		// A restore of unsaved text the page refused: its entry stays.
+		this.restoring.delete(n);
 		if (code === "read_only") {
+			// May no longer write: nothing of the typing not taken can be sent; it is kept.
+			this.keepUnsaved("read_only", this.pending);
 			this.canWrite = false;
 			this.pending = [];
 			this.emit("readonly");
 		}
+		// Acknowledged ones were answered before the refusal; the refused one is dropped; the
+		// server ignores the rest until this client joins again, and they are replayed then.
+		this.pending = this.pending.filter((tx) => tx.n !== n);
 		this.emit("rejected");
 		this.rebuild();
 	}
@@ -1198,8 +1224,17 @@ export class LiveClient {
 
 	private onClosed(code: LiveCloseCode): void {
 		this.closeCode = code;
-		if (code !== "ended" && code !== "unavailable" && this.provisional)
-			this.keepUnsaved("refused", [...this.awaiting, ...this.pending]);
+		if (code !== "ended" && code !== "unavailable") {
+			// Closed for good (refused after typing on the read, access gone, too large): nothing
+			// not acknowledged can be sent any more. Kept for the person at once, while the page
+			// turns read only.
+			this.keepUnsaved(this.provisional ? "refused" : "not_sent", [
+				...this.awaiting,
+				...this.pending,
+			]);
+			this.pending = [];
+			this.awaiting = [];
+		}
 		if (code === "ended" || code === "unavailable") {
 			// The session closed (shutdown, idle, a limit): try again a little later.
 			this.setStatus("offline");
@@ -1263,14 +1298,27 @@ export class LiveClient {
 		this.emit("deleted");
 	}
 
-	/** Bring back what the deleted notice names (one transaction). */
-	restoreDeleted(): void {
+	/**
+	 * Bring back what the deleted notice names (one transaction). False, and the notice stays,
+	 * when it no longer fits (not every operation would be taken).
+	 */
+	restoreDeleted(): boolean {
 		const notice = this.deleted;
+		if (!notice || !this.editable) return false;
+		const ops = notice.restore.filter((op) => op.t !== "i" || !this.visible.alive(op.id));
+		// Every operation, each on the structure the ones before it make: the page refuses the
+		// whole transaction for one bad operation, and the notice must not be gone by then.
+		const sim = this.visible.clone();
+		for (const op of ops) {
+			if (!this.validLocally(op, sim)) {
+				this.log.push(`restore not possible: ${op.t} ${op.id} no longer fits`);
+				return false;
+			}
+			sim.apply(op);
+		}
 		this.deleted = null;
 		this.emit("deleted");
-		if (!notice || !this.editable) return;
-		const ops = notice.restore.filter((op) => op.t !== "i" || !this.visible.alive(op.id));
-		if (ops.length === 0 || !this.validLocally(ops[0] as ClientOp)) return;
+		if (ops.length === 0) return true;
 		this.commit({
 			ops,
 			bodies: [],
@@ -1280,6 +1328,7 @@ export class LiveClient {
 			selAfter: null,
 			view: null,
 		});
+		return true;
 	}
 
 	dismissDeleted(): void {
@@ -1288,73 +1337,97 @@ export class LiveClient {
 	}
 
 	/**
-	 * The first snapshot after a seed has no block some typing went into (deleted or moved away
-	 * meanwhile): the person is told, and restoring adds the typed text back as new blocks at the
-	 * end of the nearest block still here (its seeded parent, or that one's parent, …, or the
-	 * page). Never under the old id (it may live on elsewhere) and never on its own.
+	 * The first snapshot after a seed has no block some typing went into (deleted, or moved to
+	 * another page meanwhile): the text is kept (the unsaved-text store), with where restoring
+	 * adds it back as a new block — the nearest block still here (its seeded parent, or that
+	 * one's parent, …, or the page). Never under the old id (it may live on elsewhere) and never on
+	 * its own.
 	 */
 	private noteLostWhileConnecting(txs: readonly PendingTx[], seedStore: Store): void {
-		const lost = new Map<string, string>();
+		const lost = new Map<string, { before: string; after: string }>();
 		for (const tx of txs) {
-			for (const [id, { after }] of tx.bodies) {
-				if (this.visible.alive(id)) lost.delete(id);
-				else lost.set(id, after);
+			for (const [id, change] of tx.bodies) {
+				if (this.visible.alive(id)) continue;
+				const prev = lost.get(id);
+				lost.set(id, { before: prev?.before ?? change.before, after: change.after });
 			}
 		}
 		if (lost.size === 0) return;
-		const restore: ClientOp[] = [];
-		const lastKey = new Map<string, string | null>();
-		for (const [id, text] of lost) {
+		const items: Array<Omit<UnsavedEntry, "id" | "at">> = [];
+		for (const [id, { before, after }] of lost) {
 			let parent: string | null = seedStore.get(id)?.parentId ?? null;
 			while (parent && !this.visible.alive(parent))
 				parent = seedStore.get(parent)?.parentId ?? null;
-			if (!parent) parent = this.visible.alive(this.pageId) ? this.pageId : null;
-			if (!parent) continue;
-			if (!lastKey.has(parent)) {
-				const kids = this.visible.children(parent);
-				const last = kids[kids.length - 1];
-				lastKey.set(parent, last ? (this.visible.get(last)?.orderKey ?? null) : null);
-			}
-			const k = keyBetween(lastKey.get(parent) ?? null, null);
-			lastKey.set(parent, k);
-			restore.push({
-				t: "i",
-				id: this.newId(),
-				p: parent,
-				k,
-				task: seedStore.get(id)?.task ?? null,
-				content: text,
+			items.push({
+				pageId: this.pageId,
+				blockId: id,
+				text: after,
+				base: before,
+				reason: "moved_away",
+				restore: { parentId: parent ?? this.pageId, task: seedStore.get(id)?.task ?? null },
 			});
 		}
-		if (restore.length === 0) return;
 		this.log.push(`${lost.size} block(s) typed in while connecting are gone from the snapshot`);
-		this.deleted = {
-			blockId: [...lost.keys()][0] as string,
-			restore,
-			by: "",
-			whileConnecting: true,
-		};
-		this.emit("deleted");
+		keepUnsavedTexts(items);
 	}
 
-	/** Typing of the read-only-first window that cannot be saved: kept for the person to copy. */
-	private keepUnsaved(reason: UnsavedText["reason"], txs: readonly PendingTx[]): void {
-		const texts = new Map<string, string>();
-		for (const tx of txs) for (const [id, { after }] of tx.bodies) texts.set(id, after);
+	/** Typing that cannot reach the page: kept for the person (the unsaved-text store). */
+	private keepUnsaved(reason: UnsavedReason, txs: readonly PendingTx[]): void {
+		const texts = new Map<string, { before: string; after: string }>();
+		for (const tx of txs) {
+			for (const [id, change] of tx.bodies) {
+				const prev = texts.get(id);
+				texts.set(id, { before: prev?.before ?? change.before, after: change.after });
+			}
+		}
 		if (texts.size === 0) return;
-		this.unsaved = {
-			reason,
-			texts: [...texts].map(([blockId, text]) => ({ blockId, text })),
-		};
-		this.log.push(
-			`${texts.size} block(s) typed in while connecting could not be saved (${reason})`,
+		this.log.push(`${texts.size} block(s) of typing not saved (${reason})`);
+		keepUnsavedTexts(
+			[...texts].map(([blockId, { before, after }]) => ({
+				pageId: this.pageId,
+				blockId,
+				text: after,
+				base: before,
+				reason,
+			})),
 		);
-		this.emit("unsaved");
 	}
 
-	dismissUnsaved(): void {
-		this.unsaved = null;
-		this.emit("unsaved");
+	/**
+	 * Restore a `moved_away` entry: its text as a new block at the end of the block it names (or
+	 * of the page, if that one went too). The entry stays until the page acknowledges the insert.
+	 * False when it cannot be done here and now (not live, read only, another page, refused).
+	 */
+	restoreUnsaved(entry: UnsavedEntry): boolean {
+		if (!this.ready || !this.editable || entry.pageId !== this.pageId || !entry.restore) {
+			return false;
+		}
+		// Already on its way (a second click): not twice.
+		for (const id of this.restoring.values()) if (id === entry.id) return true;
+		let parent = entry.restore.parentId;
+		if (!this.visible.alive(parent)) parent = this.pageId;
+		const kids = this.visible.children(parent);
+		const last = kids[kids.length - 1];
+		const op: ClientOp = {
+			t: "i",
+			id: this.newId(),
+			p: parent,
+			k: keyBetweenLoose(last ? (this.visible.get(last)?.orderKey ?? null) : null, null),
+			task: entry.restore.task,
+			content: entry.text,
+		};
+		if (!this.validLocally(op)) return false;
+		this.commit({
+			ops: [op],
+			bodies: [],
+			kind: "struct",
+			blockId: null,
+			selBefore: null,
+			selAfter: null,
+			view: null,
+		});
+		this.restoring.set(this.n, entry.id);
+		return true;
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────

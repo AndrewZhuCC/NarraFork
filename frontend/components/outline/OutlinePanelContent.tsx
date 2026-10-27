@@ -14,6 +14,11 @@
  * The panel keeps its own (every navigation inside it, at most `PANEL_HISTORY_MAX` entries, for as
  * long as the panel is mounted; not stored with the layout), shown as back and forward buttons on
  * the page's toolbar and bound to Mod-[ and Mod-] (`OutlineSurface`).
+ *
+ * The host shows a change a render or more later (a dock panel's parameters). Navigations in
+ * quick succession — a focus and its return before that render — build on the newest state the
+ * panel asked for, not on the props of a render that has not caught up: comparing with those
+ * would drop the return as "no change", and the host would keep a focus the page left.
  */
 import type { OutlineSpaceDetail } from "@shared/outline-api";
 import {
@@ -78,6 +83,22 @@ export function OutlinePanelContent({
 	stateRef.current = state;
 	const handlers = useRef({ onChange, onOpenNew, onTitle });
 	handlers.current = { onChange, onOpenNew, onTitle };
+	// What the panel asked its host for and the host has not shown yet, oldest first. A shown
+	// state settles the ones up to it; one the panel did not ask for (a restored layout, another
+	// owner of the parameters) settles them all.
+	const asked = useRef<OutlinePanelState[]>([]);
+	const shown = useRef(state);
+	if (!sameOutlinePanelState(shown.current, state)) {
+		shown.current = state;
+		const at = asked.current.findIndex((s) => sameOutlinePanelState(s, state));
+		asked.current = at >= 0 ? asked.current.slice(at + 1) : [];
+	}
+	/** The newest state: the last one asked for, or the one shown. */
+	const latest = useCallback(() => asked.current.at(-1) ?? stateRef.current, []);
+	const ask = useCallback((next: OutlinePanelState) => {
+		asked.current.push(next);
+		handlers.current.onChange(next);
+	}, []);
 
 	const { spaceId, blockId, view, asOf } = state;
 	const target = useMemo(
@@ -89,29 +110,32 @@ export function OutlinePanelContent({
 	const past = useRef<OutlinePanelState[]>([]);
 	const future = useRef<OutlinePanelState[]>([]);
 	const [, bumpHistory] = useReducer((n: number) => n + 1, 0);
-	const go = useCallback((next: OutlinePanelState) => {
-		const current = stateRef.current;
-		if (sameOutlinePanelState(current, next)) return;
-		past.current.push(current);
-		if (past.current.length > PANEL_HISTORY_MAX) past.current.shift();
-		future.current = [];
-		bumpHistory();
-		handlers.current.onChange(next);
-	}, []);
+	const go = useCallback(
+		(next: OutlinePanelState) => {
+			const current = latest();
+			if (sameOutlinePanelState(current, next)) return;
+			past.current.push(current);
+			if (past.current.length > PANEL_HISTORY_MAX) past.current.shift();
+			future.current = [];
+			bumpHistory();
+			ask(next);
+		},
+		[latest, ask],
+	);
 	const back = useCallback(() => {
 		const prev = past.current.pop();
 		if (!prev) return;
-		future.current.push(stateRef.current);
+		future.current.push(latest());
 		bumpHistory();
-		handlers.current.onChange(prev);
-	}, []);
+		ask(prev);
+	}, [latest, ask]);
 	const forward = useCallback(() => {
 		const next = future.current.pop();
 		if (!next) return;
-		past.current.push(stateRef.current);
+		past.current.push(latest());
 		bumpHistory();
-		handlers.current.onChange(next);
-	}, []);
+		ask(next);
+	}, [latest, ask]);
 	const history: OutlineSurfaceHistory = {
 		canBack: past.current.length > 0,
 		canForward: future.current.length > 0,
@@ -120,38 +144,48 @@ export function OutlinePanelContent({
 	};
 
 	const navigate = useCallback(
-		(to: OutlineTarget) => go(outlinePanelStateFor(to, stateRef.current)),
-		[go],
+		(to: OutlineTarget) => go(outlinePanelStateFor(to, latest())),
+		[go, latest],
 	);
 
 	const goRef = useRef(go);
 	goRef.current = go;
-	const renderLink = useCallback(({ to, onClick, ...rest }: OutlineLinkProps) => {
-		const go = (event: MouseEvent<HTMLAnchorElement>) => {
-			onClick?.(event);
-			if (!isOpenClick(event)) return;
-			event.preventDefault();
-			const next = outlinePanelStateFor(to, stateRef.current);
-			const openNew = handlers.current.onOpenNew;
-			if (wantsNewPanel(event) && openNew) openNew(next);
-			else goRef.current(next);
-		};
-		return <a {...rest} href={outlineTargetHref(hrefTargetOf(to))} onClick={go} />;
-	}, []);
+	const renderLink = useCallback(
+		({ to, onClick, ...rest }: OutlineLinkProps) => {
+			const go = (event: MouseEvent<HTMLAnchorElement>) => {
+				onClick?.(event);
+				if (!isOpenClick(event)) return;
+				event.preventDefault();
+				const next = outlinePanelStateFor(to, latest());
+				const openNew = handlers.current.onOpenNew;
+				if (wantsNewPanel(event) && openNew) openNew(next);
+				else goRef.current(next);
+			};
+			return <a {...rest} href={outlineTargetHref(hrefTargetOf(to))} onClick={go} />;
+		},
+		[latest],
+	);
 
-	const onLoaded = useCallback((info: OutlineSurfaceLoaded) => {
-		const current = stateRef.current;
-		if (current.spaceId !== info.spaceId || current.blockId !== info.rootId) return;
-		handlers.current.onTitle?.(outlinePanelTitle(info.title || info.address) ?? null);
-		if (current.pageId === info.pageId) return;
-		handlers.current.onChange({ ...current, pageId: info.pageId });
-	}, []);
+	const onLoaded = useCallback(
+		(info: OutlineSurfaceLoaded) => {
+			// A load of a state the panel already left (a newer one asked for) changes nothing.
+			const current = latest();
+			if (current.spaceId !== info.spaceId || current.blockId !== info.rootId) return;
+			handlers.current.onTitle?.(outlinePanelTitle(info.title || info.address) ?? null);
+			if (current.pageId === info.pageId) return;
+			ask({ ...current, pageId: info.pageId });
+		},
+		[latest, ask],
+	);
 
-	const onSpaceLoaded = useCallback((space: OutlineSpaceDetail, name: string) => {
-		const current = stateRef.current;
-		if (current.spaceId !== space.id || current.blockId) return;
-		handlers.current.onTitle?.(outlinePanelTitle(name) ?? null);
-	}, []);
+	const onSpaceLoaded = useCallback(
+		(space: OutlineSpaceDetail, name: string) => {
+			const current = latest();
+			if (current.spaceId !== space.id || current.blockId) return;
+			handlers.current.onTitle?.(outlinePanelTitle(name) ?? null);
+		},
+		[latest],
+	);
 
 	const onMissing = useCallback(() => handlers.current.onTitle?.(null), []);
 

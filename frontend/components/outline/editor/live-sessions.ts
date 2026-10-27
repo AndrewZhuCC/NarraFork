@@ -17,13 +17,23 @@
  * keep the participant until the socket closes. Unless something was typed on the read: then it
  * stays for the grace period after the answer, so the merged text is sent first.
  *
+ * TYPING NOT ACKNOWLEDGED
+ * -----------------------
+ * A session is never dropped (grace period, making room) while the page has not acknowledged
+ * everything typed into it (`pending` or `awaiting`): it waits, offline included, for the socket
+ * to come back and the page to take it. At most `DEFAULT_UNACKED_WAIT_MS` (2 minutes) after its
+ * last editor let go: then it is dropped all the same, and the client gives what was not taken to
+ * the unsaved-text store (`dispose`), where every editor of the page shows it. A client is never
+ * disposed with typing still inside.
+ *
  * ADMISSION
  * ---------
  * The server takes at most `OUTLINE_LIVE_LIMITS.sessionsPerSocket` sessions per socket and
  * answers one more with a bare `unavailable`. So the tab counts its own: a new page first makes
  * room by dropping sessions that were held and released (in their grace period, oldest release
- * first); when every session is still held by an editor on screen, the page is refused here
- * (`null`) and the surface says why, instead of sending a join the server would refuse.
+ * first), except ones still waiting for their join's answer or for typing to be acknowledged;
+ * when no session can go, the page is refused here (`null`) and the surface says why, instead of
+ * sending a join the server would refuse.
  */
 import { OUTLINE_LIVE_LIMITS } from "@shared/outline-live-protocol";
 import { LiveClient, type LiveTransport } from "./live-client";
@@ -42,6 +52,13 @@ export interface SharedLiveSession {
 /** How long a page's session outlives its last editor (tab flicks and focus changes). */
 const DEFAULT_GRACE_MS = 5_000;
 let graceMs = DEFAULT_GRACE_MS;
+/**
+ * How long a session with typing the page has not acknowledged waits for it once let go (the
+ * socket coming back, the join, the acknowledgement); then its typing goes to the unsaved-text
+ * store. Long enough for a reconnect after a network change or a server restart.
+ */
+const DEFAULT_UNACKED_WAIT_MS = 2 * 60_000;
+let unackedWaitMs = DEFAULT_UNACKED_WAIT_MS;
 
 const sessionsBySocket = new WeakMap<LiveTransport, Map<string, SharedLiveSession>>();
 
@@ -59,6 +76,17 @@ function occupies(shared: SharedLiveSession): boolean {
 	return shared.client.status !== "closed";
 }
 
+/** Typing the page has not acknowledged (sent or not). */
+function unacked(client: LiveClient): boolean {
+	return client.pending.length > 0 || client.awaiting.length > 0;
+}
+
+/** Still waiting for typing to be acknowledged, and not too long yet (see TYPING NOT ACKNOWLEDGED). */
+function mustWait(shared: SharedLiveSession): number {
+	if (shared.client.status === "closed" || !unacked(shared.client)) return 0;
+	return Math.max(0, shared.releasedAt + unackedWaitMs - Date.now());
+}
+
 function dispose(map: Map<string, SharedLiveSession>, key: string, shared: SharedLiveSession) {
 	if (shared.timer) clearTimeout(shared.timer);
 	shared.timer = null;
@@ -70,7 +98,8 @@ function dispose(map: Map<string, SharedLiveSession>, key: string, shared: Share
 
 /**
  * Drop released sessions, oldest release first, until a new one fits. A session whose join is
- * still on its way is left alone: its leave could reach the server before the join is bound.
+ * still on its way is left alone (its leave could reach the server before the join is bound), and
+ * so is one with typing not acknowledged yet (it would leave without it).
  */
 function makeRoom(map: Map<string, SharedLiveSession>, limit: number): void {
 	let used = 0;
@@ -82,7 +111,8 @@ function makeRoom(map: Map<string, SharedLiveSession>, limit: number): void {
 				occupies(shared) &&
 				shared.refs === 0 &&
 				shared.releasedAt > 0 &&
-				shared.client.status !== "connecting",
+				shared.client.status !== "connecting" &&
+				!unacked(shared.client),
 		)
 		.sort((a, b) => a[1].releasedAt - b[1].releasedAt);
 	for (const [key, shared] of idle) {
@@ -120,6 +150,12 @@ export function acquireLiveSession(
 		drop: () => {
 			shared.timer = null;
 			if (shared.refs > 0) return;
+			// Typing not acknowledged yet: look again a little later (until the wait is over).
+			const wait = shared.releasedAt > 0 ? mustWait(shared) : 0;
+			if (wait > 0) {
+				shared.timer = setTimeout(shared.drop, Math.min(graceMs, wait));
+				return;
+			}
 			dispose(map, key, shared);
 		},
 	};
@@ -152,19 +188,23 @@ export function releaseLiveSession(shared: SharedLiveSession): void {
 	if (waiting()) {
 		// Never live, its join on its way: wait for the server's answer (a leave before it would be
 		// lost). Then nothing typed on the read: leave at once; something typed: it was merged and
-		// is being sent, so the usual grace period lets it go out (and be acknowledged).
+		// is being sent, so the usual grace period lets it go out (and be acknowledged). Offline
+		// with typing: not longer than the wait for typing (then it goes to the store).
 		const off = client.on(() => {
 			if (waiting()) return;
 			off();
 			shared.dropWhenJoined = null;
+			if (shared.timer) clearTimeout(shared.timer);
+			shared.timer = null;
 			if (client.ready && unsent()) {
 				if (shared.refs === 0) shared.timer = setTimeout(shared.drop, graceMs);
 			} else shared.drop();
 		});
 		shared.dropWhenJoined = off;
+		if (unsent()) shared.timer = setTimeout(shared.drop, unackedWaitMs);
 		return;
 	}
-	shared.timer = setTimeout(shared.drop, client.ready ? graceMs : 0);
+	shared.timer = setTimeout(shared.drop, client.ready || unsent() ? graceMs : 0);
 }
 
 /** The page's session client on this socket, live or not (no session is made). */
@@ -205,4 +245,9 @@ export function liveSessionsOn(transport: LiveTransport): Array<{
 /** Tests: a shorter grace period (null restores the default). */
 export function setLiveSessionGraceForTests(ms: number | null): void {
 	graceMs = ms ?? DEFAULT_GRACE_MS;
+}
+
+/** Tests: a shorter wait for typing not acknowledged (null restores the default). */
+export function setLiveSessionUnackedWaitForTests(ms: number | null): void {
+	unackedWaitMs = ms ?? DEFAULT_UNACKED_WAIT_MS;
 }

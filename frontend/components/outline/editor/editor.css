@@ -337,8 +337,12 @@
 	}
 }
 
-/* What was typed while connecting and could not be saved: shown to copy. */
-.nf-outline-editor .nf-outline-unsaved {
+/* Typing that did not reach the page (UnsavedTextsNotice): shown to copy or add back. */
+.nf-outline-unsaved-entry + .nf-outline-unsaved-entry {
+	margin-top: 8px;
+}
+
+.nf-outline-unsaved-notice .nf-outline-unsaved {
 	margin: 0;
 	max-height: 10em;
 	overflow: auto;

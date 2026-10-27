@@ -8,16 +8,16 @@
  *    undo and redo wait; a viewer may not type;
  *  - the snapshot replaces the seed: what was typed is merged onto it (3-way: someone else's
  *    change to the same block meanwhile is kept), and sent once live;
- *  - nothing typed is lost without the person knowing (review round 2, probes P1–P3):
+ *  - nothing typed is lost without the person knowing (review rounds 2–4, probes P1–P3):
  *      - a read showing the page cannot go live (over the live limits) takes no typing;
  *      - refused when it joins (too large, no access), or no longer allowed to write when the
- *        snapshot arrives: nothing is sent, and what was typed is kept to copy (`unsaved`);
- *      - typed into a block that the snapshot no longer has (deleted or moved meanwhile): the
- *        "deleted" notice, whose restore adds the typed text back as a new block;
+ *        snapshot arrives: nothing is sent, and what was typed is kept to copy (the unsaved-text
+ *        store, `unsaved-texts.test.ts` for what outlives the session);
+ *      - typed into a block that the snapshot no longer has (deleted or moved meanwhile): kept
+ *        too, and adding it back makes a new block (done once the page acknowledges it);
  *  - a session let go before it was live leaves as soon as its join is answered, never before
  *    (a leave that overtakes the join would be lost on the server); held again meanwhile, it
- *    stays; with something typed it stays for the grace period after the answer, so the merged
- *    text is sent before it leaves.
+ *    stays; with something typed it stays until the page acknowledged the merged text.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import {
@@ -37,6 +37,7 @@ import {
 	retainLiveSession,
 	setLiveSessionGraceForTests,
 } from "./live-sessions";
+import { clearUnsavedTextsForTests, dropUnsavedText, unsavedTextsOf } from "./unsaved-texts";
 
 /** A connected socket that records what is sent and lets the test answer. */
 function socket() {
@@ -68,7 +69,13 @@ function socket() {
 			handles.delete(handle);
 		},
 	};
-	const deliver = (frame: { kind: number; handle: number; head?: unknown; body?: Uint8Array }) => {
+	const deliver = (frame: {
+		kind: number;
+		handle: number;
+		n?: number;
+		head?: unknown;
+		body?: Uint8Array;
+	}) => {
 		const decoded = decodeLiveFrame(encodeLiveFrame(frame));
 		if (!decoded) throw new Error("bad frame");
 		for (const l of [...listeners]) l(decoded);
@@ -141,7 +148,10 @@ const type = (client: LiveClient, id: string, md: string) =>
 
 const sentKinds = (sent: LiveFrame[]) => sent.map((f) => f.kind);
 
-afterEach(() => setLiveSessionGraceForTests(null));
+afterEach(() => {
+	setLiveSessionGraceForTests(null);
+	clearUnsavedTextsForTests();
+});
 
 describe("read-only first: a page seeded from its HTTP read", () => {
 	test("the seed shows the read in its order and texts and sends nothing", () => {
@@ -212,8 +222,6 @@ describe("read-only first: a page seeded from its HTTP read", () => {
 	test("no longer allowed to write when the snapshot arrives: nothing is sent, the typing is kept to copy", () => {
 		const { transport, sent, deliver } = socket();
 		const client = new LiveClient(transport, PAGE, "edit");
-		const events: string[] = [];
-		client.on((e) => events.push(e));
 		client.seed(read());
 		type(client, B, "Bee typed");
 		deliver(joined(sent[0]?.handle as number, {}, { w: false }));
@@ -221,13 +229,13 @@ describe("read-only first: a page seeded from its HTTP read", () => {
 		expect(client.editable).toBe(false);
 		expect(client.textOf(B)).toBe("Bee");
 		expect(sentKinds(sent)).toEqual([LIVE_FRAME.join]);
-		expect(client.unsaved).toEqual({
-			reason: "read_only",
-			texts: [{ blockId: B, text: "Bee typed" }],
-		});
-		expect(events).toContain("unsaved");
-		client.dismissUnsaved();
-		expect(client.unsaved).toBeNull();
+		const kept = unsavedTextsOf(PAGE);
+		expect(kept).toMatchObject([
+			{ pageId: PAGE, blockId: B, text: "Bee typed", base: "Bee", reason: "read_only" },
+		]);
+		// Dismissed by the person: gone.
+		dropUnsavedText(kept[0]?.id as string);
+		expect(unsavedTextsOf(PAGE)).toEqual([]);
 	});
 
 	test("a read showing the page cannot go live takes no typing (probe P2)", () => {
@@ -261,20 +269,19 @@ describe("read-only first: a page seeded from its HTTP read", () => {
 		});
 		expect(client.status).toBe("closed");
 		expect(client.closeCode).toBe("too_large");
-		expect(client.unsaved).toEqual({
-			reason: "refused",
-			texts: [
-				{ blockId: B, text: "Bee typed then refused" },
-				{ blockId: A, text: "Alpha too" },
-			],
-		});
-		// The view keeps showing it (the editor stays to offer the copy).
-		expect(client.textOf(B)).toBe("Bee typed then refused");
+		expect(unsavedTextsOf(PAGE)).toMatchObject([
+			{ blockId: B, text: "Bee typed then refused", reason: "refused" },
+			{ blockId: A, text: "Alpha too", reason: "refused" },
+		]);
+		// Nothing of it is left in the client to send (or to lose).
+		expect(client.pending).toEqual([]);
+		expect(client.awaiting).toEqual([]);
 		expect(sentKinds(sent)).toEqual([LIVE_FRAME.join]);
 		releaseLiveSession(shared);
+		expect(unsavedTextsOf(PAGE)).toHaveLength(2);
 	});
 
-	test("typed into a block the snapshot no longer has: the deleted notice restores the text as a new block (probe P3)", () => {
+	test("typed into a block the snapshot no longer has: the text is kept, and added back as a new block (probe P3)", () => {
 		const { transport, sent, deliver } = socket();
 		const client = new LiveClient(transport, PAGE, "edit");
 		client.seed(read());
@@ -298,17 +305,31 @@ describe("read-only first: a page seeded from its HTTP read", () => {
 		});
 		expect(client.ready).toBe(true);
 		expect(client.visible.alive(C)).toBeUndefined();
-		expect(client.deleted).toMatchObject({ blockId: C, whileConnecting: true, by: "" });
-		const op = client.deleted?.restore[0];
-		expect(op).toMatchObject({ t: "i", p: A, content: "Child with my words", task: null });
-		expect(op && op.t === "i" ? op.id : C).not.toBe(C);
-		// Nothing sent until the person restores.
+		// Not a "deleted" notice: the block may have moved to another page.
+		expect(client.deleted).toBeNull();
+		const [entry] = unsavedTextsOf(PAGE);
+		expect(entry).toMatchObject({
+			blockId: C,
+			text: "Child with my words",
+			base: "Child",
+			reason: "moved_away",
+			restore: { parentId: A, task: null },
+		});
+		// Nothing sent until the person adds it back.
 		expect(sentKinds(sent)).toEqual([LIVE_FRAME.join]);
-		client.restoreDeleted();
+		expect(client.restoreUnsaved(entry as NonNullable<typeof entry>)).toBe(true);
+		// A second click does not add it twice.
+		expect(client.restoreUnsaved(entry as NonNullable<typeof entry>)).toBe(true);
 		const restored = client.visible.children(A);
 		expect(restored).toHaveLength(1);
+		expect(restored[0]).not.toBe(C);
 		expect(client.textOf(restored[0] as string)).toBe("Child with my words");
 		expect(sentKinds(sent)).toEqual([LIVE_FRAME.join, LIVE_FRAME.tx]);
+		// Kept until the page acknowledges it.
+		expect(unsavedTextsOf(PAGE)).toHaveLength(1);
+		const n = sent[1]?.n as number;
+		deliver({ kind: LIVE_FRAME.batch, handle, n, head: { a: [[n, 1]] } });
+		expect(unsavedTextsOf(PAGE)).toEqual([]);
 	});
 
 	test("its parent gone too: the text goes back under the nearest block still there", () => {
@@ -338,8 +359,9 @@ describe("read-only first: a page seeded from its HTTP read", () => {
 			},
 			body: Y.encodeStateAsUpdate(doc),
 		});
-		expect(client.deleted?.restore[0]).toMatchObject({ t: "i", p: PAGE });
-		client.restoreDeleted();
+		const [entry] = unsavedTextsOf(PAGE);
+		expect(entry?.restore).toEqual({ parentId: PAGE, task: null });
+		expect(client.restoreUnsaved(entry as NonNullable<typeof entry>)).toBe(true);
 		const kids = client.visible.children(PAGE);
 		expect(kids[0]).toBe(B);
 		expect(client.textOf(kids[1] as string)).toBe("Child with my words");
@@ -376,7 +398,7 @@ describe("a session let go before it was live", () => {
 		]);
 	});
 
-	test("typed on the read, let go before the snapshot: the merged text is sent, then it leaves (probe P1)", async () => {
+	test("typed on the read, let go before the snapshot: the merged text is sent and acknowledged, then it leaves (probe P1)", async () => {
 		setLiveSessionGraceForTests(40);
 		const { transport, sent, deliver } = socket();
 		const shared = acquireLiveSession(transport, PAGE, "edit");
@@ -386,13 +408,20 @@ describe("a session let go before it was live", () => {
 		type(shared.client, B, "Bee typed fast");
 		// The person jumped elsewhere (or hid the panel) before the snapshot.
 		releaseLiveSession(shared);
-		const answer = joined(sent[0]?.handle as number);
+		const handle = sent[0]?.handle as number;
+		const answer = joined(handle);
 		deliver(answer);
 		expect(sentKinds(sent)).toEqual([LIVE_FRAME.join, LIVE_FRAME.update]);
 		expect(liveSessionsOn(transport)).toHaveLength(1);
+		// Not acknowledged yet: it stays past the grace period.
+		await new Promise((r) => setTimeout(r, 80));
+		expect(sentKinds(sent)).toEqual([LIVE_FRAME.join, LIVE_FRAME.update]);
+		expect(liveSessionsOn(transport)).toHaveLength(1);
+		deliver({ kind: LIVE_FRAME.batch, handle, n: sent[1]?.n as number });
 		await new Promise((r) => setTimeout(r, 80));
 		expect(sentKinds(sent)).toEqual([LIVE_FRAME.join, LIVE_FRAME.update, LIVE_FRAME.leave]);
 		expect(liveSessionsOn(transport)).toEqual([]);
+		expect(unsavedTextsOf(PAGE)).toEqual([]);
 		// What went out is the typed text on the server's document.
 		const server = new Y.Doc();
 		Y.applyUpdate(server, answer.body);
