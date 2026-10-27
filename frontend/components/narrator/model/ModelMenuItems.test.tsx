@@ -323,6 +323,35 @@ describe("provider group header", () => {
 	});
 });
 
+describe("group ordering", () => {
+	test("pins default/summary first and sorts the remaining groups by provider label", async () => {
+		// Insertion order is deliberately scrambled and neither alphabetical by
+		// prefix nor by label: only the rendered header order proves the sort.
+		const scrambled: ModelOption[] = [
+			{ value: "zeta:z1", label: "Z1", provider: "zeta" },
+			{ value: "__summary__", label: "Follow summary", provider: "__summary__" },
+			{ value: "codex:gpt", label: "gpt", provider: "codex" },
+			{ value: "__default__", label: "Follow default", provider: "__default__" },
+			{ value: "a:one", label: "One", provider: "a" },
+		];
+		await render("a:one", scrambled, true, true, {
+			extraProps: {
+				providerLabels: { a: "Provider A", codex: "Codex", zeta: "Zeta Gateway" },
+			},
+		});
+		const headers = Array.from(host.querySelectorAll(".mantine-Menu-label")).map(
+			(header) => header.textContent?.trim() ?? "",
+		);
+		expect(headers).toEqual([
+			narratorLocale.modelGroupDefault,
+			narratorLocale.modelGroupSummary,
+			"Codex",
+			"Provider A",
+			"Zeta Gateway",
+		]);
+	});
+});
+
 describe("per-model global role actions", () => {
 	test("hides the three-dot control when handlers are not provided", async () => {
 		await render("a:one");

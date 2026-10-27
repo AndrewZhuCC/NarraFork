@@ -69,6 +69,39 @@ export function modelMenuSelection(
 	};
 }
 
+/**
+ * Role groups that stay pinned above the provider groups, in this exact order.
+ * They are current-state groups rather than catalog providers, so they must not
+ * drift around when providers are sorted alphabetically.
+ */
+const FIXED_MODEL_GROUP_ORDER: readonly string[] = ["__default__", "__summary__"];
+
+/**
+ * Order model-menu groups: the fixed role groups first (in
+ * FIXED_MODEL_GROUP_ORDER order), then every remaining group alphabetically by
+ * its display label.
+ *
+ * Labels rather than raw provider prefixes are compared, because the list the
+ * user reads is the label column: sorting by prefix would put "xiaomi" before
+ * "Xiaomi" and scatter gateway ids that do not match their brand name.
+ */
+export function orderModelGroupEntries<T>(
+	entries: ReadonlyArray<readonly [string, T]>,
+	labelOf: (provider: string) => string,
+): Array<readonly [string, T]> {
+	const fixedRank = (provider: string) => FIXED_MODEL_GROUP_ORDER.indexOf(provider);
+	return [...entries].sort(([a], [b]) => {
+		const rankA = fixedRank(a);
+		const rankB = fixedRank(b);
+		if (rankA !== -1 || rankB !== -1) {
+			if (rankA === -1) return 1;
+			if (rankB === -1) return -1;
+			return rankA - rankB;
+		}
+		return labelOf(a).localeCompare(labelOf(b));
+	});
+}
+
 /** Never shrink the dropdown below this, even if the visible area is tiny. */
 const MODEL_MENU_MIN_HEIGHT_PX = 96;
 /** Upper bound matching the historical fixed cap on large screens. */
