@@ -21,6 +21,7 @@ import { listBacklinks, resolveAddress } from "../resolve";
 import { revertCommit } from "../revert";
 import { searchOutline } from "../search";
 import type { OutlineSpaceRow, OutlineVersionRow } from "../store/port";
+import { OUTLINE_PAGE_HEAD_CHARS } from "../store/read-port";
 import { type OutlineNode, subtreeNodes } from "../tree";
 import type { OutlineOp, OutlineWriteInput, OutlineWriteResult } from "../write";
 import { writeOutline } from "../write";
@@ -532,6 +533,64 @@ export const OUTLINE_READ_CONTRACT: ContractCase[] = [
 			expect(onQ?.commits.map((c) => c.seq)).toContain(moved.commit?.seq);
 			expect(onQ?.commits.map((c) => c.seq)).not.toContain(seqs[1]);
 			expect(await readPageTimeline("missing-page", { store: ctx.store })).toBeNull();
+		},
+	},
+	{
+		name: "page lists and block history: sibling order, cursors, heads, newest first",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			const long = `Long page ${"x".repeat(OUTLINE_PAGE_HEAD_CHARS * 2)}`;
+			const r = await write(ctx, space, [
+				{ op: "insert", tempId: "a", parent: null, content: "page A" },
+				{ op: "insert", tempId: "b", parent: null, content: long },
+				{
+					op: "insert",
+					tempId: "c",
+					parent: null,
+					content: "page C",
+					task: { status: "todo" },
+					alias: "page-c",
+				},
+				{ op: "insert", tempId: "x", parent: { tempId: "a" }, content: "not a page" },
+			]);
+			const [a, b, c, x] = ids(r) as [string, string, string, string];
+			const d = ids(await write(ctx, space, [{ op: "insert", parent: null, content: "page D" }]));
+			await write(ctx, space, [{ op: "delete", block: { id: d[0] as string } }]);
+
+			const all = await ctx.store.listSpacePages(space.id, { limit: 50 });
+			expect(all.map((p) => p.id)).toEqual([a, b, c]);
+			expect(all[1]?.contentHead.length).toBe(OUTLINE_PAGE_HEAD_CHARS);
+			expect(all[1]?.contentHead.startsWith("Long page x")).toBe(true);
+			expect(all[2]).toMatchObject({ alias: "page-c", isTask: true, contentHead: "page C" });
+			expect(all[0]?.isTask).toBe(false);
+			const paged: string[] = [];
+			let after: { orderKey: string; id: string } | null = null;
+			for (let i = 0; i < 5; i++) {
+				const page = await ctx.store.listSpacePages(space.id, { after, limit: 2 });
+				paged.push(...page.map((p) => p.id));
+				const last = page.at(-1);
+				if (page.length < 2 || !last) break;
+				after = { orderKey: last.orderKey, id: last.id };
+			}
+			expect(paged).toEqual([a, b, c]);
+			expect(paged).not.toContain(x);
+
+			const seqs = [r.commit?.seq as number];
+			for (let i = 0; i < 3; i++) {
+				const w = await write(ctx, space, [{ op: "update", block: { id: x }, content: `v${i}` }]);
+				seqs.push(w.commit?.seq as number);
+			}
+			const moved = await write(ctx, space, [{ op: "move", block: { id: x }, parent: { id: c } }]);
+			seqs.push(moved.commit?.seq as number);
+			const history = await ctx.store.listBlockHistory(x, { limit: 10 });
+			expect(history.map((h) => h.fromSeq)).toEqual([...seqs].reverse());
+			expect(history[0]).toMatchObject({ pageId: c, toSeq: null, deleted: false });
+			expect((history[0]?.changeFlags ?? 0) & OUTLINE_CHANGE.PAGE).toBeTruthy();
+			expect((history.at(-1)?.changeFlags ?? 0) & OUTLINE_CHANGE.CREATE).toBeTruthy();
+			expect(history.at(-1)?.commitId).toBe(r.commit?.id as string);
+			const older = await ctx.store.listBlockHistory(x, { before: history[1]?.fromSeq, limit: 2 });
+			expect(older.map((h) => h.fromSeq)).toEqual(history.slice(2, 4).map((h) => h.fromSeq));
+			expect(await ctx.store.listBlockHistory("missing-block", { limit: 5 })).toEqual([]);
 		},
 	},
 	{
