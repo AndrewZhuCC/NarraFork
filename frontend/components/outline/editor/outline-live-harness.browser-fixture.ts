@@ -3,6 +3,9 @@
  * sessions (registry, sessions, write path, the isolated SQLite of `tests/preload.ts`) behind a
  * WebSocket, the editor fixture bundle, and headless Chromium (puppeteer-core, the binary CI
  * installs; `NF_TEST_CHROMIUM_PATH` points at it).
+ *
+ * Named as a browser fixture so `vlist-isolation.guard.test.ts` treats it as test-only and
+ * flags any production module that imports it.
  */
 import { existsSync } from "node:fs";
 import { basename } from "node:path";

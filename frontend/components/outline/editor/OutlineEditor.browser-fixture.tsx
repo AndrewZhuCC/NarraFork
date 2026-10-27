@@ -1,6 +1,6 @@
 /**
  * Browser fixture of the live outline editor: the real `OutlineEditor` over a WebSocket to the
- * test server (`outline-live.browser-harness.ts`), which runs the real live sessions. The
+ * test server (`outline-live-harness.browser-fixture.ts`), which runs the real live sessions. The
  * transport can be held (frames queue both ways), to make two people edit before either sees
  * the other.
  */

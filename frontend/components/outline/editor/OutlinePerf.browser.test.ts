@@ -18,7 +18,7 @@ import {
 	startHarness,
 	stopHarness,
 	until,
-} from "./outline-live.browser-harness";
+} from "./outline-live-harness.browser-fixture";
 
 let h: Harness;
 
