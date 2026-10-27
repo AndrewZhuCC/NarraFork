@@ -148,7 +148,13 @@ export interface LiveJoinHead {
 	/** Identifies this editor instance across reconnects (8–64 characters). */
 	key: string;
 	/** Resume a session this instance was in: body is the client's Yjs state vector. */
-	resume?: { epoch: number; op: number; tx: number };
+	/**
+	 * The session this client was in before (sent on every join after the first). Without
+	 * `reset` the client asks to resume it (a state-vector diff); with `reset` it wants a
+	 * snapshot. Either way the answer says which of its transactions of that session the page
+	 * already has (`tx`, `dur`), so the client neither loses nor repeats them.
+	 */
+	resume?: { epoch: number; op: number; tx: number; reset?: boolean };
 }
 
 /** Participant: number, user id, display name, color, `e` editing or `v` viewing. */
@@ -169,7 +175,10 @@ export interface LiveJoinedHead {
 	w: boolean;
 	/** The session's operation sequence number now. */
 	op: number;
-	/** The highest transaction of this client's key the session has processed. */
+	/**
+	 * The highest transaction of this client's previous session (`resume.epoch`) the page has
+	 * applied: the client does not send or replay those again.
+	 */
 	tx: number;
 	/** This participant's number. */
 	me: number;
@@ -181,9 +190,9 @@ export interface LiveJoinedHead {
 	/** Cursors of the peers now. */
 	cur?: Array<[pno: number, sel: LiveSelWire | null]>;
 	/**
-	 * Reset after the session the client resumed is gone (closed, or recovered after a crash):
-	 * the client's transactions of that session up to this number are already in the page, so
-	 * the client does not replay them.
+	 * Of those, the highest already in the log or committed (so safe from a crash): the client
+	 * forgets them. Ones after it up to `tx` are applied but not logged yet; the client keeps
+	 * them, unsent and not replayed, until a batch acknowledges them.
 	 */
 	dur?: number;
 }

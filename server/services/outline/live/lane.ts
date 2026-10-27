@@ -99,6 +99,9 @@ export class SpaceLane {
 			});
 		} finally {
 			this.running = false;
+			// A task queued after the loop saw the queue empty, while this pump was still ending,
+			// found it running and did not start one: it must not wait for the next task.
+			if (this.queue.length > 0) void this.pump();
 		}
 	}
 }

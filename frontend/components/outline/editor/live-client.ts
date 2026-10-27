@@ -5,8 +5,9 @@
  *   - Structure: confirmed (what the server acknowledged) + pending (applied optimistically,
  *     not acknowledged yet) = visible. The server orders, checks and commits each structural
  *     transaction; a refused one is dropped and the page is rebuilt from a fresh snapshot (the
- *     whole Yjs document too, so nothing of the refused change lingers), then every later
- *     pending transaction is replayed on the new state: only the refused one is lost.
+ *     whole Yjs document too, so nothing of the refused change lingers), then the pending
+ *     transactions the server had not applied are replayed on the new state: only the refused
+ *     one is lost, and nothing the server already has is applied twice.
  *   - Text: one Yjs document; every block's `Y.Text` exists from the snapshot on (the server
  *     creates them all when the session opens; a new block's text is created by its creator in
  *     the same transaction).
@@ -16,7 +17,10 @@
  *   - Reconnect: the client resumes the same server session with its state vector and gets
  *     exactly what it lacks, then re-sends what the server had not processed. When the session
  *     is gone (the server restarted, or it closed while this client was away) it starts over
- *     from a snapshot and replays its unacknowledged changes.
+ *     from a snapshot. Every join names the session the client was in; the answer says which of
+ *     its transactions the page applied (`tx`) and has safely (`dur`): those are not replayed,
+ *     and applied ones not yet safe wait in {@link LiveClient.awaiting} for their
+ *     acknowledgement.
  *   - Presence: who is here and where their cursors are, as Yjs relative positions; sent at
  *     most every {@link OUTLINE_LIVE_LIMITS.presenceIntervalMs}, never stored.
  *
@@ -208,6 +212,13 @@ export class LiveClient {
 	confirmed: Store;
 	visible: Store;
 	pending: PendingTx[] = [];
+	/**
+	 * Transactions the server applied but has not logged yet (learned at a join): not sent or
+	 * replayed again, and not applied to the visible structure (the server's state has them);
+	 * kept until a batch acknowledges them, and replayed only if a later join says the page
+	 * lost them.
+	 */
+	awaiting: PendingTx[] = [];
 	readonly views = new Set<ClientView>();
 	readonly presence = new Map<number, Peer>();
 	undoStack: Step[] = [];
@@ -405,12 +416,24 @@ export class LiveClient {
 			this.emit("closed");
 			return;
 		}
-		const resume = this.ready && !this.resetting && this.epoch !== 0;
+		// After the first join the server always learns the session this client was in, so its
+		// answer says which of the client's transactions the page has, snapshot or not.
+		const known = this.epoch !== 0;
+		const resume = known && this.ready && !this.resetting;
 		const head: LiveJoinHead = {
 			page: this.pageId,
 			mode: this.mode,
 			key: this.key,
-			...(resume ? { resume: { epoch: this.epoch, op: this.opSeq, tx: this.ackedTx } } : {}),
+			...(known
+				? {
+						resume: {
+							epoch: this.epoch,
+							op: this.opSeq,
+							tx: this.ackedTx,
+							...(resume ? {} : { reset: true }),
+						},
+					}
+				: {}),
 		};
 		this.setStatus("connecting");
 		this.sendFrame(
@@ -615,7 +638,7 @@ export class LiveClient {
 	}
 
 	private checkStall(): void {
-		const bytes = this.pending.reduce((n, tx) => n + tx.bytes, 0);
+		const bytes = [...this.pending, ...this.awaiting].reduce((n, tx) => n + tx.bytes, 0);
 		const stalled =
 			this.pending.length > OUTLINE_LIVE_LIMITS.maxPendingTx ||
 			bytes > OUTLINE_LIVE_LIMITS.maxPendingBytes;
@@ -858,11 +881,20 @@ export class LiveClient {
 			const p = this.presence.get(pno);
 			if (p) p.sel = sel;
 		}
+		// What the page has of this client's transactions: forget what is logged, keep what is
+		// applied but not logged (unsent, not replayed), send or replay the rest.
+		const all = [...this.awaiting, ...this.pending].sort((x, y) => x.n - y.n);
+		const dur = head.dur ?? 0;
+		const applied = Math.max(head.tx, dur);
+		const kept = all.filter((tx) => tx.n > dur);
+		this.awaiting = kept.filter((tx) => tx.n <= applied);
+		const rest = kept.filter((tx) => tx.n > applied);
+		this.ackedTx = Math.max(this.ackedTx, dur);
 		if (head.mode === "resume" && this.ready && !this.resetting) {
 			this.stats.resumes++;
-			this.onResumed(head, body);
+			this.onResumed(head, body, rest);
 		} else {
-			this.onReset(head, body);
+			this.onReset(head, body, rest);
 		}
 		this.epoch = head.epoch;
 		this.opSeq = head.op;
@@ -875,10 +907,9 @@ export class LiveClient {
 		for (const v of this.views) v.renderPresence();
 	}
 
-	private onReset(head: LiveJoinedHead, body: Uint8Array): void {
-		// Of the session this client resumed (gone now), what reached the page is not replayed.
-		const dur = head.dur ?? 0;
-		const replay = this.ready ? this.pending.filter((tx) => tx.n > dur) : [];
+	private onReset(head: LiveJoinedHead, body: Uint8Array, rest: PendingTx[]): void {
+		// Only what the page does not have is replayed onto the snapshot.
+		const replay = this.ready ? rest : [];
 		const first = !this.ready;
 		// Everything local goes: a fresh document from the snapshot (a refused change must not
 		// linger in it), then this client's unacknowledged changes are replayed on top.
@@ -889,7 +920,6 @@ export class LiveClient {
 		this.applyRemoteY(body);
 		this.confirmed = storeFromSnapshot(this.pageId, head.blocks ?? []);
 		this.pending = [];
-		this.ackedTx = 0;
 		this.visible = this.confirmed.clone();
 		this.textCache.clear();
 		this.undoStack = [];
@@ -933,13 +963,10 @@ export class LiveClient {
 		this.flushTyping();
 	}
 
-	private onResumed(head: LiveJoinedHead, body: Uint8Array): void {
-		// What reached the server's log is done; what it processed is not sent again but kept
-		// until acknowledged (a crash before the log has it must not lose it); the rest goes again.
-		const durable = Math.min(head.dur ?? head.tx, head.tx);
-		this.pending = this.pending.filter((tx) => tx.n > durable);
-		for (const tx of this.pending) tx.sent = tx.n <= head.tx;
-		this.ackedTx = Math.max(this.ackedTx, durable);
+	private onResumed(head: LiveJoinedHead, body: Uint8Array, rest: PendingTx[]): void {
+		// What the server has not applied goes again; what it applied is in the state it sends.
+		this.pending = rest;
+		for (const tx of this.pending) tx.sent = false;
 		if (head.blocks) this.confirmed = storeFromSnapshot(this.pageId, head.blocks);
 		else for (const c of head.ops ?? []) this.applyCommit(c);
 		this.applyRemoteY(body);
@@ -958,6 +985,7 @@ export class LiveClient {
 		const commits: Array<{ o: number; apply: () => void }> = [];
 		const acks = new Map((head?.a ?? []).map((a) => [a[0], a] as const));
 		if (ack > 0) {
+			if (this.awaiting.length > 0) this.awaiting = this.awaiting.filter((tx) => tx.n > ack);
 			const done = this.pending.filter((tx) => tx.n <= ack);
 			this.pending = this.pending.filter((tx) => tx.n > ack);
 			this.ackedTx = Math.max(this.ackedTx, ack);

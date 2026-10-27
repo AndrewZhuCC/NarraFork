@@ -139,12 +139,14 @@ export async function replayLiveEpochDetailed(
 					x?: string[];
 					k?: Record<string, number>;
 				};
-				for (const [id, content] of Object.entries(parsed.i ?? {})) intents.set(id, content);
+				// Within one row, what the database held (`b`) and cancels (`x`) are older than the
+				// intents (`i`) written with them: an intent is resolved only by a later row.
 				for (const [id, content] of Object.entries(parsed.b ?? {})) {
 					base.set(id, content);
 					intents.delete(id);
 				}
 				for (const id of parsed.x ?? []) intents.delete(id);
+				for (const [id, content] of Object.entries(parsed.i ?? {})) intents.set(id, content);
 				for (const [key, tx] of Object.entries(parsed.k ?? {})) {
 					if (Number.isSafeInteger(tx) && tx > (keys.get(key) ?? 0)) keys.set(key, tx);
 				}

@@ -31,14 +31,19 @@
  *     the increments outweigh a snapshot). A participant's transactions are acknowledged only
  *     once the log (or the page) has them: after a crash, what was acknowledged is replayed
  *     from the log (a startup job, or the next join), and what was not is still held by its
- *     client, which replays it into the next session; the next session tells a client which of
- *     its transactions already reached the page, so nothing is applied twice. Before the
- *     session commits text it logs what it is about to write (an intent), so a crash between
- *     the commit and the next append does not merge committed text with itself on replay.
+ *     client, which replays it into the next session. Every join after a client's first names
+ *     the session it was in, and the answer says which of its transactions the page applied
+ *     (`tx`) and which of those are safe in the log or committed (`dur`): the client forgets
+ *     the latter, keeps the rest of what was applied unsent until acknowledged, and replays
+ *     only what the page does not have, so nothing is applied twice (also across a refusal,
+ *     a restart or days offline: an ended session's positions stay in the log, `registry.ts`).
+ *     Before the session commits text it logs what it is about to write (an intent), so a
+ *     crash between the commit and the next append does not merge committed text with itself.
  *   - Failures: a commit that fails part way keeps what was written (the session takes it as
- *     the page now is); text that cannot be normalized or written is committed as code blocks;
- *     a log that cannot be committed is taken over by the next session of the page. A frame
- *     that cannot be encoded drops only its recipient.
+ *     the page now is); text that cannot be normalized or written is committed as code blocks,
+ *     and given up on (kept live and in the log) when even that fails a few times; a log that
+ *     cannot be committed is taken over by the next session of the page. A frame that cannot
+ *     be encoded drops only its recipient.
  *
  * Every method that touches the document or the database runs in the space's lane.
  */
@@ -90,7 +95,8 @@ export const OUTLINE_LIVE_TIMING: Record<
 	| "flushIdleMs"
 	| "flushMaxMs"
 	| "idleCloseMs"
-	| "flushRetryMs",
+	| "flushRetryMs"
+	| "narrowBudgetMs",
 	number
 > = {
 	/** Changes are coalesced and broadcast this often (design §7.2). */
@@ -107,6 +113,8 @@ export const OUTLINE_LIVE_TIMING: Record<
 	idleCloseMs: 60_000,
 	/** Retry delay after a failed commit of live text. */
 	flushRetryMs: 5_000,
+	/** Time one flush may spend narrowing a permanent failure down block by block. */
+	narrowBudgetMs: 15_000,
 };
 
 /** Bounds of a session. Mutable only so tests can shrink them. */
@@ -117,6 +125,8 @@ export const OUTLINE_LIVE_BOUNDS = {
 	 * it without bound. Participants rejoin at once.
 	 */
 	maxDocBytes: 16 * 1024 * 1024,
+	/** Failed commits of a block as code after which it is no longer retried (until edited). */
+	maxCommitFailures: 3,
 	/** A socket buffering more than this gets no more frames until it drains and rejoins. */
 	lagBytes: 1024 * 1024,
 	/** …and is told to rejoin once it is below this. */
@@ -166,6 +176,11 @@ export class Participant {
 	queuedBytes = 0;
 	/** The last selection frame, checked when presence is next sent (last one wins). */
 	rawSel: unknown = undefined;
+	/**
+	 * Others' structural changes ordered after one of this participant's own that is not
+	 * acknowledged yet: held so the client applies them in order.
+	 */
+	heldCommits: LiveCommitWire[] = [];
 	/** Set after a refusal: frames are dropped until the client joins again. */
 	blocked = false;
 	/** Frames were held back because the socket fell behind; it is told to rejoin when it drains. */
@@ -303,6 +318,10 @@ export class LivePage {
 	private snapshotWanted = false;
 	/** Blocks whose text could not be normalized or written: committed as a code block next. */
 	private readonly stuck = new Set<string>();
+	/** Failed commits per block, since its last successful one. */
+	private readonly failures = new Map<string, number>();
+	/** Blocks whose text cannot be committed even as code: kept live and in the log only. */
+	private readonly parked = new Set<string>();
 
 	private idleTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -552,16 +571,22 @@ export class LivePage {
 				.filter((x) => x.sel !== null)
 				.map((x) => [x.pno, x.sel] as [number, LiveSelWire | null]),
 		};
+		// Which of the client's transactions of its previous session the page has: this session's
+		// own bookkeeping when it is that session (a resume, or a snapshot after a refusal), else
+		// what the registry knows of the ended one (`dur`).
+		const sameSession = resume !== undefined && resume.epoch === this.epoch;
+		const processed = sameSession ? (this.keys.get(head.key) ?? 0) : (dur ?? 0);
+		const durable = sameSession
+			? Math.min(processed, this.keyDurable.get(head.key) ?? 0)
+			: (dur ?? 0);
 		let diff: Uint8Array | null = null;
-		if (resume && resume.epoch === this.epoch && stateVector.length > 0) {
+		if (sameSession && !resume.reset && stateVector.length > 0) {
 			try {
 				diff = Y.encodeStateAsUpdate(this.doc, stateVector);
 			} catch {
 				diff = null;
 			}
 		}
-		const processed = this.keys.get(head.key) ?? 0;
-		const durable = Math.min(processed, this.keyDurable.get(head.key) ?? 0);
 		if (resume && diff) {
 			const covered =
 				resume.op === this.opSeq ||
@@ -581,9 +606,9 @@ export class LivePage {
 			joined = {
 				...base,
 				mode: "reset",
-				tx: 0,
+				tx: processed,
+				dur: durable,
 				blocks: this.mirror.snapshot(),
-				...(dur !== undefined ? { dur } : {}),
 			};
 			body = Y.encodeStateAsUpdate(this.doc);
 		}
@@ -597,8 +622,11 @@ export class LivePage {
 			});
 			return { refused: "unavailable" };
 		}
-		p.lastTx = joined.tx;
-		p.durableTx = joined.mode === "resume" ? durable : 0;
+		// In this same session the participant goes on from where its client was: what is
+		// applied is not taken again, and is acknowledged once logged. A client of an ended
+		// session numbers on from its old transactions, which this session never saw.
+		p.lastTx = sameSession ? processed : 0;
+		p.durableTx = sameSession ? durable : 0;
 		p.ackedTx = p.durableTx;
 		p.windowStart = this.windowUpdates.length;
 		p.commitStart = this.windowCommits.length;
@@ -796,11 +824,33 @@ export class LivePage {
 			p.commitStart = 0;
 			// A participant that fell behind rejoins and gets everything from its state vector.
 			if (p.lagging) continue;
-			const own = commits.slice(commitStart).filter((c) => c.by !== p.pno);
+			const others = [
+				...p.heldCommits,
+				...commits.slice(commitStart).filter((c) => c.by !== p.pno),
+			];
 			const ackable = Math.min(p.lastTx, p.durableTx);
 			const ack = ackable > p.ackedTx ? ackable : 0;
 			const waiting = this.windowAcks.get(p.pno);
 			const acks = ack > 0 ? waiting?.filter((a) => a[0] <= ack) : undefined;
+			// The client applies structure in operation order: others' changes after its own
+			// first unacknowledged one wait for that acknowledgement.
+			let first = Number.POSITIVE_INFINITY;
+			for (const a of waiting ?? []) if (a[0] > ack && a[1] < first) first = a[1];
+			const own = others.filter((c) => c.o < first);
+			p.heldCommits = others.filter((c) => c.o >= first);
+			if (p.heldCommits.length > OUTLINE_LIVE_BOUNDS.opLog) {
+				// Held too long (the log is not taking writes): it rejoins and gets everything.
+				p.heldCommits = [];
+				p.lagging = true;
+				p.resyncSent = true;
+				this.stats.resyncs++;
+				try {
+					p.socket.send(encodeLiveFrame({ kind: LIVE_FRAME.resync, handle: p.handle }));
+				} catch (error) {
+					this.dropBroken(p, error);
+				}
+				continue;
+			}
 			const body = mergedFor(p.pno, start);
 			if (!body && own.length === 0 && ack === 0) continue;
 			const head: LiveBatchHead = {};
@@ -1034,6 +1084,8 @@ export class LivePage {
 	}
 
 	private markDirty(id: string, userId: string | null): void {
+		// Edited again: worth another try.
+		if (this.parked.delete(id)) this.failures.delete(id);
 		this.dirty.set(id, userId);
 		const now = Date.now();
 		if (this.firstDirtyAt === 0) this.firstDirtyAt = now;
@@ -1322,17 +1374,48 @@ export class LivePage {
 		const redirty = (ids: readonly string[], user: string | null) => {
 			for (const id of ids) if (!this.dirty.has(id)) this.dirty.set(id, user);
 		};
+		// Narrowing down a permanent failure costs a normalization (up to its timeout) per block:
+		// past this budget the rest are marked to go as code next time, at once.
+		const deadline = Date.now() + OUTLINE_LIVE_TIMING.narrowBudgetMs;
+		const giveUp = (id: string, user: string | null) => {
+			const n = (this.failures.get(id) ?? 0) + 1;
+			this.failures.set(id, n);
+			if (n < OUTLINE_LIVE_BOUNDS.maxCommitFailures) {
+				ok = false;
+				redirty([id], user);
+				return;
+			}
+			// Even as code it does not go in: stop retrying (and stop holding writes from outside
+			// back). The text stays live and in the log, which this session keeps at its close;
+			// a later edit of the block tries again.
+			this.parked.add(id);
+			logger.warn("Outline live text cannot be committed; kept in the log", {
+				pageId: this.pageId,
+				blockId: id,
+			});
+		};
 		for (const [user, ids] of byUser) {
 			const stuckBefore = new Set(this.stuck);
 			const r = await this.commitTexts(ids, user);
-			if (r.ok) continue;
+			if (r.ok) {
+				for (const id of ids) this.failures.delete(id);
+				continue;
+			}
 			const failed = ids.filter((id) => !r.done.has(id));
+			for (const id of r.done) this.failures.delete(id);
 			if (!r.permanent) {
 				ok = false;
 				redirty(failed, user);
 				continue;
 			}
 			for (const id of failed) {
+				if (Date.now() >= deadline) {
+					// Not tried alone, so not counted as its failure: it goes as code next time.
+					this.stuck.add(id);
+					ok = false;
+					redirty([id], user);
+					continue;
+				}
 				let one = failed.length > 1 ? await this.commitTexts([id], user) : r;
 				if (!one.ok && one.permanent && !stuckBefore.has(id)) {
 					this.stuck.add(id);
@@ -1342,7 +1425,9 @@ export class LivePage {
 					});
 					one = await this.commitTexts([id], user);
 				}
-				if (!one.ok) {
+				if (one.ok) this.failures.delete(id);
+				else if (one.permanent && this.stuck.has(id)) giveUp(id, user);
+				else {
 					ok = false;
 					redirty([id], user);
 				}
@@ -1976,6 +2061,7 @@ export class LivePage {
 			this.schedulePersist();
 			throw error;
 		}
+		// As replay reads a row: its sync and cancels are older than its intents.
 		for (const [id, content] of sync) {
 			if (this.syncPending.get(id) === content) this.syncPending.delete(id);
 			this.openIntents.delete(id);
@@ -1986,7 +2072,7 @@ export class LivePage {
 		}
 		for (const [id, content] of intents) {
 			if (this.intentPending.get(id) === content) this.intentPending.delete(id);
-			if (!sync.has(id) && !cancels.has(id)) this.openIntents.set(id, content);
+			this.openIntents.set(id, content);
 		}
 		this.markDurable(keys);
 		this.snapshotWritten = true;
@@ -2117,7 +2203,7 @@ export class LivePage {
 		await this.persistNow();
 		this.flushBroadcast();
 		this.closed = true;
-		this.closedClean = committed && this.dirty.size === 0;
+		this.closedClean = committed && this.dirty.size === 0 && this.parked.size === 0;
 		for (const timer of [
 			this.broadcastTimer,
 			this.presenceTimer,

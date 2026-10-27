@@ -17,6 +17,7 @@ import {
 	OUTLINE_LIVE_MAX_HANDLE,
 } from "@shared/outline-live-protocol";
 import { and, eq } from "drizzle-orm";
+import * as Y from "yjs";
 import { db } from "../../../../db";
 import { aclGrants, outlineLiveUpdates, projects, users } from "../../../../db/schema";
 import { eventBus } from "../../../../lib/event-bus";
@@ -28,23 +29,32 @@ import {
 	releaseOutlineLive,
 } from "../../../../websocket/outline-live-ws";
 import { OutlineEditTextError } from "../../edit-text-runner";
-import { OutlineBusyError } from "../../errors";
+import { OutlineBusyError, OutlineWriteError } from "../../errors";
 import { ensureProjectSpace } from "../../spaces";
-import { outlineStore } from "../../store";
+import { outlineStore, setOutlineStore } from "../../store";
 import type { OutlineSpaceRow } from "../../store/port";
 import { writeOutline } from "../../write";
+import { SpaceLane } from "../lane";
 import {
 	abandonLiveSessionForTests,
 	closeAllLiveSessions,
+	ENDED_EPOCH,
+	forgetEndedSessionsForTests,
 	handleLiveFrame,
 	joinLive,
 	liveSessionOf,
+	persistAllLiveSessions,
 	releaseLiveSocket,
 	runInLane,
 	startLiveReplay,
 } from "../registry";
 import { replayLiveEpoch } from "../replay";
-import { OUTLINE_LIVE_BOUNDS, OUTLINE_LIVE_HOOKS, OUTLINE_LIVE_TIMING } from "../session";
+import {
+	LIVE_SYNC_ACTOR,
+	OUTLINE_LIVE_BOUNDS,
+	OUTLINE_LIVE_HOOKS,
+	OUTLINE_LIVE_TIMING,
+} from "../session";
 import { client, kids, settle, struct, TestLink, TestSocket, type, waitFor } from "./harness";
 
 const NOW = "2026-10-27T00:00:00.000Z";
@@ -115,12 +125,14 @@ async function content(id: string): Promise<string> {
 	return (await outlineStore.getBlock(id))?.content ?? "<missing>";
 }
 
+/** The page's log rows of its sessions (not the ended-session records under epoch 0). */
 async function logRows(pageId: string): Promise<number> {
 	return db
 		.select()
 		.from(outlineLiveUpdates)
 		.where(eq(outlineLiveUpdates.pageBlockId, pageId))
-		.all().length;
+		.all()
+		.filter((r) => r.epoch !== 0).length;
 }
 
 async function children(id: string): Promise<string[]> {
@@ -161,6 +173,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+	setOutlineStore(undefined);
 	Object.assign(OUTLINE_LIVE_HOOKS, savedHooks);
 	for (const c of clients.splice(0)) c.dispose();
 	for (const l of links.splice(0)) if (l.connected) l.disconnect();
@@ -789,5 +802,377 @@ describe("the page itself", () => {
 		await waitFor(() => a.closeCode !== null || !liveSessionOf(pageId), 3000, "ended");
 		await waitFor(() => a.closeCode === "access_denied", 5000, "rejoin refused");
 		expect(liveSessionOf(pageId)).toBeUndefined();
+	});
+});
+
+/** The session's log has its snapshot and everything so far; later typing waits (500 ms in production). */
+async function logged(a: LiveClient, pageId: string, block: string): Promise<void> {
+	type(a, block, "1");
+	await settle();
+	await waitFor(() => !!liveSessionOf(pageId) && a.pending.length === 0, 3000, "logged");
+	OUTLINE_LIVE_TIMING.persistMs = 60_000;
+}
+
+/**
+ * Alice types into X (applied, not logged yet, so not acknowledged), then indents Y while Bob
+ * deletes it: her indent is refused and her client rebuilds from a snapshot.
+ */
+async function refusedAfterTyping() {
+	const { pageId, ids } = await page(["X", "Y"]);
+	const [x, y] = ids as [string, string];
+	const la = link(owner);
+	const lb = link(writer);
+	const a = open(la, pageId);
+	const b = open(lb, pageId);
+	await waitFor(() => a.ready && b.ready, 3000, "joined");
+	await logged(a, pageId, x);
+	la.hold(true);
+	return {
+		pageId,
+		x,
+		y,
+		a,
+		b,
+		la,
+		lb,
+		/** Bob's delete goes first, then Alice's frames. */
+		async refuse() {
+			struct(a, [{ t: "m", id: y, p: x, k: keyBetween(null, null) }]);
+			struct(b, [{ t: "d", id: y }]);
+			await waitFor(() => b.pending.length === 0 || !b.visible.get(y), 3000, "deleted");
+			await settle();
+			la.hold(false);
+			await waitFor(() => a.stats.rejects >= 1, 3000, "refused");
+			await waitFor(() => a.status === "live" && a.ready, 3000, "rebuilt");
+			await settle();
+		},
+	};
+}
+
+describe("what the page already has of a client's transactions", () => {
+	test("a refused structural change does not make the client repeat its typing", async () => {
+		const t = await refusedAfterTyping();
+		type(t.a, t.x, "ab");
+		await sleep(30);
+		type(t.a, t.x, "cd");
+		await t.refuse();
+		// The page applied the typing: the client keeps it, unsent, until the log has it.
+		expect(t.a.pending.length).toBe(0);
+		expect(t.a.awaiting.length).toBe(2);
+		expect(t.a.textOf(t.x)).toBe("X1abcd");
+		expect(t.b.textOf(t.x)).toBe("X1abcd");
+		const s = liveSessionOf(t.pageId);
+		await runInLane(space.id, async () => {
+			await s?.persistNow();
+		});
+		await waitFor(() => t.a.awaiting.length === 0, 3000, "acknowledged");
+		await runInLane(space.id, async () => {
+			await s?.flushContent();
+		});
+		expect(await content(t.x)).toBe("X1abcd");
+		expect(t.a.textOf(t.x)).toBe("X1abcd");
+	});
+
+	test("what the page applied but lost in a crash is replayed, once", async () => {
+		const t = await refusedAfterTyping();
+		type(t.a, t.x, "ab");
+		await sleep(30);
+		type(t.a, t.x, "cd");
+		await t.refuse();
+		expect(t.a.awaiting.length).toBe(2);
+		t.b.dispose();
+		t.lb.disconnect();
+		// The process dies before the log has the typing.
+		abandonLiveSessionForTests(t.pageId);
+		OUTLINE_LIVE_TIMING.persistMs = 20;
+		t.la.disconnect();
+		t.la.reconnect();
+		await waitFor(
+			() => t.a.status === "live" && t.a.awaiting.length === 0 && t.a.pending.length === 0,
+			5000,
+			"rejoined, replayed, acknowledged",
+		);
+		await runInLane(space.id, async () => {
+			await liveSessionOf(t.pageId)?.flushContent();
+		});
+		expect(t.a.textOf(t.x)).toBe("X1abcd");
+		expect(await content(t.x)).toBe("X1abcd");
+	});
+
+	test("after a resume, a move the page already applied does not hide a later one", async () => {
+		const { pageId, ids } = await page(["X", "Z", "W"]);
+		const [x, z, w] = ids as [string, string, string];
+		const la = link(owner);
+		const a = open(la, pageId);
+		await waitFor(() => a.ready, 3000, "joined");
+		await logged(a, pageId, x);
+		await runInLane(space.id, async () => {
+			await liveSessionOf(pageId)?.flushContent();
+		});
+		// The log stops taking writes: Alice's move is committed, not acknowledged.
+		setOutlineStore({
+			...outlineStore,
+			appendLiveUpdates: async () => {
+				throw new Error("disk I/O error");
+			},
+		});
+		struct(a, [{ t: "m", id: z, p: x, k: keyBetween(null, null) }]);
+		await settle();
+		expect((await outlineStore.getBlock(z))?.parentId).toBe(x);
+		expect(a.pending.length).toBe(1);
+		la.disconnect();
+		la.reconnect();
+		await waitFor(() => a.status === "live", 3000, "resumed");
+		await settle();
+		expect(a.stats.resumes).toBe(1);
+		expect(a.pending.length).toBe(0);
+		expect(a.awaiting.length).toBe(1);
+		// Someone moves Z on: Alice sees that move, not her old one on top of it.
+		await writeOutline({
+			spaceId: space.id,
+			ops: [{ op: "move", block: { id: z }, parent: { id: w } }],
+			actor: { kind: "agent", id: "narrator-x" },
+			responsibleUserId: owner,
+		});
+		await waitFor(() => a.confirmed.get(z)?.parentId === w, 3000, "alice has the move");
+		expect(a.visible.get(z)?.parentId).toBe(w);
+		setOutlineStore(undefined);
+		await runInLane(space.id, async () => {
+			await liveSessionOf(pageId)?.persistNow();
+		});
+		await waitFor(() => a.awaiting.length === 0, 3000, "acknowledged");
+		expect(a.visible.get(z)?.parentId).toBe(w);
+	});
+
+	for (const restart of [false, true]) {
+		test(`sockets closing before a shutdown's acknowledgements, rejoin ${restart ? "after a restart" : "in the same process"}`, async () => {
+			const { pageId, ids } = await page(["X"]);
+			const x = ids[0] as string;
+			const la = link(owner);
+			const a = open(la, pageId);
+			await waitFor(() => a.ready, 3000, "joined");
+			await logged(a, pageId, x);
+			OUTLINE_LIVE_TIMING.persistMs = 500;
+			type(a, x, "ab");
+			await sleep(30);
+			type(a, x, "cd");
+			await waitFor(() => liveSessionOf(pageId)?.textOf(x) === "X1abcd", 3000, "applied");
+			expect(a.pending.length).toBe(2);
+			// The worst order: connections first, then the sessions close (log, commit).
+			la.disconnect();
+			await closeAllLiveSessions("ended");
+			expect(await content(x)).toBe("X1abcd");
+			// The log keeps how far each client got, for a client that comes back later.
+			const ended = db
+				.select()
+				.from(outlineLiveUpdates)
+				.where(
+					and(
+						eq(outlineLiveUpdates.pageBlockId, pageId),
+						eq(outlineLiveUpdates.epoch, ENDED_EPOCH),
+					),
+				)
+				.all();
+			expect(ended.length).toBe(1);
+			expect(await logRows(pageId)).toBe(0);
+			if (restart) forgetEndedSessionsForTests();
+			la.reconnect();
+			await waitFor(() => a.status === "live" && a.pending.length === 0, 3000, "rejoined");
+			await settle();
+			await runInLane(space.id, async () => {
+				await liveSessionOf(pageId)?.flushContent();
+			});
+			expect(a.textOf(x)).toBe("X1abcd");
+			expect(await content(x)).toBe("X1abcd");
+		});
+	}
+
+	test("a shutdown logs and acknowledges what arrived before the sockets close", async () => {
+		const { pageId, ids } = await page(["X"]);
+		const x = ids[0] as string;
+		const la = link(owner);
+		const a = open(la, pageId);
+		await waitFor(() => a.ready, 3000, "joined");
+		await logged(a, pageId, x);
+		type(a, x, "ab");
+		await settle();
+		expect(a.pending.length).toBe(1);
+		const n = a.pending[0]?.n as number;
+		// performGracefulShutdown: this step, then closeAllConnections(). The acknowledgement is
+		// on the socket when the step returns, not on a timer the closing would cancel.
+		await persistAllLiveSessions();
+		expect(la.socket.sent.some((f) => f.kind === LIVE_FRAME.batch && f.n >= n)).toBe(true);
+		await settle();
+		expect(a.pending.length).toBe(0);
+		la.disconnect();
+		await closeAllLiveSessions("ended");
+		expect(await content(x)).toBe("X1ab");
+	});
+});
+
+describe("logs written around a commit", () => {
+	test("an intent logged with its block's old content in one row is not cancelled by it", async () => {
+		const { pageId, ids } = await page(["x"]);
+		const block = ids[0] as string;
+		// The session committed "x hello!" (normalized from the typed "x hello") just before it
+		// died; its last row (a compaction, or its first snapshot) holds the block's old content
+		// and the intent together.
+		await writeOutline({
+			spaceId: space.id,
+			ops: [{ op: "update", block: { id: block }, content: "x hello!" }],
+			actor: { kind: "human", id: owner },
+			responsibleUserId: owner,
+		});
+		const doc = new Y.Doc();
+		const text = new Y.Text();
+		doc.getMap<Y.Text>("texts").set(block, text);
+		text.insert(0, "x hello");
+		const epoch = 424_242;
+		const at = new Date().toISOString();
+		const b64 = (data: Uint8Array) => Buffer.from(data).toString("base64");
+		await outlineStore.appendLiveUpdates([
+			{
+				pageBlockId: pageId,
+				epoch,
+				seq: 0,
+				updateB64: b64(Y.encodeStateAsUpdate(doc)),
+				actorKind: "system",
+				actorId: "outline-live",
+				createdAt: at,
+			},
+			{
+				pageBlockId: pageId,
+				epoch,
+				seq: 1,
+				updateB64: b64(
+					new TextEncoder().encode(
+						JSON.stringify({ b: { [block]: "x" }, i: { [block]: "x hello!" } }),
+					),
+				),
+				actorKind: "system",
+				actorId: LIVE_SYNC_ACTOR,
+				createdAt: at,
+			},
+		]);
+		doc.destroy();
+		expect(await replayLiveEpoch(pageId, epoch)).toBe("empty");
+		expect(await content(block)).toBe("x hello!");
+	});
+});
+
+describe("structure delivered in order", () => {
+	test("others' changes after an own one not acknowledged yet wait for its acknowledgement", async () => {
+		const { pageId, ids } = await page(["X", "Y", "Z"]);
+		const [x, y, z] = ids as [string, string, string];
+		const a = open(link(owner), pageId);
+		const b = open(link(writer), pageId);
+		await waitFor(() => a.ready && b.ready, 3000, "joined");
+		await logged(a, pageId, x);
+		OUTLINE_LIVE_TIMING.persistMs = 20;
+		// The log stops taking writes: commits go in, acknowledgements wait.
+		const base = outlineStore;
+		setOutlineStore({
+			...base,
+			appendLiveUpdates: async () => {
+				throw new Error("disk I/O error");
+			},
+		});
+		struct(a, [{ t: "m", id: z, p: x, k: keyBetween(null, null) }]);
+		await waitFor(() => b.confirmed.get(z)?.parentId === x, 3000, "bob has alice's move");
+		struct(b, [{ t: "m", id: z, p: y, k: keyBetween(null, null) }]);
+		await settle();
+		expect((await outlineStore.getBlock(z))?.parentId).toBe(y);
+		// Alice has neither her acknowledgement nor Bob's later move.
+		expect(a.pending.length).toBe(1);
+		expect(a.confirmed.get(z)?.parentId).toBe(pageId);
+		setOutlineStore(undefined);
+		await waitFor(() => a.pending.length === 0 && b.pending.length === 0, 3000, "acknowledged");
+		await settle();
+		expect(a.confirmed.get(z)?.parentId).toBe(y);
+		expect(a.visible.get(z)?.parentId).toBe(y);
+	});
+});
+
+describe("text that cannot be committed", () => {
+	test("narrowing a failure down block by block stops at its time budget", async () => {
+		const { pageId, ids } = await page(["one", "two", "three"]);
+		const a = open(link(owner), pageId);
+		await waitFor(() => a.ready, 3000, "joined");
+		for (const id of ids) type(a, id, " <<slow>>");
+		await settle();
+		let calls = 0;
+		OUTLINE_LIVE_HOOKS.normalize = async (texts) => {
+			calls++;
+			if (texts.some((t) => t.includes("<<slow>>") && !t.startsWith("```")))
+				throw new OutlineEditTextError("OUTLINE_TEXT_TIMEOUT", "timed out", 504);
+			return await savedHooks.normalize(texts);
+		};
+		OUTLINE_LIVE_TIMING.narrowBudgetMs = 0;
+		const s = liveSessionOf(pageId);
+		// The batch fails; no block is tried alone past the budget: all go as code next time.
+		expect(await runInLane(space.id, async () => (await s?.flushContent()) ?? false)).toBe(false);
+		expect(calls).toBe(1);
+		expect(await runInLane(space.id, async () => (await s?.flushContent()) ?? false)).toBe(true);
+		for (const [i, id] of ids.entries())
+			expect(await content(id)).toBe(`\`\`\`\n${["one", "two", "three"][i]} <<slow>>\n\`\`\``);
+	});
+
+	test("a block that fails even as code is given up on: outside writes go on, the log keeps it", async () => {
+		const { pageId, ids } = await page(["fine", "never", "other"]);
+		const [fine, never, other] = ids as [string, string, string];
+		const a = open(link(owner), pageId);
+		await waitFor(() => a.ready, 3000, "joined");
+		type(a, fine, " ok");
+		type(a, never, " typed");
+		await settle();
+		await waitFor(() => a.pending.length === 0, 3000, "logged");
+		OUTLINE_LIVE_HOOKS.write = async (input, options) => {
+			if (input.ops.some((op) => op.op === "update" && "id" in op.block && op.block.id === never))
+				throw new OutlineWriteError("too many siblings", "OUTLINE_TOO_MANY_SIBLINGS");
+			return await savedHooks.write(input, options);
+		};
+		const s = liveSessionOf(pageId);
+		const flush = () => runInLane(space.id, async () => (await s?.flushContent()) ?? false);
+		const agentWrite = () =>
+			writeOutline({
+				spaceId: space.id,
+				ops: [{ op: "update", block: { id: other }, content: "agent text" }],
+				actor: { kind: "agent", id: "narrator-x" },
+				responsibleUserId: owner,
+			});
+		expect(await flush()).toBe(false);
+		expect(await content(fine)).toBe("fine ok");
+		// The barrier's flush is the second attempt: still retried, so writes wait.
+		await expect(agentWrite()).rejects.toBeInstanceOf(OutlineBusyError);
+		// The third failure gives up: nothing is retried, the barrier lets writes through.
+		expect(await flush()).toBe(true);
+		expect(s?.hasUnflushed).toBe(false);
+		await agentWrite();
+		expect(await content(other)).toBe("agent text");
+		const epoch = s?.epoch as number;
+		await closeAllLiveSessions("ended");
+		expect(await content(never)).toBe("never");
+		expect(await logRows(pageId)).toBeGreaterThan(0);
+		// Whatever was wrong is fixed: the log's text goes in.
+		OUTLINE_LIVE_HOOKS.write = savedHooks.write;
+		expect(await replayLiveEpoch(pageId, epoch)).toBe("committed");
+		expect(await content(never)).toBe("never typed");
+		expect(await content(other)).toBe("agent text");
+	});
+});
+
+describe("the lane", () => {
+	test("a task queued while the lane finishes its last one runs at once", async () => {
+		const lane = new SpaceLane("lane-test", async () => {});
+		for (let ticks = 0; ticks < 8; ticks++) {
+			await lane.run(async () => {});
+			for (let i = 0; i < ticks; i++) await Promise.resolve();
+			let ran = false;
+			const next = lane.run(() => {
+				ran = true;
+			});
+			await Promise.race([next, sleep(200)]);
+			expect({ ticks, ran }).toEqual({ ticks, ran: true });
+		}
 	});
 });

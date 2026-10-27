@@ -42,6 +42,7 @@ import { holdsLane, isOwnLiveWrite, SpaceLane } from "./lane";
 import { type RecoveredChange, replayAllLiveEpochs, replayLiveEpochDetailed } from "./replay";
 import {
 	type CommittedEvent,
+	LIVE_SYNC_ACTOR,
 	LivePage,
 	type LiveSocket,
 	OUTLINE_LIVE_TIMING,
@@ -63,9 +64,11 @@ export const OUTLINE_LIVE_SOCKET_BOUNDS = {
 	 * `maxPendingBytes` unacknowledged, so only a misbehaving one gets here; it is dismissed.
 	 */
 	queuedBytes: 2 * OUTLINE_LIVE_LIMITS.maxPendingBytes,
-	/** How long `recovered` keeps an ended session's client positions, and for how many. */
-	recoveredMs: 30 * 60_000,
+	/** How long an ended session's client positions are kept (memory and log), and how many. */
+	recoveredMs: 7 * 24 * 60 * 60_000,
 	recoveredSessions: 1_000,
+	/** Ended sessions of one page whose client positions the log keeps. */
+	endedPerPage: 32,
 	/** Leftover epochs one open replays at most (the rest wait for the startup job). */
 	replayPerOpen: 64,
 } as const;
@@ -84,7 +87,10 @@ const state = hotSafe("narrafork.outlineLive.state", () => ({
 	reauthTimer: undefined as ReturnType<typeof setTimeout> | undefined,
 	accessEpoch: 0,
 	replayDone: null as Promise<unknown> | null,
-	/** `${pageId}:${epoch}` of an ended session → client key → highest transaction in the page. */
+	/**
+	 * `${pageId}:${epoch}` of an ended session → client key → highest transaction in the page.
+	 * A cache of the log's epoch-0 rows (`recordEnded`).
+	 */
 	recovered: new Map<string, { at: number; keys: Map<string, number> }>(),
 	/** Epochs whose log cannot be read, so opens do not read them again (an operator's job). */
 	unreadable: new Set<string>(),
@@ -93,8 +99,15 @@ const state = hotSafe("narrafork.outlineLive.state", () => ({
 	warned: 0,
 }));
 
-function rememberRecovered(pageId: string, epoch: number, keys: Map<string, number>): void {
-	if (keys.size === 0) return;
+/**
+ * The log keeps, under epoch {@link ENDED_EPOCH} of a page, one row per ended session (seq =
+ * that session's epoch, a sync row with `k` only): how far each client's transactions reached
+ * the page. A client that comes back after the session ended (a close, a crash and replay, a
+ * restart, a night offline) learns it at its join and does not replay what the page has.
+ */
+export const ENDED_EPOCH = 0;
+
+function cacheRecovered(pageId: string, epoch: number, keys: Map<string, number>): void {
 	const now = Date.now();
 	for (const [key, entry] of state.recovered) {
 		if (now - entry.at <= OUTLINE_LIVE_SOCKET_BOUNDS.recoveredMs) break;
@@ -108,13 +121,81 @@ function rememberRecovered(pageId: string, epoch: number, keys: Map<string, numb
 	}
 }
 
-/** Of a client's earlier session of a page (now gone), the transactions in the page. */
-function recoveredTx(pageId: string, head: LiveJoinHead): number | undefined {
+function fresh(createdAt: string): boolean {
+	return Date.now() - Date.parse(createdAt) <= OUTLINE_LIVE_SOCKET_BOUNDS.recoveredMs;
+}
+
+/** Record an ended session's client positions (memory and log). In the page's space lane. */
+async function recordEnded(
+	pageId: string,
+	epoch: number,
+	keys: Map<string, number>,
+): Promise<void> {
+	if (keys.size === 0) return;
+	cacheRecovered(pageId, epoch, keys);
+	try {
+		const rows = (
+			await outlineStore.listLiveUpdates(pageId, ENDED_EPOCH, {
+				limit: 2 * OUTLINE_LIVE_SOCKET_BOUNDS.endedPerPage,
+			})
+		)
+			.filter((r) => r.seq !== epoch && fresh(r.createdAt))
+			.sort((x, y) => (x.createdAt < y.createdAt ? 1 : -1))
+			.slice(0, OUTLINE_LIVE_SOCKET_BOUNDS.endedPerPage - 1);
+		rows.push({
+			pageBlockId: pageId,
+			epoch: ENDED_EPOCH,
+			seq: epoch,
+			updateB64: Buffer.from(JSON.stringify({ k: Object.fromEntries(keys) })).toString("base64"),
+			actorKind: "system",
+			actorId: LIVE_SYNC_ACTOR,
+			createdAt: new Date().toISOString(),
+		});
+		rows.sort((x, y) => x.seq - y.seq);
+		await outlineStore.replaceLiveUpdates(pageId, ENDED_EPOCH, rows);
+	} catch (error) {
+		logger.warn("Outline live session end could not be recorded", {
+			pageId,
+			error: String(error),
+		});
+	}
+}
+
+/** Of a client's earlier session of a page (now ended), its transactions the page has. */
+async function endedTx(pageId: string, head: LiveJoinHead): Promise<number | undefined> {
 	const epoch = head.resume?.epoch;
-	if (epoch === undefined) return undefined;
+	if (epoch === undefined || epoch <= ENDED_EPOCH) return undefined;
 	const entry = state.recovered.get(`${pageId}:${epoch}`);
-	if (!entry || Date.now() - entry.at > OUTLINE_LIVE_SOCKET_BOUNDS.recoveredMs) return undefined;
-	return entry.keys.get(head.key);
+	if (entry && Date.now() - entry.at <= OUTLINE_LIVE_SOCKET_BOUNDS.recoveredMs)
+		return entry.keys.get(head.key);
+	const [row] = await outlineStore.listLiveUpdates(pageId, ENDED_EPOCH, {
+		afterSeq: epoch - 1,
+		limit: 1,
+	});
+	if (!row || row.seq !== epoch || !fresh(row.createdAt)) return undefined;
+	try {
+		const parsed = JSON.parse(Buffer.from(row.updateB64, "base64").toString("utf8")) as {
+			k?: Record<string, number>;
+		};
+		const keys = new Map(
+			Object.entries(parsed.k ?? {}).filter(([, tx]) => Number.isSafeInteger(tx)),
+		);
+		cacheRecovered(pageId, epoch, keys);
+		return keys.get(head.key);
+	} catch {
+		return undefined;
+	}
+}
+
+/** Drop the ended-session rows of a page that are past keeping (the startup job). */
+async function pruneEnded(pageId: string): Promise<void> {
+	const rows = await outlineStore.listLiveUpdates(pageId, ENDED_EPOCH, {
+		limit: 2 * OUTLINE_LIVE_SOCKET_BOUNDS.endedPerPage,
+	});
+	const keep = rows.filter((r) => fresh(r.createdAt));
+	if (keep.length === rows.length) return;
+	if (keep.length === 0) await outlineStore.deleteLiveUpdates(pageId, ENDED_EPOCH);
+	else await outlineStore.replaceLiveUpdates(pageId, ENDED_EPOCH, keep);
 }
 
 /** A rate-limited warning (a misbehaving client must not flood the log). */
@@ -249,7 +330,8 @@ function validJoinHead(head: unknown): LiveJoinHead | null {
 		(!r ||
 			!Number.isSafeInteger(r.epoch) ||
 			!Number.isSafeInteger(r.op) ||
-			!Number.isSafeInteger(r.tx))
+			!Number.isSafeInteger(r.tx) ||
+			(r.reset !== undefined && typeof r.reset !== "boolean"))
 	)
 		return null;
 	return h as LiveJoinHead;
@@ -279,7 +361,7 @@ async function openSession(
 			const tag = `${pageId}:${e.epoch}`;
 			if (state.unreadable.has(tag)) continue;
 			const r = await replayLiveEpochDetailed(pageId, e.epoch);
-			rememberRecovered(pageId, e.epoch, r.keys);
+			if (r.outcome !== "kept" || r.changes) await recordEnded(pageId, e.epoch, r.keys);
 			if (r.outcome !== "kept") continue;
 			if (r.changes) adopted.push({ epoch: e.epoch, changes: r.changes });
 			else state.unreadable.add(tag);
@@ -315,7 +397,7 @@ async function closeSession(page: LivePage, code: LiveCloseCode, idle = false): 
 			if (binding.page === page) bindings.delete(handle);
 	}
 	await page.close(code);
-	rememberRecovered(page.pageId, page.epoch, page.durableKeys(page.closedClean));
+	await recordEnded(page.pageId, page.epoch, page.durableKeys(page.closedClean));
 	if (state.sessions.get(page.pageId) === page) state.sessions.delete(page.pageId);
 	retireLane(page.spaceId);
 }
@@ -376,13 +458,17 @@ export async function joinLive(socket: LiveSocket, frame: LiveFrame): Promise<vo
 			if (socket.closed) return { refused: "ended" as LiveCloseCode };
 			const page = await openSession(head.page, space);
 			if ("refused" in page) return page;
+			const ended =
+				head.resume && head.resume.epoch !== page.epoch
+					? await endedTx(head.page, head)
+					: undefined;
 			const joined = page.join(
 				socket,
 				handle,
 				head,
 				frame.body,
 				head.mode === "edit" && canWrite,
-				recoveredTx(head.page, head),
+				ended,
 			);
 			if ("refused" in joined) return joined;
 			return { page, participant: joined };
@@ -564,9 +650,17 @@ export async function closeAllLiveSessions(code: LiveCloseCode): Promise<void> {
 	);
 }
 
-/** Write every session's pending log rows now (shutdown, before anything slower). */
+/**
+ * Write every session's pending log rows now and acknowledge them (shutdown, before the
+ * sockets close).
+ */
 export async function persistAllLiveSessions(): Promise<void> {
-	await Promise.all([...state.sessions.values()].map((page) => page.persistNow()));
+	await Promise.all(
+		[...state.sessions.values()].map(async (page) => {
+			await page.persistNow();
+			page.flushBroadcast();
+		}),
+	);
 }
 
 /**
@@ -579,8 +673,12 @@ export function startLiveReplay(): Promise<unknown> {
 		async (pageId, epoch) => {
 			const page = await outlineStore.getBlock(pageId);
 			const run = async () => {
+				if (epoch === ENDED_EPOCH) {
+					await pruneEnded(pageId);
+					return "empty" as const;
+				}
 				const r = await replayLiveEpochDetailed(pageId, epoch);
-				rememberRecovered(pageId, epoch, r.keys);
+				if (r.outcome !== "kept" || r.changes) await recordEnded(pageId, epoch, r.keys);
 				return r.outcome;
 			};
 			if (!page) return await run();
@@ -589,7 +687,7 @@ export function startLiveReplay(): Promise<unknown> {
 			const lane = laneFor(page.spaceId);
 			try {
 				return await lane.run(async () =>
-					state.sessions.get(pageId) ? ("empty" as const) : await run(),
+					state.sessions.get(pageId) && epoch !== ENDED_EPOCH ? ("empty" as const) : await run(),
 				);
 			} finally {
 				retireLane(page.spaceId);
@@ -639,6 +737,11 @@ export function abandonLiveSessionForTests(pageId: string): void {
 			if (binding.page === session) bindings.delete(handle);
 	}
 	retireLane(session.spaceId);
+}
+
+/** Forget the in-memory copy of ended sessions' client positions, as a new process (tests). */
+export function forgetEndedSessionsForTests(): void {
+	state.recovered.clear();
 }
 
 /** The session of a page, if one is open (tests and diagnostics). */

@@ -448,9 +448,13 @@ describe("persistence", () => {
 		la.disconnect();
 		await waitFor(() => liveSessionOf(pageId) === undefined, 3000, "closed");
 		expect(await content(block)).toBe("idle!");
-		expect(
-			db.select().from(outlineLiveUpdates).where(eq(outlineLiveUpdates.pageBlockId, pageId)).all(),
-		).toHaveLength(0);
+		const left = db
+			.select()
+			.from(outlineLiveUpdates)
+			.where(eq(outlineLiveUpdates.pageBlockId, pageId))
+			.all();
+		// Only the record of how far each client got (epoch 0), for a client coming back later.
+		expect(left.map((r) => r.epoch)).toEqual([0]);
 	});
 });
 
