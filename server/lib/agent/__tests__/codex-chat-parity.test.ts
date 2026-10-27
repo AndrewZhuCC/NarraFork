@@ -255,6 +255,52 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 	describe(`Codex ${transport} reflection tool prefix`, () => {
 		const capture = (overrides: Partial<ChatParams> = {}) =>
 			captureChat(overrides, "codex", transport);
+		test("dynamically loaded tools stay callable without changing the prefix or reflection ceiling", async () => {
+			const normal: Partial<ChatParams> = {
+				model: "codex:gpt-6-luna",
+				history: [
+					{ role: "developer", content: "parent instructions" },
+					{ role: "user", content: "shared history" },
+				],
+				tools: [parentFunction],
+				reflectionTools: decisionTools,
+			};
+			const before = await capture(normal);
+			const loaded = { ...parentFunction, name: "LoadedTool" };
+			const addition = { type: "additional_tools", role: "developer", tools: [loaded] };
+			const history = [...(normal.history ?? []), addition];
+			const after = await capture({ ...normal, history });
+			expect(after.body.tools).toEqual(before.body.tools);
+			expect(after.body.instructions).toBe(before.body.instructions);
+			const previousInput = before.body.input as unknown[];
+			expect(after.body.input).toEqual([
+				...previousInput.slice(0, -1),
+				addition,
+				...previousInput.slice(-1),
+			]);
+			expect(after.body.tool_choice).toEqual({
+				type: "allowed_tools",
+				mode: "auto",
+				tools: [
+					...(before.body.tool_choice as { tools: unknown[] }).tools,
+					{ type: "function", name: loaded.name },
+				],
+			});
+			const reflection = await capture({
+				...normal,
+				history,
+				tools: decisionTools,
+				reflectionParentTools: after.body.tools as unknown[],
+				reflectionAllowedTools: [dangerConfirmTool.name],
+			});
+			expect(reflection.body.tools).toEqual(after.body.tools);
+			expect(reflection.body.input).toEqual(after.body.input);
+			expect(reflection.body.tool_choice).toEqual({
+				type: "allowed_tools",
+				mode: "required",
+				tools: [{ type: "function", name: dangerConfirmTool.name }],
+			});
+		});
 		test("full inherited declarations only enable the explicit reflection ceiling", async () => {
 			const parent = await capture({
 				tools: [parentFunction, ...decisionTools],

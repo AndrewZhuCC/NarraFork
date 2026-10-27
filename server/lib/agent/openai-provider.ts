@@ -319,6 +319,25 @@ export function applyCodexReflectionTools(
 	const allowed = reflection
 		? reserved
 		: tools.filter((tool) => tool.type !== "function" || !reservedNames.has(tool.name));
+	// Loaded definitions stay in history; only extend the ordinary execution gate.
+	if (!reflection && Array.isArray(body.input)) {
+		for (const item of body.input) {
+			if (!isRecord(item) || !isResponsesInputItem(item) || !Array.isArray(item.tools)) continue;
+			for (const tool of item.tools) {
+				if (
+					!isRecord(tool) ||
+					tool.type !== "function" ||
+					typeof tool.name !== "string" ||
+					!tool.name ||
+					reservedNames.has(tool.name) ||
+					names.has(tool.name)
+				)
+					continue;
+				allowed.push({ type: "function", name: tool.name });
+				names.add(tool.name);
+			}
+		}
+	}
 	// Hosted tools must also be excluded during reflection: they execute upstream.
 	body.tool_choice = allowed.length
 		? {
