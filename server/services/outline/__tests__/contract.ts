@@ -114,7 +114,7 @@ function versionAt(versions: OutlineVersionRow[], seq: number): OutlineVersionRo
 // Invariant checks over a whole space
 // ─────────────────────────────────────────────────────────────────────────────
 
-function linkSet(links: Array<{ kind: string; targetKind: string; targetRef: string }>) {
+export function linkSet(links: Array<{ kind: string; targetKind: string; targetRef: string }>) {
 	return links
 		.map((l) => linkKey(l as Parameters<typeof linkKey>[0]))
 		.sort()
@@ -249,7 +249,7 @@ interface ModelBlock {
 	pending?: boolean;
 }
 
-interface SnapshotEntry {
+export interface SnapshotEntry {
 	parentId: string | null;
 	pageId: string;
 	index: number;
@@ -263,9 +263,13 @@ interface SnapshotEntry {
  * Random transactions against the store and an independent in-memory model of their meaning.
  * After every commit the live tree in the tables must equal the model; at the end, the tree
  * rebuilt from version rows for every seq (`from_seq <= s < to_seq`) must equal the model's
- * snapshot at that seq, open links included, and the space invariants must hold.
+ * snapshot at that seq, open links included, and the space invariants must hold. Returns the
+ * space and the model's snapshot at every commit seq, for checks built on the same history.
  */
-async function randomizedHistory(ctx: OutlineContractContext, seed: number): Promise<void> {
+export async function randomizedHistory(
+	ctx: OutlineContractContext,
+	seed: number,
+): Promise<{ space: OutlineSpaceRow; snapshots: Map<number, Map<string, SnapshotEntry>> }> {
 	const rnd = mulberry32(seed);
 	const pick = <T>(items: readonly T[]): T => items[Math.floor(rnd() * items.length)] as T;
 	const space = await personalSpace(ctx);
@@ -556,10 +560,11 @@ async function randomizedHistory(ctx: OutlineContractContext, seed: number): Pro
 	for (const [seq, snapshot] of snapshots) expect(treeAt(dump, seq)).toEqual(snapshot);
 	checkSpaceInvariants(dump);
 	checkChangeFlags(dump);
+	return { space, snapshots };
 }
 
 /** The live tree as of `seq`, rebuilt from version and link rows alone. */
-function treeAt(dump: SpaceDump, seq: number): Map<string, SnapshotEntry> {
+export function treeAt(dump: SpaceDump, seq: number): Map<string, SnapshotEntry> {
 	const live = new Map<string, OutlineVersionRow>();
 	const byBlock = new Map<string, OutlineVersionRow[]>();
 	for (const v of dump.versions) {
@@ -603,7 +608,7 @@ function treeAt(dump: SpaceDump, seq: number): Map<string, SnapshotEntry> {
 }
 
 /** Each version's flags describe exactly how it differs from the previous one. */
-function checkChangeFlags(dump: SpaceDump): void {
+export function checkChangeFlags(dump: SpaceDump): void {
 	const byBlock = new Map<string, OutlineVersionRow[]>();
 	for (const v of dump.versions) {
 		const list = byBlock.get(v.blockId);
@@ -925,6 +930,80 @@ export const OUTLINE_STORE_CONTRACT: ContractCase[] = [
 				"one",
 				"two",
 			]);
+			checkSpaceInvariants(await ctx.dump(space.id));
+		},
+	},
+	{
+		name: "caller-chosen sids and content normalized by the caller",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			const r = await write(ctx, space, [
+				{ op: "insert", tempId: "a", sid: "Chosen01", parent: null, content: "page" },
+				{
+					op: "insert",
+					sid: "Chosen02",
+					parent: { tempId: "a" },
+					content: `see [[${space.key}/Chosen01]]`,
+				},
+			]);
+			expect(r.results.map((x) => x.sid)).toEqual(["Chosen01", "Chosen02"]);
+			expect((await ctx.store.getBlockBySid(space.id, "Chosen02"))?.content).toBe(
+				`see [[${space.key}/Chosen01]]`,
+			);
+			await rejects(
+				write(ctx, space, [{ op: "insert", sid: "Chosen01", parent: null, content: "again" }]),
+				"OUTLINE_ID_TAKEN",
+			);
+			await rejects(
+				write(ctx, space, [
+					{ op: "insert", sid: "Twice001", parent: null, content: "x" },
+					{ op: "insert", sid: "Twice001", parent: null, content: "y" },
+				]),
+				"OUTLINE_INVALID_OP",
+			);
+			await rejects(
+				write(ctx, space, [{ op: "insert", sid: "bad/sid", parent: null, content: "x" }]),
+				"OUTLINE_INVALID_OP",
+			);
+			// Another space may use the same sid.
+			const other = await personalSpace(ctx);
+			expect(
+				(await write(ctx, other, [{ op: "insert", sid: "Chosen01", parent: null, content: "x" }]))
+					.results[0]?.sid,
+			).toBe("Chosen01");
+
+			// Canonical content is taken as is: not normalized again, its links as handed over.
+			const content = "**bold** and [[Some page]]";
+			const canonical = await writeOutline(
+				{
+					spaceId: space.id,
+					ops: [{ op: "insert", parent: null, content }],
+					actor: ACTOR,
+					responsibleUserId: null,
+				},
+				{
+					store: ctx.store,
+					canonical: [
+						{ content, links: [{ kind: "link", targetKind: "text", targetRef: "Some page" }] },
+					],
+				},
+			);
+			const id = canonical.results[0]?.blockId as string;
+			expect((await ctx.store.getBlock(id))?.content).toBe(content);
+			expect(
+				(await ctx.store.listOpenLinks([id], 10)).map((l) => [l.kind, l.targetKind, l.targetRef]),
+			).toEqual([["link", "text", "Some page"]]);
+			await expect(
+				writeOutline(
+					{
+						spaceId: space.id,
+						ops: [{ op: "insert", parent: null, content: "other" }],
+						actor: ACTOR,
+						responsibleUserId: null,
+					},
+					{ store: ctx.store, canonical: [{ content: "not the same", links: [] }] },
+				),
+			).rejects.toThrow("canonical content does not match");
 			checkSpaceInvariants(await ctx.dump(space.id));
 		},
 	},

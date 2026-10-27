@@ -7,7 +7,8 @@
  *   1. Validate and prepare, with no database access: operation shapes and limits, content
  *      normalized to the block dialect (`normalizeBlock`; out-of-dialect structure becomes
  *      child blocks and is reported in the result's notes), content hashes and the links each
- *      content holds.
+ *      content holds. A caller may hand over content it normalized off the main thread
+ *      (`OutlineWriteOptions.canonical`); only hashing is left then.
  *   2. Plan against current state: read the space's commit counter, then only the rows the
  *      operations need (referenced blocks, sibling lists, subtrees of deleted or re-paged
  *      blocks, alias owners, open links), apply the operations to an in-memory working copy and
@@ -24,6 +25,9 @@
  *
  * A version conflict (`baseVersionSeq` no longer matches) rejects the whole transaction with
  * `OutlineConflictError` naming the blocks; the caller re-reads them.
+ *
+ * A compensating commit (`revert.ts`) is written through the same planner, so it keeps the same
+ * invariants; see `OutlineWriteOptions.compensating` for what differs.
  */
 import { createHash } from "node:crypto";
 import { NotFoundError } from "@server/lib/errors";
@@ -35,6 +39,7 @@ import {
 	type DialectNote,
 	isAlias,
 	isOrderKey,
+	isShortId,
 	isValidMention,
 	keyBetween,
 	keysBetween,
@@ -65,6 +70,7 @@ import {
 	OUTLINE_CHANGE,
 	OUTLINE_LIMITS,
 	type OutlineActorKind,
+	type OutlineCommitKind,
 	type OutlineLinkKind,
 	type OutlineTaskJson,
 } from "./model";
@@ -132,6 +138,11 @@ export type OutlineOp =
 			tempId?: string;
 			/** Caller-chosen id (a live editing client creates ids before the server sees them). */
 			id?: string;
+			/**
+			 * Caller-chosen sid, so content written in the same transaction can link to the block
+			 * by its address. Must be free in the space.
+			 */
+			sid?: string;
 			/** `null`: a new page of the space. */
 			parent: OutlineBlockRef | null;
 			position?: OutlinePosition;
@@ -163,6 +174,25 @@ export type OutlineOp =
 			block: OutlineBlockRef;
 			/** `null` makes the block a plain block again. */
 			task: OutlineTaskPatch | null;
+	  } & BaseVersioned)
+	| ({
+			/**
+			 * Bring a deleted block back (its descendants stay deleted; restore them one by one,
+			 * parents first). Every field defaults to what the block had when it was deleted. Its
+			 * page follows from its new parent. An alias another live block holds now is dropped
+			 * and reported in the result's `adjustments`, never taken over.
+			 */
+			op: "restore";
+			block: OutlineBlockRef;
+			/** `null`: as a page. Default: the parent it had, which must be live. */
+			parent?: OutlineBlockRef | null;
+			/** Default: its old order key (right after the sibling holding it, if taken). */
+			position?: OutlinePosition;
+			content?: string;
+			alias?: string | null;
+			task?: OutlineTaskInput | null;
+			/** Default: the tags it had. */
+			tags?: string[];
 	  } & BaseVersioned);
 
 export interface OutlineWriteInput {
@@ -185,11 +215,20 @@ export interface OutlineBlockAddressed {
 	address: string;
 }
 
+/** Something an operation did differently from what it asked, without failing. */
+export type OutlineAdjustment =
+	/** The alias is held by another live block (`heldBy`); the block was written without one. */
+	| { kind: "alias-dropped"; alias: string; heldBy: string }
+	/** The order key asked for is used by a sibling; the block was placed right after it. */
+	| { kind: "order-key-moved"; wanted: string; got: string };
+
 export interface OutlineOpResult extends OutlineBlockAddressed {
 	/** Blocks created from out-of-dialect structure in the content, in document order. */
 	split: OutlineBlockAddressed[];
 	/** What normalization did to the content. */
 	notes: DialectNote[];
+	/** Present when the operation was adjusted (see {@link OutlineAdjustment}). */
+	adjustments?: OutlineAdjustment[];
 }
 
 export interface OutlineWriteResult {
@@ -209,6 +248,31 @@ export interface OutlineWriteOptions {
 	now?: () => Date;
 	/** Plans tried before giving up on a space that keeps changing. */
 	maxAttempts?: number;
+	/**
+	 * Internal to `revert.ts`: the operations put blocks back to states read from their history,
+	 * so they are not caller input. The commit is recorded as `revert`; content is taken as
+	 * stored (canonical already: not normalized, never split); the operation limit becomes four
+	 * per row the commit may touch and the per-transaction content limit is lifted, while the
+	 * row limit still holds. Aliases that are taken now are dropped (reported) instead of
+	 * failing the write. When the space is no longer at `expectNextSeq` (a commit landed after
+	 * the history was read) the write rejects with `OutlineStaleWriteError`, writing nothing.
+	 */
+	compensating?: { expectNextSeq: number };
+	/**
+	 * Content the caller normalized itself, by operation index: normalization costs tens of
+	 * milliseconds per large block, so a caller handling untrusted input runs it off the main
+	 * thread (`edit-text.ts`) and hands over the result. Each entry's `content` must equal the
+	 * operation's content and be canonical already (`normalizeBlock(content).content ===
+	 * content`, so nothing is split off); `links` are what `contentLinks(content)` reads. The
+	 * writer hashes it and takes it as is.
+	 */
+	canonical?: ReadonlyArray<OutlineCanonicalContent | null | undefined>;
+}
+
+/** Content normalized before `writeOutline` was called; see `OutlineWriteOptions.canonical`. */
+export interface OutlineCanonicalContent {
+	content: string;
+	links: ExtractedLink[];
 }
 
 const DEFAULT_ATTEMPTS = 5;
@@ -226,7 +290,14 @@ const ASSIGNEE_RE = /^(?:agent|human):[\p{L}\p{N}_.-]*[\p{L}\p{N}_]$/u;
 const DUE_RE = /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?)?$/;
 const CLIENT_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 const TASK_STATUSES: ReadonlySet<string> = new Set(["todo", "doing", "done", "cancelled"]);
-const OP_KINDS: ReadonlySet<string> = new Set(["insert", "update", "move", "delete", "setTask"]);
+const OP_KINDS: ReadonlySet<string> = new Set([
+	"insert",
+	"update",
+	"move",
+	"delete",
+	"setTask",
+	"restore",
+]);
 
 interface PreparedNode {
 	content: string;
@@ -273,6 +344,32 @@ function prepareNode(node: BlockNode, opIndex: number): PreparedNode {
 		links,
 		task: node.task ? { status: node.task, assignee: null } : null,
 		children: node.children.map((child) => prepareNode(child, opIndex)),
+	};
+}
+
+/** Content read from history: canonical already, so it is hashed and its links read as is. */
+function prepareStoredContent(content: string, opIndex: number): PreparedContent {
+	const links = contentLinks(content);
+	checkLinkCount(links, opIndex);
+	return { content, contentHash: hashContent(content), links, notes: [], split: [] };
+}
+
+/** Content normalized by the caller (see `OutlineWriteOptions.canonical`). */
+function prepareCanonicalContent(
+	given: OutlineCanonicalContent,
+	content: string,
+	opIndex: number,
+): PreparedContent {
+	if (given.content !== content) {
+		throw new Error(`outline operation ${opIndex}: canonical content does not match the operation`);
+	}
+	checkLinkCount(given.links, opIndex);
+	return {
+		content,
+		contentHash: hashContent(content),
+		links: given.links,
+		notes: [],
+		split: [],
 	};
 }
 
@@ -383,23 +480,31 @@ function checkBase(op: { baseVersionSeq?: number; block: OutlineBlockRef }, opIn
 
 /**
  * Check every operation and prepare its content. Throws before any read, so a malformed or
- * oversized transaction never reaches the database.
+ * oversized transaction never reaches the database. `stored`: a compensating commit's content,
+ * read from history (see `OutlineWriteOptions.compensating`).
  */
-function prepareOps(ops: readonly OutlineOp[]): Array<PreparedContent | null> {
+function prepareOps(
+	ops: readonly OutlineOp[],
+	stored = false,
+	canonical?: OutlineWriteOptions["canonical"],
+): Array<PreparedContent | null> {
 	if (!Array.isArray(ops) || ops.length === 0)
 		throw invalid("a transaction needs at least one operation", null);
-	if (ops.length > OUTLINE_LIMITS.maxOps) {
+	const maxOps = stored ? OUTLINE_LIMITS.maxRowsTouched * 4 : OUTLINE_LIMITS.maxOps;
+	if (ops.length > maxOps) {
 		throw new OutlineWriteError(
-			`a transaction may hold at most ${OUTLINE_LIMITS.maxOps} operations (got ${ops.length})`,
+			`a transaction may hold at most ${maxOps} operations (got ${ops.length})`,
 			"OUTLINE_TOO_MANY_OPS",
 		);
 	}
 	let totalBytes = 0;
 	const tempIds = new Set<string>();
+	const sids = new Set<string>();
 	const sized: Array<string | null> = ops.map((op, i) => {
 		if (!op || typeof op !== "object" || !OP_KINDS.has((op as { op: string }).op))
 			throw invalid("unknown operation", i);
-		const content = op.op === "insert" || op.op === "update" ? op.content : undefined;
+		const content =
+			op.op === "insert" || op.op === "update" || op.op === "restore" ? op.content : undefined;
 		if (content === undefined) {
 			if (op.op === "insert") throw invalid("insert needs content", i);
 			return null;
@@ -416,7 +521,7 @@ function prepareOps(ops: readonly OutlineOp[]): Array<PreparedContent | null> {
 		totalBytes += bytes;
 		return content;
 	});
-	if (totalBytes > OUTLINE_LIMITS.maxTransactionBodyBytes) {
+	if (!stored && totalBytes > OUTLINE_LIMITS.maxTransactionBodyBytes) {
 		throw new OutlineWriteError(
 			`the transaction carries ${totalBytes} bytes of content; the limit is ${OUTLINE_LIMITS.maxTransactionBodyBytes}`,
 			"OUTLINE_TRANSACTION_TOO_LARGE",
@@ -435,6 +540,12 @@ function prepareOps(ops: readonly OutlineOp[]): Array<PreparedContent | null> {
 				}
 				if (op.id !== undefined && (typeof op.id !== "string" || !CLIENT_ID_RE.test(op.id)))
 					throw invalid("id must be 8-64 characters of [A-Za-z0-9_-]", i);
+				if (op.sid !== undefined) {
+					if (typeof op.sid !== "string" || !isShortId(op.sid))
+						throw invalid(`${JSON.stringify(op.sid)} is not a valid sid`, i);
+					if (sids.has(op.sid)) throw invalid(`sid ${op.sid} is used twice`, i);
+					sids.add(op.sid);
+				}
 				if (op.tempId !== undefined) {
 					if (typeof op.tempId !== "string" || op.tempId === "")
 						throw invalid("tempId must be a non-empty string", i);
@@ -466,9 +577,26 @@ function prepareOps(ops: readonly OutlineOp[]): Array<PreparedContent | null> {
 					checkTaskFields(op.task, i);
 				}
 				break;
+			case "restore":
+				checkRef(op.block, "block", i);
+				checkBase(op, i);
+				if (op.parent !== undefined && op.parent !== null) checkRef(op.parent, "parent", i);
+				checkPosition(op.position, i);
+				checkAlias(op.alias, i);
+				if (op.tags !== undefined) checkTags(op.tags, i);
+				if (op.task !== undefined && op.task !== null) {
+					if (op.task.status === undefined) throw invalid("a task needs a status", i);
+					checkTaskFields(op.task, i);
+				}
+				break;
 		}
 	});
-	return sized.map((content, i) => (content === null ? null : prepareContent(content, i)));
+	return sized.map((content, i) => {
+		if (content === null) return null;
+		if (stored) return prepareStoredContent(content, i);
+		const given = canonical?.[i];
+		return given ? prepareCanonicalContent(given, content, i) : prepareContent(content, i);
+	});
 }
 
 function canonicalTask(task: {
@@ -526,6 +654,8 @@ interface WorkingBlock {
 	base: OutlineBlockMeta | null;
 	/** Whether the id was chosen by the caller. */
 	callerId: boolean;
+	/** Whether the sid was chosen by the caller. */
+	callerSid?: boolean;
 	parentId: string | null;
 	pageId: string;
 	orderKey: string;
@@ -538,6 +668,8 @@ interface WorkingBlock {
 	contentLinks?: ExtractedLink[];
 	/** Set when this transaction replaced the tags. */
 	tags?: string[];
+	/** Brought back by a `restore` operation of this transaction. */
+	restored?: boolean;
 }
 
 /** Key of the children list of a parent; the space's pages are under `null`. */
@@ -563,7 +695,13 @@ class OutlinePlanner {
 		private readonly input: OutlineWriteInput,
 		private readonly prepared: ReadonlyArray<PreparedContent | null>,
 		private readonly now: string,
+		private readonly commitKind: OutlineCommitKind = "edit",
 	) {}
+
+	/** A compensating commit drops taken aliases instead of failing. */
+	private get compensating(): boolean {
+		return this.commitKind === "revert";
+	}
 
 	async plan(): Promise<Planned | null> {
 		await this.preload();
@@ -584,6 +722,9 @@ class OutlinePlanner {
 					break;
 				case "setTask":
 					await this.setTask(op, i);
+					break;
+				case "restore":
+					await this.restore(op, i);
 					break;
 			}
 		}
@@ -634,7 +775,7 @@ class OutlinePlanner {
 		};
 		for (const op of this.input.ops) {
 			if (op.op !== "insert") add(op.block);
-			if (op.op === "insert" || op.op === "move") {
+			if (op.op === "insert" || op.op === "move" || op.op === "restore") {
 				add(op.parent);
 				const p = op.position;
 				if (p && "after" in p) add(p.after);
@@ -834,6 +975,9 @@ class OutlinePlanner {
 	private newBlock(fields: {
 		id: string;
 		callerId: boolean;
+		/** Caller-chosen sid; drawn when absent. */
+		sid?: string;
+		opIndex?: number;
 		parentId: string | null;
 		pageId: string;
 		orderKey: string;
@@ -842,13 +986,21 @@ class OutlinePlanner {
 		links: ExtractedLink[];
 		task: OutlineTaskJson | null;
 	}): WorkingBlock {
-		let sid = newOutlineSid();
+		let sid = fields.sid ?? newOutlineSid();
+		if (fields.sid !== undefined && this.bySid.has(sid)) {
+			throw new OutlineWriteError(
+				`sid ${sid} is already in use`,
+				"OUTLINE_ID_TAKEN",
+				fields.opIndex ?? null,
+			);
+		}
 		while (this.bySid.has(sid)) sid = newOutlineSid();
 		const block: WorkingBlock = {
 			id: fields.id,
 			sid,
 			base: null,
 			callerId: fields.callerId,
+			...(fields.sid !== undefined ? { callerSid: true } : {}),
 			parentId: fields.parentId,
 			pageId: fields.pageId,
 			orderKey: fields.orderKey,
@@ -902,8 +1054,17 @@ class OutlinePlanner {
 		}
 	}
 
-	private async setAlias(block: WorkingBlock, alias: string | null, opIndex: number) {
-		if (alias === block.alias) return;
+	/**
+	 * Give the block an alias. One held by another live block fails the write, or with `drop`
+	 * leaves the block without an alias and returns the adjustment.
+	 */
+	private async setAlias(
+		block: WorkingBlock,
+		alias: string | null,
+		opIndex: number,
+		onTaken: "reject" | "drop" = "reject",
+	): Promise<OutlineAdjustment | null> {
+		if (alias === block.alias) return null;
 		if (alias !== null) {
 			if (!this.aliasOwner.has(alias)) {
 				const owners = await this.store.findAliasOwners(this.space.id, [alias]);
@@ -911,16 +1072,32 @@ class OutlinePlanner {
 			}
 			const owner = this.aliasOwner.get(alias);
 			if (owner && owner !== block.id) {
-				throw new OutlineWriteError(
-					`alias ${alias} is already used by ${this.address(this.blocks.get(owner)?.sid ?? owner)}`,
-					"OUTLINE_ALIAS_TAKEN",
-					opIndex,
-				);
+				if (onTaken === "reject") {
+					throw new OutlineWriteError(
+						`alias ${alias} is already used by ${this.address(this.blocks.get(owner)?.sid ?? owner)}`,
+						"OUTLINE_ALIAS_TAKEN",
+						opIndex,
+					);
+				}
+				this.releaseAlias(block);
+				block.alias = null;
+				return { kind: "alias-dropped", alias, heldBy: owner };
 			}
 		}
 		this.releaseAlias(block);
 		block.alias = alias;
 		if (alias !== null) this.aliasOwner.set(alias, block.id);
+		return null;
+	}
+
+	/** The adjustment of a placement that could not use the order key it asked for. */
+	private keyAdjustment(
+		position: OutlinePosition | undefined,
+		orderKey: string,
+	): OutlineAdjustment | null {
+		return position && "orderKey" in position && position.orderKey !== orderKey
+			? { kind: "order-key-moved", wanted: position.orderKey, got: orderKey }
+			: null;
 	}
 
 	private checkBaseVersions(): void {
@@ -943,7 +1120,12 @@ class OutlinePlanner {
 		if (conflicts.length > 0) throw new OutlineConflictError(conflicts);
 	}
 
-	private result(block: WorkingBlock, extra?: Partial<OutlineOpResult>): OutlineOpResult {
+	private result(
+		block: WorkingBlock,
+		extra?: Partial<OutlineOpResult>,
+		adjustments: ReadonlyArray<OutlineAdjustment | null> = [],
+	): OutlineOpResult {
+		const adjusted = adjustments.filter((a): a is OutlineAdjustment => a !== null);
 		return {
 			blockId: block.id,
 			sid: block.sid,
@@ -951,6 +1133,7 @@ class OutlinePlanner {
 			split: [],
 			notes: [],
 			...extra,
+			...(adjusted.length > 0 ? { adjustments: adjusted } : {}),
 		};
 	}
 
@@ -976,6 +1159,7 @@ class OutlinePlanner {
 		const block = this.newBlock({
 			id,
 			callerId: op.id !== undefined,
+			...(op.sid !== undefined ? { sid: op.sid, opIndex: i } : {}),
 			parentId,
 			pageId: parent ? parent.pageId : id,
 			orderKey,
@@ -989,7 +1173,9 @@ class OutlinePlanner {
 		if (op.alias) await this.setAlias(block, op.alias, i);
 		if (op.tags !== undefined) block.tags = canonicalTags(op.tags);
 		const split = this.insertSplit(block, prep.split);
-		this.results[i] = this.result(block, { split, notes: prep.notes });
+		this.results[i] = this.result(block, { split, notes: prep.notes }, [
+			this.keyAdjustment(op.position, orderKey),
+		]);
 	}
 
 	private async update(op: Extract<OutlineOp, { op: "update" }>, i: number): Promise<void> {
@@ -1007,9 +1193,12 @@ class OutlinePlanner {
 				split = this.insertSplit(block, prep.split);
 			}
 		}
-		if (op.alias !== undefined) await this.setAlias(block, op.alias, i);
+		const aliasDropped =
+			op.alias !== undefined
+				? await this.setAlias(block, op.alias, i, this.compensating ? "drop" : "reject")
+				: null;
 		if (op.tags !== undefined) block.tags = canonicalTags(op.tags);
-		this.results[i] = this.result(block, { split, notes });
+		this.results[i] = this.result(block, { split, notes }, [aliasDropped]);
 	}
 
 	private async move(op: Extract<OutlineOp, { op: "move" }>, i: number): Promise<void> {
@@ -1041,7 +1230,7 @@ class OutlinePlanner {
 			for (const descendant of await this.liveSubtree(block, i)) descendant.pageId = pageId;
 			block.pageId = pageId;
 		}
-		this.results[i] = this.result(block);
+		this.results[i] = this.result(block, {}, [this.keyAdjustment(op.position, orderKey)]);
 	}
 
 	private async delete(op: Extract<OutlineOp, { op: "delete" }>, i: number): Promise<void> {
@@ -1073,6 +1262,74 @@ class OutlinePlanner {
 			});
 		}
 		this.results[i] = this.result(block);
+	}
+
+	private async restore(op: Extract<OutlineOp, { op: "restore" }>, i: number): Promise<void> {
+		const block = await this.resolve(op.block, i);
+		if (!block.deleted) {
+			throw invalid(`block ${this.address(block.sid)} is not deleted`, i);
+		}
+		// A deleted block has no live descendants, so no live parent can be inside it.
+		const parentRef: OutlineBlockRef | null =
+			op.parent !== undefined ? op.parent : block.parentId === null ? null : { id: block.parentId };
+		const parent = parentRef ? await this.resolveLive(parentRef, i) : null;
+		const parentId = parent?.id ?? null;
+		await this.ensureChildren([parentId], "siblings", i);
+		const list = this.list(parentId);
+		const position = op.position ?? { orderKey: block.orderKey };
+		const { index, orderKey } = this.place(list, position, i);
+		list.splice(index, 0, block.id);
+		block.deleted = false;
+		block.restored = true;
+		block.parentId = parentId;
+		block.orderKey = orderKey;
+		block.pageId = parent ? parent.pageId : block.id;
+		// Children deleted with it (earlier in this transaction) stay deleted.
+		const own = this.children.get(listKey(block.id));
+		if (own)
+			this.children.set(
+				listKey(block.id),
+				own.filter((id) => !this.block(id).deleted),
+			);
+
+		let split: OutlineBlockAddressed[] = [];
+		let notes: DialectNote[] = [];
+		if (op.content !== undefined) {
+			const prep = this.prep(i);
+			block.content = prep.content;
+			block.contentHash = prep.contentHash;
+			block.contentLinks = prep.links;
+			notes = prep.notes;
+			if (prep.split.length > 0) {
+				await this.ensureChildren([block.id], "siblings", i);
+				split = this.insertSplit(block, prep.split);
+			}
+		} else if (block.contentLinks === undefined) {
+			// The row keeps the content a deleted block had; its links are what it produces.
+			const row = (await this.store.getBlocks([block.id]))[0];
+			block.contentLinks = contentLinks(row?.content ?? "");
+		}
+		if (op.task !== undefined) block.taskJson = op.task ? canonicalTask(op.task) : null;
+		if (op.tags !== undefined) block.tags = canonicalTags(op.tags);
+		else if (block.base?.deleted) {
+			// The tags it had just before it was deleted.
+			const tags = await this.store.listLinksAt(
+				[block.id],
+				block.base.versionSeq - 1,
+				["tag"],
+				OUTLINE_LIMITS.maxTagsPerBlock,
+			);
+			block.tags = tags.map((link) => link.targetRef);
+		}
+		// A deleted block keeps its alias without holding it (another block may have taken it
+		// since): it gets it back only if it is free.
+		const alias = op.alias !== undefined ? op.alias : block.alias;
+		block.alias = null;
+		const aliasDropped = await this.setAlias(block, alias, i, "drop");
+		this.results[i] = this.result(block, { split, notes }, [
+			aliasDropped,
+			this.keyAdjustment(position, orderKey),
+		]);
 	}
 
 	// ── the commit ───────────────────────────────────────────────────────────
@@ -1173,7 +1430,7 @@ class OutlinePlanner {
 					id: generateId(),
 					spaceId: this.space.id,
 					seq,
-					kind: "edit",
+					kind: this.commitKind,
 					actorKind: input.actor.kind,
 					actorId: input.actor.id,
 					responsibleUserId: input.responsibleUserId,
@@ -1194,12 +1451,24 @@ class OutlinePlanner {
 		};
 	}
 
-	/** Sids drawn for new blocks must be free in the space; caller-chosen ids free anywhere. */
+	/**
+	 * Sids of new blocks must be free in the space (a drawn one that is not is drawn again, a
+	 * caller-chosen one fails the write); caller-chosen ids must be free anywhere.
+	 */
 	private async checkNewIdentities(created: WorkingBlock[]): Promise<void> {
 		if (created.length === 0) return;
 		const taken = await this.store.getBlockMetas(this.space.id, {
 			sids: created.map((b) => b.sid),
 		});
+		const takenSids = new Set(taken.map((b) => b.sid));
+		const chosen = created.find((b) => b.callerSid && takenSids.has(b.sid));
+		if (chosen) {
+			throw new OutlineWriteError(
+				`sid ${chosen.sid} is already in use`,
+				"OUTLINE_ID_TAKEN",
+				this.input.ops.findIndex((op) => op.op === "insert" && op.sid === chosen.sid),
+			);
+		}
 		if (taken.length > 0) throw new SidCollision();
 		const callerIds = created.filter((b) => b.callerId).map((b) => b.id);
 		if (callerIds.length === 0) return;
@@ -1216,6 +1485,7 @@ class OutlinePlanner {
 	/** Whether a live existing block's state that produces links changed. */
 	private linksMayChange(block: WorkingBlock): boolean {
 		return (
+			block.restored === true ||
 			block.tags !== undefined ||
 			block.contentHash !== block.base?.contentHash ||
 			!sameTask(block.taskJson, block.base?.taskJson ?? null)
@@ -1232,6 +1502,7 @@ class OutlinePlanner {
 			flags |= OUTLINE_CHANGE.MOVE;
 		if (block.pageId !== base.pageId) flags |= OUTLINE_CHANGE.PAGE;
 		if (block.deleted && !base.deleted) flags |= OUTLINE_CHANGE.DELETE;
+		if (!block.deleted && base.deleted) flags |= OUTLINE_CHANGE.RESTORE;
 		if (!sameTask(block.taskJson, base.taskJson)) flags |= OUTLINE_CHANGE.TASK;
 		if (block.alias !== base.alias) flags |= OUTLINE_CHANGE.PROPS;
 		return flags;
@@ -1246,7 +1517,8 @@ class OutlinePlanner {
 			// A deleted block links nowhere; a block created and deleted here never linked.
 			return { close: open.map((l) => l.id), open: [], tagsChanged: false };
 		}
-		const isNew = block.base === null;
+		// A restored block's links are all recomputed: a deleted block has none open.
+		const isNew = block.base === null || block.restored === true;
 		const groups: Array<{ kinds: ReadonlySet<OutlineLinkKind>; want: ExtractedLink[] }> = [];
 		if (isNew || block.contentHash !== block.base?.contentHash) {
 			groups.push({ kinds: CONTENT_LINK_KINDS, want: block.contentLinks ?? [] });
@@ -1331,13 +1603,24 @@ export async function writeOutline(
 	options: OutlineWriteOptions = {},
 ): Promise<OutlineWriteResult> {
 	const store = options.store ?? outlineStore;
-	const prepared = prepareOps(input.ops);
+	const compensating = options.compensating;
+	const prepared = prepareOps(input.ops, compensating !== undefined, options.canonical);
 	const attempts = options.maxAttempts ?? DEFAULT_ATTEMPTS;
 	for (let attempt = 0; attempt < attempts; attempt++) {
 		const space = await store.getSpace(input.spaceId);
 		if (!space) throw new NotFoundError("Outline space", input.spaceId);
+		if (compensating && space.nextSeq !== compensating.expectNextSeq) {
+			throw new OutlineStaleWriteError(space.id, compensating.expectNextSeq);
+		}
 		const now = (options.now?.() ?? new Date()).toISOString();
-		const planner = new OutlinePlanner(store, space, input, prepared, now);
+		const planner = new OutlinePlanner(
+			store,
+			space,
+			input,
+			prepared,
+			now,
+			compensating ? "revert" : "edit",
+		);
 		let planned: Planned | null;
 		try {
 			planned = await planner.plan();
