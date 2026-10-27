@@ -16,6 +16,15 @@
  *    keeps it;
  *  - restoring a deleted block validates every operation: one that no longer fits keeps the
  *    notice and sends nothing.
+ *
+ * Review of round 4 (minor):
+ *  - texts the limits push out are counted on their page (the notice says so) until dismissed;
+ *  - the sessions kept only for typing not acknowledged are counted for the tab-limit notice,
+ *    with when the first of them goes at the latest;
+ *  - adding back sent but never answered (the session closed) marks the entry "may have been
+ *    added"; one never sent, or refused, does not;
+ *  - past the wait, what was sent but never acknowledged on a connection that looks live (dead
+ *    without knowing it) goes to the store too; what was acknowledged never does.
  */
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import {
@@ -32,6 +41,7 @@ import { LiveClient, type LiveTransport, type SeedBlock } from "./live-client";
 import {
 	acquireLiveSession,
 	liveSessionsOn,
+	liveSessionsWaitingOn,
 	releaseLiveSession,
 	retainLiveSession,
 	setLiveSessionGraceForTests,
@@ -39,9 +49,11 @@ import {
 } from "./live-sessions";
 import {
 	clearUnsavedTextsForTests,
+	dismissUnsavedDropped,
 	dropUnsavedText,
 	keepUnsavedTexts,
 	UNSAVED_LIMITS,
+	unsavedDroppedOf,
 	unsavedTextsOf,
 } from "./unsaved-texts";
 
@@ -195,6 +207,34 @@ describe("the unsaved-text store", () => {
 			expect(warn).toHaveBeenCalledTimes(1);
 			keepUnsavedTexts([entry(9, `9${"y".repeat(300 * 1024)}`)]);
 			expect(unsavedTextsOf(PAGE).map((e) => e.text[0])).toEqual(["9"]);
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	test("texts pushed out are counted on their page until dismissed (review: silent eviction)", () => {
+		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			keepUnsavedTexts([
+				{ pageId: "pageA", blockId: "blockA1xx", text: "a few words on A", reason: "not_sent" },
+				{ pageId: "pageA", blockId: "blockA2xx", text: "more words on A", reason: "refused" },
+			]);
+			// A refused paste of 300 KB on page B: it alone is over the bytes limit.
+			keepUnsavedTexts([
+				{ pageId: "pageB", blockId: "blockB1xx", text: "x".repeat(300 * 1024), reason: "refused" },
+			]);
+			expect(unsavedTextsOf("pageA")).toEqual([]);
+			expect(unsavedDroppedOf("pageA")).toBe(2);
+			expect(unsavedDroppedOf("pageB")).toBe(0);
+			// More than 50 on B: its own oldest go, counted on B.
+			for (let i = 0; i < UNSAVED_LIMITS.entries; i++) keepUnsavedTexts([entry(i)]);
+			expect(unsavedDroppedOf(PAGE)).toBe(0);
+			expect(unsavedDroppedOf("pageB")).toBe(1);
+			keepUnsavedTexts([entry(99)]);
+			expect(unsavedDroppedOf(PAGE)).toBe(1);
+			dismissUnsavedDropped("pageA");
+			expect(unsavedDroppedOf("pageA")).toBe(0);
+			expect(warn).toHaveBeenCalledTimes(4);
 		} finally {
 			warn.mockRestore();
 		}
@@ -398,6 +438,75 @@ describe("a session with typing not acknowledged", () => {
 		]);
 	});
 
+	test("counted for the tab-limit notice, with when the first goes at the latest", async () => {
+		setLiveSessionGraceForTests(10);
+		const s = socket();
+		const shared = acquireLiveSession(s.transport, PAGE, "edit");
+		if (!shared) throw new Error("no session");
+		retainLiveSession(shared);
+		const handle = s.sent[0]?.handle as number;
+		s.deliver(joined(handle));
+		type(shared.client, A, "Alpha typed");
+		await sleep(60);
+		expect(liveSessionsWaitingOn(s.transport)).toEqual({ count: 0, freeBy: null });
+		const released = Date.now();
+		releaseLiveSession(shared);
+		const waiting = liveSessionsWaitingOn(s.transport);
+		expect(waiting.count).toBe(1);
+		const freeBy = waiting.freeBy as number;
+		expect(freeBy - released).toBeGreaterThanOrEqual(2 * 60_000 - 50);
+		expect(freeBy - released).toBeLessThanOrEqual(2 * 60_000 + 50);
+		// Acknowledged: no longer waiting, and it goes after the grace period.
+		const update = s.sent.find((f) => f.kind === LIVE_FRAME.update);
+		s.deliver({ kind: LIVE_FRAME.batch, handle, n: update?.n as number });
+		expect(liveSessionsWaitingOn(s.transport)).toEqual({ count: 0, freeBy: null });
+		await sleep(40);
+		expect(liveSessionsOn(s.transport)).toEqual([]);
+		expect(unsavedTextsOf(PAGE)).toEqual([]);
+	});
+
+	test("live, sent, never acknowledged (a dead connection): past the wait the text goes to the store", async () => {
+		setLiveSessionGraceForTests(10);
+		setLiveSessionUnackedWaitForTests(80);
+		const s = socket();
+		const dead = acquireLiveSession(s.transport, PAGE, "edit");
+		const fine = acquireLiveSession(s.transport, "page-0000002", "edit");
+		if (!dead || !fine) throw new Error("no session");
+		retainLiveSession(dead);
+		retainLiveSession(fine);
+		const deadHandle = s.joinOf(PAGE)?.handle as number;
+		const fineHandle = s.joinOf("page-0000002")?.handle as number;
+		s.deliver(joined(deadHandle));
+		const two = new Y.Doc();
+		two.getMap<Y.Text>("texts").set("page-0000002", new Y.Text("Page two"));
+		s.deliver({
+			kind: LIVE_FRAME.joined,
+			handle: fineHandle,
+			head: { ...joined(fineHandle).head, blocks: [["page-0000002", -1, "a0", "p2", ""]] },
+			body: Y.encodeStateAsUpdate(two),
+		});
+		type(dead.client, A, "Alpha sent into the void");
+		type(fine.client, "page-0000002", "Page two typed");
+		await sleep(60);
+		// Both sent (the socket looks live); only the second page answers.
+		const updates = s.sent.filter((f) => f.kind === LIVE_FRAME.update);
+		expect(updates).toHaveLength(2);
+		const fineUpdate = updates.find((f) => f.handle === fineHandle);
+		s.deliver({ kind: LIVE_FRAME.batch, handle: fineHandle, n: fineUpdate?.n as number });
+		releaseLiveSession(dead);
+		releaseLiveSession(fine);
+		await sleep(40);
+		expect(liveSessionsOn(s.transport).map((x) => x.pageId)).toEqual([PAGE]);
+		expect(dead.client.status).toBe("live");
+		await sleep(120);
+		expect(liveSessionsOn(s.transport)).toEqual([]);
+		// Not counted as written: kept, as possibly not saved. The acknowledged one is not.
+		expect(unsavedTextsOf(PAGE)).toMatchObject([
+			{ blockId: A, text: "Alpha sent into the void", reason: "not_sent" },
+		]);
+		expect(unsavedTextsOf("page-0000002")).toEqual([]);
+	});
+
 	test("offline with typing on the read, never joined: at most the wait, then it goes to the store", async () => {
 		setLiveSessionUnackedWaitForTests(60);
 		const s = socket();
@@ -483,6 +592,37 @@ describe("text kept because its block is gone", () => {
 			head: { a: [[again, 3]] },
 		});
 		expect(unsavedTextsOf(PAGE)).toEqual([]);
+	});
+
+	test("adding back sent, the session closed before the page answered: it may have been added", () => {
+		const { client, entry } = goneWhileConnecting();
+		expect(client.restoreUnsaved(entry)).toBe(true);
+		expect(unsavedTextsOf(PAGE)[0]?.adding).toBe("sending");
+		// Live: the insert went out before the leave; whether the page took it is not known.
+		client.dispose();
+		expect(unsavedTextsOf(PAGE)).toMatchObject([{ id: entry.id, adding: "unknown" }]);
+	});
+
+	test("adding back never sent, or refused: not added, offered again as before", () => {
+		// The socket is gone before the insert could be sent (the client does not know yet).
+		const late = goneWhileConnecting();
+		late.setConnected(false, true);
+		expect(late.client.restoreUnsaved(late.entry)).toBe(true);
+		expect(late.sent.some((f) => f.kind === LIVE_FRAME.tx)).toBe(false);
+		late.client.dispose();
+		expect(unsavedTextsOf(PAGE)[0]?.adding).toBeUndefined();
+		// Refused by the page: back to "add".
+		clearUnsavedTextsForTests();
+		const refused = goneWhileConnecting();
+		expect(refused.client.restoreUnsaved(refused.entry)).toBe(true);
+		const n = refused.sent.at(-1)?.n as number;
+		refused.deliver({
+			kind: LIVE_FRAME.reject,
+			handle: refused.handle,
+			n,
+			head: { code: "conflict" },
+		});
+		expect(unsavedTextsOf(PAGE)[0]?.adding).toBeUndefined();
 	});
 
 	test("dismissed by the person: gone", () => {

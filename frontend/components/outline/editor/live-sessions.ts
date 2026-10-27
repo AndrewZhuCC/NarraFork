@@ -23,8 +23,9 @@
  * everything typed into it (`pending` or `awaiting`): it waits, offline included, for the socket
  * to come back and the page to take it. At most `DEFAULT_UNACKED_WAIT_MS` (2 minutes) after its
  * last editor let go: then it is dropped all the same, and the client gives what was not taken to
- * the unsaved-text store (`dispose`), where every editor of the page shows it. A client is never
- * disposed with typing still inside.
+ * the unsaved-text store (`dispose`), where every editor of the page shows it — what was sent but
+ * never acknowledged too, even on a connection that looks live (it may be dead without knowing
+ * it). A client is never disposed with typing still inside.
  *
  * ADMISSION
  * ---------
@@ -87,12 +88,17 @@ function mustWait(shared: SharedLiveSession): number {
 	return Math.max(0, shared.releasedAt + unackedWaitMs - Date.now());
 }
 
-function dispose(map: Map<string, SharedLiveSession>, key: string, shared: SharedLiveSession) {
+function dispose(
+	map: Map<string, SharedLiveSession>,
+	key: string,
+	shared: SharedLiveSession,
+	opts: { unconfirmed?: boolean } = {},
+) {
 	if (shared.timer) clearTimeout(shared.timer);
 	shared.timer = null;
 	shared.dropWhenJoined?.();
 	shared.dropWhenJoined = null;
-	shared.client.dispose();
+	shared.client.dispose(opts);
 	if (map.get(key) === shared) map.delete(key);
 }
 
@@ -156,7 +162,10 @@ export function acquireLiveSession(
 				shared.timer = setTimeout(shared.drop, Math.min(graceMs, wait));
 				return;
 			}
-			dispose(map, key, shared);
+			// Waited as long as it may with typing not acknowledged: none of it counts as written.
+			const unconfirmed =
+				shared.releasedAt > 0 && shared.client.status !== "closed" && unacked(shared.client);
+			dispose(map, key, shared, { unconfirmed });
 		},
 	};
 	map.set(key, shared);
@@ -225,6 +234,27 @@ export function liveSessionIfReady(
 ): LiveClient | null {
 	const shared = sessionsBySocket.get(transport)?.get(`${pageId}\u0000${mode}`);
 	return shared?.client.ready && shared.client.status !== "closed" ? shared.client : null;
+}
+
+/**
+ * Sessions of this tab that no editor holds but that keep their slot while the page has not
+ * acknowledged typing (TYPING NOT ACKNOWLEDGED): how many, and when the first of them goes at the
+ * latest (it may go sooner, once acknowledged). For the notice of a page refused for lack of room.
+ */
+export function liveSessionsWaitingOn(transport: LiveTransport): {
+	count: number;
+	freeBy: number | null;
+} {
+	let count = 0;
+	let freeBy: number | null = null;
+	for (const shared of sessionsBySocket.get(transport)?.values() ?? []) {
+		if (shared.refs > 0 || shared.releasedAt === 0 || !occupies(shared)) continue;
+		if (!unacked(shared.client)) continue;
+		count++;
+		const by = shared.releasedAt + unackedWaitMs;
+		freeBy = freeBy === null ? by : Math.min(freeBy, by);
+	}
+	return { count, freeBy };
 }
 
 /** The sessions this tab holds on `transport` (tests and diagnostics). */

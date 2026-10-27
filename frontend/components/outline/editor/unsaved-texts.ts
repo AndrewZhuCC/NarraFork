@@ -19,7 +19,12 @@
  * In memory only, per tab, never in localStorage: the text may come from a space another person
  * using this browser cannot read. Bounded: at most `UNSAVED_LIMITS.entries` entries and
  * `UNSAVED_LIMITS.bytes` of text (UTF-8, typed text and the text before); the oldest go first,
- * with a console warning. The newest entry stays even if it alone is larger (one block's text).
+ * with a console warning, and the notice of their page says how many went (until dismissed). The
+ * newest entry stays even if it alone is larger (one block's text).
+ *
+ * Adding a `moved_away` text back is tracked on its entry (`adding`): on its way, nothing to
+ * click; the session closed before the page answered, it may be on the page already, and the
+ * notice says so before the person adds it again.
  */
 import type { LiveTaskChar } from "@shared/outline-live-protocol";
 
@@ -37,6 +42,11 @@ export interface UnsavedEntry {
 	reason: UnsavedReason;
 	/** `moved_away`: where restoring adds the text back (the nearest block still on the page). */
 	restore?: { parentId: string; task: LiveTaskChar | null };
+	/**
+	 * Adding it back: `sending` — sent, the page has not answered yet; `unknown` — the session
+	 * closed before the page answered: it may have been added.
+	 */
+	adding?: "sending" | "unknown";
 	/** When it was kept (oldest go first). */
 	at: number;
 }
@@ -44,6 +54,10 @@ export interface UnsavedEntry {
 export const UNSAVED_LIMITS = { entries: 50, bytes: 256 * 1024 } as const;
 
 const entries: UnsavedEntry[] = [];
+/** Per page, how many of its entries the limits pushed out (shown until dismissed). */
+const dropped = new Map<string, number>();
+/** Pages whose dropped count is kept, at most (the oldest page goes first). */
+const DROPPED_PAGES = 100;
 const listeners = new Set<() => void>();
 let seq = 0;
 let version = 0;
@@ -78,6 +92,10 @@ export function keepUnsavedTexts(items: ReadonlyArray<Omit<UnsavedEntry, "id" | 
 	) {
 		const old = entries.shift() as UnsavedEntry;
 		total -= bytesOf(old);
+		const count = (dropped.get(old.pageId) ?? 0) + 1;
+		dropped.delete(old.pageId);
+		dropped.set(old.pageId, count);
+		if (dropped.size > DROPPED_PAGES) dropped.delete(dropped.keys().next().value as string);
 		console.warn("Outline: unsaved text dropped (this tab keeps only so much)", {
 			pageId: old.pageId,
 			blockId: old.blockId,
@@ -94,6 +112,24 @@ export function unsavedTextsOf(pageId: string): UnsavedEntry[] {
 
 export function unsavedTextById(id: string): UnsavedEntry | undefined {
 	return entries.find((e) => e.id === id);
+}
+
+/** Entries of a page the limits pushed out since the person last dismissed the count. */
+export function unsavedDroppedOf(pageId: string): number {
+	return dropped.get(pageId) ?? 0;
+}
+
+export function dismissUnsavedDropped(pageId: string): void {
+	if (dropped.delete(pageId)) changed();
+}
+
+/** Where adding an entry back stands (null: not being added). */
+export function markUnsavedAdding(id: string, adding: UnsavedEntry["adding"] | null): void {
+	const entry = entries.find((e) => e.id === id);
+	if (!entry || entry.adding === (adding ?? undefined)) return;
+	if (adding) entry.adding = adding;
+	else delete entry.adding;
+	changed();
 }
 
 /** The person dismissed it, or its restore was acknowledged. */
@@ -117,5 +153,6 @@ export function unsavedTextsVersion(): number {
 /** Tests: an empty store. */
 export function clearUnsavedTextsForTests(): void {
 	entries.length = 0;
+	dropped.clear();
 	changed();
 }

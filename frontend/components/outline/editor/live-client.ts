@@ -60,6 +60,7 @@ import { type BlockRec, type ClientOp, keyBetweenLoose, Store, wireOp } from "./
 import {
 	dropUnsavedText,
 	keepUnsavedTexts,
+	markUnsavedAdding,
 	type UnsavedEntry,
 	type UnsavedReason,
 } from "./unsaved-texts";
@@ -301,8 +302,11 @@ export class LiveClient {
 	private readonly seedTexts = new Map<string, string>();
 	/** The reads so far allow typing while connecting (the page is within the live limits). */
 	private seedTyping = true;
-	/** Restores of unsaved text on their way: transaction → store entry (dropped when acked). */
-	private readonly restoring = new Map<number, string>();
+	/**
+	 * Restores of unsaved text on their way: transaction → store entry (dropped when acked), and
+	 * whether it was ever sent (it may have reached the page).
+	 */
+	private readonly restoring = new Map<number, { entry: string; sent: boolean }>();
 	/**
 	 * Set by the page (a browser): runs the upgrade of a seeded page after the seed was painted.
 	 * Without it (tests driving the client) the snapshot is taken at once.
@@ -376,20 +380,27 @@ export class LiveClient {
 		return writer && this.mode === "edit" && this.status !== "closed" && this.status !== "stalled";
 	}
 
-	dispose(): void {
+	/**
+	 * Close the session. `unconfirmed`: what was sent but never acknowledged is kept as well, even
+	 * on a connection that looks live (its session waited for the acknowledgement as long as it
+	 * may: the connection may be dead without knowing it).
+	 */
+	dispose(opts: { unconfirmed?: boolean } = {}): void {
 		if (this.disposed) return;
 		this.flushTyping();
 		// Typing the page has not taken is kept for the person (the unsaved-text store), never
 		// disposed with the client. Live, what was sent reaches the page before the leave below
-		// (same socket): only what could not be sent is kept. Otherwise (offline, refused, closed)
-		// whatever is not acknowledged: what was applied but not stored may be gone with a restart.
-		const connected = this.status === "live" || this.status === "stalled";
+		// (same socket): only what could not be sent is kept. Otherwise (offline, refused, closed,
+		// or waited too long for the acknowledgement) whatever is not acknowledged: what was
+		// applied but not stored may be gone with a restart.
+		const connected = (this.status === "live" || this.status === "stalled") && !opts.unconfirmed;
 		this.keepUnsaved(
 			"not_sent",
 			connected
 				? this.pending.filter((tx) => !tx.sent)
 				: [...this.awaiting, ...this.pending].sort((x, y) => x.n - y.n),
 		);
+		this.abandonRestores();
 		this.disposed = true;
 		for (const off of this.off.splice(0)) off();
 		for (const t of [this.typingTimer, this.presenceTimer, this.retryTimer]) if (t) clearTimeout(t);
@@ -534,6 +545,7 @@ export class LiveClient {
 				...this.awaiting,
 				...this.pending,
 			]);
+			this.abandonRestores();
 			this.pending = [];
 			this.awaiting = [];
 			this.closeCode = "unavailable";
@@ -765,6 +777,8 @@ export class LiveClient {
 			}
 			if (!this.sendFrame(frame)) return;
 			tx.sent = true;
+			const restore = this.restoring.get(tx.n);
+			if (restore) restore.sent = true;
 			this.stats.txSent++;
 		}
 	}
@@ -1132,18 +1146,30 @@ export class LiveClient {
 				if (change) bodies.set(id, change);
 			}
 			this.enqueue(ops, bodies, ops.length > 0);
-			if (restoring && ops.length > 0) this.restoring.set(this.n, restoring);
+			if (restoring && ops.length > 0)
+				this.restoring.set(this.n, { entry: restoring.entry, sent: false });
+			else if (restoring) markUnsavedAdding(restoring.entry, null);
 		}
 		this.flushTyping();
 	}
 
 	/** Restores of unsaved text the page took (up to transaction `upTo`): their entries are done. */
 	private settleRestores(upTo: number): void {
-		for (const [n, entry] of this.restoring) {
+		for (const [n, { entry }] of this.restoring) {
 			if (n > upTo) continue;
 			this.restoring.delete(n);
 			dropUnsavedText(entry);
 		}
+	}
+
+	/**
+	 * The session ends with restores unanswered: one sent may be on the page already (its entry
+	 * says so before the person adds it again); one never sent was not added.
+	 */
+	private abandonRestores(): void {
+		for (const { entry, sent } of this.restoring.values())
+			markUnsavedAdding(entry, sent ? "unknown" : null);
+		this.restoring.clear();
 	}
 
 	private onResumed(head: LiveJoinedHead, body: Uint8Array, rest: PendingTx[]): void {
@@ -1195,8 +1221,10 @@ export class LiveClient {
 	private onReject(n: number, code: string | undefined): void {
 		this.stats.rejects++;
 		this.log.push(`transaction ${n} refused: ${code ?? "?"}`);
-		// A restore of unsaved text the page refused: its entry stays.
+		// A restore of unsaved text the page refused: its entry stays, to be added again.
+		const refused = this.restoring.get(n);
 		this.restoring.delete(n);
+		if (refused) markUnsavedAdding(refused.entry, null);
 		if (code === "read_only") {
 			// May no longer write: nothing of the typing not taken can be sent; it is kept.
 			this.keepUnsaved("read_only", this.pending);
@@ -1232,6 +1260,7 @@ export class LiveClient {
 				...this.awaiting,
 				...this.pending,
 			]);
+			this.abandonRestores();
 			this.pending = [];
 			this.awaiting = [];
 		}
@@ -1403,7 +1432,7 @@ export class LiveClient {
 			return false;
 		}
 		// Already on its way (a second click): not twice.
-		for (const id of this.restoring.values()) if (id === entry.id) return true;
+		for (const r of this.restoring.values()) if (r.entry === entry.id) return true;
 		let parent = entry.restore.parentId;
 		if (!this.visible.alive(parent)) parent = this.pageId;
 		const kids = this.visible.children(parent);
@@ -1426,7 +1455,9 @@ export class LiveClient {
 			selAfter: null,
 			view: null,
 		});
-		this.restoring.set(this.n, entry.id);
+		const tx = this.pending.find((t) => t.n === this.n);
+		this.restoring.set(this.n, { entry: entry.id, sent: tx?.sent === true });
+		markUnsavedAdding(entry.id, "sending");
 		return true;
 	}
 

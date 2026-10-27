@@ -51,7 +51,6 @@ import {
 import { useElementSize, useMediaQuery } from "@mantine/hooks";
 import { titleOf } from "@shared/outline";
 import type { OutlineViewMode } from "@shared/outline-api";
-import { OUTLINE_LIVE_LIMITS } from "@shared/outline-live-protocol";
 import {
 	IconArrowLeft,
 	IconArrowRight,
@@ -90,6 +89,7 @@ import {
 	type OutlineLiveUnavailable,
 	seedLiveSession,
 } from "./editor/OutlineEditor";
+import { TabLimitNotice } from "./editor/TabLimitNotice";
 import { liveTransport } from "./editor/transport";
 import { UnsavedTextsNotice } from "./editor/UnsavedTextsNotice";
 import classes from "./Outline.module.css";
@@ -558,16 +558,7 @@ function SurfaceBody({
 							</Alert>
 						)}
 						{fallback === "tab_limit" && (
-							<Alert variant="light" color="gray" py={6} mb="xs" data-testid="outline-tab-limit">
-								<Group gap="xs" wrap="wrap">
-									<Text size="sm">
-										{t("editor.tabLimit", { count: OUTLINE_LIVE_LIMITS.sessionsPerSocket })}
-									</Text>
-									<Button size="compact-xs" variant="light" onClick={() => setFallback(null)}>
-										{t("editor.retry")}
-									</Button>
-								</Group>
-							</Alert>
+							<TabLimitNotice transport={liveTransport()} onRetry={() => setFallback(null)} />
 						)}
 						{fallback !== null &&
 							fallback !== "too_large" &&

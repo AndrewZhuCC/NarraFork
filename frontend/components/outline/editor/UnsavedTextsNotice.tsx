@@ -3,7 +3,9 @@
  * reach the page, whichever session, panel or editor it came from. Every surface of the page
  * shows it from the moment it mounts — the live editor, and the read-only view in its place —
  * with copy and dismiss per text, and, for text whose block is no longer on the page, adding it
- * back as a new block when the page is live and writable here.
+ * back as a new block when the page is live and writable here. Adding back that may have reached
+ * the page already (the session closed before it answered) says so before it is offered again;
+ * texts of the page that the tab's limits pushed out are counted (until dismissed).
  */
 import { Alert, Button, Group, Text } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
@@ -12,9 +14,12 @@ import { useTranslation } from "react-i18next";
 import { copyTextToClipboard } from "../../../lib/clipboard";
 import type { LiveClient } from "./live-client";
 import {
+	dismissUnsavedDropped,
 	dropUnsavedText,
 	onUnsavedTexts,
+	UNSAVED_LIMITS,
 	type UnsavedReason,
+	unsavedDroppedOf,
 	unsavedTextsOf,
 	unsavedTextsVersion,
 } from "./unsaved-texts";
@@ -38,7 +43,8 @@ export function UnsavedTextsNotice({
 	const { t } = useTranslation("outline");
 	useSyncExternalStore(onUnsavedTexts, unsavedTextsVersion, unsavedTextsVersion);
 	const entries = unsavedTextsOf(pageId);
-	if (entries.length === 0) return null;
+	const dropped = unsavedDroppedOf(pageId);
+	if (entries.length === 0 && dropped === 0) return null;
 	const canRestore = !!client && client.pageId === pageId && client.ready && client.editable;
 	return (
 		<Alert
@@ -49,9 +55,25 @@ export function UnsavedTextsNotice({
 			className="nf-outline-unsaved-notice"
 			data-testid="outline-unsaved-notice"
 		>
-			<Text size="sm" mb={4}>
-				{t("editor.unsavedTitle", { count: entries.length })}
-			</Text>
+			{dropped > 0 && (
+				<Group gap="xs" wrap="wrap" mb={4} data-testid="outline-unsaved-dropped">
+					<Text size="sm">
+						{t("editor.unsavedDropped", {
+							count: dropped,
+							entries: UNSAVED_LIMITS.entries,
+							kb: UNSAVED_LIMITS.bytes / 1024,
+						})}
+					</Text>
+					<Button size="compact-xs" variant="subtle" onClick={() => dismissUnsavedDropped(pageId)}>
+						{t("editor.dismiss")}
+					</Button>
+				</Group>
+			)}
+			{entries.length > 0 && (
+				<Text size="sm" mb={4}>
+					{t("editor.unsavedTitle", { count: entries.length })}
+				</Text>
+			)}
 			{entries.map((entry) => (
 				<div
 					key={entry.id}
@@ -62,6 +84,11 @@ export function UnsavedTextsNotice({
 					<Text size="xs" c="dimmed">
 						{t(REASON_KEY[entry.reason])}
 					</Text>
+					{entry.adding === "unknown" && (
+						<Text size="xs" c="orange" fw={500} data-testid="outline-unsaved-maybe-added">
+							{t("editor.unsavedMaybeAdded")}
+						</Text>
+					)}
 					<pre className="nf-outline-unsaved" data-testid="outline-unsaved-text">
 						{entry.text}
 					</pre>
@@ -83,6 +110,8 @@ export function UnsavedTextsNotice({
 								size="compact-xs"
 								variant="light"
 								data-testid="outline-unsaved-restore"
+								// On its way: wait for the page's answer (not a second block).
+								disabled={entry.adding === "sending"}
 								onClick={() => {
 									// The entry stays until the page acknowledges the new block.
 									if (!client?.restoreUnsaved(entry))
@@ -92,7 +121,13 @@ export function UnsavedTextsNotice({
 										});
 								}}
 							>
-								{t("editor.restoreUnsaved")}
+								{t(
+									entry.adding === "sending"
+										? "editor.unsavedAdding"
+										: entry.adding === "unknown"
+											? "editor.restoreUnsavedAgain"
+											: "editor.restoreUnsaved",
+								)}
 							</Button>
 						)}
 						<Button size="compact-xs" variant="subtle" onClick={() => dropUnsavedText(entry.id)}>
