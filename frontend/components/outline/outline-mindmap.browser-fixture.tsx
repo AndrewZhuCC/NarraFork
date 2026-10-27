@@ -667,6 +667,34 @@ export function coverOutlinePanel(): boolean {
 	return !p.api.isVisible;
 }
 
+/** Panel host: bring the outline panel to the front of its group again (shown). */
+export function showOutlinePanel(): boolean {
+	const p = dockApi?.panels.find(
+		(panel) => (panel.params as Record<string, unknown>)?.panelType === "outline",
+	);
+	if (!p) return false;
+	p.api.setActive();
+	return p.api.isVisible;
+}
+
+/**
+ * The unsaved-text notice on screen: its texts and why, per entry (null when none is shown; a
+ * hidden panel's is not).
+ */
+export function unsavedNotice(): { texts: string[]; reasons: string[] } | null {
+	const notice = [
+		...document.querySelectorAll<HTMLElement>("[data-testid=outline-unsaved-notice]"),
+	].find((el) => el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }));
+	if (!notice) return null;
+	const entries = [...notice.querySelectorAll<HTMLElement>("[data-testid=outline-unsaved-entry]")];
+	return {
+		texts: entries.map(
+			(e) => e.querySelector("[data-testid=outline-unsaved-text]")?.textContent ?? "",
+		),
+		reasons: entries.map((e) => e.dataset.reason ?? ""),
+	};
+}
+
 /** The surface on screen: shown from its HTTP read, live, or not shown yet. */
 export function shownFrom(): "none" | "seed" | "live" {
 	const s = liveEditSurfaces().at(-1);

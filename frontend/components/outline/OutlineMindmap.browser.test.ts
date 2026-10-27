@@ -620,27 +620,45 @@ for (const host of HOSTS) {
 		const kb = a.page.keyboard;
 		const focus = async () => (await state(a)).focus;
 		/** The host's focus: the URL on the page, the panel's params in a panel. */
-		const hostFocus = async () =>
+		const hostFocus = async (): Promise<string | undefined> =>
 			host === "page"
 				? (await a.call((f) => f.location())).split("/").pop()
-				: (await a.call((f) => f.panelParams()))?.blockId;
+				: ((await a.call((f) => f.panelParams()))?.blockId as string | undefined);
 		const waitHost = async (id: string) => {
 			const end = Date.now() + 5000;
 			while (Date.now() < end && (await hostFocus()) !== id)
 				await new Promise((r) => setTimeout(r, 15));
 			expect(await hostFocus()).toBe(id);
 		};
+		/**
+		 * A navigation the host makes (back, forward, a breadcrumb) has landed: the host moved
+		 * from `from`, the page shows the host's focus, and its transition is over. State, not
+		 * time: the host renders the change, then the page animates to it, both later under load.
+		 */
+		const landed = async (what: string, from: string | undefined) => {
+			const end = Date.now() + 10_000;
+			let seen = "";
+			while (Date.now() < end) {
+				const there = await hostFocus();
+				const here = await focus();
+				const moving = await a.call((f) => f.animating());
+				if (there !== from && there === here && !moving) return;
+				seen = `host ${there}, page ${here}${moving ? ", animating" : ""}`;
+				await new Promise((r) => setTimeout(r, 15));
+			}
+			throw new Error(`${what} did not land: ${seen}`);
+		};
 		const back = async () => {
+			const from = await hostFocus();
 			if (host === "page") await a.call((f) => f.goBack());
 			else expect(await a.call((f) => f.clickTestId("outline-history-back"))).toBe(true);
-			await new Promise((r) => setTimeout(r, 40));
-			await settled(a);
+			await landed("back", from);
 		};
 		const forward = async () => {
+			const from = await hostFocus();
 			if (host === "page") await a.call((f) => f.goForward());
 			else await press(a.page, "Control", "]");
-			await new Promise((r) => setTimeout(r, 40));
-			await settled(a);
+			await landed("forward", from);
 		};
 		const t2 = s.id("T2");
 		const t2a = s.id("T2a");
@@ -662,9 +680,10 @@ for (const host of HOSTS) {
 		expect(await focus()).toBe(t2);
 		await waitHost(t2);
 		// A breadcrumb: back to the page.
+		const fromCrumb = await hostFocus();
 		expect(await a.call((f, t) => f.clickCrumb(t as never), `Focus ${host}`)).toBe(true);
-		await waitHost(s.pageId);
-		await settled(a);
+		await landed("the breadcrumb", fromCrumb);
+		expect(await hostFocus()).toBe(s.pageId);
 		expect(await focus()).toBe(s.pageId);
 		// Back and forward walk focus: page → T2 → T2a → T2 → page.
 		await back();
@@ -771,6 +790,68 @@ for (const host of HOSTS) {
 		expect(await a.call((f) => f.focusWhere())).toBe("outline");
 		expect(a.errors).toEqual([]);
 	}, 180_000);
+}
+
+for (const host of HOSTS) {
+	test(`${host}: a focus and its return told before the host renders the first: the host ends where the page is, and back still works (item 5)`, async () => {
+		const s = await seed(`Focus quick ${host}`);
+		const a = await openHost(h, host, s.pageId);
+		const t2 = s.id("T2");
+		const there = host === "page" ? "f.location().split('/').pop()" : "f.panelParams()?.blockId";
+		const hostFocus = async (): Promise<string | undefined> =>
+			a.page.evaluate(`((f) => ${there})(window.fixture)`) as Promise<string | undefined>;
+		const entries0 = await a.page.evaluate(() => history.length);
+		// Both in one task: the page tells the host of the two in a row, and the host may render
+		// only once (its focus seems never to change). The panel used to compare the return with
+		// a render that had not caught up and drop it (the panel kept T2 while the page showed the
+		// whole page); the page used to take a later "back to T2" for the echo of its own T2.
+		await a.call(
+			(f, x, p) => {
+				f.focusBlock(x as never);
+				f.focusBlock(p as never);
+			},
+			t2,
+			s.pageId,
+		);
+		await settled(a);
+		expect((await state(a)).focus).toBe(s.pageId);
+		// The host took the first (a history entry), then the host and the page agree.
+		await until(
+			a,
+			"the host took the focus",
+			host === "page"
+				? `() => history.length >= ${entries0 + 2}`
+				: `() => document.querySelector("[data-testid=outline-history-back]")?.disabled === false`,
+		);
+		const end = Date.now() + 5_000;
+		while (Date.now() < end && (await hostFocus()) !== (await state(a)).focus)
+			await new Promise((r) => setTimeout(r, 15));
+		expect(await hostFocus()).toBe(s.pageId);
+		// Both are in the host's history: back to T2, then back to where it started.
+		const back = async () => {
+			if (host === "page") await a.call((f) => f.goBack());
+			else expect(await a.call((f) => f.clickTestId("outline-history-back"))).toBe(true);
+		};
+		const at = (id: string) =>
+			`(f) => ${there} === ${JSON.stringify(id)} && f.state().focus === ${JSON.stringify(id)} && !f.animating()`;
+		await back();
+		await until(a, "back to T2", at(t2));
+		await back();
+		await until(a, "back to the page", at(s.pageId));
+		if (host === "panel") {
+			expect(
+				await a.call(
+					() =>
+						(
+							document.querySelector(
+								"[data-testid=outline-history-back]",
+							) as HTMLButtonElement | null
+						)?.disabled,
+				),
+			).toBe(true);
+		}
+		expect(a.errors).toEqual([]);
+	}, 60_000);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1184,7 +1265,7 @@ for (const host of HOSTS) {
 	}, 90_000);
 }
 
-test("page: read-only first — a block typed in is deleted before the snapshot: the notice restores the text", async () => {
+test("page: read-only first — a block typed in is gone before the snapshot: the text is kept and added back as a new block", async () => {
 	const p1 = await seed("RO deleted start");
 	const p2 = await seedWords("Rk");
 	const a = await openHost(h, "page", p1.pageId);
@@ -1208,19 +1289,29 @@ test("page: read-only first — a block typed in is deleted before the snapshot:
 	await a.call((f) => f.net().hold(false));
 	await until(a, "live", `(f) => f.shownFrom() === "live"`);
 	await settle(a, b);
-	const notice = await a.page.waitForSelector("[data-testid=outline-deleted-notice]", {
+	const notice = await a.page.waitForSelector("[data-testid=outline-unsaved-notice]", {
 		timeout: 5000,
 	});
-	expect(await notice?.evaluate((el) => el.textContent ?? "")).toContain("while connecting");
-	// Nothing was written on its own; Restore adds the text back under the same parent.
-	expect(serverOutline(p2.pageId)).not.toContain("我的字");
-	await a.page.evaluate(() => {
-		const button = [
-			...document.querySelectorAll("[data-testid=outline-deleted-notice] button"),
-		].find((el) => el.textContent?.trim() === "Restore") as HTMLButtonElement | undefined;
-		button?.click();
+	// Not "deleted": the block may have moved to another page.
+	expect(await notice?.evaluate((el) => el.textContent ?? "")).toContain(
+		"no longer on this page (deleted or moved)",
+	);
+	expect(await a.call((f) => f.unsavedNotice())).toEqual({
+		texts: ["Rk2b 子 我的字"],
+		reasons: ["moved_away"],
 	});
+	expect(await a.page.$("[data-testid=outline-deleted-notice]")).toBeNull();
+	// Nothing was written on its own; adding it back makes a new block under the same parent.
+	expect(serverOutline(p2.pageId)).not.toContain("我的字");
+	await a.page.click("[data-testid=outline-unsaved-restore]");
 	await settle(a, b);
+	// Acknowledged: the kept text is done.
+	await a.page.waitForFunction(
+		() => !document.querySelector("[data-testid=outline-unsaved-notice]"),
+		{
+			timeout: 5000,
+		},
+	);
 	const kids = await a.call((f, x) => f.kids(x as never), q2);
 	expect(kids).toHaveLength(2);
 	expect(serverText(p2.pageId, kids[1] as string)).toBe("Rk2b 子 我的字");
@@ -1256,7 +1347,7 @@ test("page: read-only first — a page over the live limits takes no typing on i
 	expect(a.errors).toEqual([]);
 }, 90_000);
 
-test("page: read-only first — refused after typing (access gone): the typing stays to copy, then read only", async () => {
+test("page: read-only first — refused after typing (access gone): read only, the typing kept to copy", async () => {
 	const p1 = await seed("RO refused start");
 	const p2 = await seedWords("Rm");
 	const a = await openHost(h, "page", p1.pageId);
@@ -1277,17 +1368,21 @@ test("page: read-only first — refused after typing (access gone): the typing s
 	await a.call((f, x, o) => f.caret(x as never, o as never), q2b, end);
 	await a.page.keyboard.type(" 没存上");
 	await a.call((f) => f.net().hold(false));
-	// The editor stays, with what was typed and a copy action; nothing reached the page.
-	const notice = await a.page.waitForSelector("[data-testid=outline-unsaved-notice]", {
-		timeout: 10_000,
-	});
-	expect(await a.page.$eval("[data-testid=outline-unsaved-text]", (el) => el.textContent)).toBe(
-		"Rm2b 子 没存上",
+	// The read-only view, with what was typed and a copy action; nothing reached the page.
+	await a.page.waitForFunction(
+		() =>
+			!document.querySelector("[data-testid=outline-editor]") &&
+			document.querySelector("[data-testid=outline-unsaved-notice]") !== null,
+		{ timeout: 10_000 },
 	);
+	expect(await a.call((f) => f.unsavedNotice())).toEqual({
+		texts: ["Rm2b 子 没存上"],
+		reasons: ["refused"],
+	});
+	const notice = await a.page.$("[data-testid=outline-unsaved-notice]");
 	expect(await notice?.evaluate((el) => el.textContent ?? "")).toContain("Copy text");
-	expect(await a.call((f, x) => f.text(x as never), q2b)).toBe("Rm2b 子 没存上");
 	expect(serverText(p2.pageId, q2b) ?? "").not.toContain("没存上");
-	// Dismissed: the read-only view.
+	// Dismissed: gone, the read-only view stays.
 	await a.page.evaluate(() => {
 		const button = [
 			...document.querySelectorAll("[data-testid=outline-unsaved-notice] button"),
@@ -1295,11 +1390,10 @@ test("page: read-only first — refused after typing (access gone): the typing s
 		button?.click();
 	});
 	await a.page.waitForFunction(
-		() =>
-			!document.querySelector("[data-testid=outline-unsaved-notice]") &&
-			!document.querySelector("[data-testid=outline-editor]"),
+		() => !document.querySelector("[data-testid=outline-unsaved-notice]"),
 		{ timeout: 10_000 },
 	);
+	expect(await a.page.$("[data-testid=outline-editor]")).toBeNull();
 	expect(a.errors).toEqual([]);
 }, 90_000);
 
@@ -1335,3 +1429,93 @@ test("panel: a panel hidden before its page turned live leaves the session at on
 	expect(liveSessionOf(p3.pageId)?.participants.size ?? 0).toBe(0);
 	expect(a.errors).toEqual([]);
 }, 60_000);
+
+test("panel: refused while typing, the panel hidden and shown again: the typing is shown again (probe P2′)", async () => {
+	const p1 = await seed("RO keep start");
+	const p2 = await seedWords("Rn");
+	const a = await openHost(h, "panel", p1.pageId);
+	await a.call((f, x) => f.caret(x as never, 0), p1.id("T1"));
+	await a.call((f) => {
+		f.net().hold(true);
+		f.net().refuseNextJoin = "access_denied";
+	});
+	const q2 = p2.id("Rn2");
+	const q2b = p2.id("Rn2b");
+	await switchTo(a, "Rn2 第二", q2);
+	await until(
+		a,
+		"shown from the read",
+		`(f) => f.shownFrom() === "seed" && f.focusShown(${JSON.stringify(q2)})`,
+	);
+	const end = (await a.call((f, x) => f.text(x as never), q2b)).length;
+	await a.call((f, x, o) => f.caret(x as never, o as never), q2b, end);
+	await a.page.keyboard.type(" 别丢");
+	await a.call((f) => f.net().hold(false));
+	const kept = { texts: ["Rn2b 子 别丢"], reasons: ["refused"] };
+	await until(a, "the notice", `(f) => f.unsavedNotice()?.texts[0] === "Rn2b 子 别丢"`);
+	expect(await a.call((f) => f.unsavedNotice())).toEqual(kept);
+	// Hidden: no notice on screen, and no session of the page (the refused one went).
+	expect(await a.call((f) => f.coverOutlinePanel())).toBe(true);
+	await until(
+		a,
+		"hidden, its session gone",
+		`(f) => f.unsavedNotice() === null && !f.liveSessions().some((s) => s.pageId === ${JSON.stringify(p2.pageId)})`,
+	);
+	// Shown again: the same text, still to copy.
+	expect(await a.call((f) => f.showOutlinePanel())).toBe(true);
+	await until(a, "the notice again", `(f) => f.unsavedNotice() !== null`);
+	expect(await a.call((f) => f.unsavedNotice())).toEqual(kept);
+	expect(serverText(p2.pageId, q2b) ?? "").not.toContain("别丢");
+	expect(a.errors).toEqual([]);
+}, 90_000);
+
+test("panel: typed while connecting, hidden before the page refused it: shown again, the new editor shows the typing", async () => {
+	const p1 = await seed("RO keep hidden start");
+	const p2 = await seedWords("Ro");
+	const a = await openHost(h, "panel", p1.pageId);
+	await a.call((f, x) => f.caret(x as never, 0), p1.id("T1"));
+	await a.call((f) => {
+		f.net().hold(true);
+		f.net().refuseNextJoin = "access_denied";
+	});
+	const q2 = p2.id("Ro2");
+	const q2b = p2.id("Ro2b");
+	await switchTo(a, "Ro2 第二", q2);
+	await until(
+		a,
+		"shown from the read",
+		`(f) => f.shownFrom() === "seed" && f.focusShown(${JSON.stringify(q2)})`,
+	);
+	const end = (await a.call((f, x) => f.text(x as never), q2b)).length;
+	await a.call((f, x, o) => f.caret(x as never, o as never), q2b, end);
+	await a.page.keyboard.type(" 藏起来也别丢");
+	// Hidden while its join is on its way: the editor (and the view the typing is in) goes; the
+	// session waits for the answer with the typing inside.
+	expect(await a.call((f) => f.coverOutlinePanel())).toBe(true);
+	await until(
+		a,
+		"the editor gone",
+		`() => !document.querySelector("[data-testid=outline-editor]")`,
+	);
+	await a.call((f) => f.net().hold(false));
+	// Refused while hidden: the session goes, the typing is kept (not on screen yet).
+	await until(
+		a,
+		"refused, its session gone",
+		`(f) => !f.liveSessions().some((s) => s.pageId === ${JSON.stringify(p2.pageId)})`,
+	);
+	expect(await a.call((f) => f.unsavedNotice())).toBeNull();
+	// Shown again: the page joins anew (live now), and its editor shows what was kept.
+	expect(await a.call((f) => f.showOutlinePanel())).toBe(true);
+	await until(a, "live again", `(f) => f.shownFrom() === "live"`);
+	await until(a, "the notice", `(f) => f.unsavedNotice() !== null`);
+	expect(await a.call((f) => f.unsavedNotice())).toEqual({
+		texts: ["Ro2b 子 藏起来也别丢"],
+		reasons: ["refused"],
+	});
+	expect(
+		await a.page.$("[data-testid=outline-editor] [data-testid=outline-unsaved-notice]"),
+	).not.toBeNull();
+	expect(serverText(p2.pageId, q2b) ?? "").not.toContain("别丢");
+	expect(a.errors).toEqual([]);
+}, 90_000);
