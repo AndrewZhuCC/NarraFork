@@ -138,8 +138,16 @@ export const OUTLINE_LIVE_BOUNDS = {
 	compactBytes: 1024 * 1024,
 	/** Structural batches kept for resuming clients. */
 	opLog: 256,
-	/** Client keys whose last processed transaction is remembered. */
+	/**
+	 * Client keys whose last processed transaction is remembered. Only keys with no participant
+	 * whose transactions were all acknowledged to their client are dropped to keep to this (a
+	 * client coming back without its key would replay what the page has). Kept keys are the
+	 * participants (at most `editorsPerPage` + `viewersPerPage`) and clients that left before
+	 * their last acknowledgement, which can pile up on a busy page: past `clientKeysHard` the
+	 * oldest of those goes anyway.
+	 */
 	clientKeys: 128,
+	clientKeysHard: 1024,
 	/** Blocks one block selection may name in presence. */
 	presenceBlocks: 200,
 };
@@ -254,7 +262,10 @@ export class LivePage {
 	readonly epoch = newEpoch();
 	readonly participants = new Map<number, Participant>();
 	private nextPno = 1;
+	/** Per client key: the highest transaction processed (least recently used first). */
 	private readonly keys = new Map<string, number>();
+	/** Per client key: the highest transaction acknowledged to its client. */
+	private readonly keyAcked = new Map<string, number>();
 	private opSeq = 0;
 	private readonly opLog: LiveCommitWire[] = [];
 	closed = false;
@@ -628,6 +639,8 @@ export class LivePage {
 		p.lastTx = sameSession ? processed : 0;
 		p.durableTx = sameSession ? durable : 0;
 		p.ackedTx = p.durableTx;
+		if (sameSession && durable > (this.keyAcked.get(head.key) ?? 0))
+			this.keyAcked.set(head.key, durable);
 		p.windowStart = this.windowUpdates.length;
 		p.commitStart = this.windowCommits.length;
 		if (!this.sendTo(p, frame, "control")) return { refused: "unavailable" };
@@ -867,6 +880,7 @@ export class LivePage {
 			);
 			if (sent && ack > 0) {
 				p.ackedTx = ack;
+				if (ack > (this.keyAcked.get(p.key) ?? 0)) this.keyAcked.set(p.key, ack);
 				const rest = waiting?.filter((a) => a[0] > ack) ?? [];
 				if (rest.length > 0) this.windowAcks.set(p.pno, rest);
 				else this.windowAcks.delete(p.pno);
@@ -1060,18 +1074,42 @@ export class LivePage {
 
 	private processed(p: Participant, n: number): void {
 		p.lastTx = n;
+		const added = !this.keys.has(p.key);
 		this.keys.delete(p.key);
 		this.keys.set(p.key, n);
 		this.keysPending.add(p.key);
-		while (this.keys.size > OUTLINE_LIVE_BOUNDS.clientKeys) {
-			const oldest = this.keys.keys().next().value;
-			if (oldest === undefined) break;
-			this.keys.delete(oldest);
-			this.keyDurable.delete(oldest);
-			this.keysPending.delete(oldest);
-		}
+		if (added && this.keys.size > OUTLINE_LIVE_BOUNDS.clientKeys) this.dropKeys();
 		// Acknowledged once the log has it (`persistStep`).
 		this.schedulePersist();
+	}
+
+	/** Keep the remembered client keys to their bound ({@link OUTLINE_LIVE_BOUNDS.clientKeys}). */
+	private dropKeys(): void {
+		const present = new Set<string>();
+		for (const p of this.participants.values()) present.add(p.key);
+		const drop = (key: string) => {
+			this.keys.delete(key);
+			this.keyAcked.delete(key);
+			this.keyDurable.delete(key);
+			this.keysPending.delete(key);
+		};
+		// Least recently used first: absent keys whose client has everything acknowledged.
+		for (const [key, tx] of this.keys) {
+			if (this.keys.size <= OUTLINE_LIVE_BOUNDS.clientKeys) return;
+			if (!present.has(key) && (this.keyAcked.get(key) ?? 0) >= tx) drop(key);
+		}
+		let forced = 0;
+		for (const key of this.keys.keys()) {
+			if (this.keys.size <= OUTLINE_LIVE_BOUNDS.clientKeysHard) break;
+			if (present.has(key)) continue;
+			drop(key);
+			forced++;
+		}
+		if (forced > 0)
+			logger.warn("Outline live session dropped unacknowledged client keys", {
+				pageId: this.pageId,
+				count: forced,
+			});
 	}
 
 	/**
@@ -1375,8 +1413,11 @@ export class LivePage {
 			for (const id of ids) if (!this.dirty.has(id)) this.dirty.set(id, user);
 		};
 		// Narrowing down a permanent failure costs a normalization (up to its timeout) per block:
-		// past this budget the rest are marked to go as code next time, at once.
+		// past this budget the blocks not tried alone wait, as they are, for the next flush (at
+		// least one is tried per flush, so it gets through them). Those that failed alone go as
+		// code from now on, so the next batch does not fail on them again.
 		const deadline = Date.now() + OUTLINE_LIVE_TIMING.narrowBudgetMs;
+		let tried = 0;
 		const giveUp = (id: string, user: string | null) => {
 			const n = (this.failures.get(id) ?? 0) + 1;
 			this.failures.set(id, n);
@@ -1409,13 +1450,13 @@ export class LivePage {
 				continue;
 			}
 			for (const id of failed) {
-				if (Date.now() >= deadline) {
-					// Not tried alone, so not counted as its failure: it goes as code next time.
-					this.stuck.add(id);
+				if (tried > 0 && Date.now() >= deadline) {
+					// Not tried alone: nothing known against it, so it is neither counted nor fenced.
 					ok = false;
 					redirty([id], user);
 					continue;
 				}
+				tried++;
 				let one = failed.length > 1 ? await this.commitTexts([id], user) : r;
 				if (!one.ok && one.permanent && !stuckBefore.has(id)) {
 					this.stuck.add(id);
@@ -2147,7 +2188,8 @@ export class LivePage {
 	private markDurable(keys: ReadonlyMap<string, number>): void {
 		if (keys.size === 0) return;
 		for (const [key, tx] of keys) {
-			if ((this.keyDurable.get(key) ?? 0) < tx) this.keyDurable.set(key, tx);
+			// A key dropped meanwhile (`dropKeys`) stays dropped.
+			if (this.keys.has(key) && (this.keyDurable.get(key) ?? 0) < tx) this.keyDurable.set(key, tx);
 		}
 		let advanced = false;
 		for (const p of this.participants.values()) {

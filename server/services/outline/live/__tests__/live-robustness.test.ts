@@ -987,6 +987,75 @@ describe("what the page already has of a client's transactions", () => {
 		});
 	}
 
+	test("a client that left before its acknowledgement keeps its key past the key bound", async () => {
+		OUTLINE_LIVE_BOUNDS.clientKeys = 2;
+		const { pageId, ids } = await page(["X", "Y"]);
+		const [x, y] = ids as [string, string];
+		const la = link(owner);
+		const a = open(la, pageId);
+		await waitFor(() => a.ready, 3000, "joined");
+		await logged(a, pageId, x);
+		type(a, x, "ab");
+		await sleep(30);
+		type(a, x, "cd");
+		await waitFor(() => liveSessionOf(pageId)?.textOf(x) === "X1abcd", 3000, "applied");
+		la.disconnect();
+		// The log gets Alice's typing after she left: no acknowledgement reached her.
+		OUTLINE_LIVE_TIMING.persistMs = 20;
+		await runInLane(space.id, async () => {
+			await liveSessionOf(pageId)?.persistNow();
+		});
+		// More editor instances than the bound come and go, each acknowledged.
+		const lb = link(writer);
+		for (let i = 0; i < 4; i++) {
+			const b = open(lb, pageId);
+			await waitFor(() => b.ready, 3000, "joined");
+			type(b, y, `${i}`);
+			await waitFor(() => b.pending.length === 0, 3000, "acknowledged");
+			b.dispose();
+			await settle();
+		}
+		const s = liveSessionOf(pageId) as unknown as { keys: Map<string, number> };
+		expect(s.keys.has(a.key)).toBe(true);
+		expect(s.keys.size).toBeLessThanOrEqual(3);
+		// The session ends while she is away; its record must still know her.
+		await closeAllLiveSessions("ended");
+		la.reconnect();
+		await waitFor(
+			() => a.status === "live" && a.pending.length === 0 && a.awaiting.length === 0,
+			3000,
+			"rejoined",
+		);
+		await settle();
+		await runInLane(space.id, async () => {
+			await liveSessionOf(pageId)?.flushContent();
+		});
+		expect(a.textOf(x)).toBe("X1abcd");
+		expect(await content(x)).toBe("X1abcd");
+	});
+
+	test("client keys stay within the hard bound when none is acknowledged", async () => {
+		Object.assign(OUTLINE_LIVE_BOUNDS, { clientKeys: 2, clientKeysHard: 3 });
+		const { pageId, ids } = await page(["X"]);
+		const x = ids[0] as string;
+		const first = open(link(owner), pageId);
+		await waitFor(() => first.ready, 3000, "joined");
+		await logged(first, pageId, x);
+		first.dispose();
+		for (let i = 0; i < 5; i++) {
+			const l = link(owner);
+			const c = open(l, pageId);
+			await waitFor(() => c.ready, 3000, "joined");
+			type(c, x, `${i}`);
+			await waitFor(() => liveSessionOf(pageId)?.textOf(x).endsWith(`${i}`) ?? false, 3000, "in");
+			// Gone before the log (and so the acknowledgement) has it.
+			l.disconnect();
+			await settle();
+		}
+		const s = liveSessionOf(pageId) as unknown as { keys: Map<string, number> };
+		expect(s.keys.size).toBe(3);
+	});
+
 	test("a shutdown logs and acknowledges what arrived before the sockets close", async () => {
 		const { pageId, ids } = await page(["X"]);
 		const x = ids[0] as string;
@@ -1094,11 +1163,14 @@ describe("structure delivered in order", () => {
 });
 
 describe("text that cannot be committed", () => {
-	test("narrowing a failure down block by block stops at its time budget", async () => {
-		const { pageId, ids } = await page(["one", "two", "three"]);
+	test("narrowing a failure past its time budget leaves untried blocks as they are", async () => {
+		const { pageId, ids } = await page(["one", "slow", "three"]);
+		const [one, slow, three] = ids as [string, string, string];
 		const a = open(link(owner), pageId);
 		await waitFor(() => a.ready, 3000, "joined");
-		for (const id of ids) type(a, id, " <<slow>>");
+		type(a, one, " ok");
+		type(a, slow, " <<slow>>");
+		type(a, three, " ok");
 		await settle();
 		let calls = 0;
 		OUTLINE_LIVE_HOOKS.normalize = async (texts) => {
@@ -1109,12 +1181,17 @@ describe("text that cannot be committed", () => {
 		};
 		OUTLINE_LIVE_TIMING.narrowBudgetMs = 0;
 		const s = liveSessionOf(pageId);
-		// The batch fails; no block is tried alone past the budget: all go as code next time.
-		expect(await runInLane(space.id, async () => (await s?.flushContent()) ?? false)).toBe(false);
-		expect(calls).toBe(1);
-		expect(await runInLane(space.id, async () => (await s?.flushContent()) ?? false)).toBe(true);
-		for (const [i, id] of ids.entries())
-			expect(await content(id)).toBe(`\`\`\`\n${["one", "two", "three"][i]} <<slow>>\n\`\`\``);
+		const flush = () => runInLane(space.id, async () => (await s?.flushContent()) ?? false);
+		// The batch fails; one block is tried alone, the budget is gone, the rest wait as they are.
+		expect(await flush()).toBe(false);
+		expect(calls).toBe(2);
+		expect(await content(one)).toBe("one ok");
+		expect(await content(three)).toBe("three");
+		// Next: the culprit is found and goes as code; the healthy block is never fenced.
+		expect(await flush()).toBe(false);
+		expect(await flush()).toBe(true);
+		expect(await content(slow)).toBe("```\nslow <<slow>>\n```");
+		expect(await content(three)).toBe("three ok");
 	});
 
 	test("a block that fails even as code is given up on: outside writes go on, the log keeps it", async () => {
