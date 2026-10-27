@@ -24,6 +24,7 @@ import {
 	useRef,
 	useState,
 } from "react";
+import { useTranslation } from "react-i18next";
 import { OutlineOpenerProvider } from "../../../lib/outline-opener";
 import { normalizeOutlinePanelState, type OutlinePanelState } from "../../../lib/outline-panel";
 import { OutlineHostProvider } from "../../outline/outline-host";
@@ -34,6 +35,7 @@ import { WebviewPanel } from "../browser/WebviewPanel";
 import { NarratorDockContext } from "../dock/NarratorDockContext";
 import { outlineParamsPatch } from "../dock/outline-dock";
 import { NarratorPanel } from "../NarratorPanel";
+import { NarratorPanelVisibilityProvider } from "../narrator-panel-visibility";
 import { usePanelCompact } from "../panels/shared";
 import type { WebviewLeafConfig } from "../split-tree";
 import {
@@ -65,15 +67,22 @@ const OutlinePanelContent = lazy(() =>
  * An outline member as a Director cell: the same content as its grid panel, its navigation
  * written back to the (hidden) grid panel's params, which also persists its place to its row.
  */
+/**
+ * An outline member as a Director cell. Only the primary cell is live (it joins the page's live
+ * session); a preview shows the page read only, like a session preview.
+ */
 function DirectorOutlinePanel({
 	leaf,
+	isPrimary,
 	onUpdateParams,
 	onSetPanelTitle,
 }: {
 	leaf: DirectorLeaf & { params: WorkspaceOutlineMemberParams };
+	isPrimary: boolean;
 	onUpdateParams: (leafId: string, params: WorkspacePanelParams) => void;
 	onSetPanelTitle: (leafId: string, title: string) => void;
 }) {
+	const { t } = useTranslation("outline");
 	const store = useWorkspaceDock();
 	const workspaceId = useWorkspaceId();
 	const container = useMemo(
@@ -92,23 +101,33 @@ function DirectorOutlinePanel({
 				...leaf.params,
 				...outlineParamsPatch(next),
 			} as WorkspacePanelParams);
-			if (next.title && next.title !== leaf.title) onSetPanelTitle(leaf.id, next.title);
 		},
-		[leaf.id, leaf.params, leaf.title, onUpdateParams, onSetPanelTitle],
+		[leaf.id, leaf.params, onUpdateParams],
+	);
+	const generic = t("title");
+	const onTitle = useCallback(
+		(title: string | null) => {
+			const name = title ?? generic;
+			if (name !== leaf.title) onSetPanelTitle(leaf.id, name);
+		},
+		[leaf.id, leaf.title, generic, onSetPanelTitle],
 	);
 	return (
 		<NarratorDockContext.Provider value={null}>
 			<OutlineOpenerProvider value={actions.opener}>
 				<OutlineHostProvider openSession={actions.openSession}>
-					<Suspense fallback={null}>
-						<OutlinePanelContent
-							state={state}
-							onChange={onChange}
-							onOpenNew={(next) => {
-								if (!actions.opener?.open(next, { newPanel: true })) onChange(next);
-							}}
-						/>
-					</Suspense>
+					<NarratorPanelVisibilityProvider value={isPrimary}>
+						<Suspense fallback={null}>
+							<OutlinePanelContent
+								state={state}
+								onChange={onChange}
+								onTitle={onTitle}
+								onOpenNew={(next) => {
+									if (!actions.opener?.open(next, { newPanel: true })) onChange(next);
+								}}
+							/>
+						</Suspense>
+					</NarratorPanelVisibilityProvider>
 				</OutlineHostProvider>
 			</OutlineOpenerProvider>
 		</NarratorDockContext.Provider>
@@ -257,6 +276,7 @@ function DirectorPanelContent({
 		return (
 			<DirectorOutlinePanel
 				leaf={leaf as DirectorLeaf & { params: WorkspaceOutlineMemberParams }}
+				isPrimary={isPrimary}
 				onUpdateParams={onUpdatePluginParams}
 				onSetPanelTitle={onSetPanelTitle}
 			/>

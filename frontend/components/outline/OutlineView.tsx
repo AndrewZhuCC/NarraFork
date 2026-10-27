@@ -23,6 +23,8 @@ export interface OutlineViewProps {
 	onLoaded?: (info: OutlineSurfaceLoaded) => void;
 	/** A space's page list loaded. */
 	onSpaceLoaded?: (space: OutlineSpaceDetail, name: string) => void;
+	/** The page or space could not be read (missing, or no access). */
+	onMissing?: () => void;
 	/** The host's controls in the page's toolbar (or beside the space's badges). */
 	actions?: ReactNode;
 }
@@ -35,6 +37,7 @@ export function OutlineView({
 	compact,
 	onLoaded,
 	onSpaceLoaded,
+	onMissing,
 	actions,
 }: OutlineViewProps) {
 	if (target.kind === "block") {
@@ -49,13 +52,19 @@ export function OutlineView({
 				layout={layout}
 				compact={compact}
 				onLoaded={onLoaded}
+				onMissing={onMissing}
 				actions={actions}
 			/>
 		);
 	}
 	const body =
 		target.kind === "space" ? (
-			<OutlineSpaceHome spaceId={target.spaceId} onLoaded={onSpaceLoaded} actions={actions} />
+			<OutlineSpaceHome
+				spaceId={target.spaceId}
+				onLoaded={onSpaceLoaded}
+				onMissing={onMissing}
+				actions={actions}
+			/>
 		) : (
 			<OutlineHome />
 		);

@@ -11,8 +11,15 @@
  *
  * The current page is the live editor (`OutlineEditor`): people who may write the space edit it
  * together, people who may only read it watch it change. The view as of a commit is the
- * read-only block tree, and so is a page live editing cannot take (too large, or the socket is
- * unavailable). The side panel and the timeline follow commits through the page subscription.
+ * read-only block tree, and so is a page live editing cannot take (too large, the socket is
+ * unavailable, or the tab already has as many pages live as its socket takes). The side panel
+ * and the timeline follow commits through the page subscription.
+ *
+ * Live only on screen: inside a dock panel that is not visible (a background tab, a Director
+ * preview) the surface neither joins the page's live session nor subscribes to the page, and
+ * shows the read-only tree; it joins again when shown (`live-sessions.ts` keeps a session a few
+ * seconds after its last editor, so flicking between tabs is cheap). Hidden panels so take no
+ * live slot of the socket and do not show their reader as present to others.
  *
  * Narrow (a phone, or a dock panel of 320–480 px): the side panel is a drawer, over the window on
  * a phone and inside the surface in a panel.
@@ -33,7 +40,7 @@ import {
 import { useElementSize, useMediaQuery } from "@mantine/hooks";
 import { titleOf } from "@shared/outline";
 import type { OutlineViewMode } from "@shared/outline-api";
-import type { LiveCloseCode } from "@shared/outline-live-protocol";
+import { OUTLINE_LIVE_LIMITS } from "@shared/outline-live-protocol";
 import { IconClock, IconLayoutSidebarRight } from "@tabler/icons-react";
 import { useCallback, useEffect, useMemo, useReducer, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -42,7 +49,8 @@ import { ApiError } from "../../lib/api";
 import { forgetOutlineRecent, recordOutlineRecent } from "../../lib/outline-recents";
 import type { OutlineBlockSearch } from "../../lib/outline-view";
 import { MANTINE_SM_BREAKPOINT_PX, MOBILE_VIEWPORT_MEDIA_QUERY } from "../../lib/responsive";
-import { OutlineEditor } from "./editor/OutlineEditor";
+import { useNarratorPanelVisible } from "../narrator/narrator-panel-visibility";
+import { OutlineEditor, type OutlineLiveUnavailable } from "./editor/OutlineEditor";
 import classes from "./Outline.module.css";
 import { OutlineBlockBody } from "./OutlineBlockBody";
 import { OutlineBlockTree, OutlineTaskIcon } from "./OutlineBlockTree";
@@ -82,6 +90,8 @@ export interface OutlineSurfaceProps {
 	 * tab after it and remembers the page it is on.
 	 */
 	onLoaded?: (info: OutlineSurfaceLoaded) => void;
+	/** The place could not be read (it does not exist, or the person may not read it). */
+	onMissing?: () => void;
 	/** The host's own controls, at the end of the toolbar (open beside, discuss in a session). */
 	actions?: React.ReactNode;
 }
@@ -120,14 +130,21 @@ function SurfaceBody({
 	compact: compactProp,
 	layout = "page",
 	onLoaded,
+	onMissing,
 	actions,
 }: OutlineSurfaceProps) {
 	const { t } = useTranslation("outline");
 	const mode: OutlineViewMode = viewMode ?? "facts";
-	// The current page is edited live unless live editing turned out unavailable here.
-	const [fallback, setFallback] = useState<LiveCloseCode | "timeout" | null>(null);
+	// The current page is edited live while on screen, unless live editing turned out
+	// unavailable here.
+	const onScreen = useNarratorPanelVisible();
+	const [fallback, setFallback] = useState<OutlineLiveUnavailable | null>(null);
 	const [hiddenLive, setHiddenLive] = useState(0);
-	const editing = asOf === undefined && fallback === null;
+	const editing = onScreen && asOf === undefined && fallback === null;
+	// No room was left while on screen: try again the next time the panel is shown.
+	useEffect(() => {
+		if (!onScreen) setFallback((current) => (current === "tab_limit" ? null : current));
+	}, [onScreen]);
 	// While editing, the HTTP read only feeds the breadcrumbs, side panel and timeline.
 	const query = useOutlineBlock(spaceId, blockId, {
 		asOf,
@@ -135,7 +152,7 @@ function SurfaceBody({
 		...(editing ? { blocks: 1 } : {}),
 	});
 	const view = query.data;
-	useOutlinePageLive(view);
+	useOutlinePageLive(onScreen ? view : undefined);
 	const pageId = view?.pageId;
 	useEffect(() => {
 		if (pageId) setFallback(null);
@@ -199,6 +216,9 @@ function SurfaceBody({
 	useEffect(() => {
 		if (missing && asOf === undefined) forgetOutlineRecent(blockId);
 	}, [missing, asOf, blockId]);
+	useEffect(() => {
+		if (missing) onMissing?.();
+	}, [missing, onMissing]);
 	const loadedSpaceKey = view?.space.key;
 	const loadedCanWrite = view?.space.canWrite === true;
 	const rootSid = root?.sid;
@@ -323,16 +343,31 @@ function SurfaceBody({
 								{t("editor.tooLargePage")}
 							</Alert>
 						)}
-						{fallback !== null && fallback !== "too_large" && fallback !== "access_denied" && (
-							<Alert variant="light" color="gray" py={6} mb="xs">
+						{fallback === "tab_limit" && (
+							<Alert variant="light" color="gray" py={6} mb="xs" data-testid="outline-tab-limit">
 								<Group gap="xs" wrap="wrap">
-									<Text size="sm">{t("editor.unavailable")}</Text>
+									<Text size="sm">
+										{t("editor.tabLimit", { count: OUTLINE_LIVE_LIMITS.sessionsPerSocket })}
+									</Text>
 									<Button size="compact-xs" variant="light" onClick={() => setFallback(null)}>
 										{t("editor.retry")}
 									</Button>
 								</Group>
 							</Alert>
 						)}
+						{fallback !== null &&
+							fallback !== "too_large" &&
+							fallback !== "access_denied" &&
+							fallback !== "tab_limit" && (
+								<Alert variant="light" color="gray" py={6} mb="xs">
+									<Group gap="xs" wrap="wrap">
+										<Text size="sm">{t("editor.unavailable")}</Text>
+										<Button size="compact-xs" variant="light" onClick={() => setFallback(null)}>
+											{t("editor.retry")}
+										</Button>
+									</Group>
+								</Alert>
+							)}
 						{editing && view.current ? (
 							<OutlineEditor
 								pageId={view.pageId}

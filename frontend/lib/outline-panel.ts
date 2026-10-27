@@ -5,8 +5,12 @@
  * STATE
  * -----
  * `spaceId` + `blockId` say what is shown (no space: the outline home; no block: the space's
- * pages), `view` and `asOf` how. `pageId` (the page the focused block is on) and `title` are
- * learned when the panel loads and kept so a restored layout names its tabs before reading.
+ * pages), `view` and `asOf` how. `pageId` (the page the focused block is on) is learned when the
+ * panel loads and kept, so a restored layout knows its panels' identity before reading.
+ *
+ * Titles are never stored: a layout can outlive the person who made it in a shared browser (a
+ * session's dock layout is kept per session and device), and a page title is content. A tab is
+ * named after what its panel loaded, and is the generic name until then or when nothing loads.
  *
  * IDENTITY
  * --------
@@ -24,7 +28,10 @@ export interface OutlinePanelState {
 	pageId?: string;
 	view?: "all";
 	asOf?: number;
-	/** Last loaded title (the page or focused block, or the space). */
+	/**
+	 * A title already known when a place is opened (a resolved reference names it), to name a new
+	 * panel's tab at once. Never written to params (`normalizeOutlinePanelState` drops it).
+	 */
 	title?: string;
 }
 
@@ -36,16 +43,19 @@ function id(value: unknown): string | undefined {
 	return typeof value === "string" && ID.test(value) ? value : undefined;
 }
 
-/** The outline part of stored panel params, keeping only well-formed fields. */
+/** A title as shown on a tab: trimmed, bounded, or nothing. */
+export function outlinePanelTitle(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim()
+		? value.trim().slice(0, OUTLINE_PANEL_TITLE_MAX)
+		: undefined;
+}
+
+/** The outline part of stored panel params, keeping only well-formed fields (no title). */
 export function normalizeOutlinePanelState(raw: unknown): OutlinePanelState {
 	if (!raw || typeof raw !== "object") return {};
 	const value = raw as Record<string, unknown>;
-	const title =
-		typeof value.title === "string" && value.title.trim()
-			? value.title.trim().slice(0, OUTLINE_PANEL_TITLE_MAX)
-			: undefined;
 	const spaceId = id(value.spaceId);
-	if (!spaceId) return title ? { title } : {};
+	if (!spaceId) return {};
 	const blockId = id(value.blockId);
 	const pageId = blockId ? id(value.pageId) : undefined;
 	const asOf =
@@ -58,7 +68,6 @@ export function normalizeOutlinePanelState(raw: unknown): OutlinePanelState {
 		...(pageId ? { pageId } : {}),
 		...(blockId && value.view === "all" ? { view: "all" as const } : {}),
 		...(asOf !== undefined ? { asOf } : {}),
-		...(title ? { title } : {}),
 	};
 }
 
@@ -77,8 +86,7 @@ export function outlinePanelTarget(state: OutlinePanelState): OutlineTarget {
 
 /**
  * The state after navigating to `to` inside a panel. The page stays known when the focus stays
- * (a view or time change) or moves to the page itself; otherwise it is learned again on load (a
- * focus in the same space keeps the title until then).
+ * (a view or time change) or moves to the page itself; otherwise it is learned again on load.
  */
 export function outlinePanelStateFor(
 	to: OutlineTarget,
@@ -95,7 +103,6 @@ export function outlinePanelStateFor(
 		view: to.view,
 		asOf: to.asOf,
 		...(samePage ? { pageId: previous.pageId } : {}),
-		...(previous.spaceId === to.spaceId ? { title: previous.title } : {}),
 	});
 }
 
@@ -125,11 +132,6 @@ export function isSameOutlinePanel(
 	);
 }
 
-/** The title to show for a panel before (or without) its content. */
-export function outlinePanelFallbackTitle(state: OutlinePanelState, outline: string): string {
-	return state.title ?? outline;
-}
-
 let panelSeq = 0;
 /** A fresh dockview panel id (one per panel; identity lives in the params, not the id). */
 export function nextOutlinePanelId(prefix: string): string {
@@ -144,7 +146,6 @@ export function sameOutlinePanelState(a: OutlinePanelState, b: OutlinePanelState
 		a.blockId === b.blockId &&
 		a.pageId === b.pageId &&
 		a.view === b.view &&
-		a.asOf === b.asOf &&
-		a.title === b.title
+		a.asOf === b.asOf
 	);
 }

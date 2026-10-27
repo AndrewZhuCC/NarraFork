@@ -153,7 +153,8 @@
 		"dismiss": "Dismiss",
 		"tooLargePage": "This page is too large to edit live (over 2000 blocks or 4 MB). It is shown read only; focus on a part of it or split it.",
 		"unavailable": "Live editing is not available right now; the page is shown read only.",
-		"retry": "Try again"
+		"retry": "Try again",
+		"tabLimit": "Shown read only: this tab already has {{count}} outline pages open for live editing. Close or hide one of them, then try again."
 	},
 	"link": {
 		"notFound": "This outline link points to something that does not exist, or that you cannot read."

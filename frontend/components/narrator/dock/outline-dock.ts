@@ -13,7 +13,8 @@ import {
 /**
  * Every outline field, absent ones as `undefined`: dockview merges updated params and deletes
  * keys set to `undefined`, so this replaces the panel's outline state as a whole and leaves its
- * other params (`panelType`, `hostNarratorId`, `panelRowId`) alone.
+ * other params (`panelType`, `hostNarratorId`, `panelRowId`) alone. `title` is always removed:
+ * titles are not stored in params (`lib/outline-panel.ts`), and one an older build stored goes.
  */
 export function outlineParamsPatch(state: OutlinePanelState): {
 	[K in keyof Required<OutlinePanelState>]: OutlinePanelState[K] | undefined;
@@ -24,7 +25,7 @@ export function outlineParamsPatch(state: OutlinePanelState): {
 		pageId: state.pageId,
 		view: state.view,
 		asOf: state.asOf,
-		title: state.title,
+		title: undefined,
 	};
 }
 
@@ -47,12 +48,10 @@ export function findOutlinePanel(
 }
 
 /**
- * Navigate an existing panel to `request`, keeping its title until the new place loads (so the
- * tab does not flash a generic name).
+ * Navigate an existing panel to `request`. Its tab keeps its title until the new place loads (so
+ * it does not flash a generic name), or takes the request's when one is known.
  */
 export function navigateOutlinePanel(panel: IDockviewPanel, request: OutlinePanelState): void {
-	const current = outlineStateOfPanel(panel) ?? {};
-	panel.api.updateParameters(
-		outlineParamsPatch({ ...request, title: request.title ?? current.title }),
-	);
+	panel.api.updateParameters(outlineParamsPatch(request));
+	if (request.title && panel.api.title !== request.title) panel.api.setTitle(request.title);
 }

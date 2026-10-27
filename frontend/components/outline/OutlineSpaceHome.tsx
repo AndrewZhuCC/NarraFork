@@ -30,11 +30,14 @@ import { OutlineLink, outlineBlockTarget } from "./outline-nav";
 export function OutlineSpaceHome({
 	spaceId,
 	onLoaded,
+	onMissing,
 	actions,
 }: {
 	spaceId: string;
 	/** Told the space once it has loaded (a dock panel names its tab after it). */
 	onLoaded?: (space: OutlineSpaceDetail, name: string) => void;
+	/** The space could not be read (it does not exist, or the person may not read it). */
+	onMissing?: () => void;
 	/** The host's own controls, beside the space's badges. */
 	actions?: React.ReactNode;
 }) {
@@ -50,10 +53,13 @@ export function OutlineSpaceHome({
 	useEffect(() => {
 		if (detail && onLoaded) onLoaded(detail, name);
 	}, [detail, name, onLoaded]);
+	const missing = space.error instanceof ApiError && space.error.status === 404;
+	useEffect(() => {
+		if (missing) onMissing?.();
+	}, [missing, onMissing]);
 
 	if (space.isLoading) return <Loader size="sm" />;
 	if (space.isError || !detail) {
-		const missing = space.error instanceof ApiError && space.error.status === 404;
 		return (
 			<Alert color={missing ? "gray" : "red"} variant="light">
 				{t(missing ? "notFound" : "loadFailed")}

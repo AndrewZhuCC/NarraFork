@@ -161,9 +161,12 @@ export function OutlinePageSessionsMenu({
 export function DiscussPageButton({
 	space,
 	onPick,
+	disabled = false,
 }: {
 	space: OutlineSpaceDetail | undefined;
 	onPick: (narratorId: string) => void;
+	/** The page shown has not loaded yet (its reference would name the previous one). */
+	disabled?: boolean;
 }) {
 	const { t } = useTranslation("outline");
 	const [opened, setOpened] = useState(false);
@@ -183,6 +186,7 @@ export function DiscussPageButton({
 					variant="subtle"
 					color="gray"
 					aria-label={t("dock.discuss")}
+					disabled={disabled}
 					onClick={() => setOpened(true)}
 					data-testid="outline-page-discuss"
 				>

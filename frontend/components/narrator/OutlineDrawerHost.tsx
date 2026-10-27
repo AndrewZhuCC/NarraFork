@@ -8,7 +8,7 @@
  */
 import { ActionIcon, Box, Center, Drawer, Group, Loader, Text, Tooltip } from "@mantine/core";
 import { IconExternalLink } from "@tabler/icons-react";
-import { lazy, Suspense } from "react";
+import { lazy, Suspense, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useMobileDrawerHistory } from "../../hooks/useMobileDrawerHistory";
 import { useMobileViewport } from "../../hooks/useMobileViewport";
@@ -40,6 +40,8 @@ export function OutlineDrawerHost({
 	const { t } = useTranslation("outline");
 	const isMobile = useMobileViewport();
 	const openPage = useOpenOutlinePage();
+	// What loaded is called this (a title the opener already knew until then); not stored.
+	const [title, setTitle] = useState<string | null>(state.title ?? null);
 	useMobileDrawerHistory(true, onClose);
 	return (
 		<Drawer
@@ -50,7 +52,7 @@ export function OutlineDrawerHost({
 			title={
 				<Group gap="xs" wrap="nowrap" style={{ minWidth: 0 }}>
 					<Text size="sm" fw={600} truncate>
-						{state.title ?? t("title")}
+						{title ?? t("title")}
 					</Text>
 					<Tooltip label={t("panel.openPage")}>
 						<ActionIcon
@@ -91,7 +93,12 @@ export function OutlineDrawerHost({
 			>
 				<OutlineHostProvider openSession={onOpenSession}>
 					<Box style={{ flex: 1, minHeight: 0 }}>
-						<OutlinePanelContent state={state} onChange={onChange} onOpenNew={onChange} />
+						<OutlinePanelContent
+							state={state}
+							onChange={onChange}
+							onOpenNew={onChange}
+							onTitle={setTitle}
+						/>
 					</Box>
 				</OutlineHostProvider>
 			</Suspense>

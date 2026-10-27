@@ -37,7 +37,11 @@ import {
 	useSyncExternalStore,
 } from "react";
 import type { OutlineOpener, OutlineOpenOptions } from "../../../lib/outline-opener";
-import { nextOutlinePanelId, type OutlinePanelState } from "../../../lib/outline-panel";
+import {
+	nextOutlinePanelId,
+	normalizeOutlinePanelState,
+	type OutlinePanelState,
+} from "../../../lib/outline-panel";
 import type { PluginContributionPick } from "../../plugins/PluginContributionPicker";
 import { buildPluginDockPanelOpenRequest } from "../../plugins/PluginContributionPicker";
 import type { PluginUiSessionContext } from "../../plugins/PluginUiSurfaceContext";
@@ -1055,7 +1059,7 @@ export class WorkspaceDockStore {
 			{
 				id: nextOutlinePanelId(`woutline_${hostNarratorId}_`),
 				component: PANEL_COMPONENT.outline,
-				params: { panelType: "outline", hostNarratorId, ...request },
+				params: { panelType: "outline", hostNarratorId, ...normalizeOutlinePanelState(request) },
 				...(request.title ? { title: request.title } : {}),
 			},
 			sourcePanelId,

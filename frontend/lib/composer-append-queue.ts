@@ -13,11 +13,14 @@ const TTL_MS = 2 * 60 * 1000;
 const MAX_PER_SESSION = 4;
 const MAX_SESSIONS = 16;
 const MAX_TEXT = 4000;
+/** Composers of one session listening at once (the same session open in a few places). */
+const MAX_LISTENERS = 8;
 
 type Listener = (text: string) => void;
 
 const pending = new Map<string, Array<{ text: string; at: number }>>();
-const listeners = new Map<string, Listener>();
+/** Per session, the composers listening, oldest first; the newest one gets the text. */
+const listeners = new Map<string, Listener[]>();
 
 function prune(now: number): void {
 	for (const [narratorId, list] of pending) {
@@ -31,7 +34,7 @@ function prune(now: number): void {
 export function requestComposerAppend(narratorId: string, text: string): void {
 	const value = text.slice(0, MAX_TEXT);
 	if (!narratorId || !value) return;
-	const listener = listeners.get(narratorId);
+	const listener = listeners.get(narratorId)?.at(-1);
 	if (listener) {
 		listener(value);
 		return;
@@ -50,17 +53,22 @@ export function requestComposerAppend(narratorId: string, text: string): void {
 }
 
 /**
- * Receive the session's appends: the waiting ones at once, later ones as they come. The most
- * recent listener of a session wins (one composer per session gets the text, not every copy).
+ * Receive the session's appends: the waiting ones at once, later ones as they come. One composer
+ * per session gets the text, not every copy: the most recent listener still mounted, so when the
+ * newest copy of a session's composer goes away an older one takes over.
  */
 export function listenComposerAppend(narratorId: string, listener: Listener): () => void {
-	listeners.set(narratorId, listener);
+	const stack = (listeners.get(narratorId) ?? []).filter((l) => l !== listener);
+	stack.push(listener);
+	listeners.set(narratorId, stack.slice(-MAX_LISTENERS));
 	prune(Date.now());
 	const waiting = pending.get(narratorId);
 	pending.delete(narratorId);
 	for (const item of waiting ?? []) listener(item.text);
 	return () => {
-		if (listeners.get(narratorId) === listener) listeners.delete(narratorId);
+		const remaining = (listeners.get(narratorId) ?? []).filter((l) => l !== listener);
+		if (remaining.length > 0) listeners.set(narratorId, remaining);
+		else listeners.delete(narratorId);
 	};
 }
 

@@ -33,13 +33,20 @@ export function outlinePageDockKey(userId: string): string {
 	return `${STORAGE_PREFIX}${userId}`;
 }
 
-/** The layout to remember: navigation requests dropped, the main panel's params emptied. */
+/**
+ * The layout to remember: navigation requests and outline titles dropped, the main panel's
+ * params and title emptied (it shows whatever the URL names).
+ */
 export function serializeOutlinePageDock(layout: SerializedDockview): string | null {
 	const stripped = stripNavigationFromLayout(layout);
-	const panels = (stripped as { panels?: Record<string, { params?: Record<string, unknown> }> })
-		.panels;
+	const panels = (
+		stripped as { panels?: Record<string, { params?: Record<string, unknown>; title?: string }> }
+	).panels;
 	const main = panels?.[OUTLINE_PAGE_MAIN_ID];
-	if (main) main.params = { panelType: OUTLINE_PAGE_COMPONENTS.main };
+	if (main) {
+		main.params = { panelType: OUTLINE_PAGE_COMPONENTS.main };
+		delete main.title;
+	}
 	const envelope: Envelope = { version: OUTLINE_PAGE_DOCK_VERSION, layout: stripped };
 	const text = JSON.stringify(envelope);
 	return text.length <= OUTLINE_PAGE_DOCK_MAX_CHARS ? text : null;

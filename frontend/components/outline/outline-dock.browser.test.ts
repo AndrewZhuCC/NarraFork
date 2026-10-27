@@ -9,7 +9,10 @@
  *     never the URL (neither the router's nor the window's);
  *   - typing in the composer, including the editor's own keys, never reaches the outline;
  *   - two panels on one page share one live session, and opening a block of an open page
- *     reuses that page's panel.
+ *     reuses that page's panel;
+ *   - a panel joins its page's live session only while on screen: a background tab leaves it
+ *     (after the grace period) and joins again when shown, so opening more pages one after
+ *     another than the socket takes never runs into the server's limit.
  */
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
@@ -18,6 +21,7 @@ import { Hono } from "hono";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
 import { db } from "../../../server/db";
 import { projects, users } from "../../../server/db/schema";
+import { AppError } from "../../../server/lib/errors";
 import { generateId } from "../../../server/lib/id";
 import { settings } from "../../../server/lib/settings";
 import { outlineRoutes } from "../../../server/routes/outline";
@@ -50,6 +54,8 @@ let owner: string;
 let space: OutlineSpaceRow;
 let pageId: string;
 let ids: string[];
+/** More pages than one socket may have live at once. */
+let morePages: string[];
 
 function api() {
 	const app = new Hono();
@@ -58,6 +64,11 @@ function api() {
 		c.set("user", { sub: token, role: "user", iat: 0, exp: Number.MAX_SAFE_INTEGER });
 		await next();
 	});
+	app.onError((error) =>
+		error instanceof AppError
+			? Response.json({ error: error.message, code: error.code }, { status: error.statusCode })
+			: Response.json({ error: String(error) }, { status: 500 }),
+	);
 	app.get("/api/settings", (c) => c.json({ outline: { enabled: true } }));
 	app.route("/api/outline", outlineRoutes);
 	return app;
@@ -146,6 +157,17 @@ beforeAll(async () => {
 	});
 	ids = written.results.map((result) => result.blockId);
 	pageId = ids[0] as string;
+	const more = await writeOutline({
+		spaceId: space.id,
+		ops: Array.from({ length: 10 }, (_, i) => ({
+			op: "insert" as const,
+			parent: null,
+			content: `Page ${i + 1}`,
+		})),
+		actor: { kind: "human", id: owner },
+		responsibleUserId: owner,
+	});
+	morePages = more.results.map((result) => result.blockId);
 }, 60_000);
 
 afterAll(async () => {
@@ -214,12 +236,9 @@ test("an outline panel beside the composer navigates in place and keeps the keyb
 		await until(page, (f) => f.liveEditors() === 1);
 		await until(page, (f) => f.outlinePanels()[0]?.title === "Dock page");
 		let [panel] = await call(page, (f) => f.outlinePanels());
-		expect(panel?.params).toMatchObject({
-			spaceId: space.id,
-			blockId: pageId,
-			pageId,
-			title: "Dock page",
-		});
+		expect(panel?.params).toMatchObject({ spaceId: space.id, blockId: pageId, pageId });
+		// The tab is named after the page, but the name is not stored with the panel.
+		expect(panel?.params.title).toBeUndefined();
 		expect((await call(page, (f) => f.panels())).map((p) => p.id)).toContain("ndock-chat");
 
 		// Focus a block (its bullet): the panel's params follow, the URL does not.
@@ -328,11 +347,9 @@ test("two panels on one page share one live session; a block of an open page reu
 			pageId,
 		);
 		await until(page, (f) => f.outlinePanels().length === 2);
-		// Both editors mounted (each panel in front of its own group or the same group in turn).
-		const [a, b] = await call(page, (f) => f.outlinePanels());
-		await call(page, (f, id) => f.activate(id), a?.id);
-		await until(page, (f) => f.liveEditors() >= 1);
-		await call(page, (f, id) => f.activate(id), b?.id);
+		// Both on screen (the second one split off into its own group): both editors live.
+		const [, b] = await call(page, (f) => f.outlinePanels());
+		await call(page, (f, id) => f.splitRight(id), b?.id);
 		await until(page, (f) => f.liveEditors() === 2);
 		const session = liveSessionOf(pageId);
 		expect(session).toBeDefined();
@@ -349,6 +366,103 @@ test("two panels on one page share one live session; a block of an open page reu
 		);
 		await until(page, (f) => f.outlinePanels().some((x) => x.params.blockId !== x.params.pageId));
 		expect(await call(page, (f) => f.outlinePanels().length)).toBe(2);
+		expect(errors).toEqual([]);
+	} finally {
+		await page.browserContext().close();
+		await closeAllLiveSessions("ended");
+	}
+}, 60_000);
+
+/** Participants of a page's live session on the server (none when it has no session). */
+function participants(id: string): number {
+	return liveSessionOf(id)?.participants.size ?? 0;
+}
+
+async function waitFor(check: () => boolean, timeout = 10_000): Promise<void> {
+	const end = Date.now() + timeout;
+	while (!check()) {
+		if (Date.now() > end) throw new Error(`timed out: ${check.toString()}`);
+		await new Promise((r) => setTimeout(r, 25));
+	}
+}
+
+test("a panel is live only on screen; more pages than the socket takes, one after another, all go live", async () => {
+	const { page, errors } = await openDock();
+	try {
+		await call(page, (f) => f.setGrace(300));
+		const [p1, p2, p3] = morePages as [string, string, string];
+
+		// A panel restored behind another never joins its page.
+		await call(
+			page,
+			(f, s, p) => f.openOutline({ spaceId: s, blockId: p, pageId: p }),
+			space.id,
+			p1,
+		);
+		await until(page, (f) => f.liveEditors() === 1);
+		await waitFor(() => participants(p1) === 1);
+		await call(
+			page,
+			(f, s, p) => f.openInBackground({ spaceId: s, blockId: p, pageId: p }, "bg-panel"),
+			space.id,
+			p2,
+		);
+		await new Promise((r) => setTimeout(r, 600));
+		expect(participants(p2)).toBe(0);
+		expect(participants(p1)).toBe(1);
+		expect((await call(page, (f) => f.liveState())).sessions.map((x) => x.pageId)).not.toContain(
+			p2,
+		);
+
+		// Shown, it joins; the panel it hid leaves after the grace period.
+		await call(page, (f) => f.activate("bg-panel"));
+		await waitFor(() => participants(p2) === 1);
+		await waitFor(() => participants(p1) === 0);
+		// Shown again, the first one joins again.
+		const [first] = await call(page, (f) => f.outlinePanels());
+		await call(page, (f, id) => f.activate(id), first?.id);
+		await waitFor(() => participants(p1) === 1);
+		await waitFor(() => participants(p2) === 0);
+
+		// Opened one after another faster than the grace period: the hidden ones give their slots
+		// to the new ones, and the server never refuses a join.
+		await call(page, (f) => f.setGrace(null));
+		for (const id of [p3, ...morePages.slice(3)]) {
+			await call(
+				page,
+				(f, s, p) => f.openOutline({ spaceId: s, blockId: p, pageId: p }),
+				space.id,
+				id,
+			);
+			await waitFor(() => participants(id) === 1);
+			const state = await call(page, (f) => f.liveState());
+			expect(state.sessions.length).toBeLessThanOrEqual(8);
+		}
+		const live = morePages.reduce((sum, id) => sum + participants(id), 0);
+		expect(live).toBeLessThanOrEqual(8);
+		const state = await call(page, (f) => f.liveState());
+		expect(state.closed.filter((code) => code === "unavailable")).toEqual([]);
+		expect(state.tabLimitNotices).toBe(0);
+		expect(errors).toEqual([]);
+	} finally {
+		await call(page, (f) => f.setGrace(null)).catch(() => {});
+		await page.browserContext().close();
+		await closeAllLiveSessions("ended");
+	}
+}, 90_000);
+
+test("a panel that cannot read its place shows the generic tab name, not one it was given", async () => {
+	const { page, errors } = await openDock();
+	try {
+		// As a stale link or another person's restored layout would name it.
+		await call(
+			page,
+			(f, s) => f.openOutline({ spaceId: s, blockId: "noSuchBlock01", title: "Someone's page" }),
+			space.id,
+		);
+		await until(page, (f) => f.outlinePanels().length === 1);
+		await until(page, (f) => f.outlinePanels()[0]?.title === "Outline");
+		expect((await call(page, (f) => f.outlinePanels()))[0]?.params.title).toBeUndefined();
 		expect(errors).toEqual([]);
 	} finally {
 		await page.browserContext().close();

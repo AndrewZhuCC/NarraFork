@@ -8,7 +8,7 @@
 import "@mantine/core/styles.css";
 import { MantineProvider } from "@mantine/core";
 import type { ComposerDocument } from "@shared/composer-document";
-import { decodeLiveFrame, type LiveFrame } from "@shared/outline-live-protocol";
+import { decodeLiveFrame, LIVE_FRAME, type LiveFrame } from "@shared/outline-live-protocol";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
 	type AnyRouter,
@@ -31,12 +31,17 @@ import { dockPanelId } from "../narrator/dock/dock-panel-types";
 import { NarratorDockProvider, useNarratorDockContext } from "../narrator/dock/NarratorDockContext";
 import { OutlineDockPanel } from "../narrator/dock/OutlineDockPanel";
 import type { LiveTransport } from "./editor/live-client";
+import { liveSessionsOn, setLiveSessionGraceForTests } from "./editor/live-sessions";
 import { overrideLiveTransportForTests } from "./editor/transport";
 
 const instance = i18next.createInstance();
 await instance
 	.use(initReactI18next)
 	.init({ lng: "en", resources: { en: { outline: outlineEn } }, react: { useSuspense: false } });
+
+/** Sessions the server ended for this tab (a refused join among them), by close code. */
+const closedFrames: string[] = [];
+let transport: SocketTransport | null = null;
 
 class SocketTransport implements LiveTransport {
 	connected = false;
@@ -59,6 +64,9 @@ class SocketTransport implements LiveTransport {
 		this.ws.onmessage = (event) => {
 			if (typeof event.data === "string") return;
 			const frame = decodeLiveFrame(new Uint8Array(event.data as ArrayBuffer));
+			if (frame?.kind === LIVE_FRAME.closed) {
+				closedFrames.push(String((frame.head as { code?: string } | null)?.code ?? "ended"));
+			}
 			if (frame) for (const l of this.frameListeners) l(frame);
 		};
 	}
@@ -158,7 +166,8 @@ export function ready(): boolean {
 
 /** Mount the dock (composer only) with the outline API and live frames of the test server. */
 export function open(options: { wsUrl: string }): void {
-	overrideLiveTransportForTests(new SocketTransport(options.wsUrl));
+	transport = new SocketTransport(options.wsUrl);
+	overrideLiveTransportForTests(transport);
 	const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 	// The session dock opens outline panels only while the app shell knows the outline is on.
 	queryClient.setQueryData(["settings"], { outline: { enabled: true } });
@@ -223,4 +232,48 @@ export function liveEditors(): number {
 /** Bring a panel to the front of its group. */
 export function activate(id: string): void {
 	dockApi?.getPanel(id)?.api.setActive();
+}
+
+/** Open a place in a new panel behind the others in its group (as a restored layout has it). */
+export function openInBackground(state: OutlinePanelState, id: string): void {
+	const chat = dockApi?.getPanel(dockPanelId("chat"));
+	const beside = dockApi?.panels.find((panel) => panel !== chat);
+	dockApi?.addPanel({
+		id,
+		component: "outline",
+		params: { panelType: "outline", ...state },
+		inactive: true,
+		...(beside ? { position: { referenceGroup: beside.group } } : {}),
+	});
+}
+
+/** Move a panel into a group of its own, right of its current one (both now on screen). */
+export function splitRight(id: string): void {
+	const panel = dockApi?.getPanel(id);
+	if (panel) panel.api.moveTo({ group: panel.group, position: "right" });
+}
+
+/** Panels on screen (the front panel of each group). */
+export function visiblePanels(): string[] {
+	return (dockApi?.panels ?? []).filter((panel) => panel.api.isVisible).map((panel) => panel.id);
+}
+
+/** The live sessions this tab holds, and the sessions the server ended or refused. */
+export function liveState(): {
+	sessions: Array<{ pageId: string; refs: number; status: string }>;
+	closed: string[];
+	tabLimitNotices: number;
+} {
+	return {
+		sessions: transport
+			? liveSessionsOn(transport).map(({ pageId, refs, status }) => ({ pageId, refs, status }))
+			: [],
+		closed: [...closedFrames],
+		tabLimitNotices: document.querySelectorAll("[data-testid=outline-tab-limit]").length,
+	};
+}
+
+/** How long a page's session outlives its last editor (null: the app's). */
+export function setGrace(ms: number | null): void {
+	setLiveSessionGraceForTests(ms);
 }

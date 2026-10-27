@@ -35,7 +35,11 @@ import {
 	OutlineOpenerProvider,
 	type OutlineOpenOptions,
 } from "../../../lib/outline-opener";
-import { nextOutlinePanelId, type OutlinePanelState } from "../../../lib/outline-panel";
+import {
+	nextOutlinePanelId,
+	normalizeOutlinePanelState,
+	type OutlinePanelState,
+} from "../../../lib/outline-panel";
 import {
 	type PluginUiHostSurface,
 	PluginUiSurfaceProvider,
@@ -613,7 +617,11 @@ export function NarratorDockProvider({
 				return true;
 			}
 			const id = nextOutlinePanelId(OUTLINE_DOCK_PANEL_PREFIX);
-			const params: NarratorDockPanelParams = { panelType: "outline", ...request };
+			// The place only: a known title names the tab, it is not stored with the panel.
+			const params: NarratorDockPanelParams = {
+				panelType: "outline",
+				...normalizeOutlinePanelState(request),
+			};
 			const existingSecondary = api.panels.find((panel) => {
 				const panelParams = panel.params as NarratorDockPanelParams | undefined;
 				return panelParams?.panelType !== "chat";

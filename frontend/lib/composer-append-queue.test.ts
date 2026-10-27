@@ -36,6 +36,23 @@ describe("composer append queue", () => {
 		stopSecond();
 	});
 
+	test("when the newest composer of a session goes, an older one still mounted takes over", () => {
+		const first: string[] = [];
+		const second: string[] = [];
+		const stopFirst = listenComposerAppend("n1", (text) => first.push(text));
+		const stopSecond = listenComposerAppend("n1", (text) => second.push(text));
+		stopSecond();
+		requestComposerAppend("n1", "a");
+		expect(first).toEqual(["a"]);
+		expect(second).toEqual([]);
+		// With none left, requests wait again.
+		stopFirst();
+		requestComposerAppend("n1", "b");
+		const later: string[] = [];
+		listenComposerAppend("n1", (text) => later.push(text));
+		expect(later).toEqual(["b"]);
+	});
+
 	test("bounded: a few requests per session, expiring, never another session's", () => {
 		for (let i = 0; i < 10; i++) requestComposerAppend("n1", `t${i}`);
 		requestComposerAppend("n2", "other");

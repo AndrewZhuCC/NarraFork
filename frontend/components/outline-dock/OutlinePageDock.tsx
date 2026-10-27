@@ -52,7 +52,11 @@ import {
 	type OutlineOpenOptions,
 	wantsNewPanel,
 } from "../../lib/outline-opener";
-import { nextOutlinePanelId, type OutlinePanelState } from "../../lib/outline-panel";
+import {
+	nextOutlinePanelId,
+	normalizeOutlinePanelState,
+	type OutlinePanelState,
+} from "../../lib/outline-panel";
 import { outlineRouterLink } from "../../lib/outline-router";
 import { DockviewSurface } from "../dockview";
 import { NarratorDockContext } from "../narrator/dock/NarratorDockContext";
@@ -101,6 +105,8 @@ interface OutlinePageDockState extends OutlinePageRoute {
 	discuss: (narratorId: string) => void;
 	openOutline: (state: OutlinePanelState, options?: OutlineOpenOptions) => boolean;
 	onLoaded: (info: OutlineSurfaceLoaded) => void;
+	/** The page the URL names has loaded, so "discuss" can name it. */
+	discussReady: boolean;
 }
 
 const OutlinePageDockContext = createContext<OutlinePageDockState | null>(null);
@@ -154,26 +160,35 @@ function OutlineMainPanel(props: IDockviewPanelProps) {
 	useLayoutEffect(() => {
 		if (props.api.title !== tabTitle) props.api.setTitle(tabTitle);
 	}, [props.api, tabTitle]);
+	const forget = useCallback(() => setTitle(null), []);
 	const renderLink = useMainLinkRenderer(page?.openOutline ?? (() => false));
 	if (!page) return null;
 	return (
 		<Box h="100%" style={{ overflow: "hidden" }} data-testid="outline-page-main">
-			<OutlineSurface
-				spaceId={page.spaceId}
-				blockId={page.blockId}
-				view={page.view}
-				asOf={page.asOf}
-				onNavigate={page.onNavigate}
-				renderLink={renderLink}
-				layout="panel"
-				onLoaded={handleLoaded}
-				actions={
-					<>
-						<OutlinePageSessionsMenu space={page.space} onOpen={page.openSession} />
-						<DiscussPageButton space={page.space} onPick={page.discuss} />
-					</>
-				}
-			/>
+			{/* Live while on screen: a session dragged into the page's group hides it. */}
+			<DockviewNarratorPanelVisibilityProvider api={props.api}>
+				<OutlineSurface
+					spaceId={page.spaceId}
+					blockId={page.blockId}
+					view={page.view}
+					asOf={page.asOf}
+					onNavigate={page.onNavigate}
+					renderLink={renderLink}
+					layout="panel"
+					onLoaded={handleLoaded}
+					onMissing={forget}
+					actions={
+						<>
+							<OutlinePageSessionsMenu space={page.space} onOpen={page.openSession} />
+							<DiscussPageButton
+								space={page.space}
+								onPick={page.discuss}
+								disabled={!page.discussReady}
+							/>
+						</>
+					}
+				/>
+			</DockviewNarratorPanelVisibilityProvider>
 		</Box>
 	);
 }
@@ -269,13 +284,14 @@ function OutlinePagePlain(route: OutlinePageRoute) {
 	// Off, the outline routes answer 404: do not ask.
 	const space = useOutlineSpace(route.spaceId, useOutlineEnabled().enabled).data?.space;
 	const [loaded, setLoaded] = useState<OutlineSurfaceLoaded | null>(null);
+	const current = loadedPageOf(route, loaded);
 	const goToSession = useGoToSession();
 	const discuss = useCallback(
 		(narratorId: string) => {
-			if (loaded) requestComposerAppend(narratorId, referenceTo(route, loaded));
+			if (current) requestComposerAppend(narratorId, referenceTo(current));
 			goToSession(narratorId);
 		},
-		[loaded, route, goToSession],
+		[current, goToSession],
 	);
 	return (
 		<OutlineHostProvider openSession={goToSession}>
@@ -291,7 +307,7 @@ function OutlinePagePlain(route: OutlinePageRoute) {
 					space ? (
 						<>
 							<OutlinePageSessionsMenu space={space} onOpen={goToSession} />
-							<DiscussPageButton space={space} onPick={discuss} />
+							<DiscussPageButton space={space} onPick={discuss} disabled={!current} />
 						</>
 					) : null
 				}
@@ -309,11 +325,22 @@ function useGoToSession(): (narratorId: string) => void {
 	);
 }
 
-function referenceTo(route: OutlinePageRoute, loaded: OutlineSurfaceLoaded): string {
+/** What the surface has loaded, if it is the place the URL names now (not the previous one). */
+function loadedPageOf(
+	route: OutlinePageRoute,
+	loaded: OutlineSurfaceLoaded | null,
+): OutlineSurfaceLoaded | null {
+	return loaded && loaded.spaceId === route.spaceId && loaded.rootId === route.blockId
+		? loaded
+		: null;
+}
+
+/** The reference to a loaded place: its address, title and URL all from the same load. */
+function referenceTo(loaded: OutlineSurfaceLoaded): string {
 	return outlinePageReference({
 		address: loaded.address,
 		title: loaded.title,
-		url: outlineTargetUrl({ kind: "block", spaceId: route.spaceId, blockId: route.blockId }),
+		url: outlineTargetUrl({ kind: "block", spaceId: loaded.spaceId, blockId: loaded.rootId }),
 	});
 }
 
@@ -324,9 +351,10 @@ function OutlinePageDockSurface(route: OutlinePageRoute) {
 	const apiRef = useRef<DockviewApi | null>(null);
 	const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const disposables = useRef<Array<{ dispose(): void }>>([]);
-	const loadedRef = useRef<OutlineSurfaceLoaded | null>(null);
-	const routeRef = useRef(route);
-	routeRef.current = route;
+	const [loaded, setLoaded] = useState<OutlineSurfaceLoaded | null>(null);
+	const current = loadedPageOf(route, loaded);
+	const currentRef = useRef(current);
+	currentRef.current = current;
 
 	const openSession = useCallback((narratorId: string) => {
 		const api = apiRef.current;
@@ -369,7 +397,7 @@ function OutlinePageDockSurface(route: OutlinePageRoute) {
 			api.addPanel<OutlinePanelParams>({
 				id: nextOutlinePanelId("odock-outline-"),
 				component: OUTLINE_PAGE_COMPONENTS.outline,
-				params: { panelType: "outline", ...state },
+				params: { panelType: "outline", ...normalizeOutlinePanelState(state) },
 				...(state.title ? { title: state.title } : {}),
 				position: sidePosition(api),
 				...(sideWidth(api) ? { initialWidth: sideWidth(api) } : {}),
@@ -380,13 +408,11 @@ function OutlinePageDockSurface(route: OutlinePageRoute) {
 	);
 	const opener = useMemo<OutlineOpener>(() => ({ open: openOutline }), [openOutline]);
 
-	const onLoaded = useCallback((info: OutlineSurfaceLoaded) => {
-		loadedRef.current = info;
-	}, []);
+	const onLoaded = useCallback((info: OutlineSurfaceLoaded) => setLoaded(info), []);
 	const discuss = useCallback(
 		(narratorId: string) => {
-			const loaded = loadedRef.current;
-			if (loaded) requestComposerAppend(narratorId, referenceTo(routeRef.current, loaded));
+			const page = currentRef.current;
+			if (page) requestComposerAppend(narratorId, referenceTo(page));
 			openSession(narratorId);
 		},
 		[openSession],
@@ -422,8 +448,16 @@ function OutlinePageDockSurface(route: OutlinePageRoute) {
 	);
 
 	const state = useMemo<OutlinePageDockState>(
-		() => ({ ...route, space, openSession, discuss, openOutline, onLoaded }),
-		[route, space, openSession, discuss, openOutline, onLoaded],
+		() => ({
+			...route,
+			space,
+			openSession,
+			discuss,
+			openOutline,
+			onLoaded,
+			discussReady: current !== null,
+		}),
+		[route, space, openSession, discuss, openOutline, onLoaded, current],
 	);
 
 	// The user is needed to know whose layout to restore; wait for it.

@@ -9,7 +9,7 @@ import { useEffect, useMemo, useRef } from "react";
 import { workspaceQueryKey } from "../../../hooks/useWorkspace";
 import { api as apiClient } from "../../../lib/api";
 import type { OutlineOpener, OutlineOpenOptions } from "../../../lib/outline-opener";
-import type { OutlinePanelState } from "../../../lib/outline-panel";
+import { type OutlinePanelState, outlinePanelIdentity } from "../../../lib/outline-panel";
 import { findOutlinePanel, navigateOutlinePanel } from "../dock/outline-dock";
 import type { WorkspaceOutlineMemberParams } from "./panel-types";
 
@@ -41,8 +41,42 @@ export function usePersistOutlineMember(
 }
 
 /**
+ * Members being added, per workspace: a second click on the same page (or session) before the
+ * first one's panel appears would otherwise add it twice. Kept until the workspace has been
+ * read again with the new member, plus a moment for its panel to mount.
+ */
+const addingMembers = new Map<string, Set<string>>();
+const ADDED_SETTLE_MS = 1_000;
+
+/** Run `add` unless the same member of the workspace is already being added. */
+export function addMemberOnce(
+	workspaceId: string,
+	member: string,
+	add: () => Promise<unknown>,
+): boolean {
+	let adding = addingMembers.get(workspaceId);
+	if (adding?.has(member)) return false;
+	if (!adding) {
+		adding = new Set();
+		addingMembers.set(workspaceId, adding);
+	}
+	adding.add(member);
+	const done = () => {
+		const set = addingMembers.get(workspaceId);
+		set?.delete(member);
+		if (set?.size === 0) addingMembers.delete(workspaceId);
+	};
+	void add()
+		.then(() => new Promise((resolve) => setTimeout(resolve, ADDED_SETTLE_MS)))
+		.catch(() => {})
+		.finally(done);
+	return true;
+}
+
+/**
  * What a workspace member can open: another outline page (the page's panel if the surface has
- * one, else a new member) and a session (as a member, like dropping it on the canvas).
+ * one, else a new member) and a session (as a member, like dropping it on the canvas). A page
+ * or session already being added is not added again.
  */
 export function useOutlineMemberActions(
 	workspaceId: string | null,
@@ -66,18 +100,28 @@ export function useOutlineMemberActions(
 					existing.api.setActive();
 					return true;
 				}
-				void apiClient
-					.addWorkspacePanel(workspaceId, { kind: "outline", config })
-					.then(refresh)
-					.catch((error) => console.warn("[workspace] failed to add outline panel", error));
+				const identity = outlinePanelIdentity(state);
+				// A Ctrl/Cmd-click asks for another panel even when one shows the page: only an
+				// identical request still being added is skipped.
+				const member = options.newPanel
+					? `outline-new:${JSON.stringify(config)}`
+					: `outline:${identity}`;
+				addMemberOnce(workspaceId, member, () =>
+					apiClient
+						.addWorkspacePanel(workspaceId, { kind: "outline", config })
+						.then(refresh)
+						.catch((error) => console.warn("[workspace] failed to add outline panel", error)),
+				);
 				return true;
 			},
 		};
 		const openSession = (narratorId: string) => {
-			void apiClient
-				.addWorkspacePanel(workspaceId, { kind: "narrator", narratorId })
-				.then(refresh)
-				.catch((error) => console.warn("[workspace] failed to add session panel", error));
+			addMemberOnce(workspaceId, `session:${narratorId}`, () =>
+				apiClient
+					.addWorkspacePanel(workspaceId, { kind: "narrator", narratorId })
+					.then(refresh)
+					.catch((error) => console.warn("[workspace] failed to add session panel", error)),
+			);
 		};
 		return { opener, openSession };
 	}, [workspaceId, qc]);

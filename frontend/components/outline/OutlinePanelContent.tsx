@@ -5,9 +5,10 @@
  * Everything the view navigates — focus, breadcrumbs, the view switch, the timeline, a page of
  * the space's list — becomes new panel state through `onChange`; the URL never changes. Links
  * are real anchors to the outline page (middle-click and "open in new tab" still work), a plain
- * click navigates in place, and Ctrl/Cmd-click opens a new panel through `onOpenNew`. What has
- * loaded (the page the focus is on, its title) is written back too, so a restored layout knows
- * its panels' identity and names their tabs before reading.
+ * click navigates in place, and Ctrl/Cmd-click opens a new panel through `onOpenNew`. The page
+ * the focus is on is written back once loaded, so a restored layout knows its panels' identity.
+ * The title of what loaded goes to `onTitle` for the tab and is not stored (`null` when nothing
+ * could be read: the tab goes back to the generic name).
  */
 import type { OutlineSpaceDetail } from "@shared/outline-api";
 import { type MouseEvent, type ReactNode, useCallback, useEffect, useMemo, useRef } from "react";
@@ -18,6 +19,7 @@ import {
 	type OutlinePanelState,
 	outlinePanelStateFor,
 	outlinePanelTarget,
+	outlinePanelTitle,
 } from "../../lib/outline-panel";
 import type { OutlineSurfaceLoaded } from "./OutlineSurface";
 import { OutlineView } from "./OutlineView";
@@ -29,6 +31,8 @@ export interface OutlinePanelContentProps {
 	onChange: (next: OutlinePanelState) => void;
 	/** Ctrl/Cmd-click on a link: open it in a new panel. Absent: navigate in place. */
 	onOpenNew?: (next: OutlinePanelState) => void;
+	/** What loaded is called this (`null`: nothing could be read). For the tab; not stored. */
+	onTitle?: (title: string | null) => void;
 	/** The host's controls in the page's toolbar. */
 	actions?: ReactNode;
 }
@@ -49,13 +53,14 @@ export function OutlinePanelContent({
 	state,
 	onChange,
 	onOpenNew,
+	onTitle,
 	actions,
 }: OutlinePanelContentProps) {
 	const { t } = useTranslation("outline");
 	const stateRef = useRef(state);
 	stateRef.current = state;
-	const handlers = useRef({ onChange, onOpenNew });
-	handlers.current = { onChange, onOpenNew };
+	const handlers = useRef({ onChange, onOpenNew, onTitle });
+	handlers.current = { onChange, onOpenNew, onTitle };
 
 	const { spaceId, blockId, view, asOf } = state;
 	const target = useMemo(
@@ -83,24 +88,24 @@ export function OutlinePanelContent({
 	const onLoaded = useCallback((info: OutlineSurfaceLoaded) => {
 		const current = stateRef.current;
 		if (current.spaceId !== info.spaceId || current.blockId !== info.rootId) return;
-		const title = info.title || info.address;
-		if (current.pageId === info.pageId && current.title === title) return;
-		handlers.current.onChange({ ...current, pageId: info.pageId, title });
+		handlers.current.onTitle?.(outlinePanelTitle(info.title || info.address) ?? null);
+		if (current.pageId === info.pageId) return;
+		handlers.current.onChange({ ...current, pageId: info.pageId });
 	}, []);
 
 	const onSpaceLoaded = useCallback((space: OutlineSpaceDetail, name: string) => {
 		const current = stateRef.current;
-		if (current.spaceId !== space.id || current.blockId || current.title === name) return;
-		handlers.current.onChange({ ...current, title: name });
+		if (current.spaceId !== space.id || current.blockId) return;
+		handlers.current.onTitle?.(outlinePanelTitle(name) ?? null);
 	}, []);
+
+	const onMissing = useCallback(() => handlers.current.onTitle?.(null), []);
 
 	// The home has nothing to load: name it at once.
 	const homeTitle = t("title");
 	const isHome = target.kind === "home";
 	useEffect(() => {
-		if (isHome && stateRef.current.title !== homeTitle) {
-			handlers.current.onChange({ title: homeTitle });
-		}
+		if (isHome) handlers.current.onTitle?.(homeTitle);
 	}, [isHome, homeTitle]);
 
 	return (
@@ -111,6 +116,7 @@ export function OutlinePanelContent({
 			layout="panel"
 			onLoaded={onLoaded}
 			onSpaceLoaded={onSpaceLoaded}
+			onMissing={onMissing}
 			actions={actions}
 		/>
 	);
