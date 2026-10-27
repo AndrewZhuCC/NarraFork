@@ -1,4 +1,5 @@
 import { Box, Center, Loader, Text } from "@mantine/core";
+import type { FileReferenceEditorSelection, FileSelection } from "@shared/file-reference";
 import { localFileDirectory } from "@shared/markdown-file-path";
 import { lazy, Suspense, useMemo } from "react";
 import { useTranslation } from "react-i18next";
@@ -9,6 +10,7 @@ import {
 	isStructuredParseError,
 	parseStructured,
 } from "../file-viewer/structured-parse";
+import { RenderedFileQuote } from "./RenderedFileQuote";
 
 const MarkdownContent = lazy(() =>
 	import("../markdown/MarkdownContent").then((m) => ({ default: m.MarkdownContent })),
@@ -28,6 +30,10 @@ export function FileEditorPreview({
 	deviceId,
 	narratorId,
 	withSourceLines,
+	quoteSource,
+	quoteOwnerKey,
+	quoteSelectionDisabledReason,
+	onQuoteSelection,
 }: {
 	text: string;
 	mode: Exclude<FileViewerMode, "raw">;
@@ -36,6 +42,10 @@ export function FileEditorPreview({
 	narratorId?: string;
 	/** Stamp `data-line` anchors so the split view can scroll-sync by source line. */
 	withSourceLines?: boolean;
+	quoteSource?: FileReferenceEditorSelection | null;
+	quoteOwnerKey?: string;
+	quoteSelectionDisabledReason?: string | null;
+	onQuoteSelection?: (selection: FileSelection) => boolean;
 }) {
 	const { t } = useTranslation("narrator");
 	const tooLarge = text.length > MAX_EDITOR_PREVIEW_CHARS;
@@ -72,7 +82,15 @@ export function FileEditorPreview({
 			>
 				{mode === "preview" ? (
 					<Box p="xs">
-						<MarkdownContent text={text} sourceLines={withSourceLines} />
+						<RenderedFileQuote
+							text={text}
+							ownerKey={quoteOwnerKey ?? JSON.stringify([narratorId, deviceId, filePath])}
+							source={quoteSource}
+							disabledReason={quoteSelectionDisabledReason}
+							onQuoteSelection={onQuoteSelection}
+						>
+							<MarkdownContent text={text} sourceLines={withSourceLines || !!onQuoteSelection} />
+						</RenderedFileQuote>
 					</Box>
 				) : parsed && !isStructuredParseError(parsed) ? (
 					<>

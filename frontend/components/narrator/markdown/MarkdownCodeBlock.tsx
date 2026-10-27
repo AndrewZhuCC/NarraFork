@@ -24,12 +24,14 @@ interface MarkdownCodeBlockProps {
 	language: string;
 	/** 0-based source line, present only when the body opted into scroll-sync anchors. */
 	dataLine?: string;
+	dataLineEnd?: string;
 	children: ReactNode;
 }
 
 export const MarkdownCodeBlock = memo(function MarkdownCodeBlock({
 	language,
 	dataLine,
+	dataLineEnd,
 	children,
 }: MarkdownCodeBlockProps) {
 	const { t } = useTranslation("common");
@@ -45,14 +47,18 @@ export const MarkdownCodeBlock = memo(function MarkdownCodeBlock({
 		: classes.codeBlock;
 
 	return (
-		<div className={className} {...(dataLine ? { "data-line": dataLine } : {})}>
+		<div
+			className={className}
+			data-file-quote-code
+			{...(dataLine ? { "data-line": dataLine, "data-line-end": dataLineEnd } : {})}
+		>
 			{hasLang && (
-				<Text className={classes.codeLang} component="span">
+				<Text className={classes.codeLang} component="span" data-file-quote-ignore>
 					{language}
 				</Text>
 			)}
 
-			<div className={classes.codeCopy}>
+			<div className={classes.codeCopy} data-file-quote-ignore>
 				<CopyButton value={code}>
 					{({ copied, copy }) => (
 						<Tooltip label={copied ? t("copied") : t("copy")} withArrow position="left">

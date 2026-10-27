@@ -40,7 +40,7 @@ import {
 } from "@shared/file-reference";
 import { localFileDirectory } from "@shared/markdown-file-path";
 import { IconCheck, IconCopy, IconDownload, IconRefresh } from "@tabler/icons-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useFileSystemCapability } from "../../../hooks/usePlatform";
 import { ApiError, api, authorizedFetch, readFetchError } from "../../../lib/api";
@@ -54,6 +54,7 @@ import { TruncatedText } from "../../common/TruncatedText";
 import { FileReferenceScopeProvider, useFileReferenceScope } from "../composer/FileReferenceScope";
 import { savedSelectionReference } from "../composer/file-reference-input";
 import { ContentViewer } from "../content/ContentViewer";
+import { FileEditorPreview } from "../file-editor/FileEditorPreview";
 import { MonacoEditor } from "../file-editor/MonacoEditor";
 import {
 	getFilePreviewType,
@@ -61,7 +62,6 @@ import {
 	readTextPreview,
 } from "../file-panel/FilePreviewModal";
 import { MAX_FILE_HIGHLIGHT_CODE_CHARS } from "../markdown/highlight-cache";
-import { MarkdownContent } from "../markdown/MarkdownContent";
 import { filePanelBaseName } from "../panels/panel-kind";
 import { availableModes, type FileViewerMode } from "./file-viewer-modes";
 import { StructuredNodeTree } from "./StructuredNodeTree";
@@ -410,7 +410,7 @@ export function FileViewerContent({
 			saved.text === null ||
 			!saved.hash
 		)
-			return;
+			return false;
 		// The canonical target and hash must be taken from the SAME completed response.
 		const target = saved.target ?? { deviceId, path: filePath };
 		const reference = savedSelectionReference({
@@ -419,7 +419,9 @@ export function FileViewerContent({
 			expectedHash: saved.hash,
 			dirty: false,
 		});
-		if (reference) addReferenceRef.current(reference);
+		if (!reference) return false;
+		addReferenceRef.current(reference);
+		return true;
 	};
 	const quoteSelectionDisabledReason =
 		liveLoadRef.current.key !== readKey || load.loading
@@ -537,7 +539,7 @@ export function FileViewerContent({
 		<FileReferenceScopeProvider value={viewerScope}>
 			<Box style={{ height: "100%", display: "flex", flexDirection: "column", overflow: "hidden" }}>
 				{header}
-				<Box style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
+				<Box data-file-viewer-preview style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
 					{!previewSupported ? (
 						<Box p="md">
 							<Text size="sm" c="dimmed">
@@ -598,6 +600,32 @@ export function FileViewerContent({
 							nodeUnavailable={nodeUnavailable}
 							structuredFormat={structuredFormat}
 							reloadToken={reloadToken}
+							previewContent={
+								<FileEditorPreview
+									text={load.text}
+									mode="preview"
+									filePath={sourcePath}
+									deviceId={sourceDeviceId}
+									narratorId={narratorId}
+									quoteOwnerKey={readKey}
+									quoteSource={
+										load.hash
+											? {
+													target: { deviceId: sourceDeviceId, path: sourcePath },
+													label: fileBaseName(sourcePath),
+													expectedHash: load.hash,
+													dirty: !!quoteSelectionDisabledReason,
+												}
+											: null
+									}
+									quoteSelectionDisabledReason={quoteSelectionDisabledReason}
+									onQuoteSelection={
+										parentScope.addReference
+											? (range) => liveLoadRef.current.value === load && quoteSelection(range)
+											: undefined
+									}
+								/>
+							}
 						/>
 					)}
 				</Box>
@@ -757,8 +785,10 @@ function FileBody({
 	structuredFormat,
 	reloadToken,
 	filePath,
+	previewContent,
 }: {
 	filePath: string;
+	previewContent: ReactNode;
 	fileName: string;
 	lang: string;
 	text: string;
@@ -815,9 +845,7 @@ function FileBody({
 		return (
 			<>
 				{topNotices}
-				<Box p="xs">
-					<MarkdownContent text={text} />
-				</Box>
+				{previewContent}
 				{truncationNotice}
 			</>
 		);

@@ -177,9 +177,16 @@ function createMdComponents(animateText?: AnimateTextFn, sourceLines = false): C
 	 * Off for chat bodies — they mount hundreds of trees with no use for it.
 	 */
 	// biome-ignore lint/suspicious/noExplicitAny: react-markdown hast node shape
-	const sourceLineAttr = (node: any): { "data-line"?: string } => {
-		const line = sourceLines ? node?.position?.start?.line : undefined;
-		return typeof line === "number" ? { "data-line": String(line - 1) } : {};
+	const sourceLineAttr = (node: any): { "data-line"?: string; "data-line-end"?: string } => {
+		const start = sourceLines ? node?.position?.start?.line : undefined;
+		const end = sourceLines ? node?.position?.end : undefined;
+		if (typeof start !== "number") return {};
+		return {
+			"data-line": String(start - 1),
+			...(typeof end?.line === "number"
+				? { "data-line-end": String(end.line - (end.column === 1 && end.line > start ? 2 : 1)) }
+				: {}),
+		};
 	};
 
 	// biome-ignore lint/suspicious/noExplicitAny: react-markdown node structure
@@ -245,7 +252,11 @@ function createMdComponents(animateText?: AnimateTextFn, sourceLines = false): C
 		li({ children, className, node }: any) {
 			const sourceLine = sourceLineAttr(node);
 			return (
-				<MarkdownContentListItem className={className} dataLine={sourceLine["data-line"]}>
+				<MarkdownContentListItem
+					className={className}
+					dataLine={sourceLine["data-line"]}
+					dataLineEnd={sourceLine["data-line-end"]}
+				>
 					{at(children)}
 				</MarkdownContentListItem>
 			);
@@ -306,7 +317,11 @@ function createMdComponents(animateText?: AnimateTextFn, sourceLines = false): C
 					);
 				}
 				return (
-					<MarkdownCodeBlock language={lang ?? "text"} dataLine={sourceLine["data-line"]}>
+					<MarkdownCodeBlock
+						language={lang ?? "text"}
+						dataLine={sourceLine["data-line"]}
+						dataLineEnd={sourceLine["data-line-end"]}
+					>
 						{children}
 					</MarkdownCodeBlock>
 				);
@@ -361,7 +376,11 @@ function createMdComponents(animateText?: AnimateTextFn, sourceLines = false): C
 				return <>{children}</>;
 			}
 			return (
-				<MarkdownCodeBlock language="text" dataLine={sourceLine["data-line"]}>
+				<MarkdownCodeBlock
+					language="text"
+					dataLine={sourceLine["data-line"]}
+					dataLineEnd={sourceLine["data-line-end"]}
+				>
 					{text}
 				</MarkdownCodeBlock>
 			);
@@ -388,14 +407,17 @@ function createMdComponents(animateText?: AnimateTextFn, sourceLines = false): C
 		tbody({ children }) {
 			return <Table.Tbody>{children}</Table.Tbody>;
 		},
-		tr({ children }) {
-			return <Table.Tr>{children}</Table.Tr>;
+		// biome-ignore lint/suspicious/noExplicitAny: react-markdown node structure
+		tr({ children, node }: any) {
+			return <Table.Tr {...sourceLineAttr(node)}>{children}</Table.Tr>;
 		},
-		th({ children }) {
-			return <Table.Th>{at(children)}</Table.Th>;
+		// biome-ignore lint/suspicious/noExplicitAny: react-markdown node structure
+		th({ children, node }: any) {
+			return <Table.Th {...sourceLineAttr(node)}>{at(children)}</Table.Th>;
 		},
-		td({ children }) {
-			return <Table.Td>{at(children)}</Table.Td>;
+		// biome-ignore lint/suspicious/noExplicitAny: react-markdown node structure
+		td({ children, node }: any) {
+			return <Table.Td {...sourceLineAttr(node)}>{at(children)}</Table.Td>;
 		},
 		strong({ children }) {
 			return <strong>{at(children)}</strong>;
@@ -760,7 +782,8 @@ export const MarkdownContent = memo(function MarkdownContent({
 	streaming,
 	sourceLines,
 }: MarkdownContentProps) {
-	const trimmed = text.trim();
+	// File source anchors must include leading blank lines and indentation.
+	const trimmed = sourceLines ? text : text.trim();
 
 	const canAnimateStreaming = !!streaming && trimmed.length <= STREAMING_ANIM_MAX_CHARS;
 	const advancedAnim =

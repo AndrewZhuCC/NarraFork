@@ -30,6 +30,9 @@ export type QuoteCandidate =
 			label: string;
 			/** Null while the file has unsaved edits: only saved bytes can be referenced. */
 			reference: FileReference | null;
+			/** Rendered file previews have a DOM range; Monaco gutter candidates do not. */
+			range?: Range;
+			backward?: boolean;
 	  };
 type FileQuoteCandidate = Extract<QuoteCandidate, { kind: "file" }>;
 

@@ -22,7 +22,7 @@ import type { QuoteCandidate } from "./use-quote-candidate";
 
 export interface QuoteSelectionButtonProps {
 	candidate: QuoteCandidate | null;
-	/** The composer shell: positions the touch placement and finds the owning panel/document. */
+	/** Composer shell, or a rendered file's scroll viewport when the candidate has a DOM range. */
 	anchor: HTMLElement | null;
 	placement: QuoteButtonPlacement;
 	onAccept(candidate: QuoteCandidate): void;
@@ -71,7 +71,7 @@ function box(rect: DOMRect): QuoteButtonBox {
 }
 
 function selectionGeometry(candidate: QuoteCandidate): QuoteButtonSelection | null {
-	if (candidate.kind !== "text" || !candidate.range) return null;
+	if (!candidate.range) return null;
 	const rects = [...candidate.range.getClientRects()].filter(
 		(rect) => rect.width > 0 || rect.height > 0,
 	);
@@ -118,21 +118,29 @@ export function QuoteSelectionButton({
 			return;
 		}
 		const update = () => {
-			const composer = anchor.getBoundingClientRect();
+			const anchorRect = anchor.getBoundingClientRect();
 			// A hidden pane (e.g. inactive tab) has no box; neither does its toolbar.
-			if (composer.width === 0 && composer.height === 0) {
+			if (anchorRect.width === 0 && anchorRect.height === 0) {
 				setPosition(null);
 				return;
 			}
 			const viewport = { width: view.innerWidth, height: view.innerHeight };
-			const panel = anchor.closest(NARRATOR_PANEL_SELECTOR)?.getBoundingClientRect();
+			const filePreview = candidate.kind === "file" && !!candidate.range;
+			const panel = filePreview
+				? anchorRect
+				: anchor.closest(NARRATOR_PANEL_SELECTOR)?.getBoundingClientRect();
+			// A file viewport has no composer below it; its bottom is the touch fallback edge.
+			const composer = {
+				...box(anchorRect),
+				top: filePreview ? anchorRect.bottom : anchorRect.top,
+			};
 			const next = quoteButtonPosition({
 				placement,
 				selection: selectionGeometry(candidate),
 				bounds: panel
 					? box(panel)
 					: { top: 0, left: 0, right: viewport.width, bottom: viewport.height },
-				composer: box(composer),
+				composer,
 				viewport,
 				size: { width: element.offsetWidth, height: element.offsetHeight },
 			});
@@ -192,7 +200,7 @@ export function QuoteSelectionButton({
 	}, [asking, askBusy, anchor, onAskCancel]);
 
 	if (!candidate || !anchor) return null;
-	const keyboardShortcut = showShortcut && candidate.kind === "text";
+	const keyboardShortcut = showShortcut && (candidate.kind === "text" || !!candidate.range);
 	const submit = (event: FormEvent) => {
 		event.preventDefault();
 		if (!askBusy) onAskSubmit?.(question.trim());

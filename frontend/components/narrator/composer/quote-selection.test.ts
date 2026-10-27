@@ -234,6 +234,20 @@ describe("readPanelQuoteSelection", () => {
 		expect(readPanelQuoteSelection(panel, fakeSelection(para, other))).toBeNull();
 		expect(readPanelQuoteSelection(panel, fakeSelection(input, input))).toBeNull();
 	});
+
+	test("does not downgrade a rendered file selection inside a message into a chat quote", () => {
+		const document = dom();
+		const panel = document.getElementById("a");
+		const content = document.getElementById("text");
+		if (!panel || !content) throw new Error("Missing message content");
+		const preview = document.createElement("div");
+		preview.setAttribute("data-rendered-file-quote", "");
+		preview.textContent = "Rendered file text";
+		content.appendChild(preview);
+		const text = preview.firstChild;
+		if (!text) throw new Error("Missing rendered text");
+		expect(readPanelQuoteSelection(panel, fakeSelection(text, text))).toBeNull();
+	});
 });
 
 describe("editorSelectionCandidate", () => {

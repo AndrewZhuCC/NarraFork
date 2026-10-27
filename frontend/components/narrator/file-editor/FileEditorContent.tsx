@@ -458,6 +458,9 @@ function FileEditorDocument({
 	const modeRef = useRef(mode);
 	modeRef.current = mode;
 	const [previewText, setPreviewText] = useState<string | null>(null);
+	const [previewSource, setPreviewSource] = useState<FileReferenceEditorSelection | null>(null);
+	const previewSourceRef = useRef(previewSource);
+	previewSourceRef.current = previewSource;
 	const [previewError, setPreviewError] = useState<string | null>(null);
 	const previewController = useRef<AbortController | null>(null);
 	const [conflictDiff, setConflictDiff] = useState<{
@@ -649,6 +652,22 @@ function FileEditorDocument({
 		addReferenceRef.current(reference);
 		return true;
 	};
+	const previewProofIsCurrent = () => {
+		const proof = previewSourceRef.current;
+		const current = session.state;
+		const target = session.currentDocument?.target ?? sourceTargetRef.current;
+		return (
+			!!proof &&
+			!proof.dirty &&
+			proof.expectedHash === current.baseHash &&
+			proof.expectedHashKind ===
+				(current.hashKind === "raw-sha256" ? current.hashKind : undefined) &&
+			proof.target.path === target.path &&
+			proof.target.deviceId === target.deviceId
+		);
+	};
+	const quotePreviewSelection = (range: FileSelection) =>
+		previewProofIsCurrent() && quoteSelection(range);
 	const selectionUnavailable = quoteBlocked(state);
 	const quoteSelectionDisabledReason =
 		!state?.loaded || state.loading
@@ -752,22 +771,39 @@ function FileEditorDocument({
 			const controller = new AbortController();
 			previewController.current = controller;
 			try {
+				const saved = session.state;
+				const target = session.currentDocument?.target ?? sourceTargetRef.current;
+				const proof: FileReferenceEditorSelection | null = saved.baseHash
+					? {
+							target: { ...target },
+							label: filePanelBaseName(target.path),
+							expectedHash: saved.baseHash,
+							dirty: quoteBlocked(saved),
+							...(saved.hashKind === "raw-sha256" ? { expectedHashKind: saved.hashKind } : {}),
+						}
+					: null;
 				const blob = await encodeEditorSnapshot(captureEditorSnapshot(model), controller.signal);
 				if (blob.size > PREVIEW_BYTES) throw new Error(tRef.current("fileEditor.previewTooLarge"));
 				const text = await blob.text();
 				controller.signal.throwIfAborted();
+				setPreviewSource(proof);
 				setPreviewText(text);
 			} catch (error) {
 				if (!controller.signal.aborted)
 					setPreviewError(error instanceof Error ? error.message : String(error));
 			}
 		},
-		[workingCopy, visible],
+		[workingCopy, visible, session, sourceTargetRef],
 	);
 	regeneratePreviewRef.current = () => void generatePreview(true);
+	const previewActivation = JSON.stringify([visible, state.loaded, state.paged, mode]);
+	const previousPreviewActivation = useRef<string | null>(null);
 	// A remembered non-raw default means the panel OPENS in preview/split: generate
 	// the first rendering once the model is ready, without waiting for a mode click.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: baseline and clean/dirty changes renew the preview's saved-source proof, even if its text is unchanged
 	useEffect(() => {
+		const activated = previousPreviewActivation.current !== previewActivation;
+		previousPreviewActivation.current = previewActivation;
 		if (!visible || state.paged) {
 			previewController.current?.abort();
 			setPreviewText(null);
@@ -776,8 +812,18 @@ function FileEditorDocument({
 			if (state.paged) publishSelectionRef.current?.(null);
 			return;
 		}
-		if (state.loaded && mode !== "raw") void generatePreview(true);
-	}, [visible, state.loaded, state.paged, mode, generatePreview]);
+		if (state.loaded && mode !== "raw" && (activated || !dirty)) void generatePreview(true);
+	}, [
+		visible,
+		state.loaded,
+		state.paged,
+		mode,
+		previewActivation,
+		baseHash,
+		dirty,
+		state.hashKind,
+		generatePreview,
+	]);
 	// Split mode is a LIVE view: edits regenerate the preview behind the current one
 	// (keepCurrent) after a short debounce, so typing never flashes a loader.
 	useEffect(() => {
@@ -1578,6 +1624,13 @@ function FileEditorDocument({
 										deviceId={deviceId}
 										narratorId={narratorId}
 										withSourceLines={split}
+										quoteSource={previewSource}
+										quoteOwnerKey={documentKey}
+										quoteSelectionDisabledReason={
+											quoteSelectionDisabledReason ??
+											(previewProofIsCurrent() ? null : t("quote.fileUnavailable"))
+										}
+										onQuoteSelection={scope.addReference ? quotePreviewSelection : undefined}
 									/>
 								)}
 							</Suspense>

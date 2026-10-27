@@ -110,7 +110,7 @@ beforeEach(async () => {
 	);
 	installCanvasStub();
 	const { window } = parseHTML("<!doctype html><html><head></head><body></body></html>");
-	Object.defineProperty(window.document, "getSelection", { value: () => null });
+	Object.defineProperty(window.document, "getSelection", { configurable: true, value: () => null });
 	Object.defineProperty(window.document, "hasFocus", { value: () => false });
 	Object.defineProperty(window.document, "fonts", {
 		value: { addEventListener() {}, removeEventListener() {} },
@@ -349,6 +349,55 @@ function deferred<T>() {
 	});
 	return { resolve, promise };
 }
+function selectRenderedText(selector: string) {
+	const element = host.querySelector<HTMLElement>(`[data-rendered-file-quote] ${selector}`);
+	const node = element?.firstChild;
+	if (!element || node?.nodeType !== Node.TEXT_NODE) throw new Error("Missing rendered text");
+	const doc = element.ownerDocument;
+	const previous = Object.getOwnPropertyDescriptor(doc, "getSelection");
+	if (!previous) throw new Error("Missing document selection boundary");
+	// linkedom has no native Selection or Range boundaries; the nodes and their
+	// source-line anchors come from the real Markdown renderer, not this adapter.
+	const range = {
+		startContainer: node,
+		endContainer: node,
+		startOffset: 0,
+		endOffset: node.textContent?.length ?? 0,
+		collapsed: false,
+		toString: () => node.textContent ?? "",
+	};
+	const removeAllRanges = mock(() => {
+		current = null;
+	});
+	let current: Selection | null = {
+		anchorNode: node,
+		focusNode: node,
+		anchorOffset: range.startOffset,
+		focusOffset: range.endOffset,
+		isCollapsed: false,
+		rangeCount: 1,
+		getRangeAt: () => range,
+		removeAllRanges,
+	} as unknown as Selection;
+	return {
+		removeAllRanges,
+		async pressTab() {
+			const event = new Event("keydown", { bubbles: true, cancelable: true });
+			Object.assign(event, { key: "Tab" });
+			Object.defineProperty(doc, "getSelection", { configurable: true, value: () => current });
+			try {
+				await act(async () => {
+					element.dispatchEvent(new Event("pointerdown", { bubbles: true }));
+					// Tab must work immediately, before a settled floating button exists.
+					element.dispatchEvent(event);
+				});
+				return event;
+			} finally {
+				Object.defineProperty(doc, "getSelection", previous);
+			}
+		},
+	};
+}
 test("Tab quotes only a live saved source selection and leaves ordinary editor keys alone", async () => {
 	const addReference = mock((_reference: unknown) => {});
 	const model = await mount({ selection: undefined }, { addReference });
@@ -399,6 +448,83 @@ test("Tab quotes only a live saved source selection and leaves ordinary editor k
 	expect((await pressTab()).defaultPrevented).toBe(false);
 	expect(addReference).toHaveBeenCalledTimes(1);
 });
+
+test("Markdown preview and split Tab quote canonical saved source lines, not rendered columns", async () => {
+	const addReference = mock((_reference: unknown) => {});
+	const target = { deviceId: "local", path: "/canonical/saved-note.md" };
+	const paragraph = "A **bold** paragraph.";
+	const text = `# Heading\n\n${paragraph}\n`;
+	create.mockResolvedValue({ ...descriptor, target, baseHash: "canonical-markdown-hash" });
+	read.mockResolvedValue(text);
+	await mount({ filePath: "/work/requested.md", selection: undefined }, { addReference });
+	for (const [index, mode] of (["preview", "split"] as const).entries()) {
+		await switchFileMode(mode);
+		const selected = selectRenderedText("[data-line][data-line-end] strong");
+		expect((await selected.pressTab()).defaultPrevented).toBe(true);
+		expect(addReference).toHaveBeenCalledTimes(index + 1);
+		expect(addReference.mock.calls[index]?.[0]).toMatchObject({
+			...target,
+			label: "saved-note.md",
+			selection: {
+				startLineNumber: 3,
+				startColumn: 1,
+				endLineNumber: 3,
+				endColumn: paragraph.length + 1,
+			},
+			expectedHash: "canonical-markdown-hash",
+		});
+		// text-v1 uses the implicit decoded hash kind, not a raw-byte identity.
+		expect(addReference.mock.calls[index]?.[0]).not.toHaveProperty("expectedHashKind");
+		expect(selected.removeAllRanges).toHaveBeenCalledTimes(1);
+		expect((await selected.pressTab()).defaultPrevented).toBe(false);
+		expect(addReference).toHaveBeenCalledTimes(index + 1);
+	}
+	const oldSelection = selectRenderedText("[data-line][data-line-end] strong");
+	const oldPreview = host.querySelector("[data-rendered-file-quote]");
+	const pending = deferred<string>();
+	create.mockResolvedValue({ ...descriptor, target, baseHash: "reloaded-markdown-hash" });
+	read.mockReturnValue(pending.promise);
+	await click(iconButton("refresh"));
+	expect(host.querySelector("[data-rendered-file-quote]")).toBe(oldPreview);
+	expect((await oldSelection.pressTab()).defaultPrevented).toBe(false);
+	expect(oldSelection.removeAllRanges).not.toHaveBeenCalled();
+	expect(addReference).toHaveBeenCalledTimes(2);
+	await act(async () => pending.resolve(text));
+});
+
+test("Markdown preview Tab rejects an unsaved draft and renews unchanged preview proof after save", async () => {
+	const addReference = mock((_reference: unknown) => {});
+	const model = await mount({ filePath: "/work/a.md", selection: undefined }, { addReference });
+	const paragraph = "A **bold** paragraph.";
+	await edit(model, `# Draft\n\n${paragraph}\n`);
+	await switchFileMode("preview");
+	const previewText = host.querySelector("[data-rendered-file-quote]")?.textContent;
+	expect(previewText).toContain("A bold paragraph.");
+	const unsaved = selectRenderedText("[data-line][data-line-end] strong");
+	expect((await unsaved.pressTab()).defaultPrevented).toBe(false);
+	expect(unsaved.removeAllRanges).not.toHaveBeenCalled();
+	expect(addReference).not.toHaveBeenCalled();
+	await click(iconButton("device-floppy"));
+	expectClean("saved-byte-hash");
+	expect(host.querySelector("[data-rendered-file-quote]")?.textContent).toBe(previewText);
+	const saved = selectRenderedText("[data-line][data-line-end] strong");
+	expect((await saved.pressTab()).defaultPrevented).toBe(true);
+	expect(addReference).toHaveBeenCalledTimes(1);
+	expect(addReference.mock.calls[0]?.[0]).toMatchObject({
+		deviceId: "local",
+		path: "/work/a.md",
+		selection: {
+			startLineNumber: 3,
+			startColumn: 1,
+			endLineNumber: 3,
+			endColumn: paragraph.length + 1,
+		},
+		expectedHash: "saved-byte-hash",
+	});
+	expect(addReference.mock.calls[0]?.[0]).not.toHaveProperty("expectedHashKind");
+	expect(saved.removeAllRanges).toHaveBeenCalledTimes(1);
+});
+
 test("gutter quote uses this document and clicked range, never the shared selection", async () => {
 	const addReference = mock((_reference: unknown) => {});
 	const model = await mount(

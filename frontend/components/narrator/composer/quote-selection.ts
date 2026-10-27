@@ -110,6 +110,12 @@ export function readPanelQuoteSelection(
 	if (!selection || selection.isCollapsed || selection.rangeCount === 0) return null;
 	const anchorElement = elementOf(selection.anchorNode);
 	const focusElement = elementOf(selection.focusNode);
+	// File previews own their selection and must keep file identity and source lines.
+	if (
+		anchorElement?.closest("[data-rendered-file-quote]") ||
+		focusElement?.closest("[data-rendered-file-quote]")
+	)
+		return null;
 	const anchor = sourceBlock(anchorElement, panel);
 	const focus = sourceBlock(focusElement, panel);
 	if (!anchor || !focus || !anchorElement || !focusElement) return null;

@@ -128,14 +128,16 @@ function isNativeTaskCheckbox(
 export function MarkdownContentListItem({
 	className,
 	dataLine,
+	dataLineEnd,
 	children,
 }: {
 	className?: string;
-	/** 0-based source line, present only when the body opted into scroll-sync anchors. */
+	/** 0-based source lines, present only in file previews. */
 	dataLine?: string;
+	dataLineEnd?: string;
 	children: ReactNode;
 }) {
-	const lineAttr = dataLine ? { "data-line": dataLine } : {};
+	const lineAttr = dataLine ? { "data-line": dataLine, "data-line-end": dataLineEnd } : {};
 	const nodes = Children.toArray(children);
 	const native = nodes.find(isNativeTaskCheckbox);
 	if (!native)
