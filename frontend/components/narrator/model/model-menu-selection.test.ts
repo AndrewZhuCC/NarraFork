@@ -74,6 +74,27 @@ describe("model menu group ordering", () => {
 		]);
 	});
 
+	test("pins aggregations after summary even when its label would sort last", () => {
+		const labelOfAggLast = (provider: string) =>
+			provider === "__agg__" ? "Zzz Aggregations" : labelOf(provider);
+		const entries = [
+			["zeta", 1],
+			["__agg__", 2],
+			["__summary__", 3],
+			["a", 4],
+			["__default__", 5],
+		] as const;
+		// "Zzz Aggregations" sorts after every provider label below. Pinning is
+		// what keeps the group next to Summary.
+		expect(orderModelGroupEntries(entries, labelOfAggLast).map(([provider]) => provider)).toEqual([
+			"__default__",
+			"__summary__",
+			"__agg__",
+			"a",
+			"zeta",
+		]);
+	});
+
 	test("sorts remaining groups by display label, not by raw provider prefix", () => {
 		const entries = [
 			["zeta", 1],

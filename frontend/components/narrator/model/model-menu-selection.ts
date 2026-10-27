@@ -71,10 +71,12 @@ export function modelMenuSelection(
 
 /**
  * Role groups that stay pinned above the provider groups, in this exact order.
- * They are current-state groups rather than catalog providers, so they must not
- * drift around when providers are sorted alphabetically.
+ * Default and Summary are the current selection; Aggregations is a virtual
+ * catalog rather than a provider. All three titles are translated, so leaving
+ * any of them in the alphabetical pass would move that group when the UI
+ * language changes.
  */
-const FIXED_MODEL_GROUP_ORDER: readonly string[] = ["__default__", "__summary__"];
+const FIXED_MODEL_GROUP_ORDER: readonly string[] = ["__default__", "__summary__", "__agg__"];
 
 /**
  * Order model-menu groups: the fixed role groups first (in

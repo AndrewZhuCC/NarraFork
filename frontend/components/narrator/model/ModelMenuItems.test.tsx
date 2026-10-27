@@ -324,11 +324,14 @@ describe("provider group header", () => {
 });
 
 describe("group ordering", () => {
-	test("pins default/summary first and sorts the remaining groups by provider label", async () => {
-		// Insertion order is deliberately scrambled and neither alphabetical by
-		// prefix nor by label: only the rendered header order proves the sort.
+	test("pins default, summary, and aggregations, then sorts providers by label", async () => {
+		// zh-CN titles put 聚合 after every Latin provider label under the default
+		// collation, so this header position only holds when the group is pinned.
+		// Insertion order is scrambled and is neither prefix order nor label order.
+		await instance.changeLanguage("zh-CN");
 		const scrambled: ModelOption[] = [
 			{ value: "zeta:z1", label: "Z1", provider: "zeta" },
+			{ value: "__agg__:group", label: "Group", provider: "__agg__" },
 			{ value: "__summary__", label: "Follow summary", provider: "__summary__" },
 			{ value: "codex:gpt", label: "gpt", provider: "codex" },
 			{ value: "__default__", label: "Follow default", provider: "__default__" },
@@ -343,8 +346,9 @@ describe("group ordering", () => {
 			(header) => header.textContent?.trim() ?? "",
 		);
 		expect(headers).toEqual([
-			narratorLocale.modelGroupDefault,
-			narratorLocale.modelGroupSummary,
+			narratorZhLocale.modelGroupDefault,
+			narratorZhLocale.modelGroupSummary,
+			narratorZhLocale.modelGroupAggregations,
 			"Codex",
 			"Provider A",
 			"Zeta Gateway",

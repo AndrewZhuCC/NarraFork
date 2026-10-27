@@ -197,7 +197,7 @@ export function ModelMenuItems({
 		__summary__: t("modelGroupSummary"),
 		__agg__: t("modelGroupAggregations"),
 	};
-	// Default and Summary role groups stay pinned at the top; every other provider
+	// Default, Summary, and Aggregations stay pinned at the top. Every provider
 	// group is sorted alphabetically by its display label.
 	const entries = orderModelGroupEntries([...groups.entries()], (prov) => provLabels[prov] ?? prov);
 	const normalizedFilter = filter.trim().toLowerCase();
