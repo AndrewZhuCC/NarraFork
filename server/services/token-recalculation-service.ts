@@ -132,8 +132,9 @@ export function getTokenRecalculationService(): TokenRecalculationService {
 				},
 				async createResolver() {
 					// This resolver only reads local configuration/catalog caches; it never calls providers.
-					const { createRuntimeTokenRecalculationProtocolResolver } =
-						await import("./token-recalculation-protocol");
+					const { createRuntimeTokenRecalculationProtocolResolver } = await import(
+						"./token-recalculation-protocol"
+					);
 					return createRuntimeTokenRecalculationProtocolResolver();
 				},
 			}),
