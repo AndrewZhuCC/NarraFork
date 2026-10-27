@@ -280,7 +280,7 @@ for (const host of HOSTS) {
 		const [aliasP3, aliasP1] = aliased.results.map((r) => r.blockId) as [string, string];
 		const p1 = pages[0] as { pageId: string; ids: string[] };
 		const a = await openHost(h, host, p1.pageId, VIEWPORT);
-		const lat: Array<{ name: string; ms: number }> = [];
+		const lat: Array<{ name: string; ms: number; editableMs: number; readOnlyFirst: boolean }> = [];
 		const queryMs: number[] = [];
 		const builds: Array<{ name: string; buildMs: number; parsed: number }> = [];
 		const idOfText = async (text: string, page: { pageId: string; ids: string[] }) => {
@@ -323,8 +323,17 @@ for (const host of HOSTS) {
 			queryMs.push(ix.queryMs);
 			builds.push({ name, buildMs: +ix.buildMs.toFixed(1), parsed: ix.parsed });
 			const r = await a.call((f, w) => f.switcherEnterToFocus(w as never), want);
-			expect({ name, focused: r.focused }).toEqual({ name, focused: true });
-			lat.push({ name, ms: +r.ms.toFixed(1) });
+			expect({ name, focused: r.focused, live: r.editableMs > 0 }).toEqual({
+				name,
+				focused: true,
+				live: true,
+			});
+			lat.push({
+				name,
+				ms: +r.ms.toFixed(1),
+				editableMs: +r.editableMs.toFixed(1),
+				readOnlyFirst: r.wasSeeded,
+			});
 			await settled(a);
 			// The keyboard is there too: in the map's stage, or in the outline.
 			const view = await a.call((f) => f.surface().view);
@@ -372,8 +381,13 @@ for (const host of HOSTS) {
 		const drawn = (await a.call((f) => f.mapState())).nodesInDom;
 		expect(drawn).toBeGreaterThan(10);
 		expect(drawn).toBeLessThan(400);
-		await a.call((f) => f.setView("outline"));
+		// The outline behind a map shown since the page arrived is built and laid out on the
+		// first switch when it comes before the quiet warm-up: that switch's time and longest
+		// frame (measured, not asserted).
+		// (Cold unless the surface sat quiet long enough to warm it: reported, not asserted.)
+		const coldSwitch = await a.call((f) => f.timedSetView("outline"));
 		await settled(a);
+		expect(await a.call((f) => f.surface().view)).toBe("outline");
 		await jump("alias, another page", `别名${host}P3`, aliasP3, "alias");
 		await jump(
 			"text on a second line, another page",
@@ -393,12 +407,22 @@ for (const host of HOSTS) {
 						item: 6,
 						host,
 						indexBuilds: builds,
+						firstSwitchAfterColdMap: {
+							wasCold: coldSwitch.wasCold,
+							syncMs: +coldSwitch.syncMs.toFixed(1),
+							maxFrameMs: +coldSwitch.maxFrameMs.toFixed(1),
+						},
 						keyToFocusMs: lat,
 						keyToFocusThisPage: summary(
 							lat.filter((x) => /this page/.test(x.name)).map((x) => x.ms),
 						),
 						keyToFocusOtherPage: summary(
 							lat.filter((x) => /another/.test(x.name) && !/whole/.test(x.name)).map((x) => x.ms),
+						),
+						keyToEditableOtherPage: summary(
+							lat
+								.filter((x) => /another/.test(x.name) && !/whole/.test(x.name))
+								.map((x) => x.editableMs),
 						),
 						localQueryMs: summary(queryMs),
 					},

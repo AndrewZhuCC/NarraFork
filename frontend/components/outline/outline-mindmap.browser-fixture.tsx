@@ -639,6 +639,96 @@ export function goForward(): void {
 	window.history.forward();
 }
 
+/** Panel host: put another panel in front of the outline panel (in its group): it is hidden. */
+export function coverOutlinePanel(): boolean {
+	const p = dockApi?.panels.find(
+		(panel) => (panel.params as Record<string, unknown>)?.panelType === "outline",
+	);
+	if (!dockApi || !p) return false;
+	dockApi.addPanel({
+		id: "cover-panel",
+		component: "chat",
+		title: "Cover",
+		params: { panelType: "chat", narratorId: "n-fixture" },
+		position: { referenceGroup: p.group },
+	});
+	return !p.api.isVisible;
+}
+
+/** The surface on screen: shown from its HTTP read, live, or not shown yet. */
+export function shownFrom(): "none" | "seed" | "live" {
+	const s = liveEditSurfaces().at(-1);
+	if (!s) return "none";
+	return s.client.ready ? "live" : s.client.seeded ? "seed" : "none";
+}
+
+/** The "connecting" badge: shown, and how often it nudged (a structural key refused). */
+export function connectingBadge(): { shown: boolean; nudges: number } {
+	const el = document.querySelector("[data-testid=outline-connecting]") as HTMLElement | null;
+	return { shown: !!el, nudges: Number(el?.dataset.nudge ?? 0) };
+}
+
+/** Mark the DOM a later check expects to be the very same (no re-render, no flash). */
+export function markShown(ids: string[]): number {
+	const s = surface();
+	let n = 0;
+	for (const id of ids) {
+		const row = s.frame.querySelector(`.nf-outline-scroller .ob-block[data-id="${id}"]`);
+		if (row) {
+			(row as HTMLElement & { __nfMark?: boolean }).__nfMark = true;
+			n++;
+		}
+		const node = s.map.els.get(id)?.el;
+		if (node) {
+			(node as HTMLElement & { __nfMark?: boolean }).__nfMark = true;
+			n++;
+		}
+	}
+	return n;
+}
+
+/** Which of the marked rows and nodes are still the same elements. */
+export function shownKept(ids: string[]): { rows: number; nodes: number } {
+	const s = surface();
+	let rows = 0;
+	let nodes = 0;
+	for (const id of ids) {
+		const row = s.frame.querySelector(`.nf-outline-scroller .ob-block[data-id="${id}"]`);
+		if ((row as (HTMLElement & { __nfMark?: boolean }) | null)?.__nfMark) rows++;
+		const node = s.map.els.get(id)?.el as (HTMLElement & { __nfMark?: boolean }) | undefined;
+		if (node?.__nfMark) nodes++;
+	}
+	return { rows, nodes };
+}
+
+/** Switch views and time it: the synchronous part and the longest frame within 600 ms. */
+export async function timedSetView(
+	kind: "outline" | "map",
+): Promise<{ syncMs: number; maxFrameMs: number; wasCold: boolean }> {
+	const s = surface();
+	const wasCold = s.scroller.classList.contains("nf-outline-cold");
+	recordFrames(true);
+	await new Promise((r) => requestAnimationFrame(() => r(null)));
+	const t0 = performance.now();
+	s.setView(kind);
+	const syncMs = performance.now() - t0;
+	await new Promise((r) => setTimeout(r, 600));
+	const f = recordFrames(false);
+	const gaps = f.slice(1).map((t, i) => t - (f[i] as number));
+	return { syncMs, maxFrameMs: Math.max(0, ...gaps), wasCold };
+}
+
+/** The outline behind the map is cold (not built or laid out since the page arrived). */
+export function outlineCold(): boolean {
+	return surface().scroller.classList.contains("nf-outline-cold");
+}
+
+/** The map's viewport (translation and scale). */
+export function mapViewport(): { tx: number; ty: number; scale: number } {
+	const m = surface().map;
+	return { tx: m.tx, ty: m.ty, scale: m.scale };
+}
+
 /** Panel host: the outline panel's params. */
 export function panelParams(): Record<string, unknown> | null {
 	const p = dockApi?.panels.find(
@@ -824,29 +914,47 @@ export function centerRow(id: string): boolean {
 	return true;
 }
 
-/** Enter in the quick switcher's input to the frame after the focus landed. */
+/**
+ * The focused block shown in the surface on screen: the read-only view (seeded from the HTTP
+ * read) or the live one; in the outline its row is drawn, in the map its node.
+ */
+export function focusShown(want: string): boolean {
+	const s = liveEditSurfaces().at(-1);
+	if (!s || !(s.client.ready || s.client.seeded)) return false;
+	if (s.state.focus !== want || !(want === s.pageId || s.client.visible.alive(want))) return false;
+	if (s.view === "map") return s.map.els.has(want);
+	return s.frame.querySelector(`.nf-outline-scroller .ob-block[data-id="${want}"]`) !== null;
+}
+
+/** The surface on screen is live and takes edits. */
+export function surfaceEditable(): boolean {
+	const s = liveEditSurfaces().at(-1);
+	return !!s && s.client.ready && s.client.editable;
+}
+
+/**
+ * Enter in the quick switcher's input: to the frame after the focus is shown (read-only first:
+ * from the HTTP read if the page is not live yet), and to the page being live and editable.
+ */
 export async function switcherEnterToFocus(
 	want: string,
 	timeoutMs = 10_000,
-): Promise<{ ms: number; focused: boolean }> {
+): Promise<{ ms: number; focused: boolean; editableMs: number; wasSeeded: boolean }> {
 	const input = document.querySelector(
 		"[data-testid=outline-switcher] input",
 	) as HTMLInputElement | null;
-	if (!input) return { ms: -1, focused: false };
+	if (!input) return { ms: -1, focused: false, editableMs: -1, wasSeeded: false };
 	const t0 = performance.now();
 	input.dispatchEvent(
 		new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true, cancelable: true }),
 	);
 	const end = t0 + timeoutMs;
-	const landed = () => {
-		const s = liveEditSurfaces().at(-1);
-		if (!s?.client.ready || s.state.focus !== want || !s.client.visible.alive(want)) {
-			return false;
-		}
-		// In the map: its node drawn too.
-		return s.view !== "map" || s.map.els.has(want);
-	};
-	while (!landed() && performance.now() < end) await new Promise((r) => setTimeout(r, 1));
+	while (!focusShown(want) && performance.now() < end) await new Promise((r) => setTimeout(r, 1));
+	const wasSeeded = liveEditSurfaces().at(-1)?.client.ready === false;
 	await afterPaint();
-	return { ms: performance.now() - t0, focused: landed() };
+	const ms = performance.now() - t0;
+	const focused = focusShown(want);
+	while (!surfaceEditable() && performance.now() < end) await new Promise((r) => setTimeout(r, 2));
+	const editableMs = surfaceEditable() ? performance.now() - t0 : -1;
+	return { ms, focused, editableMs, wasSeeded };
 }

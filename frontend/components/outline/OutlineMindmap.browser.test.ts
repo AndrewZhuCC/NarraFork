@@ -17,6 +17,12 @@
  *   7. Reduced motion: every switch completes at once with no animation.
  *   8. Touch: one-finger pan, pinch, tap to select, double tap to edit, long-press drag.
  *
+ * Read-only first (owner's decision for item 6): another page is shown from its HTTP read at
+ * once, in the outline and in the map, and turns live in place — the same rows and nodes,
+ * focus, folding, cursor and viewport — while what was typed meanwhile is merged and structural
+ * keys wait (the "connecting" badge nudges); a panel hidden before that leaves the session as
+ * soon as its join is answered.
+ *
  * Items 1 and 6 (performance, quick switcher on 10,000 blocks) are in
  * `OutlineMindmapPerf.browser.test.ts`. Behaviour only: no timing is asserted here.
  *
@@ -24,6 +30,7 @@
  */
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import type { KeyInput, Page } from "puppeteer-core";
+import { liveSessionOf } from "../../../server/services/outline/live/registry";
 import {
 	ime,
 	seedPage,
@@ -960,3 +967,252 @@ for (const host of HOSTS) {
 		expect(a.errors).toEqual([]);
 	}, 90_000);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Read-only first: another page is shown from its HTTP read, then turns live in place
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A small page of its own words (the switcher finds it, not the other pages' blocks). */
+async function seedWords(tag: string): Promise<Seeded> {
+	const lines = [
+		`${tag}1 第一`,
+		`  ${tag}1a 子`,
+		`${tag}2 第二`,
+		`  ${tag}2a 子`,
+		`    ${tag}2a1 孙`,
+		`  ${tag}2b 子`,
+		`${tag}3 第三`,
+	];
+	const { pageId, ids } = await seedPage(h, `${tag} 页`, lines);
+	const byLabel = new Map<string, string>();
+	lines.forEach((line, i) => {
+		byLabel.set(line.trim().split(" ")[0] as string, ids[i] as string);
+	});
+	return {
+		pageId,
+		id: (label) => {
+			const v = byLabel.get(label);
+			if (!v) throw new Error(`no block ${label}`);
+			return v;
+		},
+	};
+}
+
+/** Mod-K, the query, its first row is `want`, Enter. */
+async function switchTo(e: MapEditor, q: string, want: string): Promise<void> {
+	await press(e.page, "Control", "k");
+	await e.page.waitForSelector("[data-testid=outline-switcher] input", { timeout: 5000 });
+	await e.page.keyboard.type(q, { delay: 5 });
+	await e.page.waitForFunction(
+		(w) =>
+			(document.querySelector("[data-testid=outline-switcher] [role=option]") as HTMLElement | null)
+				?.dataset.block === w,
+		{ timeout: 10_000, polling: 10 },
+		want,
+	);
+	await e.page.keyboard.press("Enter");
+}
+
+async function until(e: MapEditor, what: string, check: string, timeout = 10_000): Promise<void> {
+	const end = Date.now() + timeout;
+	while (Date.now() < end) {
+		if (await e.page.evaluate(`(${check})(window.fixture)`)) return;
+		await new Promise((r) => setTimeout(r, 15));
+	}
+	throw new Error(`${what}: not within ${timeout} ms`);
+}
+
+for (const host of HOSTS) {
+	test(`${host}: read-only first — another page shows from its read, turns live in place; typing kept, structure waits`, async () => {
+		const tag = host === "page" ? "Ra" : "Rb";
+		const p1 = await seed(`RO start ${host}`);
+		const p2 = await seedWords(tag);
+		const a = await openHost(h, host, p1.pageId);
+		const b = await openBob(h, p2.pageId);
+		await a.call((f, x) => f.caret(x as never, 0), p1.id("T1"));
+		// Alice's live socket holds (her join waits); her HTTP reads do not.
+		await a.call((f) => f.net().hold(true));
+		const q2 = p2.id(`${tag}2`);
+		const q2a = p2.id(`${tag}2a`);
+		const q2b = p2.id(`${tag}2b`);
+		await switchTo(a, `${tag}2 第二`, q2);
+		await until(
+			a,
+			"shown from the read",
+			`(f) => f.shownFrom() === "seed" && f.focusShown(${JSON.stringify(q2)})`,
+		);
+		expect((await a.call((f) => f.connectingBadge())).shown).toBe(true);
+		// Folding works on the read; the cursor moves; typing goes in (queued).
+		await clickGutter(a, q2a, "arrow");
+		const end = (await a.call((f, x) => f.text(x as never), q2b)).length;
+		await a.call((f, x, o) => f.caret(x as never, o as never), q2b, end);
+		await a.page.keyboard.type("xyz");
+		// Structure waits: Enter and Tab change nothing, the badge nudges.
+		const before = await a.call((f, x) => f.blockTree(x as never), q2);
+		await a.page.keyboard.press("Enter");
+		await press(a.page, "Shift", "Tab");
+		await a.page.keyboard.press("Tab");
+		expect(await a.call((f, x) => f.blockTree(x as never), q2)).toEqual(before);
+		// Enter and Tab are refused (Shift-Tab cannot leave the focused block anyway).
+		expect((await a.call((f) => f.connectingBadge())).nudges).toBeGreaterThanOrEqual(2);
+		expect(await a.call((f) => f.shownFrom())).toBe("seed");
+		// Meanwhile Bob changes the start of the same block (live).
+		await b.call((f, x) => f.caret(x as never, 0), q2b);
+		await b.page.keyboard.type("B:");
+		await settle(b);
+		expect(serverText(p2.pageId, q2b)).toBe(`B:${tag}2b 子`);
+		const marked = await a.call((f, ids) => f.markShown(ids as never), [q2, q2a, q2b]);
+		expect(marked).toBe(3);
+		const st = await a.call((f) => f.state());
+		// Released: the page turns live in place.
+		await a.call((f) => f.net().hold(false));
+		await until(a, "live", `(f) => f.shownFrom() === "live"`);
+		await settle(a, b);
+		// Typing merged onto Bob's change, nothing else.
+		expect(serverText(p2.pageId, q2b)).toBe(`B:${tag}2b 子xyz`);
+		expect(await a.call((f, x) => f.text(x as never), q2b)).toBe(`B:${tag}2b 子xyz`);
+		expect(await b.call((f, x) => f.text(x as never), q2b)).toBe(`B:${tag}2b 子xyz`);
+		expect(await a.call((f) => f.outline())).toBe(serverOutline(p2.pageId));
+		// The same rows (no re-render), focus, folding and the cursor (after Bob's two characters).
+		expect(await a.call((f, ids) => f.shownKept(ids as never), [q2, q2a, q2b])).toEqual({
+			rows: 3,
+			nodes: 0,
+		});
+		const after = await a.call((f) => f.state());
+		expect(after.focus).toBe(st.focus);
+		expect(after.collapsed).toEqual(st.collapsed);
+		expect(after.collapsed).toContain(q2a);
+		expect(after.caret).toEqual({ blockId: q2b, anchor: end + 5, head: end + 5 });
+		expect(await a.call((f) => f.connectingBadge())).toMatchObject({ shown: false });
+		// Live now: Enter splits.
+		await a.page.keyboard.press("Enter");
+		await settle(a);
+		expect((await a.call((f, x) => f.kids(x as never), q2)).length).toBe(3);
+		expect(a.errors).toEqual([]);
+		expect(b.errors).toEqual([]);
+	}, 90_000);
+
+	test(`${host}: read-only first in the map — the whole page draws from the read and turns live in place`, async () => {
+		const tag = host === "page" ? "Rc" : "Rd";
+		const p1 = await seed(`RO map ${host}`);
+		const p2 = await seedWords(tag);
+		const a = await openHost(h, host, p1.pageId);
+		await a.call((f, x) => f.caret(x as never, 0), p1.id("T1"));
+		await a.call((f) => f.setView("map"));
+		await settled(a);
+		await a.call((f) => f.net().hold(true));
+		await switchTo(a, `${tag} 页`, p2.pageId);
+		await until(
+			a,
+			"drawn from the read",
+			`(f) => f.shownFrom() === "seed" && f.focusShown(${JSON.stringify(p2.pageId)})`,
+		);
+		await settled(a);
+		expect((await a.call((f) => f.mapState())).root).toBe(p2.pageId);
+		// Navigation works on the read; structure waits.
+		const q1 = p2.id(`${tag}1`);
+		const q2 = p2.id(`${tag}2`);
+		await a.call((f, x) => f.mapSelect(x as never), q1);
+		await a.page.keyboard.press("ArrowDown");
+		expect((await a.call((f) => f.mapState())).selected).toBe(q2);
+		const tree = await a.call((f) => f.blockTree());
+		await a.page.keyboard.press("Tab");
+		await a.page.keyboard.press("Enter");
+		await a.page.keyboard.press("Escape");
+		expect(await a.call((f) => f.blockTree())).toEqual(tree);
+		expect((await a.call((f) => f.connectingBadge())).nudges).toBeGreaterThanOrEqual(2);
+		expect(
+			await a.call((f, ids) => f.markShown(ids as never), [p2.pageId, q1, q2]),
+		).toBeGreaterThanOrEqual(3);
+		const viewport = await a.call((f) => f.mapViewport());
+		await a.call((f) => f.net().hold(false));
+		await until(a, "live", `(f) => f.shownFrom() === "live"`);
+		await settled(a);
+		// The same nodes where they were; the selection kept.
+		expect(await a.call((f) => f.mapViewport())).toEqual(viewport);
+		expect((await a.call((f, ids) => f.shownKept(ids as never), [p2.pageId, q1, q2])).nodes).toBe(
+			3,
+		);
+		expect((await a.call((f) => f.mapState())).selected).toBe(q2);
+		// The outline behind the map was never built: it warms in a quiet moment once live.
+		await until(a, "outline warmed", `(f) => !f.outlineCold()`, 8000);
+		expect(await a.call((f) => f.mapViewport())).toEqual(viewport);
+		// Live now: Tab adds a child.
+		await a.page.keyboard.press("Tab");
+		await a.page.keyboard.type("新");
+		await a.page.keyboard.press("Escape");
+		await settle(a);
+		expect((await a.call((f, x) => f.kids(x as never), q2)).length).toBe(3);
+		expect(a.errors).toEqual([]);
+	}, 90_000);
+}
+
+for (const host of HOSTS) {
+	test(`${host}: read-only first — composing while it connects, the page turning live mid-composition`, async () => {
+		const tag = host === "page" ? "Ri" : "Rj";
+		const p1 = await seed(`RO ime ${host}`);
+		const p2 = await seedWords(tag);
+		const a = await openHost(h, host, p1.pageId);
+		const b = await openBob(h, p2.pageId);
+		const input = ime(a);
+		await a.call((f, x) => f.caret(x as never, 0), p1.id("T1"));
+		await a.call((f) => f.net().hold(true));
+		const q2 = p2.id(`${tag}2`);
+		const q2b = p2.id(`${tag}2b`);
+		await switchTo(a, `${tag}2 第二`, q2);
+		await until(
+			a,
+			"shown from the read",
+			`(f) => f.shownFrom() === "seed" && f.focusShown(${JSON.stringify(q2)})`,
+		);
+		const orig = await a.call((f, x) => f.text(x as never), q2b);
+		await a.call((f, x, o) => f.caret(x as never, o as never), q2b, orig.length);
+		await input.set("n");
+		await input.set("nihao");
+		await b.call((f, x) => f.caret(x as never, 0), q2b);
+		await b.page.keyboard.type("B:");
+		await settle(b);
+		// Live while still composing.
+		await a.call((f) => f.net().hold(false));
+		await until(a, "live", `(f) => f.shownFrom() === "live"`);
+		await input.commit("你好");
+		await settle(a, b);
+		expect(serverText(p2.pageId, q2b)).toBe(`B:${orig}你好`);
+		expect(await a.call((f, x) => f.text(x as never), q2b)).toBe(`B:${orig}你好`);
+		expect(await b.call((f, x) => f.text(x as never), q2b)).toBe(`B:${orig}你好`);
+		expect(a.errors).toEqual([]);
+	}, 90_000);
+}
+
+test("panel: a panel hidden before its page turned live leaves the session at once", async () => {
+	const p1 = await seed("RO hide start");
+	const p3 = await seedWords("Rh");
+	const a = await openHost(h, "panel", p1.pageId);
+	await a.call((f, x) => f.caret(x as never, 0), p1.id("T1"));
+	await a.call((f) => f.net().hold(true));
+	await switchTo(a, "Rh2 第二", p3.id("Rh2"));
+	await until(a, "shown from the read", `(f) => f.shownFrom() === "seed"`);
+	expect((await a.call((f) => f.liveSessions())).map((s) => s.pageId)).toContain(p3.pageId);
+	// Hidden while its join is still on its way.
+	expect(await a.call((f) => f.coverOutlinePanel())).toBe(true);
+	await new Promise((r) => setTimeout(r, 100));
+	const released = Date.now();
+	await a.call((f) => f.net().hold(false));
+	// Well before the grace period (5 s): gone here and on the server.
+	const end = released + 2000;
+	let gone = false;
+	while (Date.now() < end) {
+		const here = (await a.call((f) => f.liveSessions())).some((s) => s.pageId === p3.pageId);
+		const there = liveSessionOf(p3.pageId)?.participants.size ?? 0;
+		if (!here && there === 0) {
+			gone = true;
+			break;
+		}
+		await new Promise((r) => setTimeout(r, 25));
+	}
+	expect(gone).toBe(true);
+	// And it stays gone (no participant left behind by a leave that overtook the join).
+	await new Promise((r) => setTimeout(r, 300));
+	expect(liveSessionOf(p3.pageId)?.participants.size ?? 0).toBe(0);
+	expect(a.errors).toEqual([]);
+}, 60_000);
