@@ -4476,6 +4476,39 @@ export async function recoverPendingQuestionAnswerDeliveries(
 					options.signal?.throwIfAborted();
 					if (!question.messageId) continue;
 					try {
+						// `resolution_json` 是模型写的「解决备注」，不是送达凭据：回答之后
+						// 会话已经继续过（后面有 assistant 消息）就说明早已送达。否则每个
+						// 没写备注的历史问题都会在每次启动被重投一次，把会话唤醒跑一轮
+						// 空输入——那一轮又留下新的待办标记，形成重启即重放的循环。
+						const answerRef = db
+							.select({ seq: narratorMessageRefs.seq })
+							.from(narratorMessageRefs)
+							.where(
+								and(
+									eq(narratorMessageRefs.narratorId, recipient.id),
+									eq(narratorMessageRefs.messageId, question.messageId),
+								),
+							)
+							.limit(1)
+							.get();
+						if (!answerRef) continue;
+						const alreadyAnswered = db
+							.select({ id: narratorMessageRefs.id })
+							.from(narratorMessageRefs)
+							.innerJoin(
+								narratorMessages,
+								eq(narratorMessages.id, narratorMessageRefs.messageId),
+							)
+							.where(
+								and(
+									eq(narratorMessageRefs.narratorId, recipient.id),
+									eq(narratorMessages.role, "assistant"),
+									gt(narratorMessageRefs.seq, answerRef.seq),
+								),
+							)
+							.limit(1)
+							.get();
+						if (alreadyAnswered) continue;
 						const principal = await getAsyncQuestionExecutionPrincipal(question.id, recipient.id);
 						if (!principal) continue;
 						const receipt = await getBoundedQuestionReceipt(question.messageId, recipient.id);
