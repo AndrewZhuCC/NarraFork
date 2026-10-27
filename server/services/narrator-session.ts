@@ -373,7 +373,13 @@ import {
 	resolveBlockTargets,
 	rowAt,
 } from "./narrator-block-targets";
-import { bodyColumns, fillBodies, fillBody } from "./narrator-body-reads";
+import {
+	bodyColumns,
+	contentJsonSql,
+	fillBodies,
+	fillBody,
+	storedBodyBytesSql,
+} from "./narrator-body-reads";
 import { readEnvelopeBody, writeEnvelopeBody } from "./narrator-body-writes";
 import {
 	cleanupBufferedTextFilesAsync,
@@ -4435,24 +4441,29 @@ function assistantReplyFollowsAnswer(narratorId: string, answerSeq: number): boo
 
 	let cursor = answerSeq;
 	for (;;) {
-		const bodies = db
-			.select({
-				seq: narratorMessageRefs.seq,
-				contentJson: narratorMessages.contentJson,
-			})
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessages.role, "assistant"),
-					gt(narratorMessageRefs.seq, cursor),
-					sql`coalesce(length(cast(${narratorMessages.contentJson} as blob)), 0) > 2`,
-				),
-			)
-			.orderBy(asc(narratorMessageRefs.seq))
-			.limit(8)
-			.all();
+		// Body bytes and the body itself go through the block-aware readers. The column
+		// is only a projection once rows are current, and a direct read is refused.
+		const bodies = fillBodies(
+			db
+				.select({
+					id: narratorMessages.id,
+					seq: narratorMessageRefs.seq,
+					contentJson: contentJsonSql(),
+				})
+				.from(narratorMessageRefs)
+				.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessages.role, "assistant"),
+						gt(narratorMessageRefs.seq, cursor),
+						sql`coalesce(${storedBodyBytesSql()}, 0) > 2`,
+					),
+				)
+				.orderBy(asc(narratorMessageRefs.seq))
+				.limit(8)
+				.all(),
+		);
 		if (!bodies.length) return false;
 		for (const body of bodies) {
 			if (

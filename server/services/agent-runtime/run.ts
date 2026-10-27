@@ -919,7 +919,10 @@ async function settleStatus(
 		errorMessage:
 			failure?.errorMessage ??
 			(outcome.hasError && !outcome.interrupted ? outcome.finalText : undefined),
-		diagnostics: options?.diagnostics,
+		// `failure` already carries the loop's diagnostics. Only a foreground throw,
+		// which has no terminal status, supplies them here — an explicit undefined
+		// would wipe the ones just spread.
+		...(options?.diagnostics ? { diagnostics: options.diagnostics } : {}),
 		skipErrorMessage: options?.skipErrorMessage ?? true,
 		unlessArchived: true,
 	});
