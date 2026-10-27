@@ -29,7 +29,19 @@ import {
 } from "@server/db/postgres-schema";
 import type { OutlineTaskJson } from "@server/db/schema";
 import { generateId } from "@server/lib/id";
-import { and, asc, desc, eq, gt, inArray, isNull, notInArray, type SQL, sql } from "drizzle-orm";
+import {
+	and,
+	asc,
+	desc,
+	eq,
+	gt,
+	inArray,
+	isNull,
+	ne,
+	notInArray,
+	type SQL,
+	sql,
+} from "drizzle-orm";
 import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
 import { newOutlineKey } from "../keys";
 import type {
@@ -636,26 +648,26 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 								set: { collapsedJson: row.collapsed, layout: row.layout, updatedAt: row.updatedAt },
 							});
 						// The person's oldest pages beyond the cap (found by the primary key's prefix, at
-						// most `keepPerUser + 1` rows).
-						await tx
-							.delete(outlineViewState)
-							.where(
-								and(
-									eq(outlineViewState.userId, row.userId),
-									notInArray(
-										outlineViewState.pageBlockId,
-										tx
-											.select({ id: outlineViewState.pageBlockId })
-											.from(outlineViewState)
-											.where(eq(outlineViewState.userId, row.userId))
-											.orderBy(
-												desc(outlineViewState.updatedAt),
-												sql`${outlineViewState.pageBlockId} COLLATE "C" DESC`,
-											)
-											.limit(keepPerUser),
-									),
+						// most `keepPerUser + 2` rows).
+						await tx.delete(outlineViewState).where(
+							and(
+								eq(outlineViewState.userId, row.userId),
+								// Never the page just written (a clock stepping back could make it the oldest).
+								ne(outlineViewState.pageBlockId, row.pageBlockId),
+								notInArray(
+									outlineViewState.pageBlockId,
+									tx
+										.select({ id: outlineViewState.pageBlockId })
+										.from(outlineViewState)
+										.where(eq(outlineViewState.userId, row.userId))
+										.orderBy(
+											desc(outlineViewState.updatedAt),
+											sql`${outlineViewState.pageBlockId} COLLATE "C" DESC`,
+										)
+										.limit(keepPerUser),
 								),
-							);
+							),
+						);
 					}),
 				{ label: "outline.putViewState" },
 			);

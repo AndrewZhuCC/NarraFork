@@ -310,9 +310,10 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 	/** A person's view state of a page, or null when they never wrote one. */
 	getViewState(userId: string, pageBlockId: string): Promise<OutlineViewStateRow | null>;
 	/**
-	 * Insert or replace a person's view state of a page, then keep only their `keepPerUser` most
-	 * recently written pages (the rest are deleted in one statement bounded by that number: the
-	 * person never has more than `keepPerUser + 1` rows).
+	 * Insert or replace a person's view state of a page, then keep only that page and their
+	 * `keepPerUser` most recently written others (the rest are deleted in one statement bounded
+	 * by that number: the person never has more than `keepPerUser + 2` rows). The page just
+	 * written is never dropped, even when a clock stepped back makes it the oldest.
 	 */
 	putViewState(row: OutlineViewStateRow, keepPerUser: number): Promise<void>;
 }

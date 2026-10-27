@@ -1748,6 +1748,14 @@ export const OUTLINE_STORE_CONTRACT: ContractCase[] = [
 			expect(await ctx.store.getViewState(me, two)).not.toBeNull();
 			expect(await ctx.store.getViewState(me, four)).not.toBeNull();
 			expect(await ctx.store.getViewState(other, one)).not.toBeNull();
+			// A clock that stepped back: the page just written is never the one dropped.
+			await ctx.store.putViewState(
+				{ ...row, pageBlockId: one, updatedAt: "2026-10-27T23:00:00.000Z" },
+				2,
+			);
+			expect(await ctx.store.getViewState(me, one)).not.toBeNull();
+			expect(await ctx.store.getViewState(me, two)).not.toBeNull();
+			expect(await ctx.store.getViewState(me, four)).not.toBeNull();
 		},
 	},
 	{

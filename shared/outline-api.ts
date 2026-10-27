@@ -152,6 +152,11 @@ export interface OutlineBlockViewResponse {
 	hiddenByView: number;
 	/** The page has more blocks than one read loads; some were left out. */
 	pageTruncated: boolean;
+	/**
+	 * Live blocks of the page, the page included, as the read counted them (at least this many
+	 * with `pageTruncated`): whether it can be edited live (PR8's limits) is known before joining.
+	 */
+	pageBlocks: number;
 }
 
 export interface OutlineCommitSummary {

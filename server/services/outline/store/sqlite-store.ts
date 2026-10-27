@@ -14,7 +14,19 @@
  * `errno`) and cross the port as `WriteConflictError`.
  */
 import { WriteConflictError } from "@server/db/backend/write-port";
-import { and, asc, desc, eq, gt, inArray, isNull, notInArray, type SQL, sql } from "drizzle-orm";
+import {
+	and,
+	asc,
+	desc,
+	eq,
+	gt,
+	inArray,
+	isNull,
+	ne,
+	notInArray,
+	type SQL,
+	sql,
+} from "drizzle-orm";
 import { db } from "../../../db";
 import {
 	outlineBlocks,
@@ -618,11 +630,13 @@ export const sqliteOutlineStore: OutlineStore = {
 						})
 						.run();
 					// The person's oldest pages beyond the cap: their rows are found by the primary
-					// key's prefix, at most `keepPerUser + 1` of them.
+					// key's prefix, at most `keepPerUser + 2` of them.
 					tx.delete(outlineViewState)
 						.where(
 							and(
 								eq(outlineViewState.userId, row.userId),
+								// Never the page just written (a clock stepping back could make it the oldest).
+								ne(outlineViewState.pageBlockId, row.pageBlockId),
 								notInArray(
 									outlineViewState.pageBlockId,
 									tx
