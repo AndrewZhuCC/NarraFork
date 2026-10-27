@@ -20,6 +20,7 @@ import type { FileTarget } from "@shared/file-reference";
 import { useNavigate } from "@tanstack/react-router";
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { useNarrator } from "../../hooks/useNarrator";
+import { lazyWithRetry } from "../../lib/lazy-with-retry";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { FileReferenceScopeProvider } from "../narrator/composer/FileReferenceScope";
 import { NarratorDockContext } from "../narrator/dock/NarratorDockContext";
@@ -41,7 +42,7 @@ import {
 	pluginPanelWindowHostContext,
 } from "./panel-window";
 
-const NarratorPanel = lazy(() =>
+const NarratorPanel = lazyWithRetry(() =>
 	import("../narrator/NarratorPanel").then((m) => ({ default: m.NarratorPanel })),
 );
 const NarratorTerminal = lazy(() =>
