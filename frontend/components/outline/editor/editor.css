@@ -336,3 +336,16 @@
 		animation: none;
 	}
 }
+
+/* What was typed while connecting and could not be saved: shown to copy. */
+.nf-outline-editor .nf-outline-unsaved {
+	margin: 0;
+	max-height: 10em;
+	overflow: auto;
+	white-space: pre-wrap;
+	word-break: break-word;
+	font-size: var(--mantine-font-size-xs);
+	padding: 4px 6px;
+	border-radius: var(--mantine-radius-xs);
+	background: var(--mantine-color-default);
+}

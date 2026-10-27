@@ -9,6 +9,9 @@ import {
 	serverHit,
 } from "./quick-switcher-index";
 
+/** Parse everything a search needs (a loaded machine must not leave blocks out). */
+const ALL = Number.POSITIVE_INFINITY;
+
 function source(texts: Record<string, string>, pageId = "page"): LocalSource {
 	return { pageId, ids: () => Object.keys(texts), textOf: (id) => texts[id] ?? "" };
 }
@@ -37,7 +40,7 @@ describe("local switcher index", () => {
 			d: "nothing here",
 		});
 		const ix = new LocalSwitcherIndex();
-		const hits = ix.search(src, "s1", "apple", []);
+		const hits = ix.search(src, "s1", "apple", [], ALL);
 		expect(hits.map((h) => [h.blockId, h.via])).toEqual([
 			["b", "title"],
 			["a", "title"],
@@ -50,12 +53,12 @@ describe("local switcher index", () => {
 	test("recently focused blocks rank first, and alone for an empty query", () => {
 		const src = source({ a: "alpha one", b: "alpha two", c: "alpha three" });
 		const ix = new LocalSwitcherIndex();
-		expect(ix.search(src, "s1", "alpha", ["c", "b"]).map((h) => h.blockId)).toEqual([
+		expect(ix.search(src, "s1", "alpha", ["c", "b"], ALL).map((h) => h.blockId)).toEqual([
 			"c",
 			"b",
 			"a",
 		]);
-		const empty = ix.search(src, "s1", "  ", ["b", "gone", "a"]);
+		const empty = ix.search(src, "s1", "  ", ["b", "gone", "a"], ALL);
 		expect(empty.map((h) => [h.blockId, h.via])).toEqual([
 			["b", "recent"],
 			["a", "recent"],
@@ -67,14 +70,17 @@ describe("local switcher index", () => {
 		for (let i = 0; i < SWITCHER_LIMIT + 10; i++) texts[`b${i}`] = `item ${i}`;
 		const src = source(texts);
 		const ix = new LocalSwitcherIndex();
-		expect(ix.search(src, "s1", "item", [])).toHaveLength(SWITCHER_LIMIT);
+		expect(ix.search(src, "s1", "item", [], ALL)).toHaveLength(SWITCHER_LIMIT);
 		expect(ix.stats.entries).toBe(SWITCHER_LIMIT + 10);
 		texts.extra = "zebra";
-		expect(ix.search(src, "s1", "zebra", [])).toHaveLength(0);
+		expect(ix.search(src, "s1", "zebra", [], ALL)).toHaveLength(0);
 		ix.invalidate();
-		expect(ix.search(src, "s1", "zebra", []).map((h) => h.blockId)).toEqual(["extra"]);
+		expect(ix.search(src, "s1", "zebra", [], ALL).map((h) => h.blockId)).toEqual(["extra"]);
 		const other = source({ q: "zebra crossing" }, "page2");
-		expect(ix.search(other, "s1", "zebra", [])[0]).toMatchObject({ blockId: "q", pageId: "page2" });
+		expect(ix.search(other, "s1", "zebra", [], ALL)[0]).toMatchObject({
+			blockId: "q",
+			pageId: "page2",
+		});
 	});
 });
 
@@ -89,19 +95,19 @@ describe("incremental index", () => {
 		while (!ix.warm(src, 0)) slices++;
 		expect(slices).toBeGreaterThan(1);
 		expect(slices).toBeLessThanOrEqual(51);
-		expect(ix.search(src, "s1", "block 7", []).map((h) => h.blockId)).toEqual(["b7"]);
+		expect(ix.search(src, "s1", "block 7", [], ALL).map((h) => h.blockId)).toEqual(["b7"]);
 		expect(ix.stats.parsed).toBe(0);
 		expect(ix.stats.entries).toBe(50);
 		texts.b3 = "renamed";
 		ix.invalidate();
-		expect(ix.search(src, "s1", "renamed", []).map((h) => [h.blockId, h.via])).toEqual([
+		expect(ix.search(src, "s1", "renamed", [], ALL).map((h) => [h.blockId, h.via])).toEqual([
 			["b3", "title"],
 		]);
 		expect(ix.stats.parsed).toBe(1);
 		// A deleted block leaves the index.
 		delete texts.b3;
 		ix.invalidate();
-		expect(ix.search(src, "s1", "renamed", [])).toEqual([]);
+		expect(ix.search(src, "s1", "renamed", [], ALL)).toEqual([]);
 		expect(ix.stats.entries).toBe(49);
 	});
 
@@ -113,7 +119,7 @@ describe("incremental index", () => {
 		// No time to parse: nothing local yet (the server's search still answers).
 		expect(ix.search(src, "s1", "entry 7", [], 0)).toEqual([]);
 		expect(ix.stats.left).toBe(40);
-		expect(ix.search(src, "s1", "entry 7", []).map((h) => h.blockId)).toEqual(["b7"]);
+		expect(ix.search(src, "s1", "entry 7", [], ALL).map((h) => h.blockId)).toEqual(["b7"]);
 		expect(ix.stats.left).toBe(0);
 		expect(ix.stats.entries).toBe(40);
 	});

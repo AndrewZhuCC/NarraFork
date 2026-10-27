@@ -14,7 +14,8 @@
  * A session let go before it was ever live (a panel hidden while its page still showed the HTTP
  * read) is not kept for the grace period: it leaves as soon as the server answers its join. Not
  * before: a leave that overtakes the join on the server would be dropped and the server would
- * keep the participant until the socket closes.
+ * keep the participant until the socket closes. Unless something was typed on the read: then it
+ * stays for the grace period after the answer, so the merged text is sent first.
  *
  * ADMISSION
  * ---------
@@ -144,10 +145,21 @@ export function releaseLiveSession(shared: SharedLiveSession): void {
 	if (shared.timer) clearTimeout(shared.timer);
 	shared.timer = null;
 	const client = shared.client;
-	if (!client.ready && client.status === "connecting") {
-		// Never live, its join on its way: leave as soon as the server answers it.
+	const unsent = () => client.pending.length > 0 || client.awaiting.length > 0;
+	// Offline with something typed on the read: it waits for the socket, and then the join.
+	const waiting = () =>
+		!client.ready && (client.status === "connecting" || (client.status === "offline" && unsent()));
+	if (waiting()) {
+		// Never live, its join on its way: wait for the server's answer (a leave before it would be
+		// lost). Then nothing typed on the read: leave at once; something typed: it was merged and
+		// is being sent, so the usual grace period lets it go out (and be acknowledged).
 		const off = client.on(() => {
-			if (client.ready || client.status !== "connecting") shared.drop();
+			if (waiting()) return;
+			off();
+			shared.dropWhenJoined = null;
+			if (client.ready && unsent()) {
+				if (shared.refs === 0) shared.timer = setTimeout(shared.drop, graceMs);
+			} else shared.drop();
 		});
 		shared.dropWhenJoined = off;
 		return;

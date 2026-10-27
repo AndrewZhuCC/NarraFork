@@ -93,6 +93,7 @@ function pageView(extra: Partial<OutlineBlockViewResponse> = {}): OutlineBlockVi
 		hiddenByBudget: 0,
 		hiddenByView: 0,
 		pageTruncated: false,
+		pageBlocks: 3,
 		...extra,
 	};
 }

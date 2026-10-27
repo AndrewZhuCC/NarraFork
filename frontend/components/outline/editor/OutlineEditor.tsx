@@ -32,15 +32,15 @@ import {
 import { notifications } from "@mantine/notifications";
 import type { OutlineBlockViewResponse } from "@shared/outline-api";
 import type { LiveCloseCode } from "@shared/outline-live-protocol";
-import { LIVE_TASK_OF_STATUS } from "@shared/outline-live-protocol";
 import { IconArrowDown, IconArrowRight, IconArrowsMaximize, IconSearch } from "@tabler/icons-react";
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { copyTextToClipboard } from "../../../lib/clipboard";
 import { EditSurface } from "../edit-surface";
 import { mapText } from "../mindmap/mindmap";
 import type { OutlineViewState } from "../view-state";
 import { chromeText } from "./chrome";
-import type { LiveClient, LiveTransport, SeedBlock } from "./live-client";
+import type { LiveClient, LiveTransport, UnsavedText } from "./live-client";
 import {
 	acquireLiveSession,
 	liveSessionClient,
@@ -48,6 +48,7 @@ import {
 	retainLiveSession,
 	type SharedLiveSession,
 } from "./live-sessions";
+import { readCanGoLive, seedBlocksOf } from "./seed";
 import { liveTransport } from "./transport";
 import type { OutlineLens, OutlineRefusal, OutlineView } from "./view";
 import "./editor.css";
@@ -114,7 +115,7 @@ export function seedLiveSession(read: OutlineBlockViewResponse, transport = live
 	if (!read.current) return;
 	for (const mode of ["edit", "view"] as const) {
 		const client = liveSessionClient(transport, read.pageId, mode);
-		if (client && !client.ready) client.seed(seedBlocksOf(read));
+		if (client && !client.ready) client.seed(seedBlocksOf(read), { typing: readCanGoLive(read) });
 	}
 }
 
@@ -130,16 +131,39 @@ function afterNextPaint(run: () => void): void {
 	setTimeout(go, 100);
 }
 
-/** The blocks of an HTTP read as the live client takes them. */
-export function seedBlocksOf(read: OutlineBlockViewResponse): SeedBlock[] {
-	return read.blocks.map((b) => ({
-		id: b.id,
-		parentId: b.parentId,
-		sid: b.sid,
-		content: b.content,
-		task: b.task ? LIVE_TASK_OF_STATUS[b.task.status] : null,
-		childIds: b.childIds,
-	}));
+/** Typing of the read-only-first window that could not be saved: shown with a copy action. */
+function UnsavedNotice({ unsaved, onDismiss }: { unsaved: UnsavedText; onDismiss: () => void }) {
+	const { t } = useTranslation("outline");
+	const all = unsaved.texts.map((x) => x.text).join("\n\n");
+	return (
+		<Alert color="red" variant="light" py={6} data-testid="outline-unsaved-notice">
+			<Text size="sm" mb={4}>
+				{t(unsaved.reason === "read_only" ? "editor.unsavedReadOnly" : "editor.unsavedRefused", {
+					count: unsaved.texts.length,
+				})}
+			</Text>
+			<pre className="nf-outline-unsaved" data-testid="outline-unsaved-text">
+				{all}
+			</pre>
+			<Group gap="xs" wrap="wrap" mt={4}>
+				<Button
+					size="compact-xs"
+					variant="light"
+					onClick={() => {
+						void copyTextToClipboard(all).then(
+							() => notifications.show({ message: t("editor.unsavedCopied") }),
+							() => undefined,
+						);
+					}}
+				>
+					{t("editor.copyUnsaved")}
+				</Button>
+				<Button size="compact-xs" variant="subtle" onClick={onDismiss}>
+					{t("editor.dismiss")}
+				</Button>
+			</Group>
+		</Alert>
+	);
 }
 
 /** Why a page shows read only instead of the live editor. */
@@ -228,11 +252,13 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 				const s = surfaceRef.current;
 				if (s) for (const v of [s.pageView, s.focusView]) v?.refreshEditable();
 			}
-			if (event === "closed" && client.closeCode && client.closeCode !== "ended")
+			// Refused with typing of the read on hand: the editor stays to show it (copy, then
+			// dismiss); the read-only view follows the dismissal.
+			if (event === "closed" && client.closeCode && client.closeCode !== "ended" && !client.unsaved)
 				callbacks.current.onUnavailable(client.closeCode);
 			if (event !== "sync") rerender();
 		});
-		if (client.status === "closed" && client.closeCode)
+		if (client.status === "closed" && client.closeCode && !client.unsaved)
 			callbacks.current.onUnavailable(client.closeCode);
 		// A page shown from its read stays (what was typed is kept for when it goes live); one with
 		// nothing to show falls back to the read-only view.
@@ -250,7 +276,7 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 	const seed = props.seed;
 	useEffect(() => {
 		if (seed && seed.pageId === pageId && seed.current && !client.ready)
-			client.seed(seedBlocksOf(seed));
+			client.seed(seedBlocksOf(seed), { typing: readCanGoLive(seed) });
 	}, [client, seed, pageId]);
 
 	// The editing surface: built once per page session and view state; focus and lens changes
@@ -463,13 +489,26 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 					)}
 				</Group>
 			</Group>
+			{client.unsaved && (
+				<UnsavedNotice
+					unsaved={client.unsaved}
+					onDismiss={() => {
+						const code = client.closeCode;
+						client.dismissUnsaved();
+						if (client.status === "closed" && code && code !== "ended")
+							callbacks.current.onUnavailable(code);
+					}}
+				/>
+			)}
 			{deleted && (
 				<Alert color="yellow" variant="light" py={6} data-testid="outline-deleted-notice">
 					<Group gap="xs" wrap="wrap">
 						<Text size="sm">
-							{deleted.by
-								? t("editor.deletedBy", { name: deleted.by })
-								: t("editor.deletedBySomeone")}
+							{deleted.whileConnecting
+								? t("editor.deletedWhileConnecting")
+								: deleted.by
+									? t("editor.deletedBy", { name: deleted.by })
+									: t("editor.deletedBySomeone")}
 						</Text>
 						{client.editable && (
 							<Button size="compact-xs" variant="light" onClick={() => client.restoreDeleted()}>
