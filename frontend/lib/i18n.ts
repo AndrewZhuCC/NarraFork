@@ -123,6 +123,7 @@ export function getNamespacesForPath(pathname: string): Namespace[] {
 				"git",
 				"chat",
 				"knowledge",
+				"outline",
 				"plugins",
 			];
 		}
@@ -151,11 +152,22 @@ function getRouteNamespaces(path: string): Namespace[] {
 	if (path === "/messages") return ["common", "nav", "chat"];
 	if (path === "/narrators") return ["common", "nav", "narrators", "narrator", "chat"];
 	if (path === "/narrators/archived") return ["common", "nav", "narrators"];
+	// Sessions open outline panels beside them (and workspaces hold outline pages).
 	if (path.startsWith("/narrators/workspace/")) {
-		return ["common", "nav", "narrators", "narrator", "terminal", "git", "chat"];
+		return ["common", "nav", "narrators", "narrator", "terminal", "git", "chat", "outline"];
 	}
 	if (path.startsWith("/narrators/")) {
-		return ["common", "nav", "narrators", "narrator", "settings", "terminal", "git", "chat"];
+		return [
+			"common",
+			"nav",
+			"narrators",
+			"narrator",
+			"settings",
+			"terminal",
+			"git",
+			"chat",
+			"outline",
+		];
 	}
 	if (path === "/settings/providers" || path === "/settings/models" || path === "/settings/agent") {
 		return ["common", "nav", "settings", "narrator"];
@@ -184,6 +196,10 @@ function getRouteNamespaces(path: string): Namespace[] {
 		return ["common", "nav", "knowledge"];
 	}
 	if (path === "/search") return ["common", "nav", "search"];
+	// A page of an outline is a dock where sessions open beside it.
+	if (path.startsWith("/outline/") && path.split("/").length > 3) {
+		return ["common", "nav", "outline", "narrators", "narrator", "terminal", "git", "chat"];
+	}
 	if (path === "/outline" || path.startsWith("/outline/")) {
 		return ["common", "nav", "outline"];
 	}

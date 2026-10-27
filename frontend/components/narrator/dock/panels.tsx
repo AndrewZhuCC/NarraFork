@@ -63,6 +63,7 @@ import { toolEditReferenceKey } from "../tool-call/tool-edit-reference";
 import type { NarratorDockPanelType } from "./dock-panel-types";
 import { FocusChatSlot } from "./FocusChatHost";
 import { NarratorDockContext, useNarratorDockContext } from "./NarratorDockContext";
+import { OutlineDockPanel } from "./OutlineDockPanel";
 
 const NarratorTerminal = lazy(() =>
 	import("../../terminal/NarratorTerminal").then((m) => ({ default: m.NarratorTerminal })),
@@ -1170,6 +1171,7 @@ export const narratorDockComponents: Record<
 	filetree: FileTreeDockPanel,
 	file: FileDockPanel,
 	knowledge: KnowledgeDockPanel,
+	outline: OutlineDockPanel,
 	plugin: PluginDockPanel,
 	// TEMPORARY (see ../mock/README-REMOVAL.md).
 	mock: MockDockPanel,
