@@ -577,6 +577,7 @@ async function executeRun(
 		// do not auto-start queued work over a retained same-run terminal checkpoint.
 		allowInboxWake = false;
 		if (active) active._resumeBufferedAfterLoop = false;
+		const failureText = error instanceof Error ? error.message : String(error);
 		// A run that threw still ends exactly once at its destination (the same
 		// finalizer); the error then reaches the session's own error reporting.
 		if (!finished && deliverTo && publicationRun)
@@ -585,12 +586,26 @@ async function executeRun(
 				run,
 				deliverTo,
 				publicationRun,
-				{ hasError: true, finalText: error instanceof Error ? error.message : String(error) },
+				{ hasError: true, finalText: failureText },
 				req,
 			).catch((finalizeError) =>
 				logger.warn("Run finalization after failure failed", {
 					id,
 					error: String(finalizeError),
+				}),
+			);
+		else if (!deliverTo)
+			// 前台 run 没有交付目标，收尾只能在这里做：漏掉它 status 会停在 working，
+			// 下次重启被当成「被上个进程切断的 run」再次续跑，于是空输入重放上一轮。
+			await settleStatus(id, undefined, {
+				hasError: true,
+				interrupted: run.cancel.signal.aborted,
+				timedOut: run.timedOut,
+				finalText: failureText,
+			}).catch((statusError) =>
+				logger.warn("Run status settle after failure failed", {
+					id,
+					error: String(statusError),
 				}),
 			);
 		throw error;
