@@ -33,7 +33,7 @@ import type { MentionResolver } from "./editor/chrome";
 import { mentionLabel } from "./editor/chrome";
 import { caretIn } from "./editor/commands";
 import type { LiveClient, SelInfo } from "./editor/live-client";
-import { findBlockPos, type OutlineLens, OutlineView } from "./editor/view";
+import { findBlockPos, type OutlineLens, type OutlineRefusal, OutlineView } from "./editor/view";
 import { MindMapView } from "./mindmap/mindmap";
 import { prewarmBodies } from "./mindmap/prewarm";
 import {
@@ -55,6 +55,12 @@ interface Pos {
 const PREWARM_HOLD_MS = 1500;
 /** Pages smaller than this are measured on the spot (faster than waiting for the Worker). */
 const PREWARM_HOLD_MIN_BLOCKS = 300;
+/**
+ * A cold outline behind the map (see the constructor) is built and laid out once the page is
+ * live and nobody touched the surface for this long (in idle time): the switch to the outline is
+ * then an ordinary one. Switching sooner builds it on the spot (one long frame).
+ */
+const COLD_WARM_QUIET_MS = 2000;
 
 /** Blocks most recently focused in this tab (the quick switcher ranks them first). */
 const recent: string[] = [];
@@ -86,7 +92,7 @@ export interface EditSurfaceOptions {
 	resolveMention: MentionResolver;
 	/** The focus moved here: the host records it (a history entry, panel params). */
 	onFocus: (id: string) => void;
-	onRefused?: (reason: "too-large" | "root") => void;
+	onRefused?: (reason: OutlineRefusal) => void;
 	/** Blocks the facts view leaves out under the focused block. */
 	onHiddenChange?: (count: number) => void;
 	/** Measure the map's nodes ahead in a Worker (default on). */
@@ -117,8 +123,17 @@ export class EditSurface {
 	private echo: string[] = [];
 	private restoring = false;
 	private destroyed = false;
-	private prewarmed = false;
+	/** What was measured ahead: nothing yet, the seeded page (HTTP read), the live page. */
+	private prewarmed: "none" | "seed" | "live" = "none";
+	/** The outline behind the map was never shown (see the constructor). */
+	private outlineCold = false;
+	private warmTimer: ReturnType<typeof setTimeout> | undefined;
 	prewarmDone: Promise<void> = Promise.resolve();
+	/**
+	 * A focus the host asked for while the page is still seeded and the block is not here yet
+	 * (its read is on its way): applied once it arrives.
+	 */
+	private pendingFocus: string | null = null;
 	private readonly offs: Array<() => void> = [];
 
 	constructor(private readonly opts: EditSurfaceOptions) {
@@ -157,10 +172,19 @@ export class EditSurface {
 			},
 			this.frame,
 		);
+		// Shown in the map from the start (a panel restored in the map, a jump to another page in
+		// the map): the outline behind it is cold — not built until it is needed (a structural
+		// command, the switch to the outline), and out of layout until first shown. Arriving on a
+		// large page in the map then draws the map without laying out every block's editor.
+		this.outlineCold = this.state.view === "map";
+		if (this.outlineCold) this.scroller.classList.add("nf-outline-cold");
 		// The initial focus, without animation (the host's: the page may not have arrived yet).
 		this.state.focus = opts.focusId;
 		this.setOutlineFocus(opts.focusId);
-		this.outline.noScroll = this.state.view === "map";
+		if (!this.outlineCold && !this.focusView) this.ensurePageView();
+		else if (this.outlineCold && this.client.ready) this.scheduleWarm();
+		const shownView = this.focusView ?? this.pageView;
+		if (shownView) shownView.noScroll = this.state.view === "map";
 		if (this.state.view === "map") {
 			// Shown again (a panel back on screen): straight into the map, no animation.
 			this.map.activate();
@@ -173,7 +197,7 @@ export class EditSurface {
 			this.client.on((event) => {
 				if (event === "sync") this.onStoreChange();
 				else if (event === "presence" && this.state.view === "map") this.map.schedule(false);
-				if (!this.prewarmed && this.client.ready) this.prewarm();
+				if (this.prewarmed !== this.shownFrom()) this.prewarm();
 			}),
 			this.state.on((part) => {
 				if (part === "stored") this.onStored();
@@ -181,14 +205,22 @@ export class EditSurface {
 			}),
 		);
 		// Input finishes a pending second step first, so it lands on the right view.
-		const flush = () => this.deferral.flush();
+		// Input also postpones warming a cold outline (it costs a long frame).
+		const flush = () => {
+			this.deferral.flush();
+			if (this.outlineCold) this.scheduleWarm();
+		};
 		this.frame.addEventListener("keydown", flush, true);
 		this.frame.addEventListener("pointerdown", flush, true);
+		this.frame.addEventListener("wheel", flush, { capture: true, passive: true });
 		this.offs.push(() => {
 			this.frame.removeEventListener("keydown", flush, true);
 			this.frame.removeEventListener("pointerdown", flush, true);
+			this.frame.removeEventListener("wheel", flush, true);
+			clearTimeout(this.warmTimer);
 		});
-		if (opts.premeasure !== false && this.client.ready) setTimeout(() => this.prewarm(), 0);
+		if (opts.premeasure !== false && this.shownFrom() !== "none")
+			setTimeout(() => this.prewarm(), 0);
 		surfaces.add(this);
 	}
 
@@ -200,36 +232,77 @@ export class EditSurface {
 		this.tracker.finish();
 		for (const off of this.offs.splice(0)) off();
 		this.map.destroy();
-		this.focusView?.destroy();
-		this.pageView?.destroy();
+		// The editors stop following the client now; their teardown (a node view and DOM per
+		// block) waits until the frame after: another page's surface in the same frame (a jump)
+		// paints first.
+		const views = [this.focusView, this.pageView].filter((v): v is OutlineView => v !== null);
+		for (const v of views) v.detach();
 		this.focusView = null;
 		this.pageView = null;
-		this.scroller.remove();
+		// Hidden without touching its layout (display: none would tear the layout of every block
+		// down in the next frame, the new page's first one); removed with the rest after it.
+		const scroller = this.scroller;
+		scroller.style.opacity = "0";
+		scroller.style.zIndex = "-1";
+		let torn = false;
+		const tearDown = () => {
+			if (torn) return;
+			torn = true;
+			for (const v of views) v.destroy();
+			scroller.remove();
+		};
+		// After the next page has arrived and painted (its read, its snapshot): in idle time a
+		// moment later, and at the latest after two seconds (a tab that paints nothing).
+		setTimeout(() => {
+			if (typeof requestIdleCallback === "function")
+				requestIdleCallback(tearDown, { timeout: 1500 });
+			else tearDown();
+		}, 400);
+		setTimeout(tearDown, 2000);
 		this.frame.classList.remove("nf-outline-frame");
 		delete this.frame.dataset.view;
 		delete this.frame.dataset.layout;
 	}
 
-	/** Measure every block of the page for the map, in a Worker (once the page has arrived). */
+	/** Where the page on screen comes from: nothing yet, an HTTP read (seed), the live session. */
+	private shownFrom(): "none" | "seed" | "live" {
+		return this.client.ready ? "live" : this.client.seeded ? "seed" : "none";
+	}
+
+	/**
+	 * Measure every block of the page for the map, in a Worker: once the page is seeded from its
+	 * HTTP read, and again once live (only bodies not measured yet are sent).
+	 */
 	prewarm(): Promise<void> {
-		if (this.opts.premeasure === false || this.destroyed || !this.client.ready) {
+		const from = this.shownFrom();
+		if (this.opts.premeasure === false || this.destroyed || from === "none") {
 			return this.prewarmDone;
 		}
-		this.prewarmed = true;
+		const firstShown = this.prewarmed === "none";
+		this.prewarmed = from;
 		const v = this.client.visible;
 		const labelOf = (ref: string, label: string | null) =>
 			mentionLabel(this.opts.resolveMention, ref, label);
 		const client = this.client;
-		const ids = v.subtree(this.pageId);
-		this.prewarmDone = prewarmBodies(
-			(function* () {
-				for (const id of ids) yield { content: client.textOf(id), labelOf };
-			})(),
-		);
+		// Posted after this task (the page arriving is busy enough); the map's hold below starts
+		// now, before its first layout.
+		this.prewarmDone = new Promise<void>((resolve) => {
+			setTimeout(() => {
+				if (this.destroyed) return resolve();
+				// Every block the client has (a seed of a focused block has no page around it).
+				const ids: string[] = [];
+				for (const b of client.visible.blocks.values()) if (!b.deleted) ids.push(b.id);
+				prewarmBodies(
+					(function* () {
+						for (const id of ids) yield { content: client.textOf(id), labelOf };
+					})(),
+				).then(resolve, resolve);
+			}, 0);
+		});
 		// The map on screen as the page arrives (a panel restored in the map, a jump to another
-		// page): it waits for the Worker (at most `PREWARM_HOLD_MS`) instead of measuring every
-		// body on the main thread.
-		if (this.state.view === "map" && ids.length > PREWARM_HOLD_MIN_BLOCKS) {
+		// page): it lays out only a part until the Worker answers (at most `PREWARM_HOLD_MS`),
+		// instead of measuring every body on the main thread.
+		if (firstShown && this.state.view === "map" && v.blocks.size > PREWARM_HOLD_MIN_BLOCKS) {
 			this.map.holdLayout(
 				Promise.race([
 					this.prewarmDone,
@@ -275,14 +348,38 @@ export class EditSurface {
 	}
 
 	private reportHidden(): void {
-		this.opts.onHiddenChange?.(this.outline.hiddenByLens);
+		// A cold outline (see the constructor) is not built for this.
+		const v = this.focusView ?? this.pageView;
+		if (v) this.opts.onHiddenChange?.(v.hiddenByLens);
 	}
 
 	private ensurePageView(): OutlineView {
 		if (this.pageView) return this.pageView;
 		this.pageView = this.makeView(this.pageId, this.pageHost);
+		this.pageView.noScroll = this.state.view === "map";
 		if (this.focusView) this.pageHost.classList.add("nf-outline-parked");
 		return this.pageView;
+	}
+
+	/** Warm a cold outline after a quiet moment once the page is live (`COLD_WARM_QUIET_MS`). */
+	private scheduleWarm(): void {
+		if (!this.outlineCold || this.destroyed || !this.client.ready) return;
+		clearTimeout(this.warmTimer);
+		this.warmTimer = setTimeout(() => {
+			const run = () => {
+				if (!this.destroyed && this.outlineCold && this.state.view === "map") this.warmOutline();
+			};
+			if (typeof requestIdleCallback === "function") requestIdleCallback(run, { timeout: 2000 });
+			else run();
+		}, COLD_WARM_QUIET_MS);
+	}
+
+	/** The outline is about to be shown: built (if the page view is the one shown) and laid out. */
+	private warmOutline(): void {
+		if (!this.outlineCold) return;
+		this.outlineCold = false;
+		if (!this.focusView) this.ensurePageView();
+		this.scroller.classList.remove("nf-outline-cold");
 	}
 
 	private makeView(rootId: string, host: HTMLElement): OutlineView {
@@ -344,7 +441,8 @@ export class EditSurface {
 			if (!opts.deferPark) this.parkPage();
 			this.focusView = this.makeView(want, this.focusHost);
 		} else {
-			this.ensurePageView();
+			// Cold (the map on screen since the page arrived): built when first needed.
+			if (!this.outlineCold || this.pageView) this.ensurePageView();
 			this.pageHost.classList.remove("nf-outline-parked");
 			this.scroller.scrollTop = this.pageScroll;
 		}
@@ -416,9 +514,16 @@ export class EditSurface {
 	}
 
 	private onStoreChange(): void {
+		const v = this.client.visible;
+		if (this.outlineCold && this.client.ready && this.warmTimer === undefined) this.scheduleWarm();
+		// A focus asked for before its block arrived (seeded from another read).
+		const pending = this.pendingFocus;
+		if (pending && (pending === this.pageId || v.alive(pending))) {
+			this.pendingFocus = null;
+			this.focusBlock(pending, { notify: false });
+		} else if (pending && this.client.ready) this.pendingFocus = null;
 		// The focused block was deleted: back to its nearest live ancestor.
 		const f = this.state.focus;
-		const v = this.client.visible;
 		if (this.client.ready && f !== this.pageId && v.get(f) && !v.alive(f)) {
 			let cur = v.get(f)?.parentId ?? null;
 			while (cur && !v.alive(cur)) cur = v.get(cur)?.parentId ?? null;
@@ -756,6 +861,9 @@ export class EditSurface {
 	private toOutline(takeFocus: boolean): void {
 		this.finishTransition();
 		const t0 = performance.now();
+		// The first time after arriving in the map: the outline is built and laid out now (one
+		// long frame instead of a long arrival).
+		this.warmOutline();
 		const st = this.state;
 		const map = this.map;
 		map.flush();
@@ -937,6 +1045,13 @@ export class EditSurface {
 		const f = this.state.focus;
 		if (f === this.pageId) return;
 		const parent = this.client.visible.get(f)?.parentId ?? null;
+		// Seeded from the read of the focused block: its parent is not here yet. The host reads
+		// it (and seeds it); the focus moves when it arrives.
+		if (parent && !this.client.visible.alive(parent) && this.client.provisional) {
+			this.pendingFocus = parent;
+			this.notifyHost(parent);
+			return;
+		}
 		this.focusBlock(parent ?? this.pageId);
 	}
 
@@ -948,7 +1063,8 @@ export class EditSurface {
 			return;
 		}
 		this.echo = [];
-		this.focusBlock(id, { notify: false });
+		// Not here yet while seeded: focused when its read arrives.
+		this.pendingFocus = !this.focusBlock(id, { notify: false }) && !this.client.ready ? id : null;
 	}
 
 	/**

@@ -11,6 +11,11 @@
  * leaks nothing. Editors are only mounted while their panel is on screen, so a hidden panel
  * leaves its page after the grace period and joins again when shown.
  *
+ * A session let go before it was ever live (a panel hidden while its page still showed the HTTP
+ * read) is not kept for the grace period: it leaves as soon as the server answers its join. Not
+ * before: a leave that overtakes the join on the server would be dropped and the server would
+ * keep the participant until the socket closes.
+ *
  * ADMISSION
  * ---------
  * The server takes at most `OUTLINE_LIVE_LIMITS.sessionsPerSocket` sessions per socket and
@@ -29,6 +34,8 @@ export interface SharedLiveSession {
 	/** When the last holder let go (0 while held, or before anyone held it). */
 	releasedAt: number;
 	drop: () => void;
+	/** Let go before it was live: leaves once its join is answered (see LIFETIME). */
+	dropWhenJoined: (() => void) | null;
 }
 
 /** How long a page's session outlives its last editor (tab flicks and focus changes). */
@@ -54,6 +61,8 @@ function occupies(shared: SharedLiveSession): boolean {
 function dispose(map: Map<string, SharedLiveSession>, key: string, shared: SharedLiveSession) {
 	if (shared.timer) clearTimeout(shared.timer);
 	shared.timer = null;
+	shared.dropWhenJoined?.();
+	shared.dropWhenJoined = null;
 	shared.client.dispose();
 	if (map.get(key) === shared) map.delete(key);
 }
@@ -106,6 +115,7 @@ export function acquireLiveSession(
 		refs: 0,
 		timer: null,
 		releasedAt: 0,
+		dropWhenJoined: null,
 		drop: () => {
 			shared.timer = null;
 			if (shared.refs > 0) return;
@@ -121,6 +131,8 @@ export function acquireLiveSession(
 export function retainLiveSession(shared: SharedLiveSession): void {
 	if (shared.timer) clearTimeout(shared.timer);
 	shared.timer = null;
+	shared.dropWhenJoined?.();
+	shared.dropWhenJoined = null;
 	shared.releasedAt = 0;
 	shared.refs++;
 }
@@ -130,7 +142,37 @@ export function releaseLiveSession(shared: SharedLiveSession): void {
 	if (shared.refs > 0) return;
 	shared.releasedAt = Date.now();
 	if (shared.timer) clearTimeout(shared.timer);
-	shared.timer = setTimeout(shared.drop, graceMs);
+	shared.timer = null;
+	const client = shared.client;
+	if (!client.ready && client.status === "connecting") {
+		// Never live, its join on its way: leave as soon as the server answers it.
+		const off = client.on(() => {
+			if (client.ready || client.status !== "connecting") shared.drop();
+		});
+		shared.dropWhenJoined = off;
+		return;
+	}
+	shared.timer = setTimeout(shared.drop, client.ready ? graceMs : 0);
+}
+
+/** The page's session client on this socket, live or not (no session is made). */
+export function liveSessionClient(
+	transport: LiveTransport,
+	pageId: string,
+	mode: "edit" | "view",
+): LiveClient | null {
+	const shared = sessionsBySocket.get(transport)?.get(`${pageId}\u0000${mode}`);
+	return shared && shared.client.status !== "closed" ? shared.client : null;
+}
+
+/** The page's session on this socket if it is live (no session is made). */
+export function liveSessionIfReady(
+	transport: LiveTransport,
+	pageId: string,
+	mode: "edit" | "view",
+): LiveClient | null {
+	const shared = sessionsBySocket.get(transport)?.get(`${pageId}\u0000${mode}`);
+	return shared?.client.ready && shared.client.status !== "closed" ? shared.client : null;
 }
 
 /** The sessions this tab holds on `transport` (tests and diagnostics). */

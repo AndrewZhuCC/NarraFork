@@ -30,7 +30,9 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import type { OutlineBlockViewResponse } from "@shared/outline-api";
 import type { LiveCloseCode } from "@shared/outline-live-protocol";
+import { LIVE_TASK_OF_STATUS } from "@shared/outline-live-protocol";
 import { IconArrowDown, IconArrowRight, IconArrowsMaximize, IconSearch } from "@tabler/icons-react";
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -38,15 +40,16 @@ import { EditSurface } from "../edit-surface";
 import { mapText } from "../mindmap/mindmap";
 import type { OutlineViewState } from "../view-state";
 import { chromeText } from "./chrome";
-import type { LiveClient, LiveTransport } from "./live-client";
+import type { LiveClient, LiveTransport, SeedBlock } from "./live-client";
 import {
 	acquireLiveSession,
+	liveSessionClient,
 	releaseLiveSession,
 	retainLiveSession,
 	type SharedLiveSession,
 } from "./live-sessions";
 import { liveTransport } from "./transport";
-import type { OutlineLens, OutlineView } from "./view";
+import type { OutlineLens, OutlineRefusal, OutlineView } from "./view";
 import "./editor.css";
 import "../mindmap/mindmap.css";
 
@@ -95,6 +98,48 @@ export interface OutlineEditorProps {
 	onClient?: (client: LiveClient, view: () => OutlineView | null) => void;
 	/** Tests: measure the map's nodes ahead in a Worker (default on). */
 	premeasure?: boolean;
+	/**
+	 * An HTTP read of the focused block of this page (`view=all`), to show while the session
+	 * connects (read-only first): typing is queued, structure waits, and the page turns live in
+	 * place when the snapshot arrives.
+	 */
+	seed?: OutlineBlockViewResponse | null;
+}
+
+/**
+ * Seed the page's session of this tab with a read as soon as the read arrives, without waiting
+ * for a render: the snapshot, often on its way at the same moment, then finds the page shown.
+ */
+export function seedLiveSession(read: OutlineBlockViewResponse, transport = liveTransport()): void {
+	if (!read.current) return;
+	for (const mode of ["edit", "view"] as const) {
+		const client = liveSessionClient(transport, read.pageId, mode);
+		if (client && !client.ready) client.seed(seedBlocksOf(read));
+	}
+}
+
+/** After the next frame is painted; at most 100 ms later in a tab that paints nothing. */
+function afterNextPaint(run: () => void): void {
+	let done = false;
+	const go = () => {
+		if (done) return;
+		done = true;
+		run();
+	};
+	requestAnimationFrame(() => setTimeout(go, 0));
+	setTimeout(go, 100);
+}
+
+/** The blocks of an HTTP read as the live client takes them. */
+export function seedBlocksOf(read: OutlineBlockViewResponse): SeedBlock[] {
+	return read.blocks.map((b) => ({
+		id: b.id,
+		parentId: b.parentId,
+		sid: b.sid,
+		content: b.content,
+		task: b.task ? LIVE_TASK_OF_STATUS[b.task.status] : null,
+		childIds: b.childIds,
+	}));
 }
 
 /** Why a page shows read only instead of the live editor. */
@@ -104,10 +149,12 @@ export function OutlineEditor(props: OutlineEditorProps) {
 	const { pageId, canWrite } = props;
 	const mode = canWrite ? "edit" : "view";
 	const transport = props.transport ?? liveTransport();
-	const shared = useMemo(
-		() => acquireLiveSession(transport, pageId, mode),
-		[transport, pageId, mode],
-	);
+	const shared = useMemo(() => {
+		const s = acquireLiveSession(transport, pageId, mode);
+		// A seeded page paints its seed before it turns live.
+		if (s) s.client.upgradeAfterPaint ??= afterNextPaint;
+		return s;
+	}, [transport, pageId, mode]);
 	const onUnavailable = useRef(props.onUnavailable);
 	onUnavailable.current = props.onUnavailable;
 	useEffect(() => {
@@ -159,7 +206,9 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 	const surfaceRef = useRef<EditSurface | null>(null);
 	const callbacks = useRef(props);
 	callbacks.current = props;
-	const [refusal, setRefusal] = useState<"too-large" | "root" | null>(null);
+	const [refusal, setRefusal] = useState<OutlineRefusal | null>(null);
+	// Structure refused while connecting: the "connecting" badge nudges.
+	const [nudge, setNudge] = useState(0);
 
 	chromeText.fold = t("page.collapse");
 	chromeText.focus = t("page.focus");
@@ -185,14 +234,24 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 		});
 		if (client.status === "closed" && client.closeCode)
 			callbacks.current.onUnavailable(client.closeCode);
+		// A page shown from its read stays (what was typed is kept for when it goes live); one with
+		// nothing to show falls back to the read-only view.
 		const timer = setTimeout(() => {
-			if (!client.ready) callbacks.current.onUnavailable("timeout");
+			if (!client.ready && !client.seeded) callbacks.current.onUnavailable("timeout");
 		}, CONNECT_TIMEOUT_MS);
 		return () => {
 			off();
 			clearTimeout(timer);
 		};
 	}, [client]);
+
+	// Read-only first: the page's HTTP read until the session is live (before the surface is
+	// built, so its first paint has the page).
+	const seed = props.seed;
+	useEffect(() => {
+		if (seed && seed.pageId === pageId && seed.current && !client.ready)
+			client.seed(seedBlocksOf(seed));
+	}, [client, seed, pageId]);
 
 	// The editing surface: built once per page session and view state; focus and lens changes
 	// go to it below without rebuilding it.
@@ -222,7 +281,11 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 			lens: lensRef.current,
 			resolveMention,
 			onFocus: (id) => callbacks.current.onFocus(id),
-			onRefused: (reason) => setRefusal(reason),
+			onRefused: (reason) => {
+				// Each structural key refused while connecting nudges the badge once more.
+				if (reason === "connecting") setNudge((n) => n + 1);
+				else setRefusal(reason);
+			},
 			onHiddenChange: (count) => callbacks.current.onHiddenChange?.(count),
 			premeasure: callbacks.current.premeasure,
 		});
@@ -375,7 +438,16 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 						</Badge>
 					)}
 					{status === "connecting" && (
-						<Badge size="sm" variant="light" color="gray">
+						<Badge
+							key={nudge}
+							size="sm"
+							variant="light"
+							color={nudge > 0 ? "yellow" : "gray"}
+							className={nudge > 0 ? "nf-outline-nudge" : undefined}
+							data-testid="outline-connecting"
+							data-nudge={nudge}
+							title={client.provisional ? t("editor.connectingHint") : undefined}
+						>
 							{t("editor.connecting")}
 						</Badge>
 					)}

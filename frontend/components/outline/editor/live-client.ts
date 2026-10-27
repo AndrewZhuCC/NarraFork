@@ -26,7 +26,14 @@
  *
  * No DOM: views (`view.ts`) attach through {@link ClientView}; tests drive this directly.
  */
-import { type DeltaOp, type Hunk, merge3, simpleDiff } from "@shared/outline";
+import {
+	type DeltaOp,
+	type Hunk,
+	keyBetween,
+	keysBetween,
+	merge3,
+	simpleDiff,
+} from "@shared/outline";
 import {
 	decodeLiveFrame,
 	encodeLiveFrame,
@@ -45,6 +52,7 @@ import {
 	type LivePresenceDown,
 	type LiveRejectHead,
 	type LiveSelWire,
+	type LiveTaskChar,
 	OUTLINE_LIVE_LIMITS,
 } from "@shared/outline-live-protocol";
 import * as Y from "yjs";
@@ -99,6 +107,21 @@ export interface ClientView {
 	/** Peers' cursors or block selections changed. */
 	renderPresence(): void;
 	restoreSelection(sel: SelInfo): void;
+}
+
+/**
+ * A block of an HTTP read (`GET /api/outline/spaces/:spaceId/blocks/:blockId`), shown before the
+ * live snapshot arrives ({@link LiveClient.seed}).
+ */
+export interface SeedBlock {
+	id: string;
+	parentId: string | null;
+	sid: string;
+	/** The block's markdown, as the live document holds it. */
+	content: string;
+	task: LiveTaskChar | null;
+	/** Children in sibling order (those the read included). */
+	childIds: readonly string[];
 }
 
 export interface BodyChange {
@@ -228,6 +251,12 @@ export class LiveClient {
 	canWrite = false;
 	/** Set once the first snapshot arrived. */
 	ready = false;
+	/**
+	 * Shown from an HTTP read while the first snapshot is on its way ({@link seed}): the page is
+	 * on screen and takes typing (queued, merged onto the snapshot when it arrives), but no
+	 * structural change.
+	 */
+	seeded = false;
 	deleted: DeletedNotice | null = null;
 	readonly key = randomId(16);
 	me = 0;
@@ -262,6 +291,16 @@ export class LiveClient {
 	private disposed = false;
 	/** A rebuild is under way: frames for the old document are ignored until the snapshot. */
 	private resetting = false;
+	/** Texts as seeded (a later read may refresh a text nobody typed in yet). */
+	private readonly seedTexts = new Map<string, string>();
+	/**
+	 * Set by the page (a browser): runs the upgrade of a seeded page after the seed was painted.
+	 * Without it (tests driving the client) the snapshot is taken at once.
+	 */
+	upgradeAfterPaint: ((run: () => void) => void) | null = null;
+	private upgradeWaited = false;
+	/** Frames that arrived while the upgrade waited for the seed's paint, in order. */
+	private heldFrames: LiveFrame[] | null = null;
 
 	constructor(
 		private readonly transport: LiveTransport,
@@ -312,15 +351,19 @@ export class LiveClient {
 		);
 	}
 
-	/** Whether the editor may take input now. */
+	/** Shown from an HTTP read, not live yet: text only, structure waits ({@link seed}). */
+	get provisional(): boolean {
+		return this.seeded && !this.ready;
+	}
+
+	/**
+	 * Whether the editor may take input now. Before the first snapshot, a seeded page of a person
+	 * who may write takes text (not structure: `provisional`); their access is checked again when
+	 * the snapshot arrives, and nothing is replayed if they may no longer write.
+	 */
 	get editable(): boolean {
-		return (
-			this.ready &&
-			this.canWrite &&
-			this.mode === "edit" &&
-			this.status !== "closed" &&
-			this.status !== "stalled"
-		);
+		const writer = this.ready ? this.canWrite : this.seeded;
+		return writer && this.mode === "edit" && this.status !== "closed" && this.status !== "stalled";
 	}
 
 	dispose(): void {
@@ -397,6 +440,57 @@ export class LiveClient {
 	newId(): string {
 		idCounter++;
 		return `${randomId(14)}${idCounter.toString(36)}`;
+	}
+
+	/**
+	 * Show the page from an HTTP read until the first snapshot arrives (read-only first, design
+	 * §6.10): blocks go into the structure with order keys made up from the read's sibling order,
+	 * texts into the document as remote changes (never sent). A later read adds blocks and
+	 * refreshes texts nobody typed in; the snapshot replaces all of it, and what was typed
+	 * meanwhile is merged onto it (`onReset`). False once live (or disposed).
+	 */
+	seed(blocks: readonly SeedBlock[]): boolean {
+		if (this.ready || this.disposed || blocks.length === 0) return false;
+		const keyOf = new Map<string, string>();
+		for (const b of blocks) {
+			if (b.childIds.length === 0) continue;
+			const keys = keysBetween(null, null, b.childIds.length);
+			b.childIds.forEach((c, i) => {
+				keyOf.set(c, keys[i] as string);
+			});
+		}
+		for (const b of blocks) {
+			const rec: BlockRec = {
+				id: b.id,
+				parentId: b.parentId,
+				orderKey: keyOf.get(b.id) ?? this.visible.get(b.id)?.orderKey ?? keyBetween(null, null),
+				task: b.task,
+				deleted: false,
+				sid: b.sid,
+			};
+			this.confirmed.put({ ...rec });
+			this.visible.put(rec);
+		}
+		this.doc.transact(() => {
+			for (const b of blocks) {
+				const t = this.ytext(b.id);
+				if (!t) this.texts.set(b.id, new Y.Text(b.content));
+				else {
+					const cur = t.toString();
+					// Typed in meanwhile: kept (the snapshot's merge decides).
+					if (cur === b.content || this.seedTexts.get(b.id) !== cur) continue;
+					t.delete(0, t.length);
+					t.insert(0, b.content);
+				}
+				this.seedTexts.set(b.id, b.content);
+			}
+		}, REMOTE);
+		const first = !this.seeded;
+		this.seeded = true;
+		this.syncViews(null);
+		// Editability changed (a writer may type now).
+		if (first) this.emit("readonly");
+		return true;
 	}
 
 	pageOf(id: string): string {
@@ -492,6 +586,13 @@ export class LiveClient {
 	/** One local transaction: structure, text, an undo step, sent to the server. */
 	commit(input: CommitInput): void {
 		if (!this.editable) return;
+		// Seeded, not live: the order keys are made up, so no structure (the views refuse it
+		// first; this is the backstop).
+		if (this.provisional && input.ops.length > 0) {
+			this.log.push("structural change refused while connecting");
+			this.syncViews(null);
+			return;
+		}
 		const now = performance.now();
 		const last = this.undoStack[this.undoStack.length - 1];
 		// Typing on from where the last keystroke left the cursor, within a second, is one step;
@@ -655,7 +756,7 @@ export class LiveClient {
 	}
 
 	undo(): boolean {
-		if (!this.editable) return false;
+		if (!this.editable || this.provisional) return false;
 		const step = this.undoStack.pop();
 		if (!step) return false;
 		this.redoStack.push(this.replay(step, "undo"));
@@ -663,7 +764,7 @@ export class LiveClient {
 	}
 
 	redo(): boolean {
-		if (!this.editable) return false;
+		if (!this.editable || this.provisional) return false;
 		const step = this.redoStack.pop();
 		if (!step) return false;
 		this.undoStack.push(this.replay(step, "redo"));
@@ -834,6 +935,27 @@ export class LiveClient {
 
 	receive(frame: LiveFrame): void {
 		if (this.disposed || frame.handle !== this.handle) return;
+		if (this.heldFrames) {
+			this.heldFrames.push(frame);
+			return;
+		}
+		// The snapshot of a seeded page: the seed is painted first (once), then the page turns
+		// live; what arrives meanwhile waits behind the snapshot, in order.
+		if (
+			frame.kind === LIVE_FRAME.joined &&
+			this.provisional &&
+			this.upgradeAfterPaint &&
+			!this.upgradeWaited
+		) {
+			this.upgradeWaited = true;
+			this.heldFrames = [frame];
+			this.upgradeAfterPaint(() => {
+				const frames = this.heldFrames ?? [];
+				this.heldFrames = null;
+				for (const f of frames) this.receive(f);
+			});
+			return;
+		}
 		switch (frame.kind) {
 			case LIVE_FRAME.joined:
 				this.onJoined(frame.head as LiveJoinedHead, frame.body);
@@ -908,8 +1030,12 @@ export class LiveClient {
 	}
 
 	private onReset(head: LiveJoinedHead, body: Uint8Array, rest: PendingTx[]): void {
-		// Only what the page does not have is replayed onto the snapshot.
-		const replay = this.ready ? rest : [];
+		// Only what the page does not have is replayed onto the snapshot. The first snapshot of a
+		// seeded page: what was typed on the HTTP read (text only), if the person may still write.
+		const upgrade = !this.ready && this.seeded;
+		const replay = this.ready || (upgrade && this.canWrite && this.mode === "edit") ? rest : [];
+		if (upgrade && replay.length < rest.length)
+			this.log.push(`dropped ${rest.length} transaction(s) typed while connecting: read only`);
 		const first = !this.ready;
 		// Everything local goes: a fresh document from the snapshot (a refused change must not
 		// linger in it), then this client's unacknowledged changes are replayed on top.
@@ -926,9 +1052,16 @@ export class LiveClient {
 		this.redoStack = [];
 		this.resetting = false;
 		this.ready = true;
+		this.seedTexts.clear();
 		if (replay.length > 0) this.replayPending(replay);
-		for (const v of this.views) v.resetCache();
+		// From a seed, the views' cached nodes are still right (keyed by text): equal texts keep
+		// their DOM, and changed ones map the cursor through the text's difference.
+		if (!upgrade) for (const v of this.views) v.resetCache();
 		this.syncViews(null);
+		if (upgrade) {
+			this.log.push(`live after a seed, merged ${replay.length} transaction(s)`);
+			this.emit("readonly");
+		}
 		if (!first) this.log.push(`rebuilt from a snapshot, replayed ${replay.length} transaction(s)`);
 	}
 

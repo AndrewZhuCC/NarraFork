@@ -145,6 +145,7 @@
 		"someone": "Someone",
 		"readOnly": "Read only",
 		"connecting": "Connecting…",
+		"connectingHint": "Connecting: typing is kept and sent once live; adding, moving or deleting blocks waits.",
 		"offline": "Offline: changes are kept and sent when the connection is back",
 		"stalled": "Too many unsent changes: waiting for the server",
 		"deletedBy": "{{name}} deleted the block you were in.",

@@ -145,6 +145,7 @@
 		"someone": "有人",
 		"readOnly": "只读",
 		"connecting": "正在连接…",
+		"connectingHint": "正在连接：输入会保留，连上后发送；新增、移动、删除块要等连上。",
 		"offline": "离线：修改会保留，连上后发出",
 		"stalled": "未发出的修改太多，等待服务器",
 		"deletedBy": "{{name}} 删除了你正在编辑的块。",

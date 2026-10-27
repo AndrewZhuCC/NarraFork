@@ -58,8 +58,10 @@ import {
 	IconClock,
 	IconLayoutSidebarRight,
 } from "@tabler/icons-react";
+import { useQueryClient } from "@tanstack/react-query";
 import {
 	type KeyboardEvent,
+	memo,
 	useCallback,
 	useEffect,
 	useMemo,
@@ -69,8 +71,10 @@ import {
 } from "react";
 import { useTranslation } from "react-i18next";
 import {
+	prefetchOutlineSeed,
 	useOutlineBlock,
 	useOutlinePageLive,
+	useOutlineSeed,
 	useOutlineViewStateSync,
 } from "../../hooks/useOutline";
 import { ApiError } from "../../lib/api";
@@ -79,11 +83,14 @@ import type { OutlineBlockSearch } from "../../lib/outline-view";
 import { MANTINE_SM_BREAKPOINT_PX, MOBILE_VIEWPORT_MEDIA_QUERY } from "../../lib/responsive";
 import { useNarratorPanelVisible } from "../narrator/narrator-panel-visibility";
 import type { EditSurface } from "./edit-surface";
+import { liveSessionIfReady } from "./editor/live-sessions";
 import {
 	OutlineEditor,
 	type OutlineFocusInfo,
 	type OutlineLiveUnavailable,
+	seedLiveSession,
 } from "./editor/OutlineEditor";
+import { liveTransport } from "./editor/transport";
 import classes from "./Outline.module.css";
 import { OutlineBlockBody } from "./OutlineBlockBody";
 import { OutlineBlockTree, OutlineTaskIcon } from "./OutlineBlockTree";
@@ -159,6 +166,9 @@ export interface OutlineSurfaceLoaded {
 	canWrite: boolean;
 }
 
+const SidePanel = memo(OutlineSidePanel);
+const Timeline = memo(OutlineTimeline);
+
 export function OutlineSurface(props: OutlineSurfaceProps) {
 	return (
 		<OutlineNavProvider onNavigate={props.onNavigate} renderLink={props.renderLink}>
@@ -211,7 +221,29 @@ function SurfaceBody({
 	);
 	const jumping =
 		jump !== null && !settled && jump.blockId === blockId && jump.spaceId === view?.space.id;
-	const pageId = jumping ? jump.pageId : view?.pageId;
+	// Read-only first (design §6.10): a block the live page on screen does not hold (another
+	// page, or the first page shown) is read in full while its session connects; the editor
+	// shows that read at once, takes typing, and turns live in place when the snapshot arrives.
+	const [editSurface, setEditSurface] = useState<EditSurface | null>(null);
+	const liveHere =
+		editSurface?.client.ready === true &&
+		(editSurface.pageId === blockId || editSurface.client.visible.alive(blockId) !== undefined);
+	const jumpLive =
+		jumping &&
+		liveSessionIfReady(liveTransport(), jump.pageId, view?.space.canWrite ? "edit" : "view") !==
+			null;
+	const seedQuery = useOutlineSeed(
+		spaceId,
+		blockId,
+		editing && !liveHere && !jumpLive,
+		seedLiveSession,
+	);
+	const seed =
+		seedQuery.data && seedQuery.data.rootId === blockId && seedQuery.data.current
+			? seedQuery.data
+			: null;
+	const seedPage = seed && seed.space.id === view?.space.id ? seed.pageId : undefined;
+	const pageId = jumping ? jump.pageId : settled ? view.pageId : (seedPage ?? view?.pageId);
 	useEffect(() => {
 		if (pageId) setFallback(null);
 	}, [pageId]);
@@ -243,7 +275,6 @@ function SurfaceBody({
 		[viewState, foldVersion],
 	);
 	useOutlineViewStateSync(pageId, viewState);
-	const [editSurface, setEditSurface] = useState<EditSurface | null>(null);
 	const [focusInfo, setFocusInfo] = useState<OutlineFocusInfo | null>(null);
 	const switcher = useRef<QuickSwitcherHandle | null>(null);
 	const openSwitcher = useCallback(() => switcher.current?.open(), []);
@@ -267,6 +298,11 @@ function SurfaceBody({
 			),
 		[onNavigate, spaceId, blockId, mode, asOf],
 	);
+	// Stable for the memoized side panel and timeline: a focus or seed change re-renders the
+	// surface, not them (they change with the read).
+	const goRef = useRef(go);
+	goRef.current = go;
+	const goAsOf = useCallback((seq: number | undefined) => goRef.current({ asOf: seq }), []);
 	const linkSearch = useMemo<OutlineBlockSearch>(
 		() => ({
 			...(asOf !== undefined ? { asOf } : {}),
@@ -320,22 +356,30 @@ function SurfaceBody({
 	// The quick switcher: a block of the live page is focused in place; anything else is the
 	// host's navigation (another page or space switches in this panel or page).
 	const arrival = useRef<string | null>(null);
+	const queryClient = useQueryClient();
+	const canWrite = view?.space.canWrite === true;
 	const pick = useCallback(
 		(hit: SwitcherHit) => {
 			if (editSurface && hit.pageId === editSurface.pageId && editSurface.reveal(hit.blockId))
 				return;
-			// Another page: once its editor is live, the cursor (or the map's selection) goes there.
+			// Another page: its read starts now (read-only first), and once its editor shows it the
+			// cursor (or the map's selection) goes there.
+			if (!liveSessionIfReady(liveTransport(), hit.pageId, canWrite ? "edit" : "view"))
+				prefetchOutlineSeed(queryClient, hit.spaceId, hit.blockId, seedLiveSession);
 			arrival.current = hit.blockId;
 			if (hit.spaceId === spaceId) setJump({ spaceId, blockId: hit.blockId, pageId: hit.pageId });
 			onNavigate(outlineBlockTarget(hit.spaceId, hit.blockId, mode));
 		},
-		[editSurface, onNavigate, mode, spaceId],
+		[editSurface, onNavigate, mode, spaceId, queryClient, canWrite],
 	);
 	useEffect(() => {
 		const target = arrival.current;
 		if (!editSurface || !target) return;
+		// Once the page is shown: live, or seeded from the read of the target.
 		const reveal = () => {
-			if (!editSurface.client.ready) return false;
+			const c = editSurface.client;
+			if (!c.ready && !(c.seeded && (target === editSurface.pageId || c.visible.alive(target))))
+				return false;
 			arrival.current = null;
 			editSurface.reveal(target);
 			return true;
@@ -360,7 +404,18 @@ function SurfaceBody({
 			else history.forward();
 		}
 	};
-	const liveCrumbs = editing && view && focusInfo && focusInfo.pageId === pageId ? focusInfo : null;
+	// The live page's breadcrumbs follow focus at once; while it is only seeded (its parents may
+	// not be there), the seed's read has them.
+	const liveCrumbs =
+		editing && view && focusInfo && focusInfo.pageId === pageId && editSurface?.client.ready
+			? focusInfo
+			: null;
+	const seedRoot = seed && !liveCrumbs ? seed.blocks.find((b) => b.id === seed.rootId) : undefined;
+	const crumbs = liveCrumbs
+		? { title: liveCrumbs.title || liveCrumbs.sid, path: liveCrumbs.path }
+		: seed && seedRoot && editing
+			? { title: titleOf(seedRoot.content) || seedRoot.sid, path: seed.path }
+			: null;
 
 	let content: React.ReactNode;
 	let drawer: React.ReactNode = null;
@@ -383,9 +438,7 @@ function SurfaceBody({
 			</Alert>
 		);
 	} else {
-		const sidePanel = (
-			<OutlineSidePanel view={view} search={linkSearch} onViewAt={(seq) => go({ asOf: seq })} />
-		);
+		const sidePanel = <SidePanel view={view} search={linkSearch} onViewAt={goAsOf} />;
 		if (compact) {
 			drawer = (
 				<Drawer
@@ -416,9 +469,9 @@ function SurfaceBody({
 				<div className={classes.toolbar}>
 					<OutlineBreadcrumbs
 						view={view}
-						rootTitle={liveCrumbs ? liveCrumbs.title || liveCrumbs.sid : rootTitle}
+						rootTitle={crumbs ? crumbs.title : rootTitle}
 						search={linkSearch}
-						path={liveCrumbs?.path}
+						path={crumbs?.path}
 					/>
 					<Group gap="xs" wrap="nowrap">
 						{history && (
@@ -542,6 +595,7 @@ function SurfaceBody({
 								onFocusInfo={setFocusInfo}
 								onSurface={setEditSurface}
 								onOpenSwitcher={openSwitcher}
+								seed={seed && seed.pageId === (pageId ?? view.pageId) ? seed : null}
 							/>
 						) : (
 							<>
@@ -578,7 +632,7 @@ function SurfaceBody({
 					{showSide && !compact && <Box className={classes.side}>{sidePanel}</Box>}
 				</div>
 
-				<OutlineTimeline view={view} asOf={asOf} onSelect={(seq) => go({ asOf: seq })} />
+				<Timeline view={view} asOf={asOf} onSelect={goAsOf} />
 			</>
 		);
 	}

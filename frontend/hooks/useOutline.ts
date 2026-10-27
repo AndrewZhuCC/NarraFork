@@ -6,7 +6,11 @@ import type {
 	OutlineSpaceSummary,
 	OutlineViewMode,
 } from "@shared/outline-api";
-import { OUTLINE_VIEW_LIMITS, OUTLINE_VIEW_STATE_LIMITS } from "@shared/outline-api";
+import {
+	OUTLINE_BLOCK_ID_RE,
+	OUTLINE_VIEW_LIMITS,
+	OUTLINE_VIEW_STATE_LIMITS,
+} from "@shared/outline-api";
 import {
 	type QueryClient,
 	useInfiniteQuery,
@@ -117,6 +121,55 @@ export function useOutlineBlock(
 	});
 }
 
+/**
+ * The read a live page is shown from before its session is live (read-only first, design
+ * §6.10): the focused block and everything under it, tasks included (the editor's lens hides
+ * them like the live page does), as many blocks as one read gives. Not kept long: once the page
+ * is live nothing reads it.
+ */
+export function useOutlineSeed(
+	spaceId: string,
+	blockId: string,
+	enabled: boolean,
+	onRead?: (read: OutlineBlockViewResponse) => void,
+) {
+	return useQuery({ ...outlineSeedQuery(spaceId, blockId, onRead), enabled, retry: false });
+}
+
+function outlineSeedQuery(
+	spaceId: string,
+	blockId: string,
+	onRead?: (read: OutlineBlockViewResponse) => void,
+) {
+	return {
+		queryKey: [...outlineKeys.block(spaceId, blockId, null, "all"), OUTLINE_VIEW_LIMITS.maxBlocks],
+		queryFn: async () => {
+			const read = await api.getOutlineBlock(spaceId, blockId, {
+				view: "all",
+				blocks: OUTLINE_VIEW_LIMITS.maxBlocks,
+			});
+			// As soon as it arrives (before any render): the page's session takes it.
+			onRead?.(read);
+			return read;
+		},
+		staleTime: 0,
+		gcTime: 30_000,
+	};
+}
+
+/**
+ * Start the read of a place about to be shown (the quick switcher's pick), so it is on its way
+ * before the surface switches pages.
+ */
+export function prefetchOutlineSeed(
+	queryClient: QueryClient,
+	spaceId: string,
+	blockId: string,
+	onRead?: (read: OutlineBlockViewResponse) => void,
+) {
+	void queryClient.prefetchQuery({ ...outlineSeedQuery(spaceId, blockId, onRead), retry: false });
+}
+
 /** Views states whose stored folding was read already (once per surface and page). */
 const loadedViewStates = new WeakSet<OutlineViewState>();
 
@@ -137,7 +190,10 @@ export function useOutlineViewStateSync(
 		let timer: ReturnType<typeof setTimeout> | null = null;
 		const write = () => {
 			timer = null;
-			const collapsed = [...state.collapsed].slice(0, OUTLINE_VIEW_STATE_LIMITS.maxCollapsed);
+			// Block ids only (the server refuses anything else); the last write of the page wins.
+			const collapsed = [...state.collapsed]
+				.filter((id) => OUTLINE_BLOCK_ID_RE.test(id))
+				.slice(0, OUTLINE_VIEW_STATE_LIMITS.maxCollapsed);
 			void api
 				.putOutlineViewState(pageId, { collapsed, layout: state.layout })
 				.catch(() => undefined);

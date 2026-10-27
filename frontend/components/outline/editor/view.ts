@@ -151,6 +151,12 @@ function lis(keys: string[]): Set<number> {
 	return out;
 }
 
+/**
+ * Why an edit was refused: a block too large, the focused root kept, or a structural change
+ * while the page is still connecting (shown from its HTTP read).
+ */
+export type OutlineRefusal = "too-large" | "root" | "connecting";
+
 export interface ViewOptions {
 	/** The facts view or everything (default). */
 	lens?: OutlineLens;
@@ -168,7 +174,7 @@ export interface ViewOptions {
 	onBlockSelection?: (ids: string[]) => void;
 	/** An edit was refused locally (`too-large`: a block over the size limit; `root`: the
 	 * focused block cannot be removed). */
-	onRefused?: (reason: "too-large" | "root") => void;
+	onRefused?: (reason: OutlineRefusal) => void;
 	/** Mention targets: the text of a block a `[[…]]` names, when it is on this page. */
 	resolveMention?: MentionResolver;
 	/**
@@ -282,9 +288,17 @@ export class OutlineView implements CmdHost, ClientView {
 	}
 
 	destroy() {
+		this.detach();
+		this.pm.destroy();
+	}
+
+	/**
+	 * Stop following the client (no more syncs, no more input into it); `destroy` tears the
+	 * editor down later (its node views and DOM: costly for a large page).
+	 */
+	detach() {
 		this.destroyed = true;
 		this.client.views.delete(this);
-		this.pm.destroy();
 	}
 
 	/**
@@ -1139,7 +1153,7 @@ export class OutlineView implements CmdHost, ClientView {
 		return false;
 	}
 
-	private refuse(before: EditorState, reason: "too-large" | "root") {
+	private refuse(before: EditorState, reason: OutlineRefusal) {
 		this.stats.refused++;
 		this.pm.updateState(before);
 		this.opts.onRefused?.(reason);
@@ -1160,6 +1174,8 @@ export class OutlineView implements CmdHost, ClientView {
 			return;
 		}
 		const fast = this.bodyOnly(tr);
+		// Shown from an HTTP read, not live yet: typing is queued, structure waits.
+		if (!fast && this.client.provisional) return this.refuse(before, "connecting");
 		if (!fast) state = this.fixIds(state);
 		this.pm.updateState(state);
 		if (fast && this.pm.composing && fast.length === 1 && fast[0] === this.composingBlock) {

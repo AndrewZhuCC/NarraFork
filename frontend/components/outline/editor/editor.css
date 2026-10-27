@@ -310,3 +310,29 @@
 		padding-left: 8px;
 	}
 }
+
+/* A structural edit refused while the page connects: the "connecting" badge nudges once. */
+.nf-outline-editor .nf-outline-nudge {
+	animation: nf-outline-nudge 360ms ease-out;
+}
+
+@keyframes nf-outline-nudge {
+	0% {
+		transform: translateX(0);
+	}
+	25% {
+		transform: translateX(-3px);
+	}
+	75% {
+		transform: translateX(3px);
+	}
+	100% {
+		transform: translateX(0);
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.nf-outline-editor .nf-outline-nudge {
+		animation: none;
+	}
+}

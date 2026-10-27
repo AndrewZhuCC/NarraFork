@@ -43,6 +43,11 @@
 	content-visibility: hidden;
 }
 
+/* The map shown since the page arrived: the outline behind it is out of layout until first shown. */
+.nf-outline-editor .nf-outline-scroller.nf-outline-cold {
+	display: none;
+}
+
 /* ── The map ─────────────────────────────────────────────────────────────── */
 
 .nf-outline-editor .mm-stage {
