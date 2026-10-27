@@ -1788,6 +1788,14 @@ void startupReadiness.barrier.then((recovery) => {
 		});
 });
 
+// Outline pages edited live when the previous process ended: commit what their logs hold.
+void startupReadiness.barrier.then((recovery) => {
+	if (!shouldStartGatedBackgroundWork(recovery)) return;
+	import("./services/outline/live/registry")
+		.then(({ startLiveReplay }) => startLiveReplay())
+		.catch((err) => logger.warn("Outline live log replay failed", { error: String(err) }));
+});
+
 // Backfill legacy RecentTabs in bounded background batches. Membership consumers await this
 // process-wide singleton before querying the authoritative indexes.
 ensureAllRecentTabsMigrated()
@@ -1968,6 +1976,16 @@ async function performGracefulShutdown(
 			tracker.markDrainComplete();
 		}
 
+		// Outline pages being edited live: commit their text and log, end the sessions.
+		await shutdownStep(
+			tracker,
+			"outlineLive.close",
+			async () => {
+				const live = await import("./services/outline/live/registry");
+				await live.closeAllLiveSessions("ended");
+			},
+			5_000,
+		);
 		getCodexManager().stopUsageRefreshScheduler();
 		stopScheduledTaskScheduler();
 		await shutdownStep(tracker, "notificationFanout.stop", stopNotificationFanout);

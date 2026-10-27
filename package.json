@@ -67,6 +67,12 @@
 		"node-telegram-bot-api": "^0.67.0",
 		"otpauth": "^9.5.1",
 		"pixi.js": "^8.18.1",
+		"prosemirror-commands": "1.7.2",
+		"prosemirror-keymap": "1.2.3",
+		"prosemirror-model": "1.25.12",
+		"prosemirror-state": "1.4.4",
+		"prosemirror-transform": "1.12.2",
+		"prosemirror-view": "1.42.6",
 		"puppeteer-core": "24.41.0",
 		"qrcode": "^1.5.4",
 		"react": "^19.2.5",
@@ -86,6 +92,7 @@
 		"undici": "6.24.1",
 		"web-tree-sitter": "0.25.10",
 		"ws": "^8.20.0",
+		"yjs": "13.6.33",
 		"zod": "^4.3.6"
 	},
 	"devDependencies": {
