@@ -397,6 +397,26 @@ export const sqliteOutlineReads: OutlineReadPort = {
 		return out;
 	},
 
+	async listAliasRange(spaceId, range, limit) {
+		// Text compares bytewise here; the `deleted = 0` literal lets the planner range-scan the
+		// partial unique alias index.
+		const rows = db
+			.select({ alias: outlineBlocks.alias })
+			.from(outlineBlocks)
+			.where(
+				and(
+					eq(outlineBlocks.spaceId, spaceId),
+					sql`${outlineBlocks.alias} >= ${range.from}`,
+					sql`${outlineBlocks.alias} < ${range.to}`,
+					sql`${outlineBlocks.deleted} = 0`,
+				),
+			)
+			.orderBy(asc(outlineBlocks.alias))
+			.limit(limit)
+			.all();
+		return rows.map((row) => row.alias as string);
+	},
+
 	async searchBlocks(query) {
 		const out: OutlineSearchRow[] = [];
 		const likes = query.short.map(() => `AND b.content LIKE ? ESCAPE '\\'`).join(" ");

@@ -172,6 +172,18 @@ export async function readProject(id: string): Promise<ProjectAccessRow | null> 
 	};
 }
 
+/** A project's name, for naming its space to people and agents. */
+export async function readProjectName(id: string): Promise<string | null> {
+	const rows = await all(sql`select name from projects where id = ${id} limit 1`);
+	return rows[0] ? textOrNull(rows[0], "name") : null;
+}
+
+/** A narrator's title, for naming its session space to people and agents. */
+export async function readNarratorTitle(id: string): Promise<string | null> {
+	const rows = await all(sql`select title from narrators where id = ${id} limit 1`);
+	return rows[0] ? textOrNull(rows[0], "title") : null;
+}
+
 export async function readUserExists(id: string): Promise<boolean> {
 	const rows = await all(sql`select id from users where id = ${id} limit 1`);
 	return rows.length > 0;

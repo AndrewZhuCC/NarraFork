@@ -120,6 +120,16 @@ export interface OutlineReadPort {
 		by: { sid: string } | { alias: string },
 		limit: number,
 	): Promise<OutlineBlockRow[]>;
+	/**
+	 * Aliases of live blocks of a space from `from` (inclusive) to `to` (exclusive) in byte order,
+	 * in that order, at most `limit`: every alias made of a prefix and a digit lies in
+	 * `[prefix + "0", prefix + ":")`, which is how the next number of a `Q?` alias is found.
+	 */
+	listAliasRange(
+		spaceId: string,
+		range: { from: string; to: string },
+		limit: number,
+	): Promise<string[]>;
 	/** Live blocks matching a full-text query, best first, at most `query.limit`. */
 	searchBlocks(query: OutlineSearchQuery): Promise<OutlineSearchRow[]>;
 	/** Open links to any of the targets, written in one of `spaceIds`, at most `limit`. */
