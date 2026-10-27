@@ -156,6 +156,37 @@
 		"retry": "Try again",
 		"tabLimit": "Shown read only: this tab already has {{count}} outline pages open for live editing. Close or hide one of them, then try again."
 	},
+	"map": {
+		"viewLabel": "View",
+		"outline": "Outline",
+		"map": "Mind map",
+		"right": "Grow rightward",
+		"down": "Grow downward",
+		"fit": "Fit to window",
+		"stage": "Mind map of the page",
+		"more_one": "… {{count}} more",
+		"more_other": "… {{count}} more"
+	},
+	"switcher": {
+		"open": "Quick switcher (Ctrl/⌘ K)",
+		"placeholder": "Jump to a block: title, alias or text",
+		"label": "Find a block to jump to",
+		"empty": "No matches.",
+		"noRecent": "Blocks you focus appear here.",
+		"searching": "Searching other pages…",
+		"via": {
+			"title": "Title",
+			"alias": "Alias",
+			"body": "Text",
+			"recent": "Recent"
+		},
+		"thisPage": "This page",
+		"otherSpace": "Another space"
+	},
+	"history": {
+		"back": "Back (Ctrl/⌘ [)",
+		"forward": "Forward (Ctrl/⌘ ])"
+	},
 	"link": {
 		"notFound": "This outline link points to something that does not exist, or that you cannot read."
 	},

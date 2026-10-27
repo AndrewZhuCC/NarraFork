@@ -9,9 +9,22 @@
  * the focus is on is written back once loaded, so a restored layout knows its panels' identity.
  * The title of what loaded goes to `onTitle` for the tab and is not stored (`null` when nothing
  * could be read: the tab goes back to the generic name).
+ *
+ * Back and forward: the panel never changes the URL, so the browser's history is not the panel's.
+ * The panel keeps its own (every navigation inside it, at most `PANEL_HISTORY_MAX` entries, for as
+ * long as the panel is mounted; not stored with the layout), shown as back and forward buttons on
+ * the page's toolbar and bound to Mod-[ and Mod-] (`OutlineSurface`).
  */
 import type { OutlineSpaceDetail } from "@shared/outline-api";
-import { type MouseEvent, type ReactNode, useCallback, useEffect, useMemo, useRef } from "react";
+import {
+	type MouseEvent,
+	type ReactNode,
+	useCallback,
+	useEffect,
+	useMemo,
+	useReducer,
+	useRef,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { type OutlineHrefTarget, outlineTargetHref } from "../../lib/outline-href";
 import { isOpenClick, wantsNewPanel } from "../../lib/outline-opener";
@@ -20,8 +33,9 @@ import {
 	outlinePanelStateFor,
 	outlinePanelTarget,
 	outlinePanelTitle,
+	sameOutlinePanelState,
 } from "../../lib/outline-panel";
-import type { OutlineSurfaceLoaded } from "./OutlineSurface";
+import type { OutlineSurfaceHistory, OutlineSurfaceLoaded } from "./OutlineSurface";
 import { OutlineView } from "./OutlineView";
 import type { OutlineLinkProps, OutlineTarget } from "./outline-nav";
 
@@ -36,6 +50,9 @@ export interface OutlinePanelContentProps {
 	/** The host's controls in the page's toolbar. */
 	actions?: ReactNode;
 }
+
+/** Navigations a panel remembers for back and forward. */
+export const PANEL_HISTORY_MAX = 50;
 
 /** The href target of a surface target (the facts view is the default and left out). */
 export function hrefTargetOf(to: OutlineTarget): OutlineHrefTarget {
@@ -68,10 +85,47 @@ export function OutlinePanelContent({
 		[spaceId, blockId, view, asOf],
 	);
 
-	const navigate = useCallback((to: OutlineTarget) => {
-		handlers.current.onChange(outlinePanelStateFor(to, stateRef.current));
+	// The panel's own history: states before (back) and after (forward) the current one.
+	const past = useRef<OutlinePanelState[]>([]);
+	const future = useRef<OutlinePanelState[]>([]);
+	const [, bumpHistory] = useReducer((n: number) => n + 1, 0);
+	const go = useCallback((next: OutlinePanelState) => {
+		const current = stateRef.current;
+		if (sameOutlinePanelState(current, next)) return;
+		past.current.push(current);
+		if (past.current.length > PANEL_HISTORY_MAX) past.current.shift();
+		future.current = [];
+		bumpHistory();
+		handlers.current.onChange(next);
 	}, []);
+	const back = useCallback(() => {
+		const prev = past.current.pop();
+		if (!prev) return;
+		future.current.push(stateRef.current);
+		bumpHistory();
+		handlers.current.onChange(prev);
+	}, []);
+	const forward = useCallback(() => {
+		const next = future.current.pop();
+		if (!next) return;
+		past.current.push(stateRef.current);
+		bumpHistory();
+		handlers.current.onChange(next);
+	}, []);
+	const history: OutlineSurfaceHistory = {
+		canBack: past.current.length > 0,
+		canForward: future.current.length > 0,
+		back,
+		forward,
+	};
 
+	const navigate = useCallback(
+		(to: OutlineTarget) => go(outlinePanelStateFor(to, stateRef.current)),
+		[go],
+	);
+
+	const goRef = useRef(go);
+	goRef.current = go;
 	const renderLink = useCallback(({ to, onClick, ...rest }: OutlineLinkProps) => {
 		const go = (event: MouseEvent<HTMLAnchorElement>) => {
 			onClick?.(event);
@@ -80,7 +134,7 @@ export function OutlinePanelContent({
 			const next = outlinePanelStateFor(to, stateRef.current);
 			const openNew = handlers.current.onOpenNew;
 			if (wantsNewPanel(event) && openNew) openNew(next);
-			else handlers.current.onChange(next);
+			else goRef.current(next);
 		};
 		return <a {...rest} href={outlineTargetHref(hrefTargetOf(to))} onClick={go} />;
 	}, []);
@@ -118,6 +172,7 @@ export function OutlinePanelContent({
 			onSpaceLoaded={onSpaceLoaded}
 			onMissing={onMissing}
 			actions={actions}
+			history={history}
 		/>
 	);
 }

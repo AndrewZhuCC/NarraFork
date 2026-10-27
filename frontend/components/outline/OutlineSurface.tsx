@@ -23,6 +23,17 @@
  *
  * Narrow (a phone, or a dock panel of 320–480 px): the side panel is a drawer, over the window on
  * a phone and inside the surface in a panel.
+ *
+ * Two views of the live page (design §6.10, D29): the outline and the mind map, switched on the
+ * editor's toolbar, sharing focus, folding, selection and the viewport anchor; folding and the
+ * map's direction are stored per person and page (`useOutlineViewStateSync`). Focus moves without
+ * rebuilding the editor: while the read of a newly focused block of the same space loads, the
+ * previous read stays and the breadcrumbs follow the live page. Mod-K opens the quick switcher
+ * (`QuickSwitcher.tsx`, D35).
+ *
+ * History: on the outline page, back and forward are the browser's (focus is in the URL). A dock
+ * panel never changes the URL, so its host passes `history` — the panel's own navigation history —
+ * and the surface shows back and forward buttons and takes Mod-[ and Mod-] for them.
  */
 import {
 	ActionIcon,
@@ -41,16 +52,38 @@ import { useElementSize, useMediaQuery } from "@mantine/hooks";
 import { titleOf } from "@shared/outline";
 import type { OutlineViewMode } from "@shared/outline-api";
 import { OUTLINE_LIVE_LIMITS } from "@shared/outline-live-protocol";
-import { IconClock, IconLayoutSidebarRight } from "@tabler/icons-react";
-import { useCallback, useEffect, useMemo, useReducer, useState } from "react";
+import {
+	IconArrowLeft,
+	IconArrowRight,
+	IconClock,
+	IconLayoutSidebarRight,
+} from "@tabler/icons-react";
+import {
+	type KeyboardEvent,
+	useCallback,
+	useEffect,
+	useMemo,
+	useReducer,
+	useRef,
+	useState,
+} from "react";
 import { useTranslation } from "react-i18next";
-import { useOutlineBlock, useOutlinePageLive } from "../../hooks/useOutline";
+import {
+	useOutlineBlock,
+	useOutlinePageLive,
+	useOutlineViewStateSync,
+} from "../../hooks/useOutline";
 import { ApiError } from "../../lib/api";
 import { forgetOutlineRecent, recordOutlineRecent } from "../../lib/outline-recents";
 import type { OutlineBlockSearch } from "../../lib/outline-view";
 import { MANTINE_SM_BREAKPOINT_PX, MOBILE_VIEWPORT_MEDIA_QUERY } from "../../lib/responsive";
 import { useNarratorPanelVisible } from "../narrator/narrator-panel-visibility";
-import { OutlineEditor, type OutlineLiveUnavailable } from "./editor/OutlineEditor";
+import type { EditSurface } from "./edit-surface";
+import {
+	OutlineEditor,
+	type OutlineFocusInfo,
+	type OutlineLiveUnavailable,
+} from "./editor/OutlineEditor";
 import classes from "./Outline.module.css";
 import { OutlineBlockBody } from "./OutlineBlockBody";
 import { OutlineBlockTree, OutlineTaskIcon } from "./OutlineBlockTree";
@@ -64,7 +97,9 @@ import {
 	type OutlineTarget,
 	outlineBlockTarget,
 } from "./outline-nav";
-import { OutlineViewStates } from "./view-state";
+import { type QuickSwitcherHandle, QuickSwitcherHost } from "./QuickSwitcher";
+import type { SwitcherHit } from "./quick-switcher-index";
+import { type OutlineViewKind, type OutlineViewState, OutlineViewStates } from "./view-state";
 
 export interface OutlineSurfaceProps {
 	spaceId: string;
@@ -94,6 +129,19 @@ export interface OutlineSurfaceProps {
 	onMissing?: () => void;
 	/** The host's own controls, at the end of the toolbar (open beside, discuss in a session). */
 	actions?: React.ReactNode;
+	/**
+	 * The host's own back and forward (a dock panel's navigation history). Absent on the outline
+	 * page, whose history is the browser's.
+	 */
+	history?: OutlineSurfaceHistory;
+}
+
+/** A host's navigation history, for hosts without a URL (dock panels). */
+export interface OutlineSurfaceHistory {
+	canBack: boolean;
+	canForward: boolean;
+	back: () => void;
+	forward: () => void;
 }
 
 /** What a surface shows, reported by `onLoaded`. */
@@ -132,6 +180,7 @@ function SurfaceBody({
 	onLoaded,
 	onMissing,
 	actions,
+	history,
 }: OutlineSurfaceProps) {
 	const { t } = useTranslation("outline");
 	const mode: OutlineViewMode = viewMode ?? "facts";
@@ -149,11 +198,20 @@ function SurfaceBody({
 	const query = useOutlineBlock(spaceId, blockId, {
 		asOf,
 		view: mode,
-		...(editing ? { blocks: 1 } : {}),
+		...(editing ? { blocks: 1, keepSpace: true } : {}),
 	});
 	const view = query.data;
+	// The read is of the focused block (not a previous one kept while it loads).
+	const settled = view !== undefined && view.rootId === blockId;
 	useOutlinePageLive(onScreen ? view : undefined);
-	const pageId = view?.pageId;
+	// A jump of the quick switcher to another page of this space names that page: the live
+	// editor joins it at once instead of after the read of the block.
+	const [jump, setJump] = useState<{ spaceId: string; blockId: string; pageId: string } | null>(
+		null,
+	);
+	const jumping =
+		jump !== null && !settled && jump.blockId === blockId && jump.spaceId === view?.space.id;
+	const pageId = jumping ? jump.pageId : view?.pageId;
 	useEffect(() => {
 		if (pageId) setFallback(null);
 	}, [pageId]);
@@ -162,11 +220,20 @@ function SurfaceBody({
 	// with another surface on the same page.
 	const [viewStates] = useState(() => new OutlineViewStates());
 	const viewState = pageId ? viewStates.of(pageId) : null;
+	// The view (outline or map) is the surface's: a page it shows for the first time opens in the
+	// view it was in (the quick switcher going to another page keeps the map).
+	const lastView = useRef<OutlineViewKind>("outline");
+	const [seenStates] = useState(() => new WeakSet<OutlineViewState>());
+	if (viewState && !seenStates.has(viewState)) {
+		seenStates.add(viewState);
+		viewState.view = lastView.current;
+	}
 	const [foldVersion, bumpFold] = useReducer((n: number) => n + 1, 0);
 	useEffect(
 		() =>
 			viewState?.on((part) => {
-				if (part === "collapsed") bumpFold();
+				if (part === "collapsed" || part === "stored") bumpFold();
+				if (part === "view") lastView.current = viewState.view;
 			}),
 		[viewState],
 	);
@@ -175,6 +242,11 @@ function SurfaceBody({
 		() => new Set(viewState?.collapsed ?? []),
 		[viewState, foldVersion],
 	);
+	useOutlineViewStateSync(pageId, viewState);
+	const [editSurface, setEditSurface] = useState<EditSurface | null>(null);
+	const [focusInfo, setFocusInfo] = useState<OutlineFocusInfo | null>(null);
+	const switcher = useRef<QuickSwitcherHandle | null>(null);
+	const openSwitcher = useCallback(() => switcher.current?.open(), []);
 	const toggle = useCallback((id: string) => viewState?.toggleCollapsed(id), [viewState]);
 
 	const mobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
@@ -209,10 +281,10 @@ function SurfaceBody({
 	// Remember pages actually opened (their current state), and forget ones that are gone.
 	const missing = query.error instanceof ApiError && query.error.status === 404;
 	useEffect(() => {
-		if (view?.current && root) {
+		if (view?.current && root && settled) {
 			recordOutlineRecent({ spaceId, blockId, title: rootTitle, visitedAt: Date.now() });
 		}
-	}, [view?.current, root, spaceId, blockId, rootTitle]);
+	}, [view?.current, root, settled, spaceId, blockId, rootTitle]);
 	useEffect(() => {
 		if (missing && asOf === undefined) forgetOutlineRecent(blockId);
 	}, [missing, asOf, blockId]);
@@ -223,7 +295,7 @@ function SurfaceBody({
 	const loadedCanWrite = view?.space.canWrite === true;
 	const rootSid = root?.sid;
 	useEffect(() => {
-		if (!onLoaded || !pageId || !loadedSpaceKey || !rootSid) return;
+		if (!onLoaded || !pageId || !loadedSpaceKey || !rootSid || !settled) return;
 		onLoaded({
 			spaceId,
 			spaceKey: loadedSpaceKey,
@@ -233,7 +305,62 @@ function SurfaceBody({
 			title: rootTitle,
 			canWrite: loadedCanWrite,
 		});
-	}, [onLoaded, spaceId, blockId, pageId, loadedSpaceKey, rootSid, rootTitle, loadedCanWrite]);
+	}, [
+		onLoaded,
+		spaceId,
+		blockId,
+		pageId,
+		loadedSpaceKey,
+		rootSid,
+		rootTitle,
+		loadedCanWrite,
+		settled,
+	]);
+
+	// The quick switcher: a block of the live page is focused in place; anything else is the
+	// host's navigation (another page or space switches in this panel or page).
+	const arrival = useRef<string | null>(null);
+	const pick = useCallback(
+		(hit: SwitcherHit) => {
+			if (editSurface && hit.pageId === editSurface.pageId && editSurface.reveal(hit.blockId))
+				return;
+			// Another page: once its editor is live, the cursor (or the map's selection) goes there.
+			arrival.current = hit.blockId;
+			if (hit.spaceId === spaceId) setJump({ spaceId, blockId: hit.blockId, pageId: hit.pageId });
+			onNavigate(outlineBlockTarget(hit.spaceId, hit.blockId, mode));
+		},
+		[editSurface, onNavigate, mode, spaceId],
+	);
+	useEffect(() => {
+		const target = arrival.current;
+		if (!editSurface || !target) return;
+		const reveal = () => {
+			if (!editSurface.client.ready) return false;
+			arrival.current = null;
+			editSurface.reveal(target);
+			return true;
+		};
+		if (reveal()) return;
+		const off = editSurface.client.on(() => {
+			if (reveal()) off();
+		});
+		return off;
+	}, [editSurface]);
+	const switcherClosed = useCallback(() => editSurface?.focusActiveView(), [editSurface]);
+	const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+		if (event.defaultPrevented || event.altKey) return;
+		const mod = event.metaKey || event.ctrlKey;
+		if (!mod) return;
+		if (!event.shiftKey && event.key.toLowerCase() === "k") {
+			event.preventDefault();
+			openSwitcher();
+		} else if (history && (event.key === "[" || event.key === "]")) {
+			event.preventDefault();
+			if (event.key === "[") history.back();
+			else history.forward();
+		}
+	};
+	const liveCrumbs = editing && view && focusInfo && focusInfo.pageId === pageId ? focusInfo : null;
 
 	let content: React.ReactNode;
 	let drawer: React.ReactNode = null;
@@ -287,8 +414,41 @@ function SurfaceBody({
 		content = (
 			<>
 				<div className={classes.toolbar}>
-					<OutlineBreadcrumbs view={view} rootTitle={rootTitle} search={linkSearch} />
+					<OutlineBreadcrumbs
+						view={view}
+						rootTitle={liveCrumbs ? liveCrumbs.title || liveCrumbs.sid : rootTitle}
+						search={linkSearch}
+						path={liveCrumbs?.path}
+					/>
 					<Group gap="xs" wrap="nowrap">
+						{history && (
+							<Group gap={2} wrap="nowrap">
+								<Tooltip label={t("history.back")}>
+									<ActionIcon
+										variant="subtle"
+										color="gray"
+										aria-label={t("history.back")}
+										disabled={!history.canBack}
+										onClick={history.back}
+										data-testid="outline-history-back"
+									>
+										<IconArrowLeft size={16} />
+									</ActionIcon>
+								</Tooltip>
+								<Tooltip label={t("history.forward")}>
+									<ActionIcon
+										variant="subtle"
+										color="gray"
+										aria-label={t("history.forward")}
+										disabled={!history.canForward}
+										onClick={history.forward}
+										data-testid="outline-history-forward"
+									>
+										<IconArrowRight size={16} />
+									</ActionIcon>
+								</Tooltip>
+							</Group>
+						)}
 						<SegmentedControl
 							size="xs"
 							value={view.view}
@@ -370,8 +530,8 @@ function SurfaceBody({
 							)}
 						{editing && view.current ? (
 							<OutlineEditor
-								pageId={view.pageId}
-								focusId={view.rootId}
+								pageId={pageId ?? view.pageId}
+								focusId={blockId}
 								spaceKey={view.space.key}
 								canWrite={view.space.canWrite}
 								lens={mode}
@@ -379,6 +539,9 @@ function SurfaceBody({
 								onFocus={(id) => go({ blockId: id })}
 								onUnavailable={setFallback}
 								onHiddenChange={setHiddenLive}
+								onFocusInfo={setFocusInfo}
+								onSurface={setEditSurface}
+								onOpenSwitcher={openSwitcher}
 							/>
 						) : (
 							<>
@@ -420,16 +583,27 @@ function SurfaceBody({
 		);
 	}
 
+	const live = editing && view?.current === true;
 	return (
+		// biome-ignore lint/a11y/noStaticElementInteractions: Mod-K and the panel's history keys
 		<div
 			ref={surfaceRef}
 			className={classes.surface}
 			data-layout={layout}
 			data-compact={compact || undefined}
+			data-live={live || undefined}
 			data-testid="outline-surface"
+			onKeyDown={onKeyDown}
 		>
 			<Box className={classes.page}>{content}</Box>
 			{drawer}
+			<QuickSwitcherHost
+				ref={switcher}
+				spaceId={spaceId}
+				surface={live ? editSurface : null}
+				onClosed={switcherClosed}
+				onPick={pick}
+			/>
 		</div>
 	);
 }

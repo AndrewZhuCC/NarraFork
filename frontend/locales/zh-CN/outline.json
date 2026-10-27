@@ -156,6 +156,37 @@
 		"retry": "重试",
 		"tabLimit": "当前为只读：这个标签页已经有 {{count}} 个大纲页处于实时编辑状态。关闭或隐藏其中一个后再重试。"
 	},
+	"map": {
+		"viewLabel": "视图",
+		"outline": "大纲",
+		"map": "导图",
+		"right": "向右展开",
+		"down": "向下展开",
+		"fit": "适应窗口",
+		"stage": "这一页的导图",
+		"more_one": "…还有 {{count}} 项",
+		"more_other": "…还有 {{count}} 项"
+	},
+	"switcher": {
+		"open": "快速切换（Ctrl/⌘ K）",
+		"placeholder": "跳到一个块：标题、别名或正文",
+		"label": "找一个块跳过去",
+		"empty": "没有匹配的块。",
+		"noRecent": "聚焦过的块会出现在这里。",
+		"searching": "正在搜其他页…",
+		"via": {
+			"title": "标题",
+			"alias": "别名",
+			"body": "正文",
+			"recent": "最近"
+		},
+		"thisPage": "这一页",
+		"otherSpace": "其他空间"
+	},
+	"history": {
+		"back": "后退（Ctrl/⌘ [）",
+		"forward": "前进（Ctrl/⌘ ]）"
+	},
 	"link": {
 		"notFound": "这个大纲链接指向的内容不存在，或你无权阅读。"
 	},

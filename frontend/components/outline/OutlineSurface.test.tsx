@@ -38,6 +38,8 @@ mock.module("../../hooks/useOutline", () => ({
 		return { data: shown, isLoading: false, error: null };
 	},
 	useOutlinePageLive: () => {},
+	useOutlineViewStateSync: () => {},
+	useOutlineSearch: () => idle,
 	useOutlineBacklinks: () => idle,
 	useOutlineBlockHistory: () => ({ ...idle, hasNextPage: false }),
 	useOutlineTimeline: () => ({ ...idle, hasNextPage: false }),

@@ -171,6 +171,11 @@ export interface ViewOptions {
 	onRefused?: (reason: "too-large" | "root") => void;
 	/** Mention targets: the text of a block a `[[…]]` names, when it is on this page. */
 	resolveMention?: MentionResolver;
+	/**
+	 * Undo or redo puts a selection back: the surface may take it (to the view on screen, the
+	 * mind map's node or node editor) and return true; otherwise this view applies it.
+	 */
+	restoreSel?: (sel: SelInfo) => boolean;
 }
 
 export class OutlineView implements CmdHost, ClientView {
@@ -192,6 +197,12 @@ export class OutlineView implements CmdHost, ClientView {
 	lens: OutlineLens;
 	/** Blocks the facts view leaves out under the root, after the last projection. */
 	hiddenByLens = 0;
+	/**
+	 * Never scroll to the selection: the view is not on screen (the outline behind the mind map,
+	 * a parked page view) or scrolls itself (a node editor), and the mind map's commands put the
+	 * cursor in it.
+	 */
+	noScroll = false;
 	stats = {
 		syncs: 0,
 		syncMs: 0,
@@ -229,6 +240,7 @@ export class OutlineView implements CmdHost, ClientView {
 			clipboardTextSerializer: (slice) => this.copyText(slice),
 			handleTextInput: (_v, from, to, text) => this.handleTextInput(from, to, text),
 			handleKeyDown: (_v, ev) => this.handleBlockKeys(ev),
+			handleScrollToSelection: () => this.noScroll,
 			handleDOMEvents: {
 				compositionstart: () => {
 					const p = this.locate(this.pm.state.doc, this.pm.state.selection.head);
@@ -273,6 +285,19 @@ export class OutlineView implements CmdHost, ClientView {
 		this.destroyed = true;
 		this.client.views.delete(this);
 		this.pm.destroy();
+	}
+
+	/**
+	 * Show another block as the root (a focus view moving to another focused block): the same
+	 * editor, so keyboard focus stays where it is; only the document changes.
+	 */
+	setRoot(rootId: string): void {
+		if (this.destroyed || this.surface.kind !== "focus" || this.surface.rootId === rootId) return;
+		this.surface = { kind: "focus", rootId };
+		this.blockSel = null;
+		this.lastSelBlock = null;
+		(this.pm.dom as HTMLElement).classList.remove("ob-blockmode");
+		this.sync();
 	}
 
 	/** Re-read `editable` (write access or status changed). */
@@ -592,6 +617,7 @@ export class OutlineView implements CmdHost, ClientView {
 	}
 
 	restoreSelection(sel: SelInfo) {
+		if (this.opts.restoreSel?.(sel)) return;
 		this.applySelection(sel);
 	}
 
