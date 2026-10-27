@@ -170,6 +170,19 @@ export function measureKey(
 	content: string,
 	labelOf: LabelOf,
 ): { key: string; labels: string[]; node: PMNode } {
+	// Without mentions the key is the text itself: parsed only when it is measured (a cache hit,
+	// or a body sent to the Worker, parses nothing here).
+	if (!content.includes("[[")) {
+		let parsed: PMNode | null = null;
+		return {
+			key: content,
+			labels: [],
+			get node() {
+				parsed ??= parseToPM(content).node;
+				return parsed;
+			},
+		};
+	}
 	const node = parseToPM(content).node;
 	const labels: string[] = [];
 	if (content.includes("[[")) {
@@ -200,6 +213,11 @@ export function bodySize(content: string, labelOf: LabelOf = plainLabel): BodySi
 	cache.set(key, r);
 	measureStats.ms += performance.now() - t0;
 	return r;
+}
+
+/** Whether a size is cached under this key (`measureKey`). */
+export function hasMeasuredKey(key: string): boolean {
+	return cache.has(key);
 }
 
 /** Whether a body's size is cached (tests and the first-switch path). */

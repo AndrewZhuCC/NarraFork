@@ -53,13 +53,13 @@ import {
 	toggleTask,
 } from "../editor/commands";
 import type { LiveClient, SelInfo } from "../editor/live-client";
-import { findBlockPos, type OutlineLens, OutlineView } from "../editor/view";
+import { findBlockPos, type OutlineLens, type OutlineRefusal, OutlineView } from "../editor/view";
 import type { OutlineViewState } from "../view-state";
 import { bodySize, MAP_FONT_FAMILY, MAP_MONO_FAMILY, NODE, nodeSize } from "./measure";
 
 /** Most blocks one map lays out and draws (design §7.2: the same cap as an editor view). */
 export /** Nodes laid out (and measured on the main thread) while the Worker measures the page. */
-const HELD_LAYOUT_MAX = 150;
+const HELD_LAYOUT_MAX = 100;
 const MAP_BUDGET = 2000;
 /** Nodes this far outside the stage still get DOM (so panning shows them at once). */
 const MARGIN = 320;
@@ -101,7 +101,7 @@ export interface MapHost {
 	/** The selected node changed. */
 	onSelect(id: string | null): void;
 	/** An edit was refused locally (`editor/view.ts`). */
-	onRefused?: (reason: "too-large" | "root") => void;
+	onRefused?: (reason: OutlineRefusal) => void;
 }
 
 interface NInfo {
@@ -258,6 +258,12 @@ export class MindMapView {
 	destroy(): void {
 		this.destroyed = true;
 		this.exitEdit(false);
+		// A long press under way would fire on a destroyed map.
+		const g = this.gesture;
+		if (g?.kind === "node") clearTimeout(g.timer);
+		this.gesture = null;
+		this.pointers.clear();
+		this.afterHoldRuns.length = 0;
 		if (this.raf) cancelAnimationFrame(this.raf);
 		this.raf = 0;
 		this.ro.disconnect();

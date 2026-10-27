@@ -58,9 +58,12 @@ function localIndexOf(surface: EditSurface): { index: LocalSwitcherIndex; source
 	let entry = indexes.get(client);
 	if (!entry) {
 		const index = new LocalSwitcherIndex();
+		// Only the client and the page id: the index lives as long as the client (shared by every
+		// surface of the page) and must not keep a destroyed surface alive.
+		const pageId = surface.pageId;
 		const source: LocalSource = {
-			pageId: surface.pageId,
-			ids: () => client.visible.subtree(surface.pageId),
+			pageId,
+			ids: () => client.visible.subtree(pageId),
 			textOf: (id) => client.textOf(id),
 		};
 		client.on((event) => {

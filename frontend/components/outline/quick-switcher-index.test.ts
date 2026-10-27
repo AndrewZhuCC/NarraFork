@@ -105,6 +105,19 @@ describe("incremental index", () => {
 		expect(ix.stats.entries).toBe(49);
 	});
 
+	test("a search parses only within its budget; the next one goes on", () => {
+		const texts: Record<string, string> = {};
+		for (let i = 0; i < 40; i++) texts[`b${i}`] = `entry ${i}`;
+		const src = source(texts);
+		const ix = new LocalSwitcherIndex();
+		// No time to parse: nothing local yet (the server's search still answers).
+		expect(ix.search(src, "s1", "entry 7", [], 0)).toEqual([]);
+		expect(ix.stats.left).toBe(40);
+		expect(ix.search(src, "s1", "entry 7", []).map((h) => h.blockId)).toEqual(["b7"]);
+		expect(ix.stats.left).toBe(0);
+		expect(ix.stats.entries).toBe(40);
+	});
+
 	test("another page starts over", () => {
 		const ix = new LocalSwitcherIndex();
 		const a = source({ x: "same text" }, "pa");

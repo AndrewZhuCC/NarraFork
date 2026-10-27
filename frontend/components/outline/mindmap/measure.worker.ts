@@ -15,6 +15,8 @@ export interface MeasureRequest {
 export interface MeasureReply {
 	id: number;
 	out: Array<[string, number, number]>;
+	/** Keys measured nowhere here (the main thread measures them when it needs them). */
+	failed: string[];
 	ms: number;
 }
 
@@ -26,6 +28,7 @@ const scope = self as unknown as {
 scope.onmessage = (e) => {
 	const t0 = performance.now();
 	const out: Array<[string, number, number]> = [];
+	const failed: string[] = [];
 	for (const it of e.data.items) {
 		try {
 			const node = parseToPM(it.content).node;
@@ -33,8 +36,9 @@ scope.onmessage = (e) => {
 			const r = measureBody(node, NODE.maxBody, (ref, label) => it.labels[i++] ?? label ?? ref);
 			out.push([it.key, r.w, r.h]);
 		} catch {
-			// A body that cannot be measured here is measured on the main thread when needed.
+			// Answered as failed: the main thread measures it when needed (and may send it again).
+			failed.push(it.key);
 		}
 	}
-	scope.postMessage({ id: e.data.id, out, ms: performance.now() - t0 });
+	scope.postMessage({ id: e.data.id, out, failed, ms: performance.now() - t0 });
 };
