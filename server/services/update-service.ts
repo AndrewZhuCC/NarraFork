@@ -44,6 +44,7 @@ import { managerChildTokenEnv } from "../lib/manager-token";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
 import { createUpdateFetchContext, type UpdateFetchContext } from "../lib/net/update-fetch";
+import { replacementLaunchArgs } from "../lib/replacement-launch";
 import {
 	beginGracefulRestartSession,
 	cancelGracefulRestartSession,
@@ -99,7 +100,6 @@ import {
 	CHECKPOINT_ACTIVE_TOOL_LIMIT,
 	checkpointPlannedUpdateContinuations,
 	isLiveNarratorForCheckpoint,
-	verifySendAwaitCheckpointEpoch,
 } from "./update-recovery-service";
 
 /** Probe budget for `zstd --version`; a hung probe must not stall the request. */
@@ -1739,10 +1739,6 @@ export interface PlannedUpdateCheckpointHooks {
 		snapshot: Pick<PlannedUpdateRecoverySnapshot, "narrators">,
 	) => Promise<string[]>;
 	listCoveredToolCallIds?: (updateEpoch: string) => Promise<string[]>;
-	verifySendAwaitContinuations?: (updateEpoch: string) => Promise<{
-		stable: boolean;
-		unstableToolCallIds: string[];
-	}>;
 }
 
 /**
@@ -1795,8 +1791,6 @@ export async function checkpointPreparedUpdateFence(
 		hooks.listCoveredToolCallIds ??
 		(async () =>
 			(await toolContinuationService.listByEpoch(recoveryEpochs())).map((row) => row.toolCallId));
-	const verifySendAwaits =
-		hooks.verifySendAwaitContinuations ?? (() => verifySendAwaitCheckpointEpoch(recoveryEpochs()));
 
 	let stablePasses = 0;
 	let snapshot: PlannedUpdateRecoverySnapshot | null = null;
@@ -1811,14 +1805,13 @@ export async function checkpointPreparedUpdateFence(
 		}
 		await waitForFence();
 
-		const [activeToolCallIds, coveredToolCallIds, sendAwaitVerification] = await Promise.all([
+		const [activeToolCallIds, coveredToolCallIds] = await Promise.all([
 			loadActiveToolCallIds(snapshot),
 			loadCoveredToolCallIds(updateEpoch),
-			verifySendAwaits(updateEpoch),
 		]);
 		const covered = new Set(coveredToolCallIds);
 		const uncovered = activeToolCallIds.filter((toolCallId) => !covered.has(toolCallId));
-		if (uncovered.length === 0 && sendAwaitVerification.stable) {
+		if (uncovered.length === 0) {
 			stablePasses++;
 			logger.debug("Planned-update checkpoint fence stable pass", {
 				updateEpoch,
@@ -1834,8 +1827,6 @@ export async function checkpointPreparedUpdateFence(
 				round,
 				uncoveredCount: uncovered.length,
 				uncoveredToolCallIds: uncovered.slice(0, 20),
-				unstableSendAwaitCount: sendAwaitVerification.unstableToolCallIds.length,
-				unstableSendAwaitToolCallIds: sendAwaitVerification.unstableToolCallIds.slice(0, 20),
 			});
 		}
 		await Promise.resolve();
@@ -1941,8 +1932,11 @@ async function drainAndSpawnPreparedUpdate(options: {
 			NARRAFORK_GRACEFUL_RESTART_MARKER_PATH: session.markerPath,
 			NARRAFORK_GRACEFUL_RESTART_MARKER_NONCE: session.markerNonce,
 		};
-		const launchArgs = process.argv.slice(2);
 		const isWindows = process.platform === "win32";
+		const launchArgs = replacementLaunchArgs(process.argv.slice(2), {
+			platform: process.platform,
+			managerManaged: process.env.NARRAFORK_MANAGER_MANAGED === "1",
+		});
 		const proc = isWindows
 			? Bun.spawn(
 					[

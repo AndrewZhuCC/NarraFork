@@ -15,7 +15,7 @@
 import { randomBytes } from "node:crypto";
 import { createWriteStream, existsSync, renameSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { urlHost } from "@shared/server-host";
+import { managerControlOrigin, urlHost } from "@shared/server-host";
 import { decodeRgbaPng, getBrandIcons } from "../lib/branding";
 import { hasHandoffEnv, takeHandoffEnv } from "../lib/restart-handoff";
 import {
@@ -23,6 +23,7 @@ import {
 	type BackendState,
 	probeServiceHealth,
 	resolveNarraforkHome,
+	SLOW_START_HINT_MS,
 } from "./backend-process";
 import { showCloseDialog } from "./close-dialog";
 import { requestManagedShutdown } from "./control-client";
@@ -52,6 +53,7 @@ import {
 } from "./manager-config";
 import { setLanguage, t } from "./manager-i18n";
 import { resolveFrontendOpen } from "./open-frontend";
+import { ServiceHealthMonitor } from "./service-health-monitor";
 import { showSettingsDialog } from "./settings-window";
 import {
 	CARD_BG,
@@ -71,6 +73,7 @@ import {
 	WHITE_REF,
 	WINDOW_BG,
 } from "./theme";
+import { TrayLifecycle } from "./tray-lifecycle";
 import {
 	acquireSingleInstanceMutex,
 	addTrayIcon,
@@ -111,6 +114,8 @@ import {
 	readScrollPixelPos,
 	readWstr,
 	redrawWindow,
+	registerWindowMessage,
+	releaseSingleInstanceMutex,
 	removeTrayIcon,
 	restoreScrollPixelPos,
 	revealInFolder,
@@ -147,8 +152,13 @@ import {
 const WM_TRAY = WM_APP + 10;
 /** 第二个启动请求：已在托盘运行时，按用户设置打开前端，不把管理器窗口带到前面。 */
 const WM_OPEN_FRONTEND = WM_APP + 6;
+/** 新版本面板请求旧面板让位（更新后由新 exe 接管托盘与服务托管）。 */
+const WM_MANAGER_HANDOVER = WM_APP + 7;
+/** 新面板等待旧面板释放单实例互斥体的上限。 */
+const MANAGER_HANDOVER_WAIT_MS = 20_000;
 /** 窗口标题：单实例聚焦时按它查找已有窗口，必须与创建时一致。 */
 const WINDOW_TITLE = "NarraFork Manager";
+const MANAGER_MUTEX_NAME = "Local\\NarraFork.Manager";
 const TRAY_ID_OPEN = 9101;
 const TRAY_ID_EXIT = 9103;
 
@@ -199,9 +209,18 @@ function activeTls(): boolean {
 	return backend?.listeningTls ?? settings.tls;
 }
 
-/** 打开面板、健康检查和更新请求共用的源。 */
+/** 面板展示与浏览器访问仍使用公共监听地址，不泄漏控制通道。 */
 function serviceOrigin(): string {
 	return `${activeTls() ? "https" : "http"}://${urlHost(activeHost())}:${activePort()}`;
+}
+
+/** 携带管理令牌的请求只能访问服务的回环控制通道。 */
+function controlOrigin(): string {
+	return managerControlOrigin({
+		protocol: activeTls() ? "https" : "http",
+		host: activeHost(),
+		port: activePort(),
+	});
 }
 
 // ── 状态 ────────────────────────────────────────────────────────────────────
@@ -273,7 +292,11 @@ let preferences: ManagerPreferences = {
 	autoStartBackend: false,
 };
 /** 托盘是否挂上了：没挂上时关闭窗口只能直接退出，否则窗口就再也找不回来了。 */
-let trayAdded = false;
+let tray: TrayLifecycle | undefined;
+let taskbarCreatedMessage = 0;
+let windowIcon: Pointer | undefined;
+let supervisionEpoch = 0;
+let supervisedStop: Promise<boolean> | undefined;
 let closeDialogShown = false;
 /** 外部启动的服务（终端里手动跑的那份）是否在响应；面板对它只读。 */
 let externalRunning = false;
@@ -446,7 +469,7 @@ function formatBackendLine(line: string): string {
 /** 子进程状态加上托管方式：灯、按钮可用性、主按钮高亮都由它推导。 */
 function applyStatus(status: BackendState, detail?: string): void {
 	const reconnecting = supervision === "reconnecting";
-	const adopted = supervision === "adopted";
+	const adopted = supervision === "adopted" && !supervisedStop;
 	// 外部启动的服务（终端里跑的那份）：面板只显示状态；点「启动 NarraFork 服务器」进入接管等待。
 	const external = !reconnecting && !adopted && status === "stopped" && externalRunning;
 	const shown: BackendState = reconnecting ? "starting" : adopted || external ? "running" : status;
@@ -487,7 +510,7 @@ function applyStatus(status: BackendState, detail?: string): void {
 }
 
 function currentStatusColor(): number {
-	if (supervision === "reconnecting") return WARNING_COLOR;
+	if (supervisedStop || supervision === "reconnecting") return WARNING_COLOR;
 	if (supervision === "adopted") return SUCCESS_COLOR;
 	const status = backend?.current ?? "stopped";
 	if (status === "stopped" && externalRunning) return STATUS_STYLE.running.color;
@@ -495,6 +518,7 @@ function currentStatusColor(): number {
 }
 
 function syncListenTarget(): void {
+	adoptedMonitor.reset();
 	backend?.setTarget({ host: settings.host, port: settings.port, tls: settings.tls });
 }
 
@@ -503,46 +527,106 @@ function serviceIsManaged(): boolean {
 	return supervision === "adopted" || backend?.pid !== undefined;
 }
 
-async function requestShutdownIfManaged(): Promise<void> {
-	if (!serviceIsManaged() && supervision !== "reconnecting") return;
-	const accepted = await requestManagedShutdown(serviceOrigin(), managerToken);
+const adoptedMonitor = new ServiceHealthMonitor({
+	isActive: () => supervision === "adopted" && !supervisedStop && !exiting && !handingOver,
+	probe: () => probeServiceHealth(activeHost(), activePort(), activeTls()),
+	onLost: () => {
+		supervisionEpoch++;
+		supervision = "none";
+		expectRelaunch = false;
+		externalRunning = false;
+		frontendOpened = false;
+		appendLog("ERROR", t("log.serviceLost"));
+		applyStatus("stopped", t("log.serviceLost"));
+		showManagerWindow();
+	},
+});
+
+async function requestShutdownIfManaged(): Promise<boolean> {
+	if (!serviceIsManaged() && supervision !== "reconnecting") return true;
+	const accepted = await requestManagedShutdown(controlOrigin(), managerToken);
 	if (!accepted) appendLog("WARN", t("error.shutdownFailed"));
+	return accepted;
 }
 
-/** 先请求优雅关闭，仍在则结束进程树。认领的替换进程没有子进程句柄，只走 HTTP。 */
-async function stopSupervised(): Promise<void> {
+/** 串行停止，避免双击停止/重启时启动第二条关闭链。 */
+async function stopSupervised(): Promise<boolean> {
+	if (supervisedStop) return supervisedStop;
+	supervisedStop = stopSupervisedOnce();
+	applyStatus("stopping");
+	try {
+		return await supervisedStop;
+	} finally {
+		supervisedStop = undefined;
+		if (!exiting && !handingOver) applyStatus(backend?.current ?? "stopped");
+	}
+}
+
+/** 直接子进程有强停兜底；认领服务没有句柄，未确认停止就必须保留控制身份。 */
+async function stopSupervisedOnce(): Promise<boolean> {
+	supervisionEpoch++;
+	adoptedMonitor.reset();
+	expectRelaunch = false;
 	const adopted = supervision === "adopted";
 	if (!adopted && backend?.pid === undefined) {
 		supervision = "none";
-		expectRelaunch = false;
-		return;
+		return true;
 	}
-	await requestShutdownIfManaged();
+	const accepted = await requestShutdownIfManaged();
 	if (adopted) {
 		const deadline = Date.now() + 15_000;
-		while (Date.now() < deadline) {
-			if (!(await probeServiceHealth(activeHost(), activePort(), activeTls()))) break;
+		do {
+			if (!(await probeServiceHealth(activeHost(), activePort(), activeTls()))) {
+				supervision = "none";
+				externalRunning = false;
+				frontendOpened = false;
+				return true;
+			}
+			if (!accepted || Date.now() >= deadline) break;
 			await Bun.sleep(500);
-		}
-		supervision = "none";
-		externalRunning = false;
-		frontendOpened = false;
-		applyStatus("stopped");
-		return;
+		} while (Date.now() < deadline);
+		appendLog("ERROR", t("error.managedStopUnconfirmed"));
+		showManagerWindow();
+		return false;
 	}
 	await backend?.stop({ graceful: true });
 	supervision = "none";
-	expectRelaunch = false;
+	return true;
 }
+
+/** 认领更新替换进程的总等待上限。 */
+const RELAUNCH_WAIT_MS = 15 * 60_000;
 
 /** 更新替换进程脱离了面板的子进程关系。健康检查通过后按远程托管继续控制它。 */
 async function adoptRelaunch(): Promise<void> {
+	const epoch = ++supervisionEpoch;
+	adoptedMonitor.reset();
 	supervision = "reconnecting";
 	applyStatus("starting");
-	const deadline = Date.now() + 90_000;
+	// 替换进程启动时要跑数据库迁移，大库上可能远超一两分钟；没有它的进程句柄可看存活，
+	// 只能宽限等待。超过提示时间只记一次日志，不判失败。
+	const startedAt = Date.now();
+	const deadline = startedAt + RELAUNCH_WAIT_MS;
+	let hinted = false;
 	while (Date.now() < deadline) {
-		if (await probeServiceHealth(activeHost(), activePort(), activeTls())) {
+		if (handingOver || exiting || epoch !== supervisionEpoch) return;
+		if (!hinted && Date.now() - startedAt > SLOW_START_HINT_MS) {
+			hinted = true;
+			appendLog("PREP", t("log.slowStart"));
+		}
+		const target = { host: activeHost(), port: activePort(), tls: activeTls() };
+		const healthy = await probeServiceHealth(target.host, target.port, target.tls);
+		if (handingOver || exiting || epoch !== supervisionEpoch) return;
+		if (
+			target.host !== activeHost() ||
+			target.port !== activePort() ||
+			target.tls !== activeTls()
+		) {
+			continue;
+		}
+		if (healthy) {
 			supervision = "adopted";
+			adoptedMonitor.reset();
 			externalRunning = false;
 			frontendOpened = false;
 			appendLog("OK", t("log.relaunched"));
@@ -552,6 +636,7 @@ async function adoptRelaunch(): Promise<void> {
 		}
 		await Bun.sleep(700);
 	}
+	if (epoch !== supervisionEpoch || handingOver || exiting) return;
 	supervision = "none";
 	appendLog("ERROR", t("error.relaunchTimeout"));
 	applyStatus("error", t("error.relaunchTimeout"));
@@ -637,7 +722,9 @@ function onCommand(id: number): void {
 		case ID.restart:
 			appendLog("RUN", t("log.restartingService"));
 			void (async () => {
-				await stopSupervised();
+				const stopping = stopSupervised();
+				const epoch = supervisionEpoch;
+				if (!(await stopping) || epoch !== supervisionEpoch || exiting || handingOver) return;
 				externalRunning = false;
 				awaitingHandover = false;
 				appendLog("RUN", t("log.startingService"));
@@ -645,6 +732,7 @@ function onCommand(id: number): void {
 			})();
 			break;
 		case ID.stop:
+			supervisionEpoch++;
 			appendLog("RUN", t("log.stoppingService"));
 			void stopSupervised();
 			break;
@@ -697,6 +785,10 @@ function handleMessage(
 	wParam: Pointer,
 	lParam: Pointer,
 ): Pointer | number | undefined {
+	if (taskbarCreatedMessage !== 0 && msg === taskbarCreatedMessage) {
+		if (!handingOver && !exiting) tray?.restore();
+		return 0;
+	}
 	switch (msg) {
 		case WM_PAINT: {
 			const paint = paintBegin(hwnd);
@@ -786,6 +878,10 @@ function handleMessage(
 		}
 		case WM_OPEN_FRONTEND: {
 			requestOpenFrontend();
+			return 0;
+		}
+		case WM_MANAGER_HANDOVER: {
+			handOverToNewManager(hwnd);
 			return 0;
 		}
 		default:
@@ -878,7 +974,7 @@ function resolveWindowIcon(instance: Pointer): Pointer | undefined {
 
 /** 关闭窗口：能缩到托盘时才询问，否则直接退出（否则窗口再也找不回来）。 */
 async function handleCloseRequest(hwnd: Pointer): Promise<void> {
-	if (!trayAdded) {
+	if (!tray?.added) {
 		exitApplication(hwnd);
 		return;
 	}
@@ -914,21 +1010,72 @@ function minimizeToTray(hwnd: Pointer): void {
 }
 
 let exiting = false;
+/** 已让位给新版本面板：只等旧服务退出，不再响应状态变化。 */
+let handingOver = false;
 
-async function exitApplication(hwnd: Pointer): Promise<void> {
+/**
+ * 让位给更新拉起的新版本面板。
+ *
+ * 立即交出单实例互斥体、托盘图标和窗口标题，新面板随即接手并拉起新服务；新服务会通过交接
+ * 让本面板托管的旧服务优雅退出。本进程要等旧服务真正退出才能走：子进程挂在本进程上，
+ * 先退出会把它连带结束，旧服务就来不及写完干净关闭标记。交接失败时旧服务会恢复运行，
+ * 这里也不设期限去结束它，宁可多留一个隐藏进程。
+ */
+function handOverToNewManager(hwnd: Pointer): void {
+	if (handingOver || exiting) return;
+	handingOver = true;
+	expectRelaunch = false;
+	awaitingHandover = false;
+	appendLog("RUN", t("log.handingOver"));
+	releaseSingleInstanceMutex();
+	// 再次双击 exe 时按标题找窗口，必须找到新面板而不是这个即将退出的。
+	setText(hwnd, `${WINDOW_TITLE} (retiring)`);
+	supervisionEpoch++;
+	adoptedMonitor.reset();
+	tray?.dispose();
+	showWindow(hwnd, SW_HIDE);
+	const timer = setInterval(() => {
+		if (backend?.pid !== undefined) return;
+		clearInterval(timer);
+		process.exit(0);
+	}, 250);
+}
+
+/**
+ * 更新拉起的新版本面板：请旧面板让位并等它释放单实例互斥体。
+ * 旧面板不认识这个消息（更老的版本）或迟迟不让位时返回 false。
+ */
+async function takeOverFromPreviousManager(): Promise<boolean> {
+	const previous = findWindowByTitle(WINDOW_TITLE);
+	if (!previous) return false;
+	postMessage(previous, WM_MANAGER_HANDOVER);
+	const deadline = Date.now() + MANAGER_HANDOVER_WAIT_MS;
+	while (Date.now() < deadline) {
+		await Bun.sleep(250);
+		if (acquireSingleInstanceMutex(MANAGER_MUTEX_NAME)) return true;
+	}
+	return false;
+}
+
+async function exitApplication(_hwnd: Pointer): Promise<void> {
 	if (exiting) return;
 	exiting = true;
 	try {
-		await stopSupervised();
-	} finally {
-		if (trayAdded) {
-			removeTrayIcon(hwnd);
-			trayAdded = false;
+		if (!(await stopSupervised())) {
+			exiting = false;
+			applyStatus(backend?.current ?? "stopped");
+			showManagerWindow();
+			return;
 		}
+		tray?.dispose();
 		backend?.dispose();
-		// 直接退出进程：WM_QUIT 是线程消息，穿过对话框的模态泵并可靠送达主循环
-		// 的路径并不总是成立（实测存在关不干净的残留），停止完成后硬退出最稳。
+		// 停止确认后再退出；不能因关闭请求失败而遗留仍在运行的认领服务。
 		process.exit(0);
+	} catch (error) {
+		exiting = false;
+		applyStatus(backend?.current ?? "stopped");
+		appendLog("ERROR", error instanceof Error ? error.message : String(error));
+		showManagerWindow();
 	}
 }
 
@@ -1043,7 +1190,7 @@ async function openSettings(): Promise<void> {
 		preferences,
 		narrafork: readNarraForkSettings(),
 		brandColorRef,
-		serviceBaseUrl: managed || externalRunning ? serviceOrigin() : undefined,
+		serviceBaseUrl: managed ? controlOrigin() : externalRunning ? serviceOrigin() : undefined,
 		managerToken: managed ? managerToken : undefined,
 		onApplyStarting: () => {
 			expectRelaunch = true;
@@ -1061,7 +1208,10 @@ async function openSettings(): Promise<void> {
 		brandColorRef = toColorRef(settings.brandColor);
 		const icon =
 			(await loadBrandedIcon(settings.brandColor)) ?? resolveWindowIcon(mainWindow.instance);
-		if (icon) setWindowIcon(mainWindow.hwnd, icon);
+		if (icon) {
+			windowIcon = icon;
+			setWindowIcon(mainWindow.hwnd, icon);
+		}
 	}
 	refreshControlTexts();
 	applyStatus(backend?.current ?? "stopped", undefined);
@@ -1081,14 +1231,17 @@ export async function runManager(): Promise<"done" | "serve"> {
 	}
 
 	// 单实例：再次双击 exe 时通知已有托盘进程打开前端，不把隐藏的管理器窗口显示出来。
-	if (!acquireSingleInstanceMutex("Local\\NarraFork.Manager")) {
-		// 更新拉起的替换进程撞上已有面板：已有面板不知道这次交接，旧服务会一直等到看门狗超时。
-		// 直接以服务身份完成交接，保证更新不中断。
-		if (hasHandoffEnv()) return "serve";
-		const existing = findWindowByTitle(WINDOW_TITLE);
-		if (existing) postMessage(existing, WM_OPEN_FRONTEND);
-		else console.error(t("error.alreadyRunning"));
-		return "done";
+	if (!acquireSingleInstanceMutex(MANAGER_MUTEX_NAME)) {
+		// 更新拉起的新版本：请旧面板让位，由本面板托管新服务，托盘也换成新 exe。
+		// 旧面板不肯让位时，直接以服务身份完成交接，保证更新不中断。
+		if (hasHandoffEnv()) {
+			if (!(await takeOverFromPreviousManager())) return "serve";
+		} else {
+			const existing = findWindowByTitle(WINDOW_TITLE);
+			if (existing) postMessage(existing, WM_OPEN_FRONTEND);
+			else console.error(t("error.alreadyRunning"));
+			return "done";
+		}
 	}
 
 	// 更新交接的一次性环境变量只给接下来那一个替换子进程；留在 process.env 里会被之后每次
@@ -1116,12 +1269,16 @@ export async function runManager(): Promise<"done" | "serve"> {
 		managerToken,
 		onLine: (line) => appendLog(undefined, formatBackendLine(line)),
 		onState: (state, detail) => {
+			// 让位中：旧服务按交接退出是预期结果，不当成崩溃，也不再弹出这个即将退出的窗口。
+			if (handingOver) return;
 			if (state === "stopped" && expectRelaunch) {
 				expectRelaunch = false;
 				void adoptRelaunch();
 				return;
 			}
 			if (state === "running") {
+				supervisionEpoch++;
+				adoptedMonitor.reset();
 				supervision = "none";
 				startupFailureShown = false;
 				openFrontendOnce();
@@ -1149,6 +1306,7 @@ export async function runManager(): Promise<"done" | "serve"> {
 
 	mainWindow = createWindow({
 		title: WINDOW_TITLE,
+		defaultButtonId: ID.open,
 		className: "NarraForkManagerWindow",
 		// 先以隐藏方式创建：托盘挂好后再决定显示，避免"先闪一下再隐藏"。
 		visible: false,
@@ -1168,12 +1326,12 @@ export async function runManager(): Promise<"done" | "serve"> {
 	const { hwnd, instance } = mainWindow;
 	const window = mainWindow;
 
-	const uiFont = createFont(13);
-	const titleFont = createFont(21, 700);
-	const subtitleFont = createFont(12);
-	const statusFont = createFont(15, 700);
-	const cardTitleFont = createFont(13, 700);
-	const monoFont = createFont(12, 400, "Consolas");
+	const uiFont = window.ownFont(createFont(13));
+	const titleFont = window.ownFont(createFont(21, 700));
+	const subtitleFont = window.ownFont(createFont(12));
+	const statusFont = window.ownFont(createFont(15, 700));
+	const cardTitleFont = window.ownFont(createFont(13, 700));
+	const monoFont = window.ownFont(createFont(12, 400, "Consolas"));
 
 	const add = (
 		className: string,
@@ -1416,15 +1574,21 @@ export async function runManager(): Promise<"done" | "serve"> {
 	});
 
 	// 图标：优先按主题色实时生成（品牌素材重着色），失败回退静态 ico / exe 内嵌资源。
-	const icon = (await loadBrandedIcon(settings.brandColor)) ?? resolveWindowIcon(instance);
-	if (icon) {
-		setWindowIcon(hwnd, icon);
-		trayAdded = addTrayIcon(hwnd, icon, WINDOW_TITLE, WM_TRAY);
-		if (!trayAdded) appendLog("WARN", t("log.trayFailed"));
-	}
+	windowIcon = (await loadBrandedIcon(settings.brandColor)) ?? resolveWindowIcon(instance);
+	taskbarCreatedMessage = registerWindowMessage("TaskbarCreated");
+	tray = new TrayLifecycle({
+		add: () => !!windowIcon && addTrayIcon(hwnd, windowIcon, WINDOW_TITLE, WM_TRAY),
+		remove: () => removeTrayIcon(hwnd),
+		onUnavailable: () => {
+			appendLog("WARN", t("log.trayFailed"));
+			showManagerWindow();
+		},
+	});
+	if (windowIcon) setWindowIcon(hwnd, windowIcon);
+	tray.restore();
 
 	// 正常启动不显示管理器。托盘没挂上时必须显示窗口，否则再也找不回来。
-	if (!trayAdded) showManagerWindow();
+	if (!tray.added) showManagerWindow();
 	else appendLog("PREP", t("log.minimized"));
 	// 必须在显示之后：RedrawWindow 对隐藏窗口不生效，否则自绘按钮首次显示时是空白，要等用户
 	// 改变窗口大小才画出来。
@@ -1455,10 +1619,33 @@ export async function runManager(): Promise<"done" | "serve"> {
 
 	// 终端里手动启动的服务面板也要能看见：立即探测一次，之后每 4 秒复查。
 	let firstProbeDone = false;
+	let externalProbePending = false;
 	const probeExternal = (): void => {
-		if (backend?.current !== "stopped") return;
+		if (handingOver || exiting || supervisedStop) return;
+		if (supervision === "adopted") {
+			void adoptedMonitor.check();
+			return;
+		}
+		if (backend?.current !== "stopped" || externalProbePending) return;
 		if (supervision !== "none" || expectRelaunch) return;
-		void probeServiceHealth(settings.host, settings.port, settings.tls).then((alive) => {
+		const epoch = supervisionEpoch;
+		const target = { host: settings.host, port: settings.port, tls: settings.tls };
+		externalProbePending = true;
+		void probeServiceHealth(target.host, target.port, target.tls).then((alive) => {
+			externalProbePending = false;
+			if (
+				epoch !== supervisionEpoch ||
+				target.host !== settings.host ||
+				target.port !== settings.port ||
+				target.tls !== settings.tls ||
+				handingOver ||
+				exiting ||
+				supervisedStop ||
+				backend?.current !== "stopped" ||
+				supervision !== "none" ||
+				expectRelaunch
+			)
+				return;
 			if (awaitingHandover && !alive) {
 				// 外部服务已退出：完成接管，启动面板托管的后端。
 				awaitingHandover = false;
@@ -1485,9 +1672,21 @@ export async function runManager(): Promise<"done" | "serve"> {
 			await backend?.start({ handoffEnv });
 			return;
 		}
-		const alive = await probeServiceHealth(settings.host, settings.port, settings.tls);
+		const epoch = supervisionEpoch;
+		const target = { host: settings.host, port: settings.port, tls: settings.tls };
+		const alive = await probeServiceHealth(target.host, target.port, target.tls);
 		firstProbeDone = true;
-		if (backend?.current !== "stopped") return;
+		if (
+			epoch !== supervisionEpoch ||
+			handingOver ||
+			exiting ||
+			supervisedStop ||
+			target.host !== settings.host ||
+			target.port !== settings.port ||
+			target.tls !== settings.tls ||
+			backend?.current !== "stopped"
+		)
+			return;
 		if (alive) {
 			externalRunning = true;
 			appendLog("PREP", t("log.externalDetected"));
@@ -1517,6 +1716,7 @@ export async function runManager(): Promise<"done" | "serve"> {
 		}
 		const currentStatus = backend?.current ?? "stopped";
 		const shouldBlink =
+			supervisedStop !== undefined ||
 			supervision === "reconnecting" ||
 			currentStatus === "starting" ||
 			currentStatus === "stopping";

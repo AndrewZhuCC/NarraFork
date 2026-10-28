@@ -4,6 +4,7 @@
  */
 
 import type { PathFlavor, RuleTargetSelector } from "@server/services/execution-policy/types";
+import type { McpLoadingMode } from "@shared/mcp-loading-mode";
 import type { RecordingSettings } from "@shared/request-recording";
 import type { SubagentModelReasoningEfforts } from "@shared/subagent-model-policy";
 import type { TokenDanceCatalogModel } from "@shared/tokendance";
@@ -418,7 +419,9 @@ export interface McpServerConfig {
 	url?: string;
 	/** sse/streamable-http: custom request headers. */
 	headers?: Record<string, string>;
-	/** Whether this server is enabled. */
+	/** Authoritative loading policy; absent only on legacy input. */
+	mode?: McpLoadingMode;
+	/** Compatibility projection of mode !== disabled. */
 	enabled: boolean;
 	/** Default permission behavior for all tools from this server. When unset, follows the narrator's permission mode. */
 	defaultBehavior?: "readOnly" | "readWrite" | "ask" | "deny";
@@ -666,6 +669,14 @@ export interface NarraForkSettings {
 		packMaxUncompressedMb: number;
 		/** Whether PackActivate requires explicit user permission (it changes the narrator's dir access). */
 		packActivateRequiresPermission: boolean;
+	};
+	/** Block outlines (spaces, pages, timeline, mind map). */
+	outline: {
+		/**
+		 * Master switch, off by default while the feature is built: when off the outline agent
+		 * tools are not offered, its routes answer 404 and navigation hides it.
+		 */
+		enabled: boolean;
 	};
 	/** Plugin subsystem settings. */
 	/** Request evidence (ring recording + auto-pin); read live for each provider request. */

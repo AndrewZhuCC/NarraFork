@@ -38,10 +38,12 @@ export const COMPILED_WORKER_ENTRIES = [
 	"lib/request-recorder-worker.ts",
 	"services/editor-document-worker.ts",
 	"services/editor-document-stream-worker.ts",
+	"services/outline/edit-text-worker.ts",
 	"services/git-untracked-line-worker.ts",
 	"services/git-current-baseline-worker.ts",
 	"services/agent-runtime/model-history-worker.ts",
 	"services/revert-transaction-manifest-worker.ts",
+	"services/token-recalculation-worker.ts",
 ] as const;
 
 export type CompiledWorkerEntry = (typeof COMPILED_WORKER_ENTRIES)[number];

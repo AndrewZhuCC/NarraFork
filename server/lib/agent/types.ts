@@ -11,6 +11,7 @@ import type { StreamingEditOrigin } from "@shared/streaming-edit-origin";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { z } from "zod/v4";
 import type { PathFlavor } from "./execution/backend";
+import { OUTLINE_EDIT_TOOL, OUTLINE_READ_TOOLS } from "./tools/outline-names";
 
 // === API error and bounded diagnostics ===
 
@@ -114,6 +115,11 @@ export interface ToolContext {
 	narratorId: string;
 	cwd: string;
 	signal: AbortSignal;
+	/**
+	 * Fires when the user queues guidance for this pass. Ordinary tools ignore it and run
+	 * to completion; only a pure wait (Await) ends early so the guidance is read sooner.
+	 */
+	guidanceSignal?: AbortSignal;
 	/** Provider prefix of the session driving this tool call (e.g. "anthropic"). */
 	provider?: string;
 	/** Model ID of the session driving this tool call (may carry a provider prefix). */
@@ -917,6 +923,9 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"LearningGuide",
 	// Visibility only: narrator-permission admits show, never create.
 	"GenUI",
+	...OUTLINE_READ_TOOLS,
+	// Planning writes the outline: OutlineEdit then writes only the session's own space.
+	OUTLINE_EDIT_TOOL,
 ]);
 
 // === Agent config ===
@@ -968,6 +977,8 @@ export interface AgentHistoryReplacement {
 	replayedInjectionMessageIds?: readonly string[];
 	/** Loading state of the rebuilt history; the `tools` array is re-derived from it. */
 	toolLoading?: import("./tool-loading").ToolLoadingState;
+	/** The same registry candidates used to build `toolLoading`; applied only together with it. */
+	toolCandidates?: readonly ToolDefinition[];
 }
 
 /** 请求前扩展上下文（每轮请求构建时提供给扩展） */
@@ -1226,6 +1237,8 @@ export interface AgentConfig {
 	 * (see `tool-loading.ts`).
 	 */
 	toolLoading?: import("./tool-loading").ToolLoadingState;
+	/** Registry candidates already materialized by the host for this pass's first request. */
+	toolCandidates?: readonly ToolDefinition[];
 	/** Live loaded state of a managed tool; a call to an unloaded one is rejected. */
 	isToolLoaded?: (name: string) => boolean;
 	/** Tool names disabled by narrator custom traits. Enforced again at execution time. */
@@ -1372,12 +1385,20 @@ export interface AgentConfig {
 	 */
 	getModelOverride?: () => string | null;
 	/**
-	 * Called after each serial tool or complete parallel-safe group. If true,
-	 * the loop exits gracefully and marks later tool calls in the turn as skipped.
+	 * Host-side stop (plan approved, workspace invalidated, reflection decided). Checked
+	 * after each serial tool or complete parallel-safe group. If true, the loop exits
+	 * gracefully and marks later tool calls in the turn as skipped.
 	 */
 	shouldStop?: () => boolean;
-	/** Event-driven immediate guidance: cancel the provider and unstarted preparation,
-	 * but drain actual running tools. Supply a fresh signal for each loop invocation. */
+	/**
+	 * Queued user input wants the model's attention. Never skips a tool call: every call
+	 * the response produced still runs, and the loop ends the turn once the step's tools
+	 * have settled instead of sending the next provider request. One-shot like shouldStop.
+	 */
+	shouldYieldToInput?: () => boolean;
+	/** Event-driven immediate guidance: cut the provider response at the next tool-call
+	 * boundary and end the turn after its tools ran. Only Await stops waiting early.
+	 * Supply a fresh signal for each loop invocation. */
 	guidanceSignal?: AbortSignal;
 	/** Urgent guidance: cancel provider and tool IO, then persist results and soft-stop.
 	 * Unlike signal, this does not mark the whole narrator run as user-interrupted. */

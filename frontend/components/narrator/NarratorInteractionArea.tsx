@@ -1,4 +1,4 @@
-import { Box } from "@mantine/core";
+import { Box, Button } from "@mantine/core";
 import type React from "react";
 import { useTranslation } from "react-i18next";
 import { useLocalPref } from "../../hooks/useLocalPref";
@@ -6,6 +6,7 @@ import { startBottomSpacingResize, useBottomSpacing } from "../../hooks/useResiz
 import { NarratorComposerRow, type NarratorComposerRowProps } from "./composer/NarratorComposerRow";
 import { NarratorGitBar } from "./header/NarratorGitBar";
 import { NarratorInteractionStatusBar } from "./interaction/NarratorInteractionStatusBar";
+import { PendingAgentMessagesPanel } from "./interaction/PendingAgentMessagesPanel";
 import { QueuedMessagesPanel } from "./interaction/QueuedMessagesPanel";
 import { UploadProgressBar } from "./interaction/UploadProgressBar";
 import {
@@ -35,6 +36,8 @@ export interface NarratorInteractionCommon {
 export interface NarratorInteractionAreaProps {
 	// ── Shared context, passed once (see NarratorInteractionCommon). ──
 	common: NarratorInteractionCommon;
+	/** Model traces expose only a return control, with no composer or status tools. */
+	onModelTraceReturn?: () => void;
 
 	// ── Attachments ──
 	// imagePreviewUrls, formatFileSize and openImageViewer are no longer passed in:
@@ -94,6 +97,23 @@ export interface NarratorInteractionAreaProps {
 
 export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 	const { t } = useTranslation("narrator");
+	if (props.onModelTraceReturn) {
+		return (
+			<Box
+				p="xs"
+				style={{ flexShrink: 0, borderTop: "1px solid var(--mantine-color-default-border)" }}
+			>
+				<Button fullWidth variant="subtle" onClick={props.onModelTraceReturn}>
+					{t("modelTraceReturn")}
+				</Button>
+			</Box>
+		);
+	}
+	return <NarratorEditableInteractionArea {...props} />;
+}
+
+function NarratorEditableInteractionArea(props: NarratorInteractionAreaProps) {
+	const { t } = useTranslation("narrator");
 	const retainWorktreeRequirement = (text: string) =>
 		props.composerRowProps.composerRef.current?.appendText(text);
 	const bottomSpacing = useBottomSpacing();
@@ -150,6 +170,10 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 							: "1px solid var(--mantine-color-default-border)",
 				}}
 			/>
+
+			{!props.common.isWorkspacePreview && (
+				<PendingAgentMessagesPanel narratorId={props.common.narratorId} />
+			)}
 
 			{/* Queued messages indicator */}
 			<QueuedMessagesPanel

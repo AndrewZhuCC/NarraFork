@@ -5,12 +5,13 @@ import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { z } from "zod/v4";
 import { db } from "../../../db";
-import { narratorMessages, narrators, narratorToolCalls } from "../../../db/schema";
+import { narratorMessages, narrators, narratorToolCalls, users } from "../../../db/schema";
 import {
 	compileDelegationPolicy,
 	resolveRuntimePolicy,
 } from "../../../services/agent-runtime/policy";
 import {
+	classifyDanger,
 	extractToolPaths,
 	MAX_PLAN_FILE_BYTES,
 	resolveExitPlanModeInput,
@@ -151,6 +152,39 @@ function stubAdmissionPersistence(records: Array<Record<string, unknown>>): void
 		return input as never;
 	}) as typeof toolContinuationService.upsert;
 }
+
+describe("admin tool execution role gate", () => {
+	test("keeps a declared admin tool but blocks a non-admin before approval", async () => {
+		const original = toolRegistry.get("NarraForkAdmin");
+		const permission = mock(async () => ({ behavior: "allow" as const }));
+		const now = new Date().toISOString();
+		const ids = ["exec-admin-user", "exec-regular-user"];
+		try {
+			toolRegistry.register({
+				name: "NarraForkAdmin",
+				description: "already declared",
+				parameters: z.object({}),
+				execute: async () => ({ output: "must not run for ordinary user" }),
+			});
+			await db.insert(users).values([
+				{ id: ids[0], username: ids[0], role: "admin", passwordHash: "test", createdAt: now },
+				{ id: ids[1], username: ids[1], role: "user", passwordHash: "test", createdAt: now },
+			]);
+			const call = { toolUseId: "admin-role-gate", name: "NarraForkAdmin", input: {} };
+			const denied = await executeTool(call, { ...makeConfig(permission), userId: ids[1] });
+			expect(denied.isError).toBe(true);
+			expect(denied.output).toContain("restricted to administrators");
+			expect(permission).not.toHaveBeenCalled();
+			const allowed = await executeTool(call, { ...makeConfig(permission), userId: ids[0] });
+			expect(allowed.output).toBe("must not run for ordinary user");
+			expect(permission).toHaveBeenCalledTimes(1);
+		} finally {
+			for (const id of ids) await db.delete(users).where(eq(users.id, id));
+			if (original) toolRegistry.register(original);
+			else toolRegistry.unregister("NarraForkAdmin");
+		}
+	});
+});
 
 describe("knowledge tool internal permission feedback", () => {
 	test("preserves the internal denial after outer approval and keeps both approval inputs intact", async () => {
@@ -483,9 +517,10 @@ describe("executeTool update admission gate", () => {
 			classifyToolUpdateExecution({
 				toolUseId: "classify-send-await",
 				name: "Send",
+				// A legacy await flag no longer makes Send wait.
 				input: { await: true, message: "wait for reply" },
 			}),
-		).toBe("resumable");
+		).toBe("ordinary");
 		expect(
 			classifyToolUpdateExecution({
 				toolUseId: "classify-send-ordinary",
@@ -1157,6 +1192,54 @@ describe("executeTool permission guard", () => {
 				cwd: "/tmp/project",
 			}),
 		).toBe("deny");
+	});
+
+	test("outline reads are reads; OutlineEdit needs no approval in any mode", () => {
+		for (const toolName of ["OutlineRead", "OutlineSearch"]) {
+			expect(
+				resolvePermissionDecision({
+					toolName,
+					input: { address: "Q17" },
+					permMode: "readOnly",
+					cwd: "/tmp/project",
+				}),
+			).toBe("allow");
+		}
+		// Where it may write (the session's own space only, in read-only and strict plan mode)
+		// is the tool's decision: it resolves the addresses.
+		const edit = { edits: [{ add: "/", markdown: "- note" }] };
+		for (const permMode of ["default", "acceptEdits", "readOnly", "dontAsk", "bypassPermissions"]) {
+			expect(
+				resolvePermissionDecision({
+					toolName: "OutlineEdit",
+					input: edit,
+					permMode,
+					cwd: "/tmp/project",
+				}),
+			).toBe("allow");
+		}
+		expect(
+			resolvePermissionDecision({
+				toolName: "OutlineEdit",
+				input: edit,
+				permMode: "default",
+				cwd: "/tmp/project",
+				planMode: true,
+			}),
+		).toBe("allow");
+	});
+
+	test("under bypass, outline deletes and moves are a medium danger, other edits low", () => {
+		const add = classifyDanger("OutlineEdit", { edits: [{ add: "/", markdown: "- x" }] }, "/tmp");
+		expect(add?.severity).toBe("low");
+		const restructure = classifyDanger(
+			"OutlineEdit",
+			{ edits: [{ delete: "Ab3dEf9Q" }, { move: "Q1", to: "Q2" }] },
+			"/tmp",
+		);
+		expect(restructure?.severity).toBe("medium");
+		expect(restructure?.summary).toContain("2 outline block(s)");
+		expect(classifyDanger("OutlineRead", { address: "Q1" }, "/tmp")).toBeNull();
 	});
 
 	test("does not execute unresolved dangerReflection permission results", async () => {

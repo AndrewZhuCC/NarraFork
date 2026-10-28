@@ -2840,3 +2840,161 @@ describe("resolveFileDiffStats — non-file tools", () => {
 		expect(resolveFileDiffStats("Read", { file_path: "/a.ts" }, null)).toBeUndefined();
 	});
 });
+
+describe("classifyToolDetail — outline", () => {
+	it("renders an OutlineRead as markdown under its address, space and size", () => {
+		const outline = "‹space Kx81mPqa · project›\n- [Ab3dEf9Q] Auth\n  - [Pq83nXcB] refresh";
+		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "OutlineRead",
+			category: "outline",
+			inputJson: { address: "Ab3dEf9Q" },
+			outputJson: outline,
+			metadata: {
+				address: "Kx81mPqa/Ab3dEf9Q",
+				space: { key: "Kx81mPqa", kind: "project" },
+				blocks: 2,
+				truncated: true,
+			},
+		});
+		const body = cappedSectionBody(d, "knowledge");
+		expect(body.format).toBe("markdown");
+		expect(body.text).toBe(outline);
+		expect(metaTexts(d)).toEqual(["Kx81mPqa/Ab3dEf9Q"]);
+		expect(metaBadgeLabels(d)).toEqual(["Kx81mPqa", "2 blocks", "more not shown"]);
+	});
+
+	it("lists OutlineSearch hits with their address, path and process mark", () => {
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "OutlineSearch",
+				category: "outline",
+				metadata: {
+					results: [
+						{
+							address: "Kx81mPqa/Ab3dEf9Q",
+							title: "Token refresh",
+							path: ["Auth", "Tokens"],
+							snippet: "refresh has a race",
+							alias: "Q7",
+							process: true,
+						},
+					],
+				},
+			}),
+			"structured",
+		);
+		expect(d.badges).toEqual([{ label: "1 results", color: "teal" }]);
+		expect(d.entries?.[0]).toMatchObject({
+			title: "Token refresh",
+			meta: "Kx81mPqa/Ab3dEf9Q · Auth › Tokens",
+			snippet: "refresh has a race",
+			badges: [
+				{ label: "Q7", color: "teal" },
+				{ label: "process", color: "gray" },
+			],
+		});
+	});
+
+	it("shows what an OutlineEdit wrote and its commit", () => {
+		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "OutlineEdit",
+			category: "outline",
+			inputJson: {
+				edits: [
+					{ add: "/", markdown: "- [ ] step one\n- step two" },
+					{ set: "Ab3dEf9Q", checkbox: "x" },
+					{ move: "Q1", to: "Kx81mPqa/" },
+				],
+			},
+			outputJson: "Committed #4 to Kx81mPqa",
+			metadata: { space: { key: "Kx81mPqa" }, commit: { id: "c1", seq: 4 } },
+		});
+		const input = sectionBody(d, "input") as ToolCappedDetail;
+		expect(input.format).toBe("markdown");
+		expect(input.text).toBe(
+			[
+				"**add** `/`",
+				"",
+				"- [ ] step one\n- step two",
+				"",
+				'**set** `Ab3dEf9Q`: checkbox "x"',
+				"**move** `Q1` → Kx81mPqa/",
+			].join("\n"),
+		);
+		expect((sectionBody(d, "result") as ToolCappedDetail).text).toBe("Committed #4 to Kx81mPqa");
+		// The commit is a link to the page it changed (as of the commit), not a badge.
+		expect(metaBadgeLabels(d)).toEqual(["Kx81mPqa"]);
+		expect(metaTexts(d)).toEqual(["commit #4"]);
+		expect(metaRowsOf(d).rows.find((row) => row.text === "commit #4")?.href).toBe(
+			"/outline/ref?space=Kx81mPqa&commit=4",
+		);
+	});
+
+	it("links an OutlineEdit's targets to the blocks it changed or created", () => {
+		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "OutlineEdit",
+			category: "outline",
+			inputJson: {
+				edits: [
+					{ add: "/", markdown: "- new" },
+					{ set: "Ab3dEf9Q", checkbox: "x" },
+					{ delete: "Q1" },
+				],
+			},
+			outputJson: "Committed #5",
+			metadata: {
+				space: { key: "Kx81mPqa" },
+				commit: { id: "c2", seq: 5 },
+				edits: [
+					{ op: "add", created: ["Kx81mPqa/Nw1Blk00"] },
+					{ op: "set", address: "Kx81mPqa/Ab3dEf9Q" },
+					{ op: "delete", address: "Kx81mPqa/Qq1Sid00" },
+				],
+			},
+		});
+		const input = sectionBody(d, "input") as ToolCappedDetail;
+		expect(input.text).toBe(
+			[
+				"**add** [/](/outline/ref?a=Kx81mPqa%2FNw1Blk00)",
+				"",
+				"- new",
+				"",
+				'**set** [Ab3dEf9Q](/outline/ref?a=Kx81mPqa%2FAb3dEf9Q): checkbox "x"',
+				"**delete** [Q1](/outline/ref?a=Kx81mPqa%2FQq1Sid00)",
+			].join("\n"),
+		);
+	});
+
+	it("links OutlineRead's address and each OutlineSearch hit, but not a space read", () => {
+		const read = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "OutlineRead",
+			category: "outline",
+			outputJson: "- [Ab3dEf9Q] Auth",
+			metadata: { address: "Kx81mPqa/Ab3dEf9Q", space: { key: "Kx81mPqa" } },
+		});
+		expect(metaRowsOf(read).rows[0]?.href).toBe("/outline/ref?a=Kx81mPqa%2FAb3dEf9Q");
+		const spaceRead = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "OutlineRead",
+			category: "outline",
+			outputJson: "pages",
+			metadata: { address: "Kx81mPqa/", space: { key: "Kx81mPqa" } },
+		});
+		expect(metaRowsOf(spaceRead).rows[0]?.href).toBeUndefined();
+		const search = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "OutlineSearch",
+				category: "outline",
+				metadata: { results: [{ address: "Kx81mPqa/Ab3dEf9Q", title: "Auth" }] },
+			}),
+			"structured",
+		);
+		expect(search.entries?.[0]?.href).toBe("/outline/ref?a=Kx81mPqa%2FAb3dEf9Q");
+	});
+});

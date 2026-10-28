@@ -655,6 +655,7 @@ export const updateSettingsSchema = z
 			.partial()
 			.optional(),
 		workspace: z.object({ treeSnapshotsEnabled: z.boolean() }).partial().optional(),
+		outline: z.object({ enabled: z.boolean() }).partial().optional(),
 		narratorBlocks: z
 			.object({
 				write: z.boolean(),

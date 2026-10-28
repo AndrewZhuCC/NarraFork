@@ -40,6 +40,9 @@ export const DEFAULTS: NarraForkSettings = {
 		packMaxUncompressedMb: 500,
 		packActivateRequiresPermission: true,
 	},
+	outline: {
+		enabled: false,
+	},
 	requestEvidence: {
 		ringEnabled: true,
 		ringRequestBytes: DEFAULT_RECORDING_REQUEST_BYTES,
@@ -396,6 +399,13 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"knowledge.packActivateRequiresPermission": {
 		desc: "PackActivate 是否需要用户显式批准（它会改变叙述者的目录访问范围）。",
 		type: "boolean",
+	},
+
+	// ── outline ─────────────────────────────────────────────────────────
+	"outline.enabled": {
+		desc: "大纲系统（块大纲、时间轴、导图）的总开关，开发中，默认关闭。关闭时大纲的 agent 工具不出现、接口返回 404、导航不显示；现有的 spec:// 和知识库不受影响。",
+		type: "boolean",
+		valid: "true / false，默认 false",
 	},
 
 	// ── plugins ─────────────────────────────────────────────────────────
@@ -889,7 +899,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "string[]",
 	},
 	"routines.toolModes": {
-		desc: '工具类例程的三段式模式表，键为例程 ID（如 "terminal"、"browser"）。"manual" 仅可通过 /load 临时加载；"auto" 预留给未来的 toolsearch 机制，当前行为等同 manual；"resident" 每个新会话默认加载。未列出的例程按 enabledRoutines/disabledRoutines 推导。',
+		desc: '工具类例程的三段式模式表，键为例程 ID（如 "terminal"、"browser"）。"manual" 仅可通过 /load 临时加载；"auto" 通过 ToolSearch 按需发现并加载，不预加载；"resident" 每个新会话默认加载。未列出的例程按 enabledRoutines/disabledRoutines 推导。',
 		type: "Record<string, string>",
 		valid: '"manual" | "auto" | "resident"',
 	},

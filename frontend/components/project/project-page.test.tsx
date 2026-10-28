@@ -4,8 +4,13 @@ import { act, type ComponentType, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 
 let canWrite = true;
+let projectLoading = false;
 let projectError = false;
 let settingsError = false;
+let outlineEnabled = false;
+const openOutline = mock((_kind: string, _id: string) => {});
+const notify = mock((_value: unknown) => {});
+let outlineCallbacks: { onMissing: () => void; onError: (error: unknown) => void } | undefined;
 const navigate = mock(async (_value: unknown) => {});
 const invalidate = mock(async (_value: unknown) => {});
 const fetchNextPage = mock(async () => {});
@@ -17,6 +22,7 @@ mock.module("@mantine/core", () => ({
 	Stack: box,
 	Text: box,
 	Title: box,
+	Skeleton: () => <div data-skeleton />,
 	Loader: () => <div data-loader />,
 	Button: ({
 		children,
@@ -79,14 +85,16 @@ mock.module("@tanstack/react-router", () => ({
 }));
 mock.module("../../hooks/useProjects", () => ({
 	useProject: () => ({
-		isLoading: false,
+		isLoading: projectLoading,
 		isError: projectError,
-		data: {
-			name: "My project",
-			gitPath: "/project-directory",
-			description: "Description",
-			canWrite,
-		},
+		data: projectLoading
+			? undefined
+			: {
+					name: "My project",
+					gitPath: "/project-directory",
+					description: "Description",
+					canWrite,
+				},
 	}),
 }));
 const fullAccess = mock(() => {
@@ -96,6 +104,17 @@ const installAccessListener = mock(() => {});
 mock.module("../../hooks/useProjectAccess", () => ({
 	useProjectAccess: fullAccess,
 	installProjectAccessListener: installAccessListener,
+}));
+mock.module("../../hooks/useOutline", () => ({
+	useOutlineEnabled: () => ({ enabled: outlineEnabled, loading: false }),
+	useOpenOutlineSpace: (callbacks: typeof outlineCallbacks) => {
+		outlineCallbacks = callbacks;
+		return { open: openOutline, pending: false };
+	},
+}));
+mock.module("@mantine/notifications", () => ({ notifications: { show: notify } }));
+mock.module("../../lib/api-error", () => ({
+	describeApiError: (error: unknown) => ({ message: String(error) }),
 }));
 const list = mock(async (_options: unknown) => ({}));
 mock.module("../../lib/api", () => ({ api: { listNarratorsPaginated: list } }));
@@ -132,9 +151,21 @@ let container: HTMLDivElement;
 const saved = new Map<string, PropertyDescriptor | undefined>();
 beforeEach(() => {
 	canWrite = true;
+	projectLoading = false;
 	projectError = false;
 	settingsError = false;
-	for (const fn of [navigate, invalidate, fetchNextPage, list, fullAccess, installAccessListener])
+	outlineEnabled = false;
+	outlineCallbacks = undefined;
+	for (const fn of [
+		navigate,
+		invalidate,
+		fetchNextPage,
+		list,
+		fullAccess,
+		installAccessListener,
+		openOutline,
+		notify,
+	])
 		fn.mockClear();
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
 	for (const [key, value] of Object.entries({
@@ -194,6 +225,21 @@ test("project shows directory and sessions, but does not mount tools on read", a
 	await click("compatibility.loadMore");
 	expect(fetchNextPage).toHaveBeenCalledTimes(1);
 });
+test("project and sessions start together while the loading shell stays visible", async () => {
+	projectLoading = true;
+	await act(async () => root.render(<Page />));
+	expect(container.querySelector("[data-skeleton]")).not.toBeNull();
+	expect(container.textContent).toContain("compatibility.sessions");
+	expect(list).toHaveBeenCalledWith({
+		projectId: "original-project",
+		limit: 30,
+		cursor: "cursor",
+	});
+	const create = Array.from(container.querySelectorAll("button")).find(
+		(node) => node.textContent === "newSession",
+	);
+	expect(create?.disabled).toBe(true);
+});
 test("write-only members can create with explicit project/default cwd then invalidate and navigate", async () => {
 	await act(async () => root.render(<Page />));
 	await click("newSession");
@@ -235,4 +281,14 @@ test("optional settings render failure stays local to the expanded section", asy
 	expect(container.textContent).toContain("compatibility.unavailable");
 	expect(container.textContent).toContain("My project");
 	expect(container.querySelector('a[href="/narrators/new-session"]')).not.toBeNull();
+});
+test("the outline entry appears only while the outline is on and opens the project's space", async () => {
+	await act(async () => root.render(<Page />));
+	expect(container.textContent).not.toContain("openOutline");
+	outlineEnabled = true;
+	await act(async () => root.render(<Page />));
+	await click("openOutline");
+	expect(openOutline).toHaveBeenCalledWith("project", "original-project");
+	outlineCallbacks?.onMissing();
+	expect(notify).toHaveBeenCalledWith({ color: "gray", message: "outlineNotCreated" });
 });

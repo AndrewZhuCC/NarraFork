@@ -114,6 +114,14 @@ const MESSAGES: Record<string, Message> = {
 		"zh-CN": "更新后的服务已重新就绪。",
 		en: "The updated service is ready.",
 	},
+	"log.serviceLost": {
+		"zh-CN": "托管服务连续无响应，请检查服务状态后重新启动。",
+		en: "The managed service is not responding. Check its status before starting it again.",
+	},
+	"error.managedStopUnconfirmed": {
+		"zh-CN": "尚未确认托管服务停止，已保留管理器连接；请稍后重试停止。",
+		en: "The managed service has not stopped. The manager connection is retained; retry stopping later.",
+	},
 	"log.trayFailed": {
 		"zh-CN": "托盘图标添加失败，关闭窗口将直接退出。",
 		en: "Failed to add the tray icon; closing the window will exit.",
@@ -297,6 +305,14 @@ const MESSAGES: Record<string, Message> = {
 		"zh-CN": "数据目录仍被上一个 NarraFork 进程（PID {pid}）占用，等待它退出...",
 		en: "The data directory is still held by the previous NarraFork process (PID {pid}); waiting for it to exit...",
 	},
+	"log.slowStart": {
+		"zh-CN": "服务仍在启动（可能正在迁移数据库，大库需要几分钟），继续等待...",
+		en: "The server is still starting (likely migrating the database, which can take minutes); still waiting...",
+	},
+	"log.handingOver": {
+		"zh-CN": "新版本管理器已启动，本窗口让位并在旧服务退出后关闭。",
+		en: "The updated manager has started; this one is retiring and closes once the old server exits.",
+	},
 	"log.lockHolderExited": {
 		"zh-CN": "上一个 NarraFork 进程（PID {pid}）已退出，重新启动服务...",
 		en: "The previous NarraFork process (PID {pid}) has exited; starting the server again...",
@@ -304,10 +320,6 @@ const MESSAGES: Record<string, Message> = {
 	"error.instanceLockConflict": {
 		"zh-CN": "已有 NarraFork 实例在运行（PID {pid}）：同一数据目录只能运行一个，请先停止它",
 		en: "Another NarraFork instance is running (PID {pid}): only one process may use a data directory, stop it first",
-	},
-	"error.readyTimeout": {
-		"zh-CN": "启动超时：健康检查未通过",
-		en: "Startup timed out: health check did not pass",
 	},
 	"error.relaunchTimeout": {
 		"zh-CN": "更新后没有重新连上服务",

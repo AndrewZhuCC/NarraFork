@@ -189,7 +189,7 @@ describe("event-driven immediate guidance", () => {
 					signal: new AbortController().signal,
 					[channel]: guidance.signal,
 					permissionHandler: async () => ({ behavior: "allow" }),
-					shouldStop: () => {
+					shouldYieldToInput: () => {
 						softStopCalls++;
 						softStopTaken = true;
 						return true;
@@ -254,7 +254,8 @@ describe("event-driven immediate guidance", () => {
 			expect(attempts).toBe(1);
 			expect(providerSignal?.aborted).toBe(true);
 			expect(parent.signal.aborted).toBe(false);
-			expect(started).toEqual([]);
+			// The call completed before the cut is executed, never skipped.
+			expect(started).toEqual(phase === "tool-input" ? ["partial"] : []);
 			expectSuccess(events);
 			expect(events.at(-1)?.type).toBe("turn_complete");
 			const message = events.find((e) => e.type === "assistant_message");
@@ -278,7 +279,7 @@ describe("event-driven immediate guidance", () => {
 			if (phase === "tool-input")
 				expect(
 					events.find((e) => e.type === "tool_result" && e.toolUseId === "partial"),
-				).toMatchObject({ metadata: { skippedForSoftStop: true } });
+				).toMatchObject({ output: "ok:partial", isError: false });
 		});
 	}
 
@@ -339,25 +340,26 @@ describe("event-driven immediate guidance", () => {
 		};
 		const events = await run({ guidanceSignal: guidance.signal });
 		expect(providerSignal?.aborted).toBe(true);
-		expect(started).toEqual(["a", "b"]);
-		for (const id of ["a", "b"])
+		expect(started).toEqual(["a", "b", "queued"]);
+		for (const id of ["a", "b", "queued"])
 			expect(
 				events.filter((e) => e.type === "tool_result" && e.toolUseId === id && !e.isError),
 			).toHaveLength(1);
-		expect(events.find((e) => e.type === "tool_result" && e.toolUseId === "queued")).toMatchObject({
-			metadata: { skippedForSoftStop: true },
-		});
+		expect(events.some((e) => e.type === "tool_result" && e.toolUseId === "cut")).toBe(false);
 		expectSuccess(events);
+		expect(events.at(-1)).toEqual({ type: "turn_complete", turnIndex: 0 });
 	});
 
-	test("revokes pending permission preparation before any body starts", async () => {
+	test("keeps a pending permission request open and runs the call once granted", async () => {
 		const guidance = new AbortController();
 		const permissionEntered = gate();
+		const guided = gate();
 		let permissionSignal: AbortSignal | undefined;
 		script = async function* (params) {
 			yield { toolUses: [tool("Read", "permission", 0)] };
 			await permissionEntered.promise;
 			guidance.abort();
+			guided.resolve();
 			yield { toolUses: [tool("Write", "cut", 9)] };
 			await waitForAbort(params.signal);
 		};
@@ -366,19 +368,21 @@ describe("event-driven immediate guidance", () => {
 			permissionHandler: async (_name, _input, _id, options) => {
 				permissionSignal = options?.signal;
 				permissionEntered.resolve();
-				if (!options?.signal) throw new Error("Missing preparation signal");
-				return waitForAbort(options.signal);
+				await guided.promise;
+				await nextTick();
+				return { behavior: "allow" };
 			},
 		});
-		expect(permissionSignal?.aborted).toBe(true);
-		expect(started).toEqual([]);
-		expect(
-			events.filter((e) => e.type === "tool_result" && e.toolUseId === "permission"),
-		).toHaveLength(1);
+		expect(permissionSignal?.aborted).toBe(false);
+		expect(started).toEqual(["permission"]);
+		expect(events.filter((e) => e.type === "tool_result" && e.toolUseId === "permission")).toEqual([
+			expect.objectContaining({ output: "ok:permission", isError: false }),
+		]);
 		expectSuccess(events);
+		expect(events.at(-1)?.type).toBe("turn_complete");
 	});
 
-	test("guidance during the before snapshot cannot claim or run the tool body", async () => {
+	test("guidance during the before snapshot still runs the tool body", async () => {
 		const guidance = new AbortController();
 		const beforeEntered = gate();
 		const releaseBefore = gate();
@@ -397,10 +401,10 @@ describe("event-driven immediate guidance", () => {
 				await releaseBefore.promise;
 			},
 		});
-		expect(started).toEqual([]);
-		expect(
-			events.filter((e) => e.type === "tool_result" && e.toolUseId === "snapshot"),
-		).toHaveLength(1);
+		expect(started).toEqual(["snapshot"]);
+		expect(events.filter((e) => e.type === "tool_result" && e.toolUseId === "snapshot")).toEqual([
+			expect.objectContaining({ output: "ok:snapshot", isError: false }),
+		]);
 		expectSuccess(events);
 	});
 
@@ -423,14 +427,14 @@ describe("event-driven immediate guidance", () => {
 		const step = steps[0] as Extract<AgentEvent, { type: "assistant_message" }>;
 		expect(step.text).toBe("partial");
 		expect(step.toolUses.map((tu) => tu.toolUseId)).toEqual(["history", "queued"]);
-		// Each call settles exactly once: the one that ran, and the one skipped by the stop.
+		// Each call settles exactly once, and both run: guidance never skips a produced call.
 		const results = events.filter(
 			(event): event is Extract<AgentEvent, { type: "tool_result" }> =>
 				event.type === "tool_result",
 		);
 		expect(results.map((result) => [result.toolUseId, result.isError])).toEqual([
 			["history", false],
-			["queued", true],
+			["queued", false],
 		]);
 		expect(results[0]?.output).toBe("ok:history");
 		expect(events.at(-1)).toEqual({ type: "turn_complete", turnIndex: 0 });

@@ -17,6 +17,7 @@ import { NarratorPanelSkeleton } from "../../components/narrator/NarratorPanelSk
 import { serializeSeedEnvelope } from "../../components/narrator/panels/layout-envelope";
 import { twoNarratorWorkspaceSeed } from "../../components/narrator/workspace/dockview-layout";
 import { readOpeningLod } from "../../hooks/useNarratorLod";
+import { lazyWithRetry } from "../../lib/lazy-with-retry";
 import { narratorLoadingMetrics } from "../../lib/narrator-loading-metrics";
 import { clearShikiTokenCache } from "../../lib/shiki-token-cache";
 
@@ -31,7 +32,7 @@ const SpecPanel = lazy(() =>
 		default: m.SpecPanel,
 	})),
 );
-const NarratorPanel = lazy(() =>
+const NarratorPanel = lazyWithRetry(() =>
 	import("../../components/narrator/NarratorPanel").then((m) => ({
 		default: memo(m.NarratorPanel),
 	})),
@@ -205,6 +206,10 @@ function NarratorDetailPage() {
 	// First visit: register the tab on the server (once per narratorId)
 	useEffect(() => {
 		if (!narrator) return;
+		// An archived session must not be re-registered: archiving the one being viewed
+		// flips its status here, and re-running this effect would resurrect the tab that
+		// the archive just removed. Interacting auto-unarchives it, which re-registers.
+		if (narratorStatus === "archived") return;
 		if (isSubagent) {
 			if (
 				!shouldAddSubagentRecentTab({

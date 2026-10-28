@@ -52,6 +52,7 @@ import {
 	narratorToolCalls,
 	narratorToolContinuations,
 } from "../db/schema";
+import { OUTLINE_EDIT_TOOL } from "../lib/agent/tools/outline-names";
 import {
 	measureMessageCharacters,
 	measureSummaryCharacters,
@@ -128,10 +129,7 @@ import {
 } from "./narrator-scoped-revert";
 import { withNarratorWorkAdmission } from "./narrator-session-state";
 import { narratorStore } from "./narrator-store";
-import {
-	attachActiveSendDeliveryTargets,
-	attachSendTargetDetails,
-} from "./send-delivery-resolution";
+import { attachSendTargetDetails } from "./send-delivery-resolution";
 import {
 	assertSnapshotRevertComplete,
 	DEFAULT_REVERT_SCOPE,
@@ -2003,8 +2001,11 @@ export const EXACT_TOOL_IO_BUDGET = TOOL_IO_BUDGETS.leaf;
 /** Tool names whose inputJson/outputJson should never be truncated in message lists */
 const SKIP_TRUNCATE_TOOLS = new Set(["ExitPlanMode"]);
 
-/** Tool names whose inputJson should not be truncated */
-const SKIP_INPUT_TRUNCATE_TOOLS = new Set(["Agent", "Task", "Send"]);
+/**
+ * Tool names whose inputJson should not be truncated. OutlineEdit's input is the markdown it
+ * writes, bounded by the tool (200 edits, 256 KiB of text), and its card renders it whole.
+ */
+const SKIP_INPUT_TRUNCATE_TOOLS = new Set(["Agent", "Task", "Send", OUTLINE_EDIT_TOOL]);
 
 const SPEC_TASKS_URI = "spec://tasks.json";
 
@@ -3072,9 +3073,7 @@ async function buildTreeFromTopLevelRefs(
 	// row can open the child's session before the wait returns.
 	const awaitAgentIds = await resolveAwaitAgentIdsForMessages([...topMessages, ...childMessages]);
 	const result = attachTakenOverFlags(
-		await attachSendTargetDetails(
-			attachActiveSendDeliveryTargets(attachAwaitAgentNarratorIds(enriched, awaitAgentIds)),
-		),
+		await attachSendTargetDetails(attachAwaitAgentNarratorIds(enriched, awaitAgentIds)),
 		collectTakenOverToolUseIds(activities, awaitAgentIds),
 	);
 	assertDisplayReadActive(signal, deadlineAt);
@@ -4584,18 +4583,16 @@ const narratorMessageQueriesUnlocked = {
 		attachSubagentActivities(topMsgs, topActivities);
 		const awaitAgentIds = await resolveAwaitAgentIdsForMessages([...topMsgs, ...childMsgs]);
 		const takenOverToolUseIds = collectTakenOverToolUseIds(topActivities, awaitAgentIds);
-		const tree = attachActiveSendDeliveryTargets(
-			attachTakenOverFlags(
-				attachAwaitAgentNarratorIds(
-					enrichToolUseBlocks(
-						filterExitPlanBeforePlanCompact(
-							truncateToolIO(buildMessageTree([...topMsgs, ...childMsgs])),
-						),
+		const tree = attachTakenOverFlags(
+			attachAwaitAgentNarratorIds(
+				enrichToolUseBlocks(
+					filterExitPlanBeforePlanCompact(
+						truncateToolIO(buildMessageTree([...topMsgs, ...childMsgs])),
 					),
-					awaitAgentIds,
 				),
-				takenOverToolUseIds,
+				awaitAgentIds,
 			),
+			takenOverToolUseIds,
 		);
 
 		const newTopToolUseIdSet = new Set(newTopToolUseIds);
@@ -4617,14 +4614,12 @@ const narratorMessageQueriesUnlocked = {
 		return {
 			topLevel: await attachSendTargetDetails(tree),
 			orphanChildren: await attachSendTargetDetails(
-				attachActiveSendDeliveryTargets(
-					attachTakenOverFlags(
-						attachAwaitAgentNarratorIds(
-							enrichToolUseBlocks(truncateToolIO(orphanChildren)),
-							awaitAgentIds,
-						),
-						takenOverToolUseIds,
+				attachTakenOverFlags(
+					attachAwaitAgentNarratorIds(
+						enrichToolUseBlocks(truncateToolIO(orphanChildren)),
+						awaitAgentIds,
 					),
+					takenOverToolUseIds,
 				),
 			),
 			subagentActivities,

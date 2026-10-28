@@ -34,6 +34,34 @@ export type NarraForkEvent =
 	  }
 	| { type: "human_attention:changed" }
 	/**
+	 * Who may read or drive a narrator changed: its audiences, its grants, its owner, or a
+	 * public share link. Ids only. Server-side holders of access decisions about the narrator
+	 * (and about its subagents, which are judged on it) drop what they cached; clients get the
+	 * `narrator_access_changed` WebSocket hint separately.
+	 */
+	| {
+			type: "narrator:access_changed";
+			narratorId: string;
+			reason:
+				| "visibility_changed"
+				| "write_audience_changed"
+				| "shared"
+				| "unshared"
+				| "grant_changed"
+				| "owner_changed"
+				| "public_share_created"
+				| "public_share_revoked";
+	  }
+	/**
+	 * Who may reach a project changed: visibility, members or owner. Emitted for every change,
+	 * including the ones no client is told about, so server-side caches never outlive it.
+	 */
+	| {
+			type: "project:access_changed";
+			projectId: string;
+			reason: "visibility_changed" | "members_changed" | "owner_changed";
+	  }
+	/**
 	 * Notification-center projection changed for one user (insert/mark-read/delete).
 	 * Carries no titles/rows — clients refetch unread-count and, if open, the list.
 	 * `userId` is required: this is a per-user event; broadcasting it fleet-wide
@@ -375,6 +403,21 @@ export type NarraForkEvent =
 			targetId: string;
 			previousOwnerUserId: string | null;
 			newOwnerUserId: string | null;
+	  }
+	| {
+			/**
+			 * An outline transaction committed. Ids and scalars only, never block content: a
+			 * listener (page subscriptions over WebSocket) re-reads what its subscriber may see.
+			 * Emitted after the commit, once per commit.
+			 */
+			type: "outline:committed";
+			spaceId: string;
+			commitId: string;
+			seq: number;
+			/** Pages whose blocks changed, including pages blocks moved out of. */
+			pageIds: string[];
+			actorKind: "human" | "agent" | "system";
+			actorId: string;
 	  }
 	// Human-to-human chat. Ids and scalars only — never message bodies — so a
 	// listener (WS fan-out today, an IM bridge later) can route without holding a

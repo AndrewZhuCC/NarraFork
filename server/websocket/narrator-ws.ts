@@ -103,6 +103,8 @@ import {
 	type NarratorListStateSnapshotItem,
 	type NarratorServerMessage,
 } from "./narrator-ws-types";
+import { releaseOutlineLive } from "./outline-live-ws";
+import { handleOutlinePageMessage, releaseOutlinePageSubscriptions } from "./outline-page-ws";
 import type { WSData } from "./ws-handler";
 
 // Re-export the type so existing `import { NarratorServerMessage } from "../websocket/narrator-ws"` keeps working
@@ -163,6 +165,7 @@ type NarratorSubscriptionKind = "list" | "panel" | "messages" | "activity";
 export type NarratorClientMessage =
 	| GitWorkspaceClientMessage
 	| import("@shared/editor-file-events").EditorFileClientMessage
+	| import("@shared/outline-page-events").OutlinePageClientMessage
 	| { type: "pong" }
 	| {
 			type: "subscribe";
@@ -255,6 +258,8 @@ function removeConnection(ws: NarratorWS): void {
 	removeAllChatSubscriptions(ws);
 	releaseGitWorkspaceSubscriptions(ws);
 	releaseEditorFileSubscriptions(ws);
+	releaseOutlinePageSubscriptions(ws);
+	releaseOutlineLive(ws);
 	const removed = connections.delete(ws);
 	if (removed && ws.data.publicShare) {
 		try {
@@ -1894,6 +1899,10 @@ export const handleNarratorWS = {
 			case "git_workspace_refresh":
 				await handleGitWorkspaceMessage(ws, msg);
 				break;
+			case "outline_page_subscribe":
+			case "outline_page_unsubscribe":
+				await handleOutlinePageMessage(ws, msg);
+				break;
 			case "pong":
 				// Heartbeat response — lastPongAt already updated above
 				break;
@@ -2065,6 +2074,7 @@ export const handleNarratorWS = {
 								msg.narratorId,
 								cmdResult as UnloadToolResult | UnloadToolNotFound,
 								locale,
+								userId,
 							);
 							return;
 						}

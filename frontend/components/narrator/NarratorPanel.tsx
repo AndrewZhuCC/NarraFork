@@ -73,6 +73,7 @@ import {
 } from "../../hooks/useNarrator";
 import { readOpeningLod, useNarratorLod } from "../../hooks/useNarratorLod";
 import { useOpencodeUsage } from "../../hooks/useOpencodeUsage";
+import { useOpenOutlineSpace, useOutlineEnabled } from "../../hooks/useOutline";
 import {
 	useNarratorBrowserSessionsCapability,
 	useNarratorCompactCapability,
@@ -94,6 +95,7 @@ import {
 } from "../../hooks/useWorkspaceContext";
 import { ApiError, api } from "../../lib/api";
 import type { RevertActionConfirmOptions } from "../../lib/api/narrators";
+import { describeApiError } from "../../lib/api-error";
 import { statusRegistry } from "../../lib/constants";
 import { collectElementTextPreview, compactWhitespacePreview } from "../../lib/dom-text";
 import {
@@ -102,6 +104,12 @@ import {
 	formatFullLocaleDateTime,
 } from "../../lib/format";
 import { knowledgePersonalEntryDestination } from "../../lib/knowledge-review-nav";
+import {
+	type OutlineOpener,
+	OutlineOpenerProvider,
+	useOutlineOpener,
+} from "../../lib/outline-opener";
+import type { OutlinePanelState } from "../../lib/outline-panel";
 import { formatProviderBalance } from "../../lib/provider-balance-format";
 import {
 	formatRevertFailure,
@@ -154,6 +162,7 @@ import type { NarratorToolbarHost } from "./header/narrator-toolbar-items";
 import { useHeaderToolbar } from "./header/use-header-toolbar";
 import { DropOverlay } from "./interaction/DropOverlay";
 import { buildMobileToolbarActions } from "./interaction/mobile-toolbar-actions";
+import { returnFromModelTrace } from "./interaction/model-trace-return";
 import {
 	normalizeBooleanOverride,
 	normalizeDangerReflectionLevel,
@@ -194,6 +203,7 @@ import { NarratorMessageListSkeleton } from "./NarratorMessageListSkeleton";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import type { NarratorPanelProps } from "./narrator-panel-types";
 import { useNarratorPanelVisible } from "./narrator-panel-visibility";
+import { OutlineDrawerHost } from "./OutlineDrawerHost";
 import {
 	createResponsiveNarratorPanel,
 	NarratorPanelCompactContext,
@@ -301,6 +311,17 @@ function NarratorPanelBody({
 	const preloadStateRef = useRef({ narratorId, detailReady: !!fetchedNarrator });
 	preloadStateRef.current = { narratorId, detailReady: !!fetchedNarrator };
 	const narrator = narratorProp ?? fetchedNarrator;
+	const isModelTrace = Array.isArray(narrator?.traits) && narrator.traits.includes("modeltrace");
+	const handleModelTraceReturn = useCallback(() => {
+		if (!narrator) return;
+		returnFromModelTrace({
+			narrator,
+			onClose,
+			navigateToNarrator: (id) =>
+				navigate({ to: "/narrators/$narratorId", params: { narratorId: id } }),
+			navigateToDefault: () => navigate({ to: "/narrators" }),
+		});
+	}, [narrator, onClose, navigate]);
 	const relaxedPlanForced = narrator?.permissionMode === "bypassPermissions";
 	const relaxedPlanEnabled = relaxedPlanForced || narrator?.relaxedPlan === true;
 
@@ -938,19 +959,16 @@ function NarratorPanelBody({
 	);
 
 	// Pending composer attachments (images + text files) + their IndexedDB draft
-	// persistence. The send flow (hide/clear/restore) and drag handlers below
+	// persistence. The send flow (clear after acceptance) and drag handlers below
 	// consume these; see the hook for why both kinds share one version counter.
 	const {
 		attachedImages,
 		attachedTextFiles,
-		attachedImagesRef,
-		attachedTextFilesRef,
 		isDragging,
 		setIsDragging,
 		dragCounterRef,
 		updateAttachedImages,
 		updateAttachedTextFiles,
-		hideAttachedFilesForSend,
 		clearAttachedFilesAndDraft,
 		reconcileDocumentAssets,
 		attachmentsHydrating,
@@ -1991,6 +2009,39 @@ function NarratorPanelBody({
 	const compatibilityProjectId = workspaceContext?.contextProjectId ?? projectId;
 	/** Stable identity so HeaderToolbar's memo is not busted every render. */
 	const openCompatibility = useCallback(() => setCompatibilityOpen(true), []);
+	/**
+	 * Outline places this session opens (its menu, its tool cards' addresses and commits, links in
+	 * its messages): in the surrounding dock when there is one (the session page's side dock, the
+	 * workspace cluster, the outline page), else in this panel's own drawer (a phone, a detached
+	 * window). Null while the outline is off, so nothing is intercepted and no entry is shown.
+	 */
+	const outlineEnabled = useOutlineEnabled().enabled;
+	const hostOutlineOpener = useOutlineOpener();
+	const [outlineDrawer, setOutlineDrawer] = useState<OutlinePanelState | null>(null);
+	const outlineOpener = useMemo<OutlineOpener | null>(
+		() =>
+			outlineEnabled && !isWorkspacePreview
+				? {
+						open: (state, options) => {
+							if (hostOutlineOpener?.open(state, options)) return true;
+							setOutlineDrawer(state);
+							return true;
+						},
+					}
+				: null,
+		[outlineEnabled, isWorkspacePreview, hostOutlineOpener],
+	);
+	/** The session's outline space, offered in the overflow menu while the outline is on. */
+	const { open: openOutlineSpace } = useOpenOutlineSpace({
+		onMissing: () => notifications.show({ color: "gray", message: t("outlineNotCreated") }),
+		onError: (error) =>
+			notifications.show({ color: "red", message: describeApiError(error, t).message }),
+		onOpen: (space) => outlineOpener?.open({ spaceId: space.id }),
+	});
+	const openOutline = useCallback(
+		() => openOutlineSpace("narrator", narratorId),
+		[openOutlineSpace, narratorId],
+	);
 	useMobileDrawerHistory(useInternalSpec && internalSpecOpen, () => setInternalSpecOpen(false));
 
 	// File opening (dock file panel when hosted in a dock, else an off-dock right
@@ -2604,17 +2655,13 @@ function NarratorPanelBody({
 		handleContinue,
 	} = useNarratorSend({
 		narratorId,
+		composerVisible: !isWorkspacePreview && fileDrawerVisible,
 		composerRef,
 		ingestingRef,
 		attachmentsHydrating,
 		attachmentsRestoreFailed,
 		attachedImages,
 		attachedTextFiles,
-		attachedImagesRef,
-		attachedTextFilesRef,
-		updateAttachedImages,
-		updateAttachedTextFiles,
-		hideAttachedFilesForSend,
 		clearAttachedFilesAndDraft,
 		sendingRef,
 		setQueuedMessages,
@@ -2639,6 +2686,10 @@ function NarratorPanelBody({
 			navigate({ to: "/narrators/$narratorId", params: { narratorId: id } }),
 		onForkCommand: handleForkCommand,
 		onCompactCommand: handleCompactCommand,
+		onModelTraceStarted: (id) => {
+			if (dock?.openSubagentPanel) dock.openSubagentPanel(id);
+			else navigate({ to: "/narrators/$narratorId", params: { narratorId: id } });
+		},
 		onRequestRecordingSaved: handleRecordingSaved,
 		normalizeBooleanOverride,
 		normalizeDangerReflectionOverride,
@@ -3086,7 +3137,7 @@ function NarratorPanelBody({
 		renderLod,
 	].join(":");
 
-	return (
+	const body = (
 		<PermEnterHintCtx.Provider value={permEnterHintCtxValue}>
 			<ContentViewerEnvironmentProvider
 				value={contentViewerEnvironment}
@@ -3231,6 +3282,7 @@ function NarratorPanelBody({
 										dock={dock}
 										mockStreamEnabled={mockStreamEnabled}
 										onOpenCompatibility={compatibilityProjectId ? openCompatibility : undefined}
+										onOpenOutline={outlineEnabled ? openOutline : undefined}
 										onClose={onClose}
 										visibleToolCount={headerLayout.visibleToolCount}
 										unmeasured={headerLayout.unmeasured}
@@ -3531,6 +3583,7 @@ function NarratorPanelBody({
 
 					{/* ═══════════════════ Bottom Interaction Area ═══════════════════ */}
 					<NarratorInteractionArea
+						onModelTraceReturn={isModelTrace ? handleModelTraceReturn : undefined}
 						common={{ narratorId, narrator, isWorkspacePreview, isMobileViewport }}
 						attachedImages={attachedImages}
 						attachedTextFiles={attachedTextFiles}
@@ -3851,6 +3904,18 @@ function NarratorPanelBody({
 							</Suspense>
 						</Drawer>
 					)}
+					{/* The outline's off-dock host: opened only when no dock took the place. */}
+					{outlineDrawer && (
+						<OutlineDrawerHost
+							state={outlineDrawer}
+							onChange={setOutlineDrawer}
+							onClose={() => setOutlineDrawer(null)}
+							onOpenSession={(sessionId) => {
+								setOutlineDrawer(null);
+								handleVlistViewSubagentSession(sessionId);
+							}}
+						/>
+					)}
 					{/*
 					 * Off-dock hosts for the entries that previously had NO mobile entry
 					 * point. Mounted only when this panel has no dock to put panels in, so
@@ -3921,4 +3986,5 @@ function NarratorPanelBody({
 			/>
 		</PermEnterHintCtx.Provider>
 	);
+	return <OutlineOpenerProvider value={outlineOpener}>{body}</OutlineOpenerProvider>;
 }

@@ -325,7 +325,7 @@ describe("approval feedback takes one path for every session", () => {
 					await permission;
 					expect(options.config.getWorkTurnId?.()).toBe("original-work-turn");
 					// The next safe boundary stops the pass for the feedback.
-					expect(options.config.shouldStop?.()).toBe(true);
+					expect(options.config.shouldYieldToInput?.()).toBe(true);
 					return {
 						finalText: "",
 						hasError: false,

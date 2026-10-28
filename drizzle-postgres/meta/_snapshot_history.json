@@ -347,11 +347,27 @@
 		},
 		{
 			"idx": 43,
-			"tag": "0043_merge_selfuse_098",
-			"id": "e0d3c559-183c-4e8a-a293-800e26851da5",
+			"tag": "0043_token_accounting_version",
+			"id": "4079ddee-70fe-4250-a6f9-614a7270d6ae",
 			"prevId": "738f075a-db1e-4d17-ab16-032656d87253",
 			"version": "7",
-			"snapshotDigest": "1da0fa5d253a602c6446979e6b4dc3b20bbbf02ab80732406187835b0d63a0cf"
+			"snapshotDigest": "dce20ffffd337aff8dc399f63ae547393c304dee16acac60c01eefed5c0e1004"
+		},
+		{
+			"idx": 44,
+			"tag": "0044_outline_storage",
+			"id": "30f5ec4d-b57c-40b3-a85d-a69332fe44bf",
+			"prevId": "4079ddee-70fe-4250-a6f9-614a7270d6ae",
+			"version": "7",
+			"snapshotDigest": "8f5daccf0d27fa16385d9de26e353e15fd162de8ca4b99e24c286f6f399ecae5"
+		},
+		{
+			"idx": 45,
+			"tag": "0045_merge_selfuse_099",
+			"id": "3777f5ae-f05a-413c-b1ff-5fb2eca4be99",
+			"prevId": "30f5ec4d-b57c-40b3-a85d-a69332fe44bf",
+			"version": "7",
+			"snapshotDigest": "36970c92d95133a0e0dca0957cf838342a4626cf469c2810dd25581978b7836d"
 		}
 	]
 }

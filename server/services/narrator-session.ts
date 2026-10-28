@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { isAbsolute } from "node:path";
 import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
+import { resolveMcpLoadingMode } from "@shared/mcp-loading-mode";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { parseStored } from "@shared/narrator-blocks/plan";
@@ -19,7 +20,7 @@ import {
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
 	MAX_NARRATOR_ATTACHMENT_BYTES,
 } from "@shared/text-file-types";
-import { and, asc, desc, eq, exists, gt, inArray, isNotNull, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, exists, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
 	narratorBufferedMessages,
@@ -33,7 +34,9 @@ import {
 import type { ReasoningEffort } from "../lib/agent";
 import { diagnosticsFromError } from "../lib/agent/error-diagnostics";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
+import { forgetModelTraceRequest } from "../lib/agent/modeltrace-request";
 import { projectMessageSenderText } from "../lib/agent/sender-projection";
+import { toolRegistry } from "../lib/agent/tool-registry";
 import {
 	clearBehaviorFenceEditGrant,
 	grantBehaviorFenceEdit,
@@ -80,7 +83,12 @@ import {
 import { normalizeLegacyPlanPreviousPermissionMode } from "../lib/permission-modes";
 import { resolveExistingPlanFileRelPath } from "../lib/plan-file-path";
 import { getHome } from "../lib/platform";
-import { getBlockedTaskActionInstruction, getToolMessage, type Locale } from "../lib/prompt-i18n";
+import {
+	getBlockedTaskActionInstruction,
+	getToolMessage,
+	getToolMessageWithParams,
+	type Locale,
+} from "../lib/prompt-i18n";
 import {
 	executionPrincipalOf,
 	type OwnTurnPlacement,
@@ -128,6 +136,7 @@ import {
 	claimInboxHead,
 	deliverInboxInjection,
 	flushInboxPublicationBarrier,
+	type InboxWakeOptions,
 	inboxClaim,
 	inboxConsumption,
 	inboxMetadata,
@@ -161,8 +170,10 @@ import {
 	formatBackgroundCompletionNotifications,
 } from "./bg-completion-queue";
 import { gitService } from "./git-service";
+import { cancelModelTrace } from "./modeltrace-service";
 import { invalidateComposerSuggestion } from "./narrator-composer";
 import { isFormerChapterSessionWithoutDirectory, resolveNarratorSessionCwd } from "./narrator-cwd";
+import { optionalToolDescription, reconcileEpoch } from "./narrator-epochs";
 import {
 	clearStreamingSnapshot,
 	type EventHooks,
@@ -202,6 +213,7 @@ import { appendSubagentFileChanges } from "./subagent-file-changes";
 import { agentResultTag, resolveAgentLabel } from "./subagent-label";
 import { resolveSubagentModelForRun, subagentRunReasoningEffort } from "./subagent-model";
 import { buildFinalToolStartAuthorization } from "./tool-final-start-authorization";
+import { parseMcpServerMarker } from "./tool-load-markers";
 import { resolveEffectiveTraits, resolveNarratorRuntimePolicy } from "./trait-layer-service";
 import {
 	buildSpecContinuationPrompt,
@@ -367,7 +379,13 @@ import {
 	resolveBlockTargets,
 	rowAt,
 } from "./narrator-block-targets";
-import { bodyColumns, fillBodies, fillBody } from "./narrator-body-reads";
+import {
+	bodyColumns,
+	contentJsonSql,
+	fillBodies,
+	fillBody,
+	storedBodyBytesSql,
+} from "./narrator-body-reads";
 import { readEnvelopeBody, writeEnvelopeBody } from "./narrator-body-writes";
 import {
 	cleanupBufferedTextFilesAsync,
@@ -1410,6 +1428,24 @@ async function createNarrator(
 			for (const toolName of narrator.enabledTools) {
 				if (OPTIONAL_TOOLS.has(toolName)) active._enabledOptionalTools.add(toolName);
 			}
+		}
+	}
+
+	if (!initialOAuthRuntime) {
+		const loadedServers = new Set(
+			(narrator.enabledTools ?? []).flatMap((value) => {
+				const id = parseMcpServerMarker(value);
+				return id ? [id] : [];
+			}),
+		);
+		for (const tool of toolRegistry.all()) {
+			const server = settings.mcpServers?.find((item) => item.id === tool.metadata?.mcpServerId);
+			if (
+				server &&
+				resolveMcpLoadingMode(server) !== "disabled" &&
+				(resolveMcpLoadingMode(server) === "resident" || loadedServers.has(server.id))
+			)
+				active._enabledOptionalTools.add(tool.name);
 		}
 	}
 
@@ -2725,6 +2761,8 @@ export interface ContextManagementOptions {
 	getAttachmentCwd?: () => string | undefined;
 	/** Optional tool loading input for rebuilt histories (see `RuntimeHistoryOptions`). */
 	getToolLoading?: () => import("./agent-runtime/history").RuntimeHistoryOptions["toolLoading"];
+	/** Refresh registry membership and explicit MCP server grants before every request. */
+	refreshToolLoading?: () => Promise<void>;
 	attachmentSignal?: AbortSignal;
 	/** Called after compact completes (e.g. reset conversationId, set restart flag) */
 	onCompactDone?: () => void;
@@ -2801,10 +2839,35 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 		const deadline = Date.now() + 10_000;
 		const signal = opts.attachmentSignal;
 		signal?.throwIfAborted();
-		const rawMsgs = await narratorService.getModelHistorySinceLastCompact(narratorId, undefined, {
+		if (opts.refreshToolLoading) await opts.refreshToolLoading();
+		let rawMsgs = await narratorService.getModelHistorySinceLastCompact(narratorId, undefined, {
 			signal,
 			deadline,
 		});
+		let toolLoading = opts.getToolLoading?.();
+		if (toolLoading) {
+			const reconciled = await reconcileEpoch({
+				narratorId,
+				messages: rawMsgs,
+				...toolLoading,
+				model: getModel(),
+				provider: getProvider(),
+				noticeText: (kind, toolName) =>
+					kind === "tool_loaded"
+						? getToolMessageWithParams("toolLoaded", locale, {
+								toolName,
+								toolDescription: optionalToolDescription(toolName, locale),
+							})
+						: getToolMessageWithParams("toolUnloaded", locale, { toolName }),
+			});
+			if (reconciled.changed) {
+				rawMsgs = await narratorService.getModelHistorySinceLastCompact(narratorId, undefined, {
+					signal,
+					deadline,
+				});
+			}
+			toolLoading = { ...toolLoading, epoch: reconciled.epoch };
+		}
 		// The in-memory history is now rebuilt from the latest (post-compact)
 		// messages, so any pending-compact guard can be released.
 		clearActiveHistoryCompactPending(narratorId);
@@ -2816,8 +2879,11 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 			attachmentCwd: opts.getAttachmentCwd?.(),
 			attachmentSignal: signal,
 			deadline,
-			toolLoading: opts.getToolLoading?.(),
+			toolLoading,
 		});
+		if (result.toolLoading && !result.toolCandidates) {
+			throw new Error("A tool-loading history rebuild must include tool candidates");
+		}
 		const systemPrompt = includeSystemPrompt
 			? ((await rebuildSystemPrompt?.()) ?? undefined)
 			: undefined;
@@ -2827,7 +2893,12 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 			history: result.history,
 			rows: result.modelMessages,
 			replayedInjectionMessageIds: result.replayedInjectionMessageIds,
-			...(result.toolLoading ? { toolLoading: result.toolLoading } : {}),
+			...(result.toolLoading
+				? {
+						toolLoading: result.toolLoading,
+						...(result.toolCandidates ? { toolCandidates: result.toolCandidates } : {}),
+					}
+				: {}),
 			...(systemPrompt !== undefined ? { systemPrompt } : {}),
 		};
 	};
@@ -2945,6 +3016,33 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 	};
 
 	return { onContextUsage, onBeforeTurn, rebuildRequestHistory, onReasoningOnlyHighContext };
+}
+
+/**
+ * Session catch for a thrown run. `executeRun` already settles a foreground failure
+ * (idle, and error / interrupted / timeout). Writing again would replace that
+ * classification and broadcast a second `narrator_error`. Throws that never reached
+ * the finalizer — registration rejected, or the run still working/waiting — still
+ * report here.
+ */
+async function reportUnsettledRunLoopError(
+	narratorId: string,
+	err: unknown,
+	diagnostics?: ReturnType<typeof diagnosticsFromError>,
+): Promise<void> {
+	const current = await narratorService.getById(narratorId).catch(() => null);
+	if (!current || (current.status !== "working" && current.status !== "waiting")) return;
+	await narratorService.updateStatus(narratorId, "idle", {
+		substatus: ["error"],
+		errorMessage: String(err),
+		...(diagnostics ? { diagnostics } : {}),
+	});
+	broadcastToNarrator(narratorId, {
+		type: "narrator_error",
+		narratorId,
+		error: String(err),
+		...(diagnostics ? { diagnostics } : {}),
+	});
 }
 
 /**
@@ -3327,17 +3425,7 @@ async function feedMessageUnlocked(
 		terminal.catch(async (err) => {
 			const diagnostics = diagnosticsFromError(err);
 			logger.error("runAgentLoop unhandled error", { narratorId, error: String(err), diagnostics });
-			await narratorService.updateStatus(narratorId, "idle", {
-				substatus: ["error"],
-				errorMessage: String(err),
-				diagnostics,
-			});
-			broadcastToNarrator(narratorId, {
-				type: "narrator_error",
-				narratorId,
-				error: String(err),
-				diagnostics,
-			});
+			await reportUnsettledRunLoopError(narratorId, err, diagnostics);
 		});
 
 		return { active, userMsg, userBroadcasted: !!preBashCommand, terminal };
@@ -3709,7 +3797,7 @@ async function executeQueuedControlCommand(
 	} else if ("loadTool" in result || "loadToolNotFound" in result) {
 		await handlers.handleLoadToolCommand(narratorId, result, locale, userId);
 	} else if ("unloadTool" in result || "unloadToolNotFound" in result) {
-		await handlers.handleUnloadToolCommand(narratorId, result, locale);
+		await handlers.handleUnloadToolCommand(narratorId, result, locale, userId);
 	} else if ("blockSkill" in result) {
 		await handlers.handleBlockSkillCommand(narratorId, result, locale);
 	} else if ("blockAllSkills" in result) {
@@ -4309,15 +4397,7 @@ export async function startSpecContinuationIfPossible(
 				narratorId,
 				error: String(err),
 			});
-			await narratorService.updateStatus(narratorId, "idle", {
-				substatus: ["error"],
-				errorMessage: String(err),
-			});
-			broadcastToNarrator(narratorId, {
-				type: "narrator_error",
-				narratorId,
-				error: String(err),
-			});
+			await reportUnsettledRunLoopError(narratorId, err);
 		});
 		return { started: true };
 	});
@@ -4385,6 +4465,81 @@ export function isQuestionAnswerWakeEligible(recipient: {
 			(tag) => tag === "error" || tag === "waiting_permission",
 		)
 	);
+}
+
+/**
+ * The answer is already in the transcript and a later assistant turn actually
+ * replied. Empty shells (`createPartialAssistantMessage`) and reasoning-only
+ * tails are not replies: a crash can leave them after the answer without the
+ * model having continued, and treating them as delivered would drop the wake
+ * forever. Text or a tool call is enough; other non-reasoning bodies count too.
+ */
+function assistantReplyFollowsAnswer(narratorId: string, answerSeq: number): boolean {
+	const substantive = db
+		.select({ id: narratorMessageRefs.id })
+		.from(narratorMessageRefs)
+		.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+		.where(
+			and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessages.role, "assistant"),
+				gt(narratorMessageRefs.seq, answerSeq),
+				or(
+					sql`length(trim(coalesce(${narratorMessages.contentText}, ''))) > 0`,
+					exists(
+						db
+							.select({ one: sql`1` })
+							.from(narratorToolCalls)
+							.where(eq(narratorToolCalls.messageId, narratorMessages.id)),
+					),
+				),
+			),
+		)
+		.limit(1)
+		.get();
+	if (substantive) return true;
+
+	let cursor = answerSeq;
+	for (;;) {
+		// Body bytes and the body itself go through the block-aware readers. The column
+		// is only a projection once rows are current, and a direct read is refused.
+		const bodies = fillBodies(
+			db
+				.select({
+					id: narratorMessages.id,
+					seq: narratorMessageRefs.seq,
+					contentJson: contentJsonSql(),
+				})
+				.from(narratorMessageRefs)
+				.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessages.role, "assistant"),
+						gt(narratorMessageRefs.seq, cursor),
+						sql`coalesce(${storedBodyBytesSql()}, 0) > 2`,
+					),
+				)
+				.orderBy(asc(narratorMessageRefs.seq))
+				.limit(8)
+				.all(),
+		);
+		if (!bodies.length) return false;
+		for (const body of bodies) {
+			if (
+				!isDanglingReasoningOnlyAssistantMessage({
+					role: "assistant",
+					contentJson: body.contentJson,
+					contentText: null,
+					toolCalls: [],
+				})
+			)
+				return true;
+		}
+		const next = bodies[bodies.length - 1]?.seq;
+		if (next == null || next <= cursor || bodies.length < 8) return false;
+		cursor = next;
+	}
 }
 
 async function canWakeQuestionAnswer(
@@ -4471,6 +4626,22 @@ export async function recoverPendingQuestionAnswerDeliveries(
 					options.signal?.throwIfAborted();
 					if (!question.messageId) continue;
 					try {
+						// `resolution_json` 是模型写的「解决备注」，不是送达凭据。回答已经在
+						// refs 里、并且后面有一次真正的 assistant 回复，才说明会话继续过。
+						// 没有 ref 时仍交给下面的 schedule：它会抛出并记
+						// "Pending question recovery deferred"，下一次启动再试。
+						const answerRef = db
+							.select({ seq: narratorMessageRefs.seq })
+							.from(narratorMessageRefs)
+							.where(
+								and(
+									eq(narratorMessageRefs.narratorId, recipient.id),
+									eq(narratorMessageRefs.messageId, question.messageId),
+								),
+							)
+							.limit(1)
+							.get();
+						if (answerRef && assistantReplyFollowsAnswer(recipient.id, answerRef.seq)) continue;
 						const principal = await getAsyncQuestionExecutionPrincipal(question.id, recipient.id);
 						if (!principal) continue;
 						const receipt = await getBoundedQuestionReceipt(question.messageId, recipient.id);
@@ -4773,15 +4944,7 @@ export async function startInjectionContinuationIfPossible(
 					narratorId,
 					error: String(err),
 				});
-				await narratorService.updateStatus(narratorId, "idle", {
-					substatus: ["error"],
-					errorMessage: String(err),
-				});
-				broadcastToNarrator(narratorId, {
-					type: "narrator_error",
-					narratorId,
-					error: String(err),
-				});
+				await reportUnsettledRunLoopError(narratorId, err);
 			},
 		);
 		return { started: true };
@@ -4877,6 +5040,7 @@ export async function startParentInboundContinuationIfPossible(
 	narratorId: string,
 	locale: Locale = "en",
 	replyInUserLanguage = false,
+	options: InboxWakeOptions = {},
 ): Promise<{ started: boolean }> {
 	return continuationStartLock.acquire(narratorId, async () => {
 		// Recheck inside start admission: publication may have observed an idle
@@ -4890,7 +5054,10 @@ export async function startParentInboundContinuationIfPossible(
 
 		const narrator = await narratorService.getById(narratorId);
 		if (narrator.status !== "idle") return { started: false };
-		if (narrator.lastStopReason === "user_interrupt" || narrator.lastStopReason === "error")
+		if (
+			(narrator.lastStopReason === "user_interrupt" || narrator.lastStopReason === "error") &&
+			!options.resumeStopped?.includes(narrator.lastStopReason)
+		)
 			return { started: false };
 
 		// Restore the recipient's own identity before touching its inbox. Unknown is
@@ -4923,15 +5090,7 @@ export async function startParentInboundContinuationIfPossible(
 				narratorId,
 				error: String(err),
 			});
-			await narratorService.updateStatus(narratorId, "idle", {
-				substatus: ["error"],
-				errorMessage: String(err),
-			});
-			broadcastToNarrator(narratorId, {
-				type: "narrator_error",
-				narratorId,
-				error: String(err),
-			});
+			await reportUnsettledRunLoopError(narratorId, err);
 		});
 		return { started: true };
 	});
@@ -5163,15 +5322,7 @@ async function retryLastMessageUnlocked(
 		principal: userId,
 	}).catch(async (err) => {
 		logger.error("runAgentLoop unhandled error (retry)", { narratorId, error: String(err) });
-		await narratorService.updateStatus(narratorId, "idle", {
-			substatus: ["error"],
-			errorMessage: String(err),
-		});
-		broadcastToNarrator(narratorId, {
-			type: "narrator_error",
-			narratorId,
-			error: String(err),
-		});
+		await reportUnsettledRunLoopError(narratorId, err);
 	});
 
 	return { ok: true };
@@ -5408,15 +5559,7 @@ async function continueNarratorUnlocked(
 	});
 	terminal.catch(async (err) => {
 		logger.error("runAgentLoop unhandled error (continue)", { narratorId, error: String(err) });
-		await narratorService.updateStatus(narratorId, "idle", {
-			substatus: ["error"],
-			errorMessage: String(err),
-		});
-		broadcastToNarrator(narratorId, {
-			type: "narrator_error",
-			narratorId,
-			error: String(err),
-		});
+		await reportUnsettledRunLoopError(narratorId, err);
 	});
 
 	return { ok: true, terminal };
@@ -6923,15 +7066,7 @@ async function editAndRegenerateUnlocked(
 			narratorId,
 			error: String(err),
 		});
-		await narratorService.updateStatus(narratorId, "idle", {
-			substatus: ["error"],
-			errorMessage: String(err),
-		});
-		broadcastToNarrator(narratorId, {
-			type: "narrator_error",
-			narratorId,
-			error: String(err),
-		});
+		await reportUnsettledRunLoopError(narratorId, err);
 	});
 
 	return { ok: true, ...warnings };
@@ -7759,6 +7894,7 @@ export function interruptNarrator(narratorId: string): boolean {
 		.set({ lastStopReason: "user_interrupt" })
 		.where(eq(narrators.id, narratorId))
 		.run();
+	if (cancelModelTrace(narratorId)) return true;
 	const active = activeNarrators.get(narratorId);
 	const recovery = interruptPlannedUpdateRecovery(narratorId);
 	if (!active && !recovery.interrupted) return false;
@@ -7784,6 +7920,8 @@ export function interruptNarrator(narratorId: string): boolean {
 
 /** Gracefully close a narrator. */
 export function closeNarrator(narratorId: string): void {
+	cancelModelTrace(narratorId);
+	forgetModelTraceRequest(narratorId);
 	const active = activeNarrators.get(narratorId);
 	if (!active) return;
 	active.alive = false;
@@ -9004,32 +9142,17 @@ export async function loadOptionalTool(
 ): Promise<"loaded" | "already_loaded" | "unknown_tool"> {
 	if (!OPTIONAL_TOOLS.has(toolName)) return "unknown_tool";
 
-	// Read current enabled tools from DB
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { enabledTools: true },
-	});
-	const current: string[] = (narrator?.enabledTools as string[] | null) ?? [];
-	if (current.includes(toolName)) return "already_loaded";
-	// A resident tool is preloaded in memory only. Loading it again changes nothing the
-	// model sees, so no load notice may be written for it: the notice would move it out
-	// of the request's tool array (see lib/agent/tool-loading.ts).
-	const active = activeNarrators.get(narratorId);
-	const alreadyActive = active?._enabledOptionalTools.has(toolName) ?? false;
-
-	// Persist
-	await db
-		.update(narrators)
-		.set({ enabledTools: [...current, toolName] })
-		.where(eq(narrators.id, narratorId));
-
-	// Also update in-memory session if active
-	if (active) {
-		active._enabledOptionalTools.add(toolName);
-	}
-
-	logger.info("Optional tool loaded", { narratorId, toolName });
-	return alreadyActive ? "already_loaded" : "loaded";
+	const { changeLoadedToolGroup } = await import("./tool-loading-service");
+	const result = await changeLoadedToolGroup(
+		narratorId,
+		{ id: toolName, description: toolName, toolNames: [toolName] },
+		true,
+	);
+	return result === "loaded"
+		? "loaded"
+		: result === "already_loaded"
+			? "already_loaded"
+			: "unknown_tool";
 }
 
 /**
@@ -9042,32 +9165,29 @@ export async function unloadOptionalTool(
 ): Promise<"unloaded" | "not_loaded" | "unknown_tool"> {
 	if (!OPTIONAL_TOOLS.has(toolName)) return "unknown_tool";
 
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { enabledTools: true },
-	});
-	const current: string[] = (narrator?.enabledTools as string[] | null) ?? [];
-	const next = current.filter((name) => name !== toolName);
-	const wasPersisted = next.length !== current.length;
-
-	const active = activeNarrators.get(narratorId);
-	const wasActive = active?._enabledOptionalTools.has(toolName) ?? false;
-
-	if (!wasPersisted && !wasActive) return "not_loaded";
-
-	if (wasPersisted) {
-		await db.update(narrators).set({ enabledTools: next }).where(eq(narrators.id, narratorId));
-	}
-
-	if (active) {
-		active._enabledOptionalTools.delete(toolName);
-	}
-
-	logger.info("Optional tool unloaded", { narratorId, toolName });
-	return "unloaded";
+	const { changeLoadedToolGroup } = await import("./tool-loading-service");
+	const result = await changeLoadedToolGroup(
+		narratorId,
+		{ id: toolName, description: toolName, toolNames: [toolName] },
+		false,
+	);
+	return result === "unloaded" ? "unloaded" : "not_loaded";
 }
 
 /** Get the set of enabled optional tool names for a narrator session. */
+export function updateActiveLoadedTools(
+	narratorId: string,
+	toolNames: Iterable<string>,
+	loaded = true,
+): void {
+	const active = activeNarrators.get(narratorId);
+	if (!active) return;
+	for (const name of toolNames) {
+		if (loaded) active._enabledOptionalTools.add(name);
+		else active._enabledOptionalTools.delete(name);
+	}
+}
+
 export function getEnabledOptionalTools(narratorId: string): Set<string> {
 	const active = activeNarrators.get(narratorId);
 	return active?._enabledOptionalTools ?? new Set();

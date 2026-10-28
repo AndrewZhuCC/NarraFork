@@ -26,6 +26,7 @@ import { learningGuideTool } from "./learning-guide";
 import { mcpAdminTool } from "./mcp-admin";
 import { narraforkAdminTool } from "./narrafork-admin";
 import { notificationTool } from "./notification";
+import { outlineEditTool, outlineReadTool, outlineSearchTool } from "./outline";
 import { packActivateTool, packDeactivateTool, packListTool } from "./pack";
 import { extractPipelineTool, startPipelineTool } from "./pipeline";
 import { enterPlanModeTool, exitPlanModeTool } from "./plan-mode";
@@ -48,6 +49,7 @@ import { agentTool } from "./task";
 import { taskReflectConfirmTool, taskReflectReviseTool } from "./task-reflection";
 import { teamStatusTool } from "./team-status";
 import { terminalTool } from "./terminal";
+import { toolSearchTool } from "./tool-search";
 import { transferFileTool } from "./transfer-file";
 import { webFetchTool } from "./web-fetch";
 import { webSearchTool } from "./web-search";
@@ -83,6 +85,7 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["KnowledgeEdit", knowledgeEditTool],
 	["KnowledgeAdmin", knowledgeAdminTool],
 	["KnowledgeReview", knowledgeReviewTool],
+	["OutlineEdit", outlineEditTool],
 	["StartPipeline", startPipelineTool],
 	["ExtractPipeline", extractPipelineTool],
 ]);
@@ -115,6 +118,7 @@ const coreProvider: ToolProvider = {
 	name: "core",
 	tools() {
 		return [
+			toolSearchTool,
 			bashTool,
 			readTool,
 			writeTool,
@@ -140,6 +144,8 @@ const coreProvider: ToolProvider = {
 			knowledgeSearchTool,
 			knowledgeReadTool,
 			knowledgeLibraryTool,
+			outlineReadTool,
+			outlineSearchTool,
 			switchDeviceTool,
 			switchWorkingDirectoryTool,
 			worktreeTool,

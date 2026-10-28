@@ -1,6 +1,7 @@
 import { count } from "drizzle-orm";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import type { UnofficialStatusCode } from "hono/utils/http-status";
 import { db } from "./db";
 import { users } from "./db/schema";
 import { buildAppErrorResponse, toErrorPayload } from "./lib/app-error-response";
@@ -64,6 +65,7 @@ import { oauthAppRoutes } from "./routes/oauth-apps";
 import { oauthGrantRoutes } from "./routes/oauth-grants";
 import { openaiRoutes } from "./routes/openai";
 import { opencodeRoutes } from "./routes/opencode";
+import { outlineRoutes } from "./routes/outline";
 import { pluginUiRoutes } from "./routes/plugin-ui";
 import { pluginRoutes } from "./routes/plugins";
 import { projectRoutes } from "./routes/projects";
@@ -450,6 +452,7 @@ app.route("/api/skills", skillRoutes);
 app.route("/api/grammars", grammarRoutes);
 app.route("/api/knowledge/packs", knowledgePackRoutes);
 app.route("/api/knowledge", knowledgeRoutes);
+app.route("/api/outline", outlineRoutes);
 app.route("/api/storage", storageRoutes);
 app.route("/api/runtime", runtimeRoutes);
 app.route("/api/custom-subagents", customSubagentRoutes);
@@ -474,6 +477,12 @@ app.onError((err, c) => {
 		: err;
 	const knownErrorResponse = buildAppErrorResponse(storageError, c);
 	if (knownErrorResponse) return knownErrorResponse;
+	// The client went away (closed the page, switched narrators) and the abort surfaced from
+	// whatever the handler awaited. Not a server fault, and nobody receives this response.
+	if (c.req.raw.signal.aborted && (err as Error).name === "AbortError") {
+		logger.debug("Request aborted by client", { path: c.req.path, error: String(err) });
+		return c.body(null, 499 as UnofficialStatusCode);
+	}
 	logger.error("Unhandled error", { error: String(err), stack: (err as Error).stack });
 	// The message stays deliberately generic (an unhandled error may quote internals), but it
 	// still carries a code so the client can localize it rather than print English.

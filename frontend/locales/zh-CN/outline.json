@@ -1,0 +1,226 @@
+{
+	"title": "大纲",
+	"subtitle": "用大纲记下项目、会话和个人的笔记、结论与计划。",
+	"unavailable": "此服务器没有开启大纲功能。",
+	"notFound": "这一页不存在，或者你没有权限查看。",
+	"notAtTime": "历史上的这个时间点还没有这个块。",
+	"loadFailed": "加载失败，请稍后再试。",
+	"loadMore": "加载更多",
+	"home": {
+		"searchPlaceholder": "在你能读的所有大纲中搜索",
+		"noResults": "没有匹配的内容。",
+		"process": "过程",
+		"recent": "最近访问",
+		"noRecent": "打开过的页面会出现在这里。",
+		"spaces": "空间",
+		"noSpaces": "还没有空间。"
+	},
+	"space": {
+		"personalMine": "我的笔记",
+		"personalOther": "个人笔记",
+		"project": "{{name}}",
+		"projectUnnamed": "已删除的项目",
+		"session": "{{name}}",
+		"sessionUnnamed": "未命名会话",
+		"kind": {
+			"project": "项目",
+			"personal": "个人",
+			"session": "会话"
+		},
+		"orphaned": "所有者已删除",
+		"commits_one": "{{count}} 次提交",
+		"commits_other": "{{count}} 次提交",
+		"readOnly": "只读",
+		"searchPlaceholder": "在这个空间中搜索",
+		"pages": "页面",
+		"noPages": "还没有页面。agent 和编辑器写入的页面会出现在这里。"
+	},
+	"page": {
+		"task": {
+			"todo": "待办",
+			"doing": "进行中",
+			"done": "完成",
+			"cancelled": "已取消"
+		},
+		"expand": "展开",
+		"collapse": "折叠",
+		"focus": "聚焦到这个块",
+		"due": "截止 {{date}}",
+		"alias": "别名 {{alias}}",
+		"inProgress_one": "进行中 · {{count}}",
+		"inProgress_other": "进行中 · {{count}}",
+		"inProgressHint": "这个块下面有未完成的任务。切到「全部」可以看到。",
+		"more_one": "… 还有 {{count}} 项",
+		"more_other": "… 还有 {{count}} 项",
+		"moreAtRoot_one": "… 还有 {{count}} 个块放不下，请聚焦到其中一部分。",
+		"moreAtRoot_other": "… 还有 {{count}} 个块放不下，请聚焦到其中一部分。",
+		"factsEmpty": "这里只有任务和进展。切到「全部」可以看到。",
+		"empty": "这个块下面还没有内容。",
+		"view": {
+			"facts": "事实",
+			"all": "全部"
+		},
+		"viewLabel": "显示范围",
+		"sidePanel": "反链与历史",
+		"asOfBanner": "正在查看提交 #{{seq}} 时的页面（只读）。",
+		"backToCurrent": "回到现在",
+		"truncated": "这一页太大，无法一次读完；请聚焦到其中一部分。",
+		"processHidden_one": "任务下的 {{count}} 个块没有显示。",
+		"processHidden_other": "任务下的 {{count}} 个块没有显示。",
+		"showAll": "显示全部"
+	},
+	"side": {
+		"backlinks": "反链",
+		"history": "历史",
+		"noBacklinks": "没有链接到这里的内容。",
+		"backlinksTruncated_one": "只显示前 {{count}} 条。",
+		"backlinksTruncated_other": "只显示前 {{count}} 条。",
+		"noHistory": "没有历史。",
+		"linkKind": {
+			"link": "链接",
+			"embed": "嵌入",
+			"depends": "前置",
+			"tag": "标签"
+		},
+		"change": {
+			"create": "创建",
+			"content": "修改",
+			"move": "移动",
+			"delete": "删除",
+			"restore": "恢复",
+			"task": "任务",
+			"page": "换页",
+			"props": "别名或标签"
+		},
+		"viewAt": "查看提交 #{{seq}} 时的页面"
+	},
+	"timeline": {
+		"label": "时间轴",
+		"previous": "上一次提交",
+		"next": "下一次提交",
+		"older": "加载更早的提交",
+		"empty": "还没有提交。",
+		"now": "现在",
+		"commit": "#{{seq}}",
+		"kind": {
+			"edit": "编辑",
+			"revert": "撤销",
+			"import": "导入"
+		},
+		"actor": {
+			"unknown": "某人",
+			"agent": "agent",
+			"agentFor": "agent（代 {{name}}）",
+			"system": "系统"
+		},
+		"revert": "撤销",
+		"revertTitle": "撤销提交 #{{seq}}？",
+		"revertConfirm": "会新建一个提交，把这次提交改动的内容恢复原样。之后又被改过的块保持不变。",
+		"cancel": "取消",
+		"revertAction": "撤销",
+		"reverted": "已撤销 #{{seq}}",
+		"revertFailed": "撤销失败",
+		"revertChanged_one": "恢复了 {{count}} 个块。",
+		"revertChanged_other": "恢复了 {{count}} 个块。",
+		"revertedNothing": "没有可以恢复的内容。",
+		"revertSkipped_one": "{{count}} 个块保持不变：",
+		"revertSkipped_other": "{{count}} 个块保持不变：",
+		"skipReason": {
+			"changed-later": "之后的提交又改过它",
+			"parent-gone": "它原来所在的块已被删除",
+			"later-children": "之后有块加到了它下面",
+			"cycle": "恢复后会挂到自己下面"
+		},
+		"openSession": "打开写入它的会话",
+		"sessionUnavailable": "你无法打开写入它的会话。"
+	},
+	"editor": {
+		"changeStatus": "切换状态",
+		"hiddenUnder_one": "任务下还有 {{count}} 块",
+		"hiddenUnder_other": "任务下还有 {{count}} 块",
+		"tooLarge": "一个块最多 16 KB，请拆成几个块。",
+		"rootKept": "正在聚焦的块不能在这里删除；退到上一层再删。",
+		"peerEditing": "{{name}} 正在编辑",
+		"peerViewing": "{{name}} 正在查看",
+		"someone": "有人",
+		"readOnly": "只读",
+		"connecting": "正在连接…",
+		"connectingHint": "正在连接：输入会保留，连上后发送；新增、移动、删除块要等连上。",
+		"unsavedTitle_one": "你在这里输入的文字没有写进这一页。它只保存在这个标签页里，直到你关掉提示：",
+		"unsavedTitle_other": "你在这里 {{count}} 处输入的文字没有写进这一页。它们只保存在这个标签页里，直到你关掉提示：",
+		"unsavedRefused": "这一页无法实时编辑（太大，或没有权限）。",
+		"unsavedReadOnly": "你已不能编辑这一页。",
+		"unsavedNotSent": "服务器确认这段文字之前这一页已关闭。请检查页面，它可能没写进去。",
+		"unsavedMovedAway": "你输入时所在的块已不在这一页（被删除或移走）。如果它只是被移到了别处，在这里加回会多出一份。",
+		"restoreUnsaved": "作为新块加回",
+		"restoreNotPossible": "现在无法在这里恢复，请复制文字。",
+		"unsavedDropped_one": "这一页有 {{count}} 条较早的未保存文字因上限被丢弃：每个标签页最多保留 {{entries}} 条、{{kb}}KB。",
+		"unsavedDropped_other": "这一页有 {{count}} 条较早的未保存文字因上限被丢弃：每个标签页最多保留 {{entries}} 条、{{kb}}KB。",
+		"unsavedMaybeAdded": "加回的请求已发出，但页面在确认前关闭了：它可能已经在页面上。再加一次之前请先检查。",
+		"unsavedAdding": "正在加回…",
+		"restoreUnsavedAgain": "仍然再加一次",
+		"tabLimitWaiting_one": "其中 {{count}} 个是已隐藏、仍在等待服务器确认输入的页面，最迟 {{seconds}} 秒后空出名额。",
+		"tabLimitWaiting_other": "其中 {{count}} 个是已隐藏、仍在等待服务器确认输入的页面，最迟 {{seconds}} 秒后空出第一个名额。",
+		"copyUnsaved": "复制文字",
+		"unsavedCopied": "已复制",
+		"offline": "离线：修改会保留，连上后发出",
+		"stalled": "未发出的修改太多，等待服务器",
+		"deletedBy": "{{name}} 删除了你正在编辑的块。",
+		"deletedBySomeone": "有人删除了你正在编辑的块。",
+		"restore": "恢复",
+		"dismiss": "知道了",
+		"tooLargePage": "这一页太大（超过 2000 块或 4 MB），不能实时编辑，先以只读显示；可以聚焦到其中一部分，或把页拆开。",
+		"unavailable": "现在不能实时编辑，先以只读显示这一页。",
+		"retry": "重试",
+		"tabLimit": "当前为只读：这个标签页已经有 {{count}} 个大纲页处于实时编辑状态。关闭或隐藏其中一个后再重试。"
+	},
+	"map": {
+		"viewLabel": "视图",
+		"outline": "大纲",
+		"map": "导图",
+		"right": "向右展开",
+		"down": "向下展开",
+		"fit": "适应窗口",
+		"stage": "这一页的导图",
+		"more_one": "…还有 {{count}} 项",
+		"more_other": "…还有 {{count}} 项"
+	},
+	"switcher": {
+		"open": "快速切换（Ctrl/⌘ K）",
+		"placeholder": "跳到一个块：标题、别名或正文",
+		"label": "找一个块跳过去",
+		"empty": "没有匹配的块。",
+		"noRecent": "聚焦过的块会出现在这里。",
+		"searching": "正在搜其他页…",
+		"via": {
+			"title": "标题",
+			"alias": "别名",
+			"body": "正文",
+			"recent": "最近"
+		},
+		"thisPage": "这一页",
+		"otherSpace": "其他空间"
+	},
+	"history": {
+		"back": "后退（Ctrl/⌘ [）",
+		"forward": "前进（Ctrl/⌘ ]）"
+	},
+	"link": {
+		"notFound": "这个大纲链接指向的内容不存在，或你无权阅读。"
+	},
+	"panel": {
+		"openPage": "在大纲页打开"
+	},
+	"dock": {
+		"sessions": "会话",
+		"recentSessions": "这个空间最近的会话",
+		"noSessions": "这里还没有会话。",
+		"discuss": "在会话里讨论这一页",
+		"discussTitle": "在会话里讨论这一页",
+		"discussHint": "会在会话的输入框里放入这一页的链接。",
+		"newSession": "新建会话…"
+	},
+	"workspace": {
+		"addTitle": "添加大纲页"
+	}
+}

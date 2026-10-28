@@ -37,12 +37,12 @@ const { activateSqliteRuntimePublication } = await import("../agent-runtime/publ
 activateSqliteRuntimePublication(db);
 const provider = await import("../../lib/agent/provider");
 const executor = await import("../narrator-executor");
-const { isGitCommandToolResult, runAgentLoopUnlocked } = await import(
-	"../agent-runtime/orchestrator"
-);
+const orchestrator = await import("../agent-runtime/orchestrator");
+const { isGitCommandToolResult, runAgentLoopUnlocked } = orchestrator;
 const {
 	tryClaimExecution,
 	getExecutionOwner,
+	getRunControl,
 	getRunHold,
 	isExecutionSuspended,
 	setRunControl,
@@ -993,7 +993,9 @@ describe("real shared orchestrator profile contract", () => {
 					return { ...finished, completedNaturally: false, hadToolUses: true };
 				},
 				async (options) => {
-					expect(options.userText).toContain(feedback);
+					// Persisted approval feedback rides in history, not a second current input.
+					expect(options.userText).toBe("");
+					expect(JSON.stringify(options.history.built)).toContain(feedback);
 					expect(options.config.getWorkTurnId?.()).toBe("original-work-turn");
 					expect(reflectedWorkTurn?.()).toBe("original-work-turn");
 					return finished;
@@ -1081,7 +1083,7 @@ describe("real shared orchestrator profile contract", () => {
 					acceptedId = accepted.id;
 					expect(options.config.getWorkTurnId?.()).toBe("original-work-turn");
 					order.push("queued");
-					if (scenario.softStop) expect(options.config.shouldStop?.()).toBe(true);
+					if (scenario.softStop) expect(options.config.shouldYieldToInput?.()).toBe(true);
 					const injection = await options.config.getAfterToolsInjections?.();
 					const text = typeof injection === "string" ? injection : injection?.text;
 					expect(text ?? "").not.toContain(feedback);
@@ -1170,7 +1172,7 @@ describe("real shared orchestrator profile contract", () => {
 				const accepted = (await enqueueInboxAgent(delivery, text, { createdBy: "principal-a" }))
 					.delivery;
 				expect(options.config.getWorkTurnId?.()).toBe("original-work-turn");
-				expect(options.config.shouldStop?.()).toBe(false);
+				expect(options.config.shouldYieldToInput?.()).toBe(false);
 				const packet = await options.config.getAfterToolsInjections?.();
 				if (!packet || typeof packet === "string") throw new Error("Missing after-tools packet");
 				expect(packet.text).toContain(text);
@@ -1239,6 +1241,35 @@ describe("real shared orchestrator profile contract", () => {
 		if (!read || !write) throw new Error("Core tools must be registered");
 		expect(h.calls[0].config.toolFilter?.(read)).toBe(true);
 		expect(h.calls[0].config.toolFilter?.(write)).toBe(false);
+	});
+
+	test("explicit capability ceiling does not hide auto or resident MCP tools", async () => {
+		const { toolRegistry } = await import("../../lib/agent/tool-registry");
+		const original = settings.mcpServers;
+		const tools = (["auto", "resident"] as const).map((mode) => ({
+			name: `mcp__ceiling_${mode}__read`,
+			description: mode,
+			parameters: {} as never,
+			metadata: { mcpServerId: `ceiling-${mode}`, mcpToolName: "read" },
+			execute: async () => ({ output: "ok" }),
+		}));
+		try {
+			settings.mcpServers = (["auto", "resident"] as const).map((mode) => ({
+				id: `ceiling-${mode}`,
+				name: mode,
+				mode,
+				enabled: true,
+				transport: "stdio",
+				command: "unused",
+			}));
+			for (const tool of tools) toolRegistry.register(tool);
+			const h = fixture(profiles[1], [finished]);
+			expect((await h.run()).hasError).toBe(false);
+			for (const tool of tools) expect(h.calls[0].config.toolFilter?.(tool)).toBe(true);
+		} finally {
+			settings.mcpServers = original;
+			for (const tool of tools) toolRegistry.unregister(tool.name);
+		}
 	});
 
 	test("child stream reaches both audiences through the real event handler with different origin projection", async () => {
@@ -1588,3 +1619,78 @@ for (const profile of profiles) {
 		}
 	});
 }
+
+describe("foreground run failure status", () => {
+	function tags(id: string): string[] {
+		const row = db.select().from(narrators).where(eq(narrators.id, id)).get();
+		return row?.substatus ? (JSON.parse(row.substatus) as string[]) : [];
+	}
+
+	test("a primary throw settles idle with error instead of staying working", async () => {
+		db.update(narrators)
+			.set({ status: "working" })
+			.where(eq(narrators.id, "contract-primary"))
+			.run();
+		// The loop converts its own failures into a result. This is the infrastructure
+		// throw that used to leave `narrators.status` at working.
+		spyOn(orchestrator, "runAgentLoopUnlocked").mockRejectedValue(new Error("model exploded"));
+		const handle = await startNarratorRun({
+			narratorId: "contract-primary",
+			locale: "en",
+			text: "hello",
+			principal: null,
+			active: active("contract-primary"),
+		});
+		await expect(handle.completion).rejects.toThrow("model exploded");
+		expect(
+			db.select().from(narrators).where(eq(narrators.id, "contract-primary")).get()?.status,
+		).toBe("idle");
+		expect(tags("contract-primary")).toContain("error");
+		expect(tags("contract-primary")).not.toContain("interrupted");
+	});
+
+	test("a throw before registration does not settle a delivering session", async () => {
+		db.update(narrators).set({ status: "working" }).where(eq(narrators.id, "contract-child")).run();
+		const { getRuntimePublicationService } = await import("../agent-runtime/publication");
+		spyOn(getRuntimePublicationService(), "startRun").mockRejectedValue(
+			new Error("registration unavailable"),
+		);
+		const handle = await startNarratorRun({
+			narratorId: "contract-child",
+			locale: "en",
+			text: "",
+			principal: null,
+			active: active("contract-child"),
+		});
+		await expect(handle.completion).rejects.toThrow("registration unavailable");
+		expect(
+			db.select().from(narrators).where(eq(narrators.id, "contract-child")).get()?.status,
+		).toBe("working");
+		expect(tags("contract-child")).not.toContain("error");
+	});
+
+	test("a timed-out throw is timeout rather than interrupted", async () => {
+		db.update(narrators)
+			.set({ status: "working" })
+			.where(eq(narrators.id, "contract-primary"))
+			.run();
+		spyOn(orchestrator, "runAgentLoopUnlocked").mockImplementation(async () => {
+			const run = getRunControl("contract-primary");
+			if (!run) throw new Error("missing run control");
+			run.timedOut = true;
+			run.cancel.abort("Run deadline reached");
+			throw new Error("deadline blew up");
+		});
+		const handle = await startNarratorRun({
+			narratorId: "contract-primary",
+			locale: "en",
+			text: "hello",
+			principal: null,
+			active: active("contract-primary"),
+		});
+		await expect(handle.completion).rejects.toThrow("deadline blew up");
+		expect(tags("contract-primary")).toContain("timeout");
+		expect(tags("contract-primary")).not.toContain("interrupted");
+		expect(tags("contract-primary")).not.toContain("error");
+	});
+});

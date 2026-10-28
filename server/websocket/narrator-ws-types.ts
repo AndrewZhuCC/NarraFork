@@ -86,6 +86,7 @@ export type NarratorServerMessage =
 	| import("@shared/permission-policy-events").PermissionPolicyChangedEvent
 	| import("@shared/git-workspace-events").GitWorkspaceServerMessage
 	| import("@shared/editor-file-events").EditorFileServerMessage
+	| import("@shared/outline-page-events").OutlinePageServerMessage
 	/** No narrator identifiers or payloads; clients re-fetch their ACL-filtered inbox. */
 	| { type: "human_attention_changed" }
 	/** Per-user activity invalidation; no titles, previews or source identifiers. */
@@ -490,6 +491,8 @@ export type NarratorServerMessage =
 	// inline a narrower shape that had already drifted (missing imageCount/creator),
 	// so clients could not see attachments the server was in fact sending.
 	| { type: "buffer_set"; narratorId: string; messages: BufferMessageSummary[] }
+	/** Queued agent messages changed; clients refetch the bounded projection. */
+	| { type: "agent_inbox_changed"; narratorId: string }
 	| {
 			type: "buffer_consumed";
 			narratorId: string;

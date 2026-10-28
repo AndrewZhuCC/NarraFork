@@ -1,3 +1,4 @@
+import { useSharedComputedColorScheme } from "@frontend/hooks/useSharedComputedColorScheme";
 /**
  * RenderToolCall.tsx — Render copy for the ToolCallCard (batch-2 P10).
  *
@@ -34,6 +35,7 @@ import { GenUICard } from "@frontend/components/gen-ui/GenUICard";
 import { DiffContent } from "@frontend/components/narrator/diff/DiffContent";
 import { resolveServerUrl } from "@frontend/lib/base-path";
 import { formatDurationText, formatFullLocaleDateTime } from "@frontend/lib/format";
+import { useOutlineLinkProps } from "@frontend/lib/outline-opener";
 import { getShikiLang } from "@frontend/lib/shiki-lang";
 import {
 	STRUCT_THEME_DARK,
@@ -55,7 +57,6 @@ import {
 	ThemeIcon,
 	Tooltip,
 	UnstyledButton,
-	useComputedColorScheme,
 } from "@mantine/core";
 import {
 	CARD_SHIMMER_CLASS,
@@ -154,6 +155,7 @@ import { FragmentGap, LineFragments } from "./line-fragments";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { type InlinePermissionLabels, RenderInlinePermission } from "./RenderPermission";
 import { type ReflectionNoticeLabels, RenderReflectionNotice } from "./RenderReflectionNotice";
+import { ROW_BUTTON_CLASS, ROW_FLEX_CLASS, rowFlexStyle } from "./row-chrome";
 import { ShareFilePreview } from "./ShareFilePreview";
 import { readExactDisplayBox, VListImage } from "./vlist-image";
 
@@ -290,6 +292,7 @@ export const CATEGORY_COLOR: Record<ToolCategory, string> = {
 	skill: "grape",
 	browser: "teal",
 	knowledge: "grape",
+	outline: "teal",
 	workspace: "gray",
 	generic: "gray",
 };
@@ -338,23 +341,32 @@ function InlineLines({
 	frame,
 	availableWidth,
 	color,
+	unlinkedColor,
 	leadingSlot,
-	href,
+	href: rawHref,
 }: {
 	block: PreparedInlineBlock;
 	frame: BlockFrame;
 	availableWidth: number;
 	color?: string;
+	/** The colour when `href` turns out not to be a link here (an outline link nothing opens). */
+	unlinkedColor?: string;
 	/** Optional glyph drawn in the reserved indent lane (spec-task status icon). */
 	leadingSlot?: React.ReactNode;
 	/**
 	 * When set, the whole measured line box becomes an external link. Drawn as an
 	 * overlay so the pretext line geometry stays the single source of truth (an
 	 * <a> wrapper would let the browser re-lay out the fragments).
+	 *
+	 * An outline link (a block address, a commit) opens an outline panel beside the
+	 * session instead, and is plain text where nothing can open it.
 	 */
 	href?: string | null;
 }) {
 	const lines = useInlineLines(block, availableWidth);
+	const outlineLink = useOutlineLinkProps(rawHref);
+	const href = outlineLink === null ? null : (outlineLink?.href ?? rawHref);
+	if (outlineLink === null && unlinkedColor !== undefined) color = unlinkedColor;
 	return (
 		<div
 			style={{
@@ -368,8 +380,9 @@ function InlineLines({
 			{href ? (
 				<a
 					href={href}
-					target="_blank"
-					rel="noopener noreferrer"
+					{...(outlineLink
+						? { onClick: outlineLink.onClick, "data-outline-link": "" }
+						: { target: "_blank", rel: "noopener noreferrer" })}
 					title={href}
 					style={{
 						position: "absolute",
@@ -510,15 +523,15 @@ function ToolHeaderRow({
 	const statusMark = resolveToolRowStatusMark(status, { reflectionStatus, queuedBehindUpstream });
 	const running = isRunningStatus(status);
 	return (
-		<Group
+		// biome-ignore lint/a11y/noStaticElementInteractions: role/tabIndex/keyboard handler are set together whenever the row is togglable
+		// biome-ignore lint/a11y/useAriaPropsSupportedByRole: aria-expanded is only emitted alongside role="button"
+		<div
 			data-nf-card-header
+			className={ROW_FLEX_CLASS}
 			// The header doubles as the card's selectable surface: Ctrl/Cmd/Shift+Click
 			// must reach the row's selection wrapper (which ignores role="button"
 			// targets) instead of being treated as an interactive island.
 			{...{ [TOOL_HEADER_SELECT_ATTR]: "" }}
-			gap={HEADER_CELL_GAP}
-			wrap="nowrap"
-			align="center"
 			// A keyboard and a screen reader cannot use a bare `onClick` on a div. That
 			// matters most for a DRILLED-IN trace row: its summary line (which did carry
 			// these attributes) is not painted, so this header is the ONLY control that
@@ -528,6 +541,7 @@ function ToolHeaderRow({
 			tabIndex={onToggle ? 0 : undefined}
 			aria-expanded={onToggle ? opened : undefined}
 			style={{
+				...rowFlexStyle(HEADER_CELL_GAP),
 				height: headerRowHeight(),
 				cursor: onToggle ? "pointer" : "default",
 				userSelect: "none",
@@ -702,7 +716,7 @@ function ToolHeaderRow({
 			>
 				{opened ? <IconChevronDown size={12} /> : <IconChevronRight size={12} />}
 			</span>
-		</Group>
+		</div>
 	);
 }
 
@@ -1159,9 +1173,10 @@ export function ToolTimingArea({
 			: merged.title;
 
 	const trigger = (
-		<UnstyledButton
+		<button
 			ref={triggerRef}
 			type="button"
+			className={ROW_BUTTON_CLASS}
 			aria-label={ariaLabel}
 			onFocus={breakdownMount.ensure}
 			style={{
@@ -1202,7 +1217,7 @@ export function ToolTimingArea({
 			}}
 		>
 			{text}
-		</UnstyledButton>
+		</button>
 	);
 
 	const withBreakdown = showBreakdown ? (
@@ -1555,7 +1570,7 @@ function HighlightedBody({ text, lang }: { text: string; lang: string | undefine
  * `TokenFlowText`, so the exactness check and the plain-text fallback apply identically.
  */
 function CustomHighlightedBody({ text, kind }: { text: string; kind: "struct-view" }) {
-	const dark = useComputedColorScheme("dark") !== "light";
+	const dark = useSharedComputedColorScheme("dark") !== "light";
 	// Synchronous: unlike Shiki there is no grammar or WASM to fetch, so there is nothing
 	// to cache and no pending state to render around.
 	const tokens = useMemo(
@@ -1693,6 +1708,7 @@ function DetailBlocks({
 							frame={bf}
 							availableWidth={availableWidth}
 							color={href ? "var(--mantine-color-teal-text)" : lineColor}
+							unlinkedColor={lineColor}
 							leadingSlot={iconSlot}
 							href={href}
 						/>

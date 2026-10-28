@@ -88,6 +88,8 @@ export interface ChatParams extends ProtocolChatParams {
 	stickySessionKey?: string;
 	/** Explicit user-work boundary; omission continues the session's current work turn. */
 	workTurnId?: string;
+	/** Local transport isolation only; does not change wire session IDs or credential affinity. */
+	transportSessionKey?: string;
 	/** Reasoning effort level — maps to thinking config (Anthropic), reasoning config (Codex), or provider-specific effort ("max" may be provider-specific) */
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
 	/** Optional output ceiling; effective model metadata may lower, never raise it. */

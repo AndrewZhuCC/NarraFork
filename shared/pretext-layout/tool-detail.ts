@@ -13,10 +13,12 @@
  * Shared types are the single source for classification, measurement and paint.
  */
 
+import { toolOutputImages } from "../agent-protocol/tool-output";
 import { type GenUiFileReference, readGenUiFileReference } from "../gen-ui-files";
 import { type GenUiKitNotice, readGenUiKitNotice } from "../gen-ui-kit";
 import { GEN_UI_PUBLIC_SUMMARY, GEN_UI_PUBLIC_SUMMARY_CODE } from "../gen-ui-public";
 import { GEN_UI_INLINE_HEIGHTS, readGenUiInlineSize } from "../gen-ui-tool-policy";
+import { outlineAddressPath, outlineCommitPath } from "../outline-links";
 import { hasUsablePlanBody } from "../plan-reference";
 import { classifySharePreview, type SharePreviewRef, sharePreviewHeight } from "../share-preview";
 import { readBackgroundTaskId, stripAwaitAgentEnvelope } from "../subagent-result-text";
@@ -106,6 +108,8 @@ export interface ToolMediaRef {
 	filePath?: string;
 	/** An uploaded image id → fetched via /api/uploads/:narratorId/:imageId. */
 	imageId?: string;
+	/** Upload owner retained across narrator forks; the upload endpoint enforces access. */
+	uploadNarratorId?: string;
 	/** Filename (alt text / image viewer title). */
 	filename?: string;
 	/** Optional size (KB) + format label shown above an image read. */
@@ -987,7 +991,9 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 				: null;
 	const base = withErrorSection(
 		toolName === "GenUI"
-			? (uiDetail ?? sections([textSection("output.main", output, "output")]))
+			? uiInput?.action === "inspect"
+				? classifyGenUiInspection(output)
+				: (uiDetail ?? sections([textSection("output.main", output, "output")]))
 			: classifyByCategory(toolName, category, status, fields, output, metadata, input),
 		input.errorMessage,
 		input.outputJson,
@@ -1000,6 +1006,28 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 			body: part.body.kind === "capped" ? describeToolBody(part.body, input) : part.body,
 		})),
 	};
+}
+
+/** Inspection screenshots use the existing private upload lane, not diagnostic metadata URLs. */
+function classifyGenUiInspection(output: unknown): ToolDetailData | null {
+	return sections([
+		textSection("output.main", output, "output"),
+		...toolOutputImages(output).flatMap((image, index) => {
+			if (!("uploadNarratorId" in image) || !image.imageId || !image.uploadNarratorId) return [];
+			const source = `output._images.${index}` as const;
+			return [
+				section(
+					source,
+					undefined,
+					capped(source, "media", {
+						format: "media",
+						contentPx: MEDIA_IMAGE_CONTENT_PX,
+						media: { imageId: image.imageId, uploadNarratorId: image.uploadNarratorId },
+					}),
+				),
+			];
+		}),
+	]);
 }
 
 /** Resolve each field once: current delta > settled stream fields > formal input. */
@@ -1156,6 +1184,8 @@ function classifyByCategory(
 			return classifyBrowser(status, inputJson, outputJson, metadata);
 		case "knowledge":
 			return classifyKnowledge(toolName, inputJson, outputJson, metadata);
+		case "outline":
+			return classifyOutline(toolName, inputJson, outputJson, metadata);
 		case "contextAsk":
 			return classifyContextAsk(inputJson, outputJson, metadata, status);
 		case "workspace":
@@ -3363,6 +3393,163 @@ function classifyKnowledge(
 		]);
 	}
 	return classifyGeneric(inputJson, outputJson);
+}
+
+/**
+ * The outline tools. A read is a markdown outline (rendered as markdown, under a header naming
+ * the address, its space and size); a search lists its hits; an edit shows what it wrote (its
+ * input is kept whole, see `SKIP_INPUT_TRUNCATE_TOOLS`) and what came of it.
+ *
+ * Block addresses and the commit link to the outline (`outline-links.ts`): the read's address,
+ * each hit, each edit's target (the block the edit changed or created, from the result) and the
+ * edit's commit. The render layer opens them in an outline panel beside the session, and shows
+ * them as plain text where nothing can open them.
+ */
+function classifyOutline(
+	toolName: string,
+	inputJson: unknown,
+	outputJson: unknown,
+	metadata: Record<string, unknown> | null,
+): ToolDetailData | null {
+	const space = asObject(metadata?.space);
+	const spaceKey = space ? readLeafText(space.key) : undefined;
+	if (toolName === "OutlineSearch" && metadata && Array.isArray(metadata.results)) {
+		const results = metadata.results as unknown[];
+		const entries: ToolStructuredEntry[] = [];
+		for (const raw of results.slice(0, 50)) {
+			const r = asObject(raw) ?? {};
+			const address = readLeafText(r.address) ?? "";
+			const path = stringArray(r.path);
+			const snippet = readLeafText(r.snippet) ?? "";
+			const href = outlineAddressPath(address);
+			entries.push({
+				title: readLeafText(r.title) || address,
+				...(href ? { href } : {}),
+				...(address || path.length > 0
+					? { meta: [address, path.join(" › ")].filter(Boolean).join(" · ") }
+					: {}),
+				badges: chips([
+					chip(readLeafText(r.alias), "teal"),
+					chip(r.process === true ? "process" : undefined, "gray"),
+				]),
+				...(snippet ? { snippet: snippet.slice(0, 300) } : {}),
+			});
+		}
+		return single("output.results", {
+			kind: "structured",
+			badgeRows: 1,
+			badges: chips([chip(`${results.length} results`, "teal")]),
+			bodyLines: [],
+			entries,
+		});
+	}
+	if (toolName === "OutlineRead") {
+		const body = resolveDisplayText(outputJson);
+		const address = (metadata ? readLeafText(metadata.address) : undefined) || "";
+		const blocks = typeof metadata?.blocks === "number" ? metadata.blocks : undefined;
+		const asOf = typeof metadata?.asOf === "number" ? metadata.asOf : undefined;
+		const addressHref = outlineAddressPath(address);
+		const header = metaRows([
+			pathRow(address, addressHref ? { href: addressHref } : {}),
+			badgeRow(
+				chips([
+					chip(spaceKey, "teal"),
+					chip(blocks === undefined ? undefined : `${blocks} blocks`, "gray"),
+					chip(asOf === undefined ? undefined : `as of #${asOf}`, "yellow"),
+					chip(metadata?.truncated === true ? "more not shown" : undefined, "orange"),
+				]),
+			),
+		]);
+		return sections([
+			section("meta.read", undefined, header),
+			textSection("output.main", outputJson ?? "", undefined, {
+				cap: "knowledge",
+				contentLines: countLines(body) + 2,
+				text: body,
+				...(body ? { format: "markdown" as const } : {}),
+			}),
+		]);
+	}
+	if (toolName === "OutlineEdit") {
+		const edits = asObject(inputJson)?.edits;
+		// What each edit touched, once committed: one summary per edit, in order.
+		const done = Array.isArray(metadata?.edits) ? (metadata.edits as unknown[]) : [];
+		const lines: string[] = [];
+		if (Array.isArray(edits)) {
+			edits.forEach((raw, index) => {
+				const edit = asObject(raw);
+				if (!edit) return;
+				const kind = ["add", "replace", "move", "delete", "set"].find((k) => k in edit);
+				if (!kind) return;
+				const target = readLeafText(edit[kind]) ?? "";
+				const extra =
+					kind === "move"
+						? ` → ${readLeafText(edit.to) ?? ""}`
+						: kind === "set"
+							? setText(edit)
+							: "";
+				const result = asObject(done[index]);
+				const touched =
+					result?.op === kind
+						? kind === "add"
+							? stringArray(result.created)[0]
+							: readLeafText(result.address)
+						: undefined;
+				const href = outlineAddressPath(touched);
+				// Link text without code spans: the brackets of a markdown link must not be split.
+				const label = target.replace(/[[\]`]/g, "");
+				lines.push(
+					href && label
+						? `**${kind}** [${label}](${href})${extra}`
+						: `**${kind}** \`${target}\`${extra}`,
+				);
+				const text = readLeafText(
+					kind === "add" ? edit.markdown : kind === "replace" ? edit.text : undefined,
+				);
+				if (text) lines.push("", text, "");
+			});
+		}
+		const commit = asObject(metadata?.commit);
+		const seq = commit && typeof commit.seq === "number" ? commit.seq : undefined;
+		const commitHref = spaceKey && seq !== undefined ? outlineCommitPath(spaceKey, seq) : null;
+		const input = lines.join("\n").trim();
+		return sections([
+			section(
+				"meta.edit",
+				undefined,
+				metaRows([
+					badgeRow(
+						chips([
+							chip(spaceKey, "teal"),
+							chip(seq === undefined || commitHref ? undefined : `commit #${seq}`, "green"),
+						]),
+					),
+					commitHref ? pathRow(`commit #${seq}`, { href: commitHref, dimmed: false }) : null,
+				]),
+			),
+			input
+				? textSection("input.edits", inputJson, "input", {
+						cap: "knowledge",
+						contentLines: countLines(input) + 2,
+						text: input,
+						format: "markdown",
+					})
+				: null,
+			outputJson != null
+				? textSection("output.main", outputJson, "result", { format: "markdown" })
+				: null,
+		]);
+	}
+	return classifyGeneric(inputJson, outputJson);
+}
+
+function setText(edit: Record<string, unknown>): string {
+	const parts: string[] = [];
+	const checkbox = readLeafText(edit.checkbox);
+	if (checkbox !== undefined) parts.push(`checkbox ${JSON.stringify(checkbox)}`);
+	if ("assignee" in edit) parts.push(`assignee ${readLeafText(edit.assignee) ?? "none"}`);
+	if ("alias" in edit) parts.push(`alias ${readLeafText(edit.alias) ?? "none"}`);
+	return parts.length > 0 ? `: ${parts.join(", ")}` : "";
 }
 
 /** In-app link to a knowledge entry (the chunked EntryLink target). */

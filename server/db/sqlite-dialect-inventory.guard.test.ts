@@ -410,6 +410,14 @@ const SQLITE_ONLY_MODULES: ReadonlyMap<string, string> = new Map([
 	["server/services/storage-scan-queries.ts", "`dbstat`/page-level SQLite storage accounting"],
 	["server/services/database-cleanup-service.ts", "SQLite VACUUM / page accounting maintenance"],
 	[
+		"server/services/token-recalculation-sqlite.ts",
+		"SQLite batch adapter; PostgreSQL uses token-recalculation-postgres.ts instead",
+	],
+	[
+		"server/services/token-recalculation-worker.ts",
+		"SQLite-only background writer and short busy timeout; PostgreSQL uses its async client",
+	],
+	[
 		"server/services/file-change-physical-audit-worker.ts",
 		"SQLite-side physical audit in a worker",
 	],
@@ -582,6 +590,10 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/notification-center-maintenance.ts": ["sessionFn"],
 	"server/services/notification-center-service.ts": ["sessionFn"],
 	"server/services/oauth-grant-service.ts": ["errorCode"],
+	// The SQLite side of `outline/store/read-port.ts`: FTS5 search, and cached raw statements for
+	// the reads on every page read's path. The PostgreSQL store answers the same port (search
+	// from its pg_trgm shadow table).
+	"server/services/outline/store/sqlite-read.ts": ["handle", "rowid", "fts5"],
 	"server/services/parent-injection-queue.ts": ["json1"],
 	"server/services/revert-history-commit.ts": [
 		"driver",
@@ -627,6 +639,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	],
 	"server/services/subagent-activity.ts": ["json1"],
 	"server/services/subagent-file-changes.ts": ["drizzleDialect"],
+	"server/services/token-recalculation-sqlite.ts": ["driver"],
+	"server/services/token-recalculation-worker.ts": ["connectionModule", "pragma"],
 	"server/services/tool-continuation-service.ts": ["json1"],
 	"server/services/tool-edit-preview.ts": ["json1"],
 	"server/services/usage-history-service.ts": ["connectionModule"],

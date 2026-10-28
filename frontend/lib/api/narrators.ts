@@ -4,6 +4,7 @@ import type {
 	PendingPermission,
 } from "@frontend/types/narrator";
 import type { UsageHistoryStats } from "@frontend/types/usage-history";
+import type { PendingAgentMessagesPage } from "@shared/agent-inbox";
 import type { BackgroundTaskListPage } from "@shared/background-task-list";
 import type { CodexComposerSuggestion } from "@shared/codex-composer";
 import type { ComposerDocument } from "@shared/composer-document";
@@ -670,6 +671,10 @@ export const narratorsApi = {
 			`/narrators/${encodeURIComponent(narratorId)}/request-recordings/requests/${encodeURIComponent(requestId)}`,
 			{ method: "POST", signal },
 		),
+	startModelTrace: (narratorId: string) =>
+		request<{ id: string }>(`/narrators/${encodeURIComponent(narratorId)}/modeltrace`, {
+			method: "POST",
+		}),
 	saveRequestRecording: (narratorId: string, signal?: AbortSignal) =>
 		request<SavedRecording>(`/narrators/${encodeURIComponent(narratorId)}/request-recordings`, {
 			method: "POST",
@@ -1233,6 +1238,21 @@ export const narratorsApi = {
 		}),
 	clearBufferedMessages: (narratorId: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/buffer`, { method: "DELETE" }),
+	getPendingAgentMessages: (narratorId: string, signal?: AbortSignal) =>
+		request<PendingAgentMessagesPage>(
+			`/narrators/${encodeURIComponent(narratorId)}/inbox/agent-messages`,
+			{ signal },
+		),
+	resumeAgentInbox: (narratorId: string) =>
+		request<{ ok: true; resumed: boolean }>(
+			`/narrators/${encodeURIComponent(narratorId)}/inbox/resume`,
+			{ method: "POST" },
+		),
+	discardPendingAgentMessage: (narratorId: string, messageId: string) =>
+		request<{ ok: true }>(
+			`/narrators/${encodeURIComponent(narratorId)}/inbox/agent-messages/${encodeURIComponent(messageId)}`,
+			{ method: "DELETE" },
+		),
 	reorderBufferedMessages: (narratorId: string, orderedIds: string[]) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/buffer/reorder`, {
 			method: "PUT",

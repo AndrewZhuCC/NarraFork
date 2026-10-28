@@ -61,6 +61,7 @@ import { buildAdapterHistory, historyTail } from "./history-build";
 import { countInputCharacters } from "./input-characters";
 import { LoopTranscript, type TranscriptImage } from "./loop-transcript";
 import { isMalformedRequestBodyError, summarizeRequestBody } from "./malformed-request";
+import { rememberModelTraceRequest } from "./modeltrace-request";
 import { type ContentLane, OutputContentAccumulator } from "./output-content";
 import {
 	type ChatParams,
@@ -68,7 +69,7 @@ import {
 	type ParsedStreamEvent,
 	resolveProviderAndModel,
 } from "./provider";
-import { projectAskUserQuestionInput, projectQuestionModelInput } from "./question-model-input";
+import { projectQuestionModelInput } from "./question-model-input";
 import {
 	bindPermissionRecovery,
 	isRecoveredHumanPermission,
@@ -103,7 +104,6 @@ import { ToolInputStream } from "./tool-input-stream";
 import {
 	formatRequestTools,
 	resolveAdapterToolLoadingStrategy,
-	sameToolLoadingLayout,
 	type ToolLoadingStrategy,
 	usesToolLoading,
 } from "./tool-loading";
@@ -124,6 +124,7 @@ import {
 	isExitPlanReflectionWaitingForUser,
 	markExitPlanReflectionStarted,
 } from "./tools/exit-plan-reflection";
+import { isOutlineTool } from "./tools/outline-names";
 import {
 	broadcastTaskReflectionProgress,
 	cleanupTaskReflection,
@@ -148,6 +149,7 @@ import type {
 	ContentBlock,
 	PermissionResult,
 	ResolvedToolDefinition,
+	ToolDefinition,
 } from "./types";
 import {
 	PLAN_MODE_ALLOWED_TOOLS,
@@ -1419,6 +1421,7 @@ export async function runReflectionLoop(
 			onCompletedToolCount: undefined,
 			silentToolCallThreshold: -1,
 			shouldStop: () => observed.decisionSucceeded === true,
+			shouldYieldToInput: undefined,
 			guidanceSignal: undefined,
 			urgentGuidanceSignal: undefined,
 			onToolExecutionInvoking: (toolUse) => {
@@ -2863,40 +2866,49 @@ async function* agentLoopInMetadataSnapshot(
 		return run;
 	};
 
-	let allTools: ResolvedToolDefinition[] = (inheritedTools ? [] : toolRegistry.all())
-		.filter((t) => t.name && (!t.isAvailable || t.isAvailable()))
-		// Last line of defence before the wire. Providers validate the whole `tools`
-		// array and reject the entire request when one name breaks their alphabet
-		// (OpenAI: `Invalid 'tools[19].function.name': ... '^[a-zA-Z0-9_-]+$'`), so a
-		// single malformed dynamic tool would otherwise make every turn fail. Names are
-		// minted sanitized upstream (MCP + plugin bridges); dropping the tool here keeps
-		// the session usable if a future source misses that, instead of rewriting the
-		// name behind the registry's back — a renamed tool could not be executed or
-		// matched against history.
-		.filter((t) => {
-			if (isValidToolName(t.name)) return true;
-			logger.warn("Dropping tool with a provider-invalid name", { toolName: t.name });
-			return false;
-		})
-		.map((t) => ({
-			...t,
-			description: typeof t.description === "function" ? t.description(config) : t.description,
-			rawJsonSchema: t.getRawJsonSchema ? t.getRawJsonSchema(config) : t.rawJsonSchema,
-		}));
+	/** Materialize one candidate view; rebuilds never read a second registry snapshot. */
+	function materializeToolCandidates(
+		candidates: readonly ToolDefinition[],
+	): ResolvedToolDefinition[] {
+		let resolved = candidates
+			.filter((t) => t.name && (!t.isAvailable || t.isAvailable()))
+			// Last line of defence before the wire. Providers validate the whole `tools`
+			// array and reject the entire request when one name breaks their alphabet
+			// (OpenAI: `Invalid 'tools[19].function.name': ... '^[a-zA-Z0-9_-]+$'`), so a
+			// single malformed dynamic tool would otherwise make every turn fail. Names are
+			// minted sanitized upstream (MCP + plugin bridges); dropping the tool here keeps
+			// the session usable if a future source misses that, instead of rewriting the
+			// name behind the registry's back — a renamed tool could not be executed or
+			// matched against history.
+			.filter((t) => {
+				if (isValidToolName(t.name)) return true;
+				logger.warn("Dropping tool with a provider-invalid name", { toolName: t.name });
+				return false;
+			})
+			.map((t) => ({
+				...t,
+				description: typeof t.description === "function" ? t.description(config) : t.description,
+				rawJsonSchema: t.getRawJsonSchema ? t.getRawJsonSchema(config) : t.rawJsonSchema,
+			}));
 
-	// Keep declarations stable across the parent and reflection; the executor still
-	// enforces reflectionOnly/allowedTools, and Codex additionally restricts hosted tools.
-	const reflectionToolDefinitions = allTools.filter((tool) => tool.reflectionOnly);
+		// Keep the wire-level tool list identical for primary and reflection requests so
+		// provider prompt caches can share the same prefix. Reflection permissions remain
+		// narrow: the reflection loop's permissionHandler and executeTool checks enforce
+		// `reflectionLoop.allowedTools` when the model actually attempts a call.
+		if (config.toolFilter) {
+			resolved = resolved.filter((tool) => tool.reflectionOnly || config.toolFilter?.(tool));
+		}
 
-	// Apply toolFilter if provided (used by subagents to restrict available tools)
-	if (config.toolFilter) {
-		allTools = allTools.filter((tool) => tool.reflectionOnly || config.toolFilter?.(tool));
+		// Keep SwitchDevice available for a stale remote default so the model can
+		// recover by explicitly switching back to local. TransferFile still requires
+		// at least one online remote endpoint.
+		return filterDeviceTools(resolved, config);
 	}
 
-	// Keep SwitchDevice available for a stale remote default so the model can
-	// recover by explicitly switching back to local. TransferFile still requires
-	// at least one online remote endpoint.
-	allTools = filterDeviceTools(allTools, config);
+	// Only a standalone first request without host candidates materializes the registry.
+	let allTools = materializeToolCandidates(
+		inheritedTools ? [] : (config.toolCandidates ?? toolRegistry.all()),
+	);
 
 	/**
 	 * Whether plan mode should currently blank out the forbidden tools' descriptions.
@@ -3186,9 +3198,10 @@ async function* agentLoopInMetadataSnapshot(
 			});
 		}
 		// Point B: scan this tool's output for relevant knowledge and inject a reminder.
-		// Skip the knowledge tools themselves to avoid self-amplification.
+		// Skip the knowledge and outline tools themselves to avoid self-amplification.
 		if (
 			!tu.name.startsWith("Knowledge") &&
+			!isOutlineTool(tu.name) &&
 			typeof result.output === "string" &&
 			result.output.length > 0
 		) {
@@ -3391,6 +3404,9 @@ async function* agentLoopInMetadataSnapshot(
 		replacement: AgentHistoryReplacement,
 		options: { sameUpstreamSession?: boolean } = {},
 	) {
+		if (!inheritedTools && replacement.toolLoading && !replacement.toolCandidates) {
+			throw new Error("A tool-loading history replacement must include tool candidates");
+		}
 		historyReplacements++;
 		if (!options.sameUpstreamSession) {
 			resetCacheDropBaseline(config.narratorId);
@@ -3404,13 +3420,11 @@ async function* agentLoopInMetadataSnapshot(
 		}
 		hostHistory = withSystemPrompt(replacement.history);
 		transcript.replace(replacement.rows);
-		// A rebuild after compact (or a load the old history did not contain) moves tools
-		// between the array and the history; keep the array in step with the new history.
-		if (
-			!inheritedTools &&
-			replacement.toolLoading &&
-			!sameToolLoadingLayout(config.toolLoading, replacement.toolLoading)
-		) {
+		// Only a loading-aware rebuild may replace the request's tool view. Candidates and
+		// loading state move together; even an unchanged layout may carry a new tool/schema.
+		if (!inheritedTools && replacement.toolLoading && replacement.toolCandidates) {
+			config.toolCandidates = replacement.toolCandidates;
+			allTools = materializeToolCandidates(replacement.toolCandidates);
 			config.toolLoading = replacement.toolLoading;
 			tools = formatRequestToolsForProvider();
 			void reportToolsCharacters(tools);
@@ -3527,7 +3541,7 @@ async function* agentLoopInMetadataSnapshot(
 		if (guidanceSignal?.aborted) {
 			// FIFO guidance may intentionally enter a pass already stopped. Consume the
 			// host flag and preserve pending input without activating provider/preflight IO.
-			config.shouldStop?.();
+			config.shouldYieldToInput?.();
 			yield { type: "turn_complete", turnIndex };
 			return;
 		}
@@ -3726,21 +3740,28 @@ async function* agentLoopInMetadataSnapshot(
 			 */
 			let gracefulStopRequested = false;
 			/**
-			 * Consume a pending soft-stop request at most once per turn.
+			 * Consume a pending host stop request at most once per turn.
 			 *
 			 * Every boundary asks through here, so the grant is spent exactly once no
 			 * matter which phase observes it first. Asking again after a grant would
 			 * return the *next* request's answer (usually false) and silently resurrect
-			 * the turn the caller already agreed to end.
+			 * the turn the caller already agreed to end. A host stop skips the calls that
+			 * have not started yet.
 			 */
 			const observeSoftStopForTurn = (): boolean => {
-				if (!gracefulStopRequested && guidanceSignal?.aborted) {
-					// Consume the host's one-shot flag too, so the next pass is not stopped again.
-					config.shouldStop?.();
-					gracefulStopRequested = true;
-				}
 				if (!gracefulStopRequested && config.shouldStop?.()) gracefulStopRequested = true;
 				return gracefulStopRequested;
+			};
+			/** Same one-shot contract for queued user input, which never skips a call. */
+			let inputStopRequested = false;
+			const observeInputStopForTurn = (): boolean => {
+				if (!inputStopRequested && guidanceSignal?.aborted) {
+					// Consume the host's one-shot flag too, so the next pass is not stopped again.
+					config.shouldYieldToInput?.();
+					inputStopRequested = true;
+				}
+				if (!inputStopRequested && config.shouldYieldToInput?.()) inputStopRequested = true;
+				return inputStopRequested;
 			};
 			// Map of tool executions started during streaming (toolUseId → Promise)
 			const earlyExecMap = new Map<string, Promise<ToolExecResult>>();
@@ -3756,48 +3777,23 @@ async function* agentLoopInMetadataSnapshot(
 			const startToolExecution = (tu: AgentToolUse): Promise<ToolExecResult> => {
 				const existing = earlyExecMap.get(tu.toolUseId);
 				if (existing) return existing;
-				const preparationAbort = new AbortController();
-				const onGuidance = () =>
-					preparationAbort.abort(new Error("Stopped for immediate guidance"));
-				const removeGuidance = () => guidanceSignal?.removeEventListener("abort", onGuidance);
-				if (guidanceSignal?.aborted) onGuidance();
-				else guidanceSignal?.addEventListener("abort", onGuidance, { once: true });
-				const preparationSignal = AbortSignal.any([toolSignal, preparationAbort.signal]);
+				// Queued guidance never cancels a produced call, not even while it waits for
+				// permission: only the run's own signal and urgent input cancel preparation.
 				const invocationConfig = new Proxy(toolConfig, {
 					get(target, key, receiver) {
-						if (key === "signal") return preparationSignal;
 						if (key === "permissionHandler") {
 							return ((name, input, id, options) =>
 								target.permissionHandler(name, input, id, {
 									...options,
-									signal: preparationSignal,
+									signal: toolSignal,
 								})) satisfies AgentConfig["permissionHandler"];
-						}
-						if (key === "onToolExecutionInvoking") {
-							return (tool: AgentToolUse) => {
-								// No await between this synchronous boundary and tool.execute.
-								preparationSignal.throwIfAborted();
-								removeGuidance();
-								target.onToolExecutionInvoking?.(tool);
-							};
 						}
 						return Reflect.get(target, key, receiver);
 					},
 				});
 				const execution = settleToolExecutionResult(
 					executeToolAfterReflections(tu, invocationConfig, requestRows(), locale),
-				)
-					.then((result) =>
-						preparationAbort.signal.aborted
-							? {
-									...result,
-									output: getToolMessage("skippedForSoftStop", locale),
-									isError: true,
-									metadata: { ...result.metadata, skippedForSoftStop: true },
-								}
-							: result,
-					)
-					.finally(removeGuidance);
+				);
 				earlyExecMap.set(tu.toolUseId, execution);
 				void execution.then((result) => {
 					settledResults.set(tu.toolUseId, result);
@@ -4868,9 +4864,9 @@ async function* agentLoopInMetadataSnapshot(
 				let attemptStreamedContent = false;
 				const guidanceCutsNow = () =>
 					config.urgentGuidanceSignal?.aborted === true || !attemptStreamedContent;
+				// Calls already complete keep their eager start; the turn ends after its tools.
 				const onGuidanceAbort = () => {
-					observeSoftStopForTurn();
-					streamExecutionOpen = false;
+					observeInputStopForTurn();
 					if (guidanceCutsNow()) attemptAbort.abort(guidanceStop);
 				};
 				// Urgent guidance can follow live guidance whose combined signal already fired.
@@ -5085,7 +5081,7 @@ async function* agentLoopInMetadataSnapshot(
 						}
 						consumeSearchExecutionTurn();
 					}
-					const stream = provider.chat({
+					const requestParams: import("./provider").ChatParams = {
 						conversationId: config.conversationId,
 						content: requestContent,
 						model: effectiveModel,
@@ -5096,7 +5092,7 @@ async function* agentLoopInMetadataSnapshot(
 						get reflectionTools() {
 							return config.reflectionLoop
 								? undefined
-								: provider.formatTools(reflectionToolDefinitions);
+								: provider.formatTools(allTools.filter((tool) => tool.reflectionOnly));
 						},
 						reflectionAllowedTools: config.reflectionLoop?.allowedTools,
 						reflectionParentTools: config.reflectionLoop
@@ -5115,7 +5111,12 @@ async function* agentLoopInMetadataSnapshot(
 						requestDump,
 						streamProgress,
 						resetUpstreamSession,
-						onRequestStart: markRequestStarted,
+						onRequestStart: (info) => {
+							if (!config.reflectionLoop) {
+								rememberModelTraceRequest(config.narratorId, provider, requestParams);
+							}
+							markRequestStarted(info);
+						},
 						captureComposerSeed: !!config.onCodexComposerSeed && !config.reflectionLoop,
 						onInputCharacters: async (counts) => {
 							inputCharacters = validInputCharacters(counts);
@@ -5132,7 +5133,8 @@ async function* agentLoopInMetadataSnapshot(
 							}
 						},
 						...(hostHistory && turnImages?.length ? { images: turnImages } : {}),
-					});
+					};
+					const stream = provider.chat(requestParams);
 
 					streamExecutionOpen = true;
 					for await (const streamItem of interleaveWakeups(stream, toolSettledWake)) {
@@ -6258,7 +6260,7 @@ async function* agentLoopInMetadataSnapshot(
 						continue;
 					}
 					if (guidanceSignal?.aborted) {
-						observeSoftStopForTurn();
+						observeInputStopForTurn();
 						// Guidance is not a transport fault. Finalize this partial turn below,
 						// without replay/retry or cancelling tools whose bodies already began.
 						break;
@@ -6702,7 +6704,7 @@ async function* agentLoopInMetadataSnapshot(
 				}
 
 				if (guidanceSignal?.aborted) {
-					observeSoftStopForTurn();
+					observeInputStopForTurn();
 					break;
 				}
 				if (firstTokenTimeoutTriggered) {
@@ -7443,15 +7445,21 @@ async function* agentLoopInMetadataSnapshot(
 			// Tool execution may remain paused behind phase two without holding the response fence.
 			responseActivity.release();
 
-			if (guidanceSignal?.aborted) {
-				observeSoftStopForTurn();
+			// Guidance ends the turn here only when nothing remains to run, or when urgent
+			// input has already cancelled tool IO. Otherwise every produced call executes
+			// below and the step boundary ends the turn: a complete call is never skipped.
+			if (
+				guidanceSignal?.aborted &&
+				(toolUses.length === 0 || config.urgentGuidanceSignal?.aborted === true)
+			) {
+				observeInputStopForTurn();
 				yield* drainStartedEarlyToolResults();
 				if (config.signal.aborted) {
 					yield { type: "error", message: "Aborted" };
 					return;
 				}
 				// Still-running detached calls retain their real pending rows. Do not fabricate
-				// skipped results or replay their incomplete pairs into model-facing history.
+				// results or replay their incomplete pairs into model-facing history.
 				const guidanceTools = toolUses.filter((tu) => !detachedToolResults.has(tu.toolUseId));
 				for (const tu of guidanceTools) {
 					if (yieldedToolResults.has(tu.toolUseId)) continue;
@@ -7459,11 +7467,11 @@ async function* agentLoopInMetadataSnapshot(
 					yield toolResultEvent(
 						tu,
 						settledResults.get(tu.toolUseId) ?? {
-							output: getToolMessage("skippedForSoftStop", locale),
+							output: getToolMessage("cancelledForInterrupt", locale),
 							isError: true,
 							durationMs: 0,
 							completedAt: Date.now(),
-							metadata: { skippedForSoftStop: true },
+							metadata: { cancelledForInterrupt: true },
 						},
 					);
 				}
@@ -7520,7 +7528,10 @@ async function* agentLoopInMetadataSnapshot(
 							{ provider: effectiveProvider, model: effectiveModel },
 							{ narratorId: config.narratorId },
 						);
-						config.onCodexComposerSeed(composerCapture.finalize(finalAnswer.history), requestUserId);
+						config.onCodexComposerSeed(
+							composerCapture.finalize(finalAnswer.history),
+							requestUserId,
+						);
 					} catch (error) {
 						logger.warn("Could not capture optional Composer request", {
 							narratorId: config.narratorId,
@@ -7589,7 +7600,7 @@ async function* agentLoopInMetadataSnapshot(
 						yield* drainEarlyToolResultsAfterAbort();
 						if (config.signal.aborted) yield { type: "error", message: "Aborted" };
 						else {
-							observeSoftStopForTurn();
+							observeInputStopForTurn();
 							yield { type: "turn_complete", turnIndex };
 						}
 						return;
@@ -7684,7 +7695,7 @@ async function* agentLoopInMetadataSnapshot(
 							yield* drainEarlyToolResultsAfterAbort();
 							if (config.signal.aborted) yield { type: "error", message: "Aborted" };
 							else {
-								observeSoftStopForTurn();
+								observeInputStopForTurn();
 								yield { type: "turn_complete", turnIndex };
 							}
 							return;
@@ -7734,11 +7745,12 @@ async function* agentLoopInMetadataSnapshot(
 					}
 				}
 
-				// Check after every serial tool and complete parallel-safe group. Once a soft
+				// Check after every serial tool and complete parallel-safe group. Once a host
 				// stop is observed, never start another tool: only await promises that were
 				// already registered in earlyExecMap and mark every other remaining call skipped.
+				// Queued user input is not a host stop; it waits for the step boundary below.
 				if (observeSoftStopForTurn()) {
-					const skippedOutput = getToolMessage("skippedForSoftStop", locale);
+					const skippedOutput = getToolMessage("skippedForPassEnd", locale);
 					let fatalOutput: string | undefined;
 					for (const remainingTool of toolUses.slice(toolIndex)) {
 						const earlyPromise = earlyExecMap.get(remainingTool.toolUseId);
@@ -7755,7 +7767,7 @@ async function* agentLoopInMetadataSnapshot(
 									isError: true,
 									durationMs: 0,
 									completedAt: Date.now(),
-									metadata: { skippedForSoftStop: true },
+									metadata: { skippedForPassEnd: true },
 								};
 							}
 							continue;
@@ -7766,7 +7778,7 @@ async function* agentLoopInMetadataSnapshot(
 							yield* drainEarlyToolResultsAfterAbort();
 							if (config.signal.aborted) yield { type: "error", message: "Aborted" };
 							else {
-								observeSoftStopForTurn();
+								observeInputStopForTurn();
 								yield { type: "turn_complete", turnIndex };
 							}
 							return;
@@ -7821,9 +7833,10 @@ async function* agentLoopInMetadataSnapshot(
 			await flushLoopInjections();
 			await collectAfterToolsInjections();
 
-			// Close the small race between the final group boundary and the next provider
-			// request: direct user feedback may arrive while after-tools injections are drained.
-			if (observeSoftStopForTurn()) {
+			// Every call of the step has run: queued user input takes the next turn. This also
+			// closes the race with feedback arriving while after-tools injections are drained.
+			const hostStop = observeSoftStopForTurn();
+			if (observeInputStopForTurn() || hostStop) {
 				yield { type: "turn_complete", turnIndex };
 				return;
 			}

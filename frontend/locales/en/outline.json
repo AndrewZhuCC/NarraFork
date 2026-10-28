@@ -1,0 +1,226 @@
+{
+	"title": "Outline",
+	"subtitle": "Notes, decisions and plans as outlines, for projects, sessions and yourself.",
+	"unavailable": "The outline is not turned on for this server.",
+	"notFound": "This page does not exist, or you cannot read it.",
+	"notAtTime": "This block did not exist at that point in the history.",
+	"loadFailed": "Could not load this. Try again in a moment.",
+	"loadMore": "Load more",
+	"home": {
+		"searchPlaceholder": "Search all outlines you can read",
+		"noResults": "No matches.",
+		"process": "Process",
+		"recent": "Recently visited",
+		"noRecent": "Pages you open appear here.",
+		"spaces": "Spaces",
+		"noSpaces": "No spaces yet."
+	},
+	"space": {
+		"personalMine": "My notes",
+		"personalOther": "Personal notes",
+		"project": "{{name}}",
+		"projectUnnamed": "Removed project",
+		"session": "{{name}}",
+		"sessionUnnamed": "Untitled session",
+		"kind": {
+			"project": "Project",
+			"personal": "Personal",
+			"session": "Session"
+		},
+		"orphaned": "Owner removed",
+		"commits_one": "{{count}} commit",
+		"commits_other": "{{count}} commits",
+		"readOnly": "Read only",
+		"searchPlaceholder": "Search this space",
+		"pages": "Pages",
+		"noPages": "No pages yet. Agents and editors add them here."
+	},
+	"page": {
+		"task": {
+			"todo": "To do",
+			"doing": "In progress",
+			"done": "Done",
+			"cancelled": "Cancelled"
+		},
+		"expand": "Expand",
+		"collapse": "Collapse",
+		"focus": "Focus on this block",
+		"due": "Due {{date}}",
+		"alias": "Alias {{alias}}",
+		"inProgress_one": "In progress · {{count}}",
+		"inProgress_other": "In progress · {{count}}",
+		"inProgressHint": "Open tasks under this block. Switch to All to see them.",
+		"more_one": "… {{count}} more",
+		"more_other": "… {{count}} more",
+		"moreAtRoot_one": "… {{count}} more block does not fit on this page; focus on a part of it.",
+		"moreAtRoot_other": "… {{count}} more blocks do not fit on this page; focus on a part of it.",
+		"factsEmpty": "Only tasks and their progress are here. Switch to All to see them.",
+		"empty": "No blocks under this one yet.",
+		"view": {
+			"facts": "Facts",
+			"all": "All"
+		},
+		"viewLabel": "What to show",
+		"sidePanel": "Backlinks and history",
+		"asOfBanner": "Viewing the page as of commit #{{seq}} (read only).",
+		"backToCurrent": "Back to now",
+		"truncated": "This page is too large to read at once; focus on a part of it.",
+		"processHidden_one": "{{count}} block under tasks is not shown.",
+		"processHidden_other": "{{count}} blocks under tasks are not shown.",
+		"showAll": "Show all"
+	},
+	"side": {
+		"backlinks": "Backlinks",
+		"history": "History",
+		"noBacklinks": "Nothing links here.",
+		"backlinksTruncated_one": "Showing the first {{count}}.",
+		"backlinksTruncated_other": "Showing the first {{count}}.",
+		"noHistory": "No history.",
+		"linkKind": {
+			"link": "Link",
+			"embed": "Embed",
+			"depends": "Depends on",
+			"tag": "Tag"
+		},
+		"change": {
+			"create": "Created",
+			"content": "Edited",
+			"move": "Moved",
+			"delete": "Deleted",
+			"restore": "Restored",
+			"task": "Task",
+			"page": "Page changed",
+			"props": "Alias or tags"
+		},
+		"viewAt": "View the page as of commit #{{seq}}"
+	},
+	"timeline": {
+		"label": "Timeline",
+		"previous": "Previous commit",
+		"next": "Next commit",
+		"older": "Load older commits",
+		"empty": "No commits yet.",
+		"now": "Now",
+		"commit": "#{{seq}}",
+		"kind": {
+			"edit": "Edit",
+			"revert": "Revert",
+			"import": "Import"
+		},
+		"actor": {
+			"unknown": "Someone",
+			"agent": "Agent",
+			"agentFor": "Agent for {{name}}",
+			"system": "System"
+		},
+		"revert": "Revert",
+		"revertTitle": "Revert commit #{{seq}}?",
+		"revertConfirm": "A new commit puts back what this commit changed. Blocks changed since then are left as they are.",
+		"cancel": "Cancel",
+		"revertAction": "Revert",
+		"reverted": "Reverted #{{seq}}",
+		"revertFailed": "Revert failed",
+		"revertChanged_one": "{{count}} block put back.",
+		"revertChanged_other": "{{count}} blocks put back.",
+		"revertedNothing": "Nothing could be put back.",
+		"revertSkipped_one": "{{count}} block left as it is:",
+		"revertSkipped_other": "{{count}} blocks left as they are:",
+		"skipReason": {
+			"changed-later": "changed by a later commit",
+			"parent-gone": "the block it belonged under is deleted",
+			"later-children": "blocks were added under it later",
+			"cycle": "it would end up under itself"
+		},
+		"openSession": "Open the session",
+		"sessionUnavailable": "You cannot open the session that wrote this."
+	},
+	"editor": {
+		"changeStatus": "Change status",
+		"hiddenUnder_one": "+{{count}} under a task",
+		"hiddenUnder_other": "+{{count}} under tasks",
+		"tooLarge": "A block can hold at most 16 KB. Split it into more blocks.",
+		"rootKept": "The block in focus stays; go up a level to delete it.",
+		"peerEditing": "{{name}} is editing",
+		"peerViewing": "{{name}} is viewing",
+		"someone": "Someone",
+		"readOnly": "Read only",
+		"connecting": "Connecting…",
+		"connectingHint": "Connecting: typing is kept and sent once live; adding, moving or deleting blocks waits.",
+		"unsavedTitle_one": "What you typed here did not reach the page. It is kept in this tab only, until you dismiss it:",
+		"unsavedTitle_other": "What you typed here in {{count}} places did not reach the page. It is kept in this tab only, until you dismiss it:",
+		"unsavedRefused": "The page could not go live (too large, or no access).",
+		"unsavedReadOnly": "You can no longer edit this page.",
+		"unsavedNotSent": "The page was closed before the server confirmed this text. Check the page: it may be missing.",
+		"unsavedMovedAway": "The block you typed in is no longer on this page (deleted or moved). If it was moved elsewhere, adding it back here makes a second copy.",
+		"restoreUnsaved": "Add as a new block",
+		"restoreNotPossible": "This cannot be restored here now; copy it instead.",
+		"unsavedDropped_one": "{{count}} earlier unsaved text of this page was dropped: this tab keeps at most {{entries}} texts and {{kb}} KB.",
+		"unsavedDropped_other": "{{count}} earlier unsaved texts of this page were dropped: this tab keeps at most {{entries}} texts and {{kb}} KB.",
+		"unsavedMaybeAdded": "Adding it back was sent, but the page closed before confirming it: it may be on the page already. Check before adding it again.",
+		"unsavedAdding": "Adding…",
+		"restoreUnsavedAgain": "Add again anyway",
+		"tabLimitWaiting_one": "{{count}} of them is a hidden page still waiting for the server to confirm what you typed; its place frees up within {{seconds}} s at the latest.",
+		"tabLimitWaiting_other": "{{count}} of them are hidden pages still waiting for the server to confirm what you typed; the first place frees up within {{seconds}} s at the latest.",
+		"copyUnsaved": "Copy text",
+		"unsavedCopied": "Copied",
+		"offline": "Offline: changes are kept and sent when the connection is back",
+		"stalled": "Too many unsent changes: waiting for the server",
+		"deletedBy": "{{name}} deleted the block you were in.",
+		"deletedBySomeone": "Someone deleted the block you were in.",
+		"restore": "Restore",
+		"dismiss": "Dismiss",
+		"tooLargePage": "This page is too large to edit live (over 2000 blocks or 4 MB). It is shown read only; focus on a part of it or split it.",
+		"unavailable": "Live editing is not available right now; the page is shown read only.",
+		"retry": "Try again",
+		"tabLimit": "Shown read only: this tab already has {{count}} outline pages open for live editing. Close or hide one of them, then try again."
+	},
+	"map": {
+		"viewLabel": "View",
+		"outline": "Outline",
+		"map": "Mind map",
+		"right": "Grow rightward",
+		"down": "Grow downward",
+		"fit": "Fit to window",
+		"stage": "Mind map of the page",
+		"more_one": "… {{count}} more",
+		"more_other": "… {{count}} more"
+	},
+	"switcher": {
+		"open": "Quick switcher (Ctrl/⌘ K)",
+		"placeholder": "Jump to a block: title, alias or text",
+		"label": "Find a block to jump to",
+		"empty": "No matches.",
+		"noRecent": "Blocks you focus appear here.",
+		"searching": "Searching other pages…",
+		"via": {
+			"title": "Title",
+			"alias": "Alias",
+			"body": "Text",
+			"recent": "Recent"
+		},
+		"thisPage": "This page",
+		"otherSpace": "Another space"
+	},
+	"history": {
+		"back": "Back (Ctrl/⌘ [)",
+		"forward": "Forward (Ctrl/⌘ ])"
+	},
+	"link": {
+		"notFound": "This outline link points to something that does not exist, or that you cannot read."
+	},
+	"panel": {
+		"openPage": "Open in the outline page"
+	},
+	"dock": {
+		"sessions": "Sessions",
+		"recentSessions": "Recent sessions of this space",
+		"noSessions": "No sessions here yet.",
+		"discuss": "Discuss this page in a session",
+		"discussTitle": "Discuss this page in a session",
+		"discussHint": "A link to this page is put in the session's message box.",
+		"newSession": "New session…"
+	},
+	"workspace": {
+		"addTitle": "Add an outline page"
+	}
+}
