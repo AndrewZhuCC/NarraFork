@@ -270,6 +270,7 @@ def main():
             ['0014_blue_tomorrow_man.sql'], ['0015_nifty_magma.sql'],
             ['0016_high_shiva.sql'], ['0017_merge_opensource_083.sql'],
             ['0018_merge_upstream_090.sql'], ['0205_merge_upstream_093.sql'],
+            ['0227_merge_selfuse_099.sql'],
             ['0209_unified-runtime-registration.sql', '0210_fresh_mephisto.sql',
              '0211_editor_operation_recovery.sql', '0212_file_write_redesign.sql'],
             ['0016_high_shiva.sql', '0017_merge_opensource_083.sql'],

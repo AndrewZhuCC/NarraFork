@@ -21,6 +21,7 @@ const ALLOWED_TARGET_TAGS = new Set([
 	"0212_file_write_redesign",
 	"0225_high_baron_zemo",
 	"0226_merge_selfuse_098",
+	"0227_merge_selfuse_099",
 ]);
 const JOURNAL_TAIL_TAGS = new Set([
 	"0013_omniscient_dormammu",
@@ -34,8 +35,13 @@ const JOURNAL_TAIL_TAGS = new Set([
 	"0212_file_write_redesign",
 	"0225_high_baron_zemo",
 	"0226_merge_selfuse_098",
+	"0227_merge_selfuse_099",
 ]);
 const MAX_REPORT_BYTES = 64 * 1024;
+const MERGE_099_NEW_TABLES = [
+	"outline_block_versions", "outline_blocks", "outline_commits", "outline_links",
+	"outline_live_updates", "outline_spaces", "outline_view_state",
+];
 const MERGE_090_NEW_TABLES = ["user_git_identities", "narrator_git_identity_bindings"];
 const MERGE_092_TAGS = [
 	"0196_narrator_model_history_revision", "0197_fluffy_the_professor",
@@ -268,6 +274,13 @@ function affectedSummary(
 	targetTag: string,
 	excludeNew: boolean,
 ): Record<string, unknown> {
+	if (targetTag === "0227_merge_selfuse_099") {
+		return {
+			api_requests: tableDigest(
+				db, "api_requests", excludeNew ? new Set(["token_accounting_version"]) : new Set(),
+			),
+		};
+	}
 	if (MERGE_098_TARGETS.has(targetTag)) {
 		return Object.fromEntries(
 			Object.entries(MERGE_098_CHANGED_COLUMNS).map(([table, changed]) => [
@@ -431,6 +444,14 @@ function narratorRefsIndexShape(db: Database) {
 }
 
 function schemaShape(db: Database, targetTag?: string): Record<string, unknown> {
+	if (targetTag === "0227_merge_selfuse_099") {
+		return {
+			...Object.fromEntries(MERGE_099_NEW_TABLES.map((table) => [table, tableSchemaShape(db, table)])),
+			tokenAccountingVersion: columnShape(db, "api_requests", "token_accounting_version"),
+			tokenAccountingIndex: db.query("SELECT sql FROM sqlite_master WHERE type='index' AND name=?")
+				.get("idx_api_requests_token_accounting_pending"),
+		};
+	}
 	if (targetTag && MERGE_098_TARGETS.has(targetTag)) {
 		const shape: Record<string, unknown> = {};
 		for (const table of [...MERGE_098_NEW_TABLES, ...MERGE_098_REBUILT_TABLES]) {
@@ -715,7 +736,8 @@ async function main() {
 			throw new Error("Target migration hash was not applied");
 		}
 		const expectedCounts = { ...beforeCounts };
-		const newTables = merge098Chain ? MERGE_098_NEW_TABLES :
+		const newTables = target.tag === "0227_merge_selfuse_099" ? MERGE_099_NEW_TABLES :
+			merge098Chain ? MERGE_098_NEW_TABLES :
 			target.tag === "0012_curved_bloodstorm"
 				? ["file_change_scope_recoveries"]
 				: target.tag === "0013_omniscient_dormammu"
