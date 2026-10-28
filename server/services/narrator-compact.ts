@@ -16,6 +16,10 @@ import {
 	findUnpairedCodexFunctionCallIds,
 } from "../lib/agent/openai-provider";
 import { isCodexRemoteCompactEnabled, resolveProviderAndModel } from "../lib/agent/provider";
+import {
+	deriveHistoricalToolLoadingState,
+	resolveAdapterToolLoadingStrategy,
+} from "../lib/agent/tool-loading";
 import { trackApiRequest } from "../lib/api-request-tracker";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
@@ -38,7 +42,7 @@ import {
 } from "./compact-live-state";
 import { drainQueuedMessagesAfterCompact } from "./compact-queue-drain";
 import { narratorContext } from "./narrator-context";
-import { compactEpochRecord } from "./narrator-epochs";
+import { compactEpochRecord, toolLoadingEpochOf } from "./narrator-epochs";
 import { estimateNarratorBuildHistoryTokens } from "./narrator-history-token-estimate";
 import { narratorService } from "./narrator-service";
 import type { CompactLock, CompactLockResult, CompactMode } from "./narrator-session-state";
@@ -1093,6 +1097,24 @@ async function doRunCustomCompact({
 		messages[0].contentJson.some((block) => parseCompactMessageBlock(block)?.remoteCompact)
 			? messages.shift()
 			: undefined;
+	// Freeze the historical declaration view before the new compact marker is inserted.
+	// Reuse ordinary history projection; never move additions into the cached tools array.
+	const remoteRows = remotePredecessor ? [remotePredecessor, ...messages] : messages;
+	const remoteHistoryOptions =
+		resolvedCompact && isCodexRemoteCompactEnabled(resolvedCompact.adapter)
+			? {
+					toolLoading: {
+						state: deriveHistoricalToolLoadingState(
+							remoteRows,
+							await toolLoadingEpochOf(narratorId, remoteRows),
+						),
+						strategy: resolveAdapterToolLoadingStrategy(
+							resolvedCompact.adapter,
+							resolvedCompact.model,
+						),
+					},
+				}
+			: undefined;
 	let compactBeforeMessageId = beforeMessageId;
 	let expectedAttempt = options?.preparedRetryMessage
 		? compactAttemptNumber(options.preparedRetryMessage)
@@ -1110,6 +1132,7 @@ async function doRunCustomCompact({
 			resolvedCompact.model,
 			resolvedCompact.provider,
 			narratorId,
+			remoteHistoryOptions,
 		);
 		const unpairedCallIds = findUnpairedCodexFunctionCallIds(preview.history, []);
 		if (unpairedCallIds.length > 0) {
@@ -1216,6 +1239,7 @@ async function doRunCustomCompact({
 					resolvedCompact.model,
 					resolvedCompact.provider,
 					narratorId,
+					remoteHistoryOptions,
 				);
 				logger.info("Requesting Codex remote compact", {
 					narratorId,

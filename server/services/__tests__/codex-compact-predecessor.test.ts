@@ -771,3 +771,47 @@ for (const mode of ["disabled", "non-codex"] as const) {
 		expect(localInputs).toEqual([["new"]]);
 	});
 }
+
+test("remote compact replays dynamically loaded tool declarations with their frozen schema", async () => {
+	await seedNarrator();
+	await db
+		.update(narrators)
+		.set({ model: "test-relay:gpt-6-luna", enabledTools: ["GenUI"] })
+		.where(eq(narrators.id, "n1"));
+	await message("load-genui", 1, {
+		type: "tool_loaded",
+		toolName: "gen_ui",
+		toolNames: ["GenUI"],
+		text: "GenUI loaded",
+		definitionSnapshots: [
+			{
+				name: "GenUI",
+				description: "frozen GenUI definition",
+				parameters: { type: "object", properties: { action: { type: "string" } } },
+			},
+		],
+	});
+	await db
+		.update(narratorMessages)
+		.set({ role: "user" })
+		.where(eq(narratorMessages.id, "load-genui"));
+	await message("after-load", 2);
+	expect(await runCustomCompact("n1", "en", undefined, { mode: "blocking" })).toBe(true);
+	expect(requests).toHaveLength(1);
+	expect(requests[0].input.filter((entry) => entry.type === "additional_tools")).toEqual([
+		{
+			type: "additional_tools",
+			role: "developer",
+			tools: [
+				{
+					type: "function",
+					name: "GenUI",
+					description: "frozen GenUI definition",
+					parameters: { type: "object", properties: { action: { type: "string" } } },
+					strict: false,
+				},
+			],
+		},
+	]);
+	expect(localInputs).toEqual([]);
+});

@@ -441,6 +441,25 @@ export function deriveToolLoadingState(
 	};
 }
 
+/** Replay-only state: event-bearing names have their base membership fixed by their
+ * first event (or the recorded epoch). Untouched resident tools produce no additions.
+ * This must not be used to select executable tools or grant current membership. */
+export function deriveHistoricalToolLoadingState(
+	messages: readonly DbMessage[],
+	epoch?: ToolLoadingEpoch,
+): ToolLoadingState {
+	const managed = new Set(epoch?.toolNames ?? []);
+	for (const message of messages) {
+		if (message.role !== "user" || message.parentToolUseId) continue;
+		const block = Array.isArray(message.contentJson) ? message.contentJson[0] : null;
+		if (!block || typeof block !== "object") continue;
+		const record = block as Record<string, unknown>;
+		if (record.type !== "tool_loaded" && record.type !== "tool_unloaded") continue;
+		for (const name of eventToolNames(record)) managed.add(name);
+	}
+	return deriveToolLoadingState(messages, managed, [], epoch);
+}
+
 /**
  * What the current set says that the epoch's frozen set and its notices do not: tools
  * loaded or unloaded without a notice row. Only meaningful for a frozen epoch; the
