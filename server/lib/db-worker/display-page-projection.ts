@@ -6,7 +6,7 @@ import type { NarratorDisplayMessage, NarratorDisplayToolCall } from "./display-
 
 const PRESERVE_ALL = new Set(["ExitPlanMode"]);
 /** Kept whole like `SKIP_INPUT_TRUNCATE_TOOLS` in `narrator-messages.ts`. */
-const PRESERVE_INPUT = new Set(["Agent", "Task", "Send", OUTLINE_EDIT_TOOL]);
+const PRESERVE_INPUT = new Set(["Agent", "Task", "Send", "GenUI", OUTLINE_EDIT_TOOL]);
 
 function preserveInput(toolName: string, input: unknown): boolean {
 	if (PRESERVE_ALL.has(toolName) || PRESERVE_INPUT.has(toolName)) return true;

@@ -1,4 +1,6 @@
 import { afterAll, describe, expect, mock, test } from "bun:test";
+import { classifyToolDetail } from "@shared/pretext-layout/tool-detail";
+import { projectNarratorDisplayMessage } from "../../lib/db-worker/display-page-projection";
 
 // narrator-messages.ts sits in a load-time import cycle
 // (narrator-messages → websocket/narrator-ws → narrator-service → narrator-messages)
@@ -16,9 +18,8 @@ afterAll(() => {
 	mock.restore();
 });
 
-const { stripRedundantToolCallRows, stripProviderMetadata, enrichToolUseBlocks } = await import(
-	"../narrator-messages"
-);
+const { stripRedundantToolCallRows, stripProviderMetadata, enrichToolUseBlocks, truncateToolIO } =
+	await import("../narrator-messages");
 
 const {
 	getReasoningEncryptionState,
@@ -79,6 +80,43 @@ function messageWithTool(overrides: Record<string, unknown> = {}) {
 		...overrides,
 	};
 }
+
+test("GenUI retains complete markup through both display projection paths", () => {
+	const source = `<Stack><Text>${"x".repeat(9000)}</Text></Stack>`;
+	const input = { action: "render", title: "Long UI", size: "lg", source };
+	const metadata = { genUiInline: { version: 1, kit: "builtin" } };
+	const message = messageWithTool({
+		contentJson: [{ type: "tool_use", id: "tu-1", name: "GenUI", input }],
+		toolCalls: [
+			toolCallRow({
+				toolName: "GenUI",
+				inputJson: input,
+				outputJson: { _text: "Rendered", _metadata: metadata },
+			}),
+		],
+	});
+	for (const budget of [2000, 8192]) {
+		const projected = [
+			truncateToolIO([message], budget)[0],
+			projectNarratorDisplayMessage(message as never, budget),
+		];
+		for (const item of projected) {
+			const block = enrichToolUseBlocks([item])[0].contentJson[0];
+			const detail = classifyToolDetail({
+				toolName: block.name,
+				toolUseId: block.id,
+				category: "generic",
+				status: block.status,
+				inputJson: block.inputJson,
+				outputJson: block.outputJson,
+				metadata: block.outputJson._metadata,
+			});
+			expect(detail?.sections[0]?.body.kind).toBe("gen-ui");
+			expect(block.inputJson.source).toBe(source);
+			expect(item.contentJson[0].input.source).toBe(source);
+		}
+	}
+});
 
 describe("stripRedundantToolCallRows", () => {
 	test("drops the rows while leaving the enriched tool_use block intact", () => {

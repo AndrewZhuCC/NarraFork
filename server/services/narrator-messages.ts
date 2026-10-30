@@ -2004,8 +2004,9 @@ const SKIP_TRUNCATE_TOOLS = new Set(["ExitPlanMode"]);
 /**
  * Tool names whose inputJson should not be truncated. OutlineEdit's input is the markdown it
  * writes, bounded by the tool (200 edits, 256 KiB of text), and its card renders it whole.
+ * GenUI's markup is the card itself, bounded by UI_MARKUP_LIMITS to 12,000 characters.
  */
-const SKIP_INPUT_TRUNCATE_TOOLS = new Set(["Agent", "Task", "Send", OUTLINE_EDIT_TOOL]);
+const SKIP_INPUT_TRUNCATE_TOOLS = new Set(["Agent", "Task", "Send", "GenUI", OUTLINE_EDIT_TOOL]);
 
 const SPEC_TASKS_URI = "spec://tasks.json";
 
