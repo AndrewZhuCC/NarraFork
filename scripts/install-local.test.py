@@ -60,6 +60,7 @@ class InstallTest(unittest.TestCase):
             'version': '0.7.3', 'platform': f'darwin-{self.arch}', 'name': self.source.name,
             'size': len(data), 'sha256': hashlib.sha256(data).hexdigest(), 'sha512': 'fixture',
             'commit': self.HEAD[:8],
+            'buildDate': installer.datetime.datetime.now(installer.datetime.timezone.utc).isoformat(),
         }))
 
     def add_pending_0012(self):
@@ -122,6 +123,74 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(len(codesign_calls), 2)
         for call in codesign_calls:
             self.assertIn('=identifier "app.narrafork.selfuse" and certificate leaf', call.args[0][4])
+
+    def test_deployment_cleanup_preserves_current_newer_and_user_data(self):
+        mini_spec = importlib.util.spec_from_file_location(
+            'mini_installer', Path(__file__).with_name('install-ks-mini.py'))
+        mini = importlib.util.module_from_spec(mini_spec)
+        mini_spec.loader.exec_module(mini)
+        for module in (installer, mini):
+            with self.subTest(installer=module.__name__):
+                directory = self.repo / module.__name__
+                directory.mkdir()
+                metadata = {'commit': 'a' * 9, 'buildDate': '2026-10-01T00:00:00Z'}
+
+                def bundle(name, commit, built):
+                    path = directory / name
+                    path.mkdir()
+                    (path / 'deploy.json').write_text(json.dumps({
+                        'metadata': {'commit': commit, 'buildDate': built}}))
+                    return path
+
+                current = bundle('ks-mini-0.9.9-' + 'a' * 9, 'a' * 9, metadata['buildDate'])
+                old = bundle('ks-mini-deploy-' + 'b' * 8 + '-20260920', 'b' * 8,
+                             '2026-09-20T00:00:00Z')
+                newer = bundle('selfuse-0.9.9-' + 'c' * 9, 'c' * 9, '2026-10-02T00:00:00Z')
+                archive = bundle('selfuse-materials-20260917-103049', 'b' * 8,
+                                 '2026-09-17T00:00:00Z')
+                for name in ('project.db', 'project.db-wal', 'project.db-shm', 'notes.log'):
+                    (directory / name).write_bytes(b'keep')
+                attached = directory / 'attached'
+                attached.mkdir()
+                (attached / 'keep.png').write_bytes(b'keep')
+                linked = directory / ('deploy-ks-mini-' + 'd' * 9)
+                linked.symlink_to(archive, target_is_directory=True)
+                unknown = directory / ('deploy-ks-mini-' + 'e' * 9)
+                unknown.mkdir()  # A matching name without a deployment manifest is not ours to remove.
+                for name in ('build-bbbbbbbb.log', 'build-aaaaaaaa.log', 'validate-local-upgrade'):
+                    path = directory / name
+                    path.write_bytes(b'build artifact')
+                    os.utime(path, (1, 1))
+
+                result = module.prune_deployment_staging(directory, metadata, current=current)
+                self.assertEqual(result['removed'], 3)
+                self.assertEqual(result['errorCount'], 0)
+                self.assertFalse(old.exists())
+                self.assertFalse((directory / 'build-bbbbbbbb.log').exists())
+                self.assertFalse((directory / 'validate-local-upgrade').exists())
+                for path in (current, newer, archive, linked, unknown):
+                    self.assertTrue(path.exists())
+                for name in ('project.db', 'project.db-wal', 'project.db-shm', 'notes.log'):
+                    self.assertEqual((directory / name).read_bytes(), b'keep')
+                self.assertEqual((attached / 'keep.png').read_bytes(), b'keep')
+                self.assertTrue((directory / 'build-aaaaaaaa.log').is_file())
+
+
+    def test_deployment_cleanup_runs_only_after_successful_install(self):
+        directory = self.repo / '.narrafork'
+        old = directory / 'deploy-ks-mini-bbbbbbbb'
+        old.mkdir(parents=True)
+        (old / 'deploy.json').write_text(json.dumps({'metadata': {
+            'commit': 'b' * 8, 'buildDate': '2000-01-01T00:00:00Z'}}))
+        database = directory / 'project.db'
+        database.write_bytes(b'user project data')
+        with self.assertRaises(AssertionError):
+            self.install(bad_resolve=True)
+        self.assertTrue(old.exists())
+        self.install()
+        self.assertFalse(old.exists())
+        self.assertEqual(database.read_bytes(), b'user project data')
+
 
     def test_repeated_install_keeps_actual_path_and_backs_up_old_binary(self):
         self.install()

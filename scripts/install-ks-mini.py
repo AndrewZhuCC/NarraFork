@@ -3,8 +3,9 @@
 Usage: python3 install-ks-mini.py <bundle-directory> [--check] [--validate-migrations] [--prepare-update]
 The bundle contains deploy.json and its named artifact; validation bundles also contain the
 validator and migrations. Bundles never contain signing keys.
-After a successful install, keep its backup and remove older timestamped automatic backups.
-Special archives and symlinks are untouched; --check and failed installs never prune backups.
+After a successful install, keep its backup and deployment bundle, removing older automatic
+backups and recognized deployment staging in updates/. User data, special archives, symlinks
+and newer staged builds are preserved; --check and failed installs never prune.
 """
 import datetime
 import hashlib
@@ -122,6 +123,58 @@ def prune_previous_backups(state, current):
                 error_count += 1
                 if len(errors) < 10:
                     errors.append({'backup': entry.name, 'error': str(error)[:500]})
+    return {'removed': removed, 'errorCount': error_count, 'errors': errors}
+
+
+def prune_deployment_staging(directory, metadata, current=None):
+    """Remove only recognized deployment artifacts older than this successful install."""
+    removed, error_count, errors = 0, 0, []
+    if not directory.is_dir() or directory.is_symlink():
+        return {'removed': 0, 'errorCount': 0, 'errors': []}
+    cutoff = datetime.datetime.fromisoformat(metadata['buildDate'].replace('Z', '+00:00'))
+    bundles = re.compile(
+        r'(?:ks-mini(?:-deploy|-compact)?|deploy(?:-ks-mini|-genui)?|selfuse|comments|composer|tab-focus)'
+        r'-(?:\d+\.\d+\.\d+-)?[a-f0-9]{8,40}(?:-(?:\d{8}(?:T\d{6}Z)?|[a-f0-9]{8,40}))?')
+    files = re.compile(
+        r'(?:build-[a-f0-9]{8,40}\.log|deploy-[a-f0-9]{8,40}-host(?:\.err)?\.log|'
+        r'(?:prepare-ksmini|watch-ksmini|restart-host)-[a-f0-9]{8,40}\.py|'
+        r'update-drain-probe-[a-f0-9]{8,40}\.(?:json|release)|validate-local-upgrade)')
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            path = Path(entry.path)
+            if path == current or entry.is_symlink():
+                continue
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    if not bundles.fullmatch(entry.name):
+                        continue
+                    manifest = path / 'deploy.json'
+                    if manifest.is_symlink() or not manifest.is_file() or manifest.stat().st_size > 262144:
+                        continue
+                    old = json.loads(manifest.read_text()).get('metadata', {})
+                    commit = old.get('commit', '')
+                    if not isinstance(commit, str) or not re.fullmatch(r'[a-f0-9]{8,40}', commit):
+                        continue
+                    built = datetime.datetime.fromisoformat(old['buildDate'].replace('Z', '+00:00'))
+                    if built > cutoff or (current is None and (
+                            metadata['commit'].startswith(commit) or commit.startswith(metadata['commit']))):
+                        continue
+                    shutil.rmtree(path)
+                elif entry.is_file(follow_symlinks=False) and files.fullmatch(entry.name):
+                    commit = re.search(r'[a-f0-9]{8,40}', entry.name)
+                    if commit and (metadata['commit'].startswith(commit[0]) or
+                                   commit[0].startswith(metadata['commit'])):
+                        continue
+                    if entry.stat(follow_symlinks=False).st_mtime > cutoff.timestamp():
+                        continue
+                    path.unlink()
+                else:
+                    continue
+                removed += 1
+            except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+                error_count += 1
+                if len(errors) < 10:
+                    errors.append({'artifact': entry.name, 'error': str(error)[:500]})
     return {'removed': removed, 'errorCount': error_count, 'errors': errors}
 
 
@@ -423,6 +476,10 @@ def main():
         result['backupCleanup'] = prune_previous_backups(state, backup)
     except (OSError, AssertionError) as error:
         result['backupCleanup'] = {'errorCount': 1, 'error': str(error)[:500]}
+    try:
+        result['stagingCleanup'] = prune_deployment_staging(bundle.parent, meta, current=bundle)
+    except (OSError, ValueError, KeyError, TypeError, AssertionError) as error:
+        result['stagingCleanup'] = {'errorCount': 1, 'error': str(error)[:500]}
     print(json.dumps(result), flush=True)
 
 
