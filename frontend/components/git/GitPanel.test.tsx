@@ -1,7 +1,12 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import type { WorkspaceContext } from "@shared/workspace-context";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import {
+	focusManager,
+	onlineManager,
+	QueryClient,
+	QueryClientProvider,
+} from "@tanstack/react-query";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
 import { act } from "react";
@@ -13,6 +18,7 @@ import { __resetGitGraphCollapsedCache } from "../../hooks/useGitGraphCollapsed"
 import { __resetGitViewModeCache } from "../../hooks/useGitViewMode";
 import { api } from "../../lib/api";
 import { type GitTarget, type GitWorkspace, gitTargetKey } from "../../lib/api/git";
+import { GitWorkspaceSubscriptions } from "../../lib/git-workspace-subscription";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import commonLocale from "../../locales/en/common.json";
 import gitLocale from "../../locales/en/git.json";
@@ -844,6 +850,120 @@ describe("GitPanel", () => {
 			...overrides,
 		};
 	}
+
+	test("manual scan stays off, reads once with WebSocket connected, and ignores automatic refresh triggers", async () => {
+		const connection = Object.getOwnPropertyDescriptor(narratorWSManager, "connected");
+		Object.defineProperty(narratorWSManager, "connected", {
+			configurable: true,
+			get: () => true,
+		});
+		const calls = { workspace: 0, status: 0, lines: 0, log: 0 };
+		const original = {
+			getGitWorkspace: api.getGitWorkspace,
+			getGitStatus: api.getGitStatus,
+			getGitLineStats: api.getGitLineStats,
+			getGitLog: api.getGitLog,
+		};
+		api.getGitWorkspace = async (_id, _signal, _key, discover) => {
+			expect(discover).toBe(true);
+			calls.workspace++;
+			return readyWorkspace();
+		};
+		api.getGitStatus = async (_target, _signal, fresh) => {
+			expect(fresh).toBe(true);
+			calls.status++;
+			return makeStatus();
+		};
+		api.getGitLineStats = async () => {
+			calls.lines++;
+			return { files: [], linesAdded: 0, linesRemoved: 0, complete: true };
+		};
+		api.getGitLog = async () => {
+			calls.log++;
+			return [];
+		};
+		restoreGitApi = () => Object.assign(api, original);
+		const subscribe = spyOn(GitWorkspaceSubscriptions.prototype, "subscribe");
+		const qc = new QueryClient({
+			defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+		});
+		qc.setQueryData(["settings"], { git: { narratorDetectionDefaultEnabled: false } });
+		qc.setQueryData(["narrators", "manual-git"], { id: "manual-git", cwd: "/repo/sub" });
+		qc.setQueryData(["workspaceContext", "manual-git"], {
+			revision: 1,
+			deviceId: "local",
+			cwd: "/repo/sub",
+		});
+		localStorage.setItem(`${GIT_DETECTION_PREF_PREFIX}manual-git`, "0");
+		const container = document.createElement("div");
+		document.body.appendChild(container);
+		root = createRoot(container);
+		try {
+			root.render(
+				<I18nextProvider i18n={i18n}>
+					<MantineProvider env="test">
+						<QueryClientProvider client={qc}>
+							<GitPanel narratorId="manual-git" />
+						</QueryClientProvider>
+					</MantineProvider>
+				</I18nextProvider>,
+			);
+			await flushRender();
+			await flushRender();
+			expect(calls).toEqual({ workspace: 0, status: 0, lines: 0, log: 0 });
+			const clickScan = () => {
+				const button = Array.from(container.querySelectorAll("button")).find(
+					(node) => node.textContent === "Scan once",
+				);
+				if (!button) throw new Error("Missing scan button");
+				button.click();
+			};
+			clickScan();
+			for (let i = 0; i < 12; i++) await flushRender();
+			expect(calls.workspace).toBe(1);
+			expect(calls.status).toBe(1);
+			expect(calls.lines).toBe(1);
+			expect(container.textContent).toContain("Changes");
+			expect(container.querySelector<HTMLInputElement>('input[type="checkbox"]')?.checked).toBe(
+				false,
+			);
+			expect(localStorage.getItem(`${GIT_DETECTION_PREF_PREFIX}manual-git`)).toBe("0");
+			expect(subscribe).not.toHaveBeenCalled();
+			const afterScan = { ...calls };
+			await qc.invalidateQueries({
+				predicate: (query) => String(query.queryKey[0]).startsWith("git"),
+			});
+			focusManager.setFocused(false);
+			focusManager.setFocused(true);
+			onlineManager.setOnline(false);
+			onlineManager.setOnline(true);
+			for (let i = 0; i < 8; i++) await flushRender();
+			expect(calls).toEqual(afterScan);
+			clickScan();
+			for (let i = 0; i < 12; i++) await flushRender();
+			expect(calls.workspace).toBe(2);
+			expect(calls.status).toBe(2);
+			expect(calls.lines).toBe(2);
+			expect(subscribe).not.toHaveBeenCalled();
+			qc.setQueryData(["workspaceContext", "manual-git"], {
+				revision: 2,
+				deviceId: "local",
+				cwd: "/different",
+			});
+			for (let i = 0; i < 4; i++) await flushRender();
+			expect(container.textContent).not.toContain("Changes");
+			expect(calls.workspace).toBe(2);
+		} finally {
+			root?.unmount();
+			root = undefined;
+			qc.clear();
+			subscribe.mockRestore();
+			if (connection) Object.defineProperty(narratorWSManager, "connected", connection);
+			else Reflect.deleteProperty(narratorWSManager, "connected");
+			focusManager.setFocused(undefined);
+			onlineManager.setOnline(true);
+		}
+	});
 
 	test("narrator Git detection safely defaults off and synchronizes per narrator", async () => {
 		const workspaceCalls: Array<{

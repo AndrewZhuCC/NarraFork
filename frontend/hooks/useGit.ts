@@ -5,7 +5,14 @@ import {
 	useQuery,
 	useQueryClient,
 } from "@tanstack/react-query";
-import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
+import {
+	createContext,
+	useCallback,
+	useContext,
+	useEffect,
+	useMemo,
+	useSyncExternalStore,
+} from "react";
 import type { CurrentDiffView } from "../../server/services/git-current-diff-view";
 import type {
 	FileChangeActorKind,
@@ -333,6 +340,8 @@ export function gitWorkspaceTarget(narratorId: string, workspace?: GitWorkspace)
 	};
 }
 
+export const GitLiveUpdatesContext = createContext(true);
+
 const gitWorkspaceSubscriptions = new WeakMap<QueryClient, GitWorkspaceSubscriptions>();
 // One-shot explicit refresh flags. Ordinary HTTP fallback keeps the server's short cache.
 const freshGitReads = new WeakMap<QueryClient, Set<string>>();
@@ -373,13 +382,14 @@ export function useGitWorkspaceSubscription(
 	view: GitWorkspaceView = "details",
 ) {
 	const subscriptions = workspaceSubscriptions(useQueryClient());
+	const live = useContext(GitLiveUpdatesContext);
 	const narratorId = target?.narratorId;
 	const workspaceKey = gitTargetKey(target);
 	useSyncExternalStore(subscriptions.watch, subscriptions.getRevision, subscriptions.getRevision);
 	useEffect(() => {
-		if (!workspaceKey || !narratorId) return;
+		if (!live || !workspaceKey || !narratorId) return;
 		return subscriptions.subscribe({ narratorId, workspaceKey, canWrite: false }, view);
-	}, [subscriptions, narratorId, workspaceKey, view]);
+	}, [subscriptions, narratorId, workspaceKey, view, live]);
 	return subscriptions;
 }
 
@@ -823,6 +833,7 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 		layoutReady: true,
 		detectionEnabled: detection.enabled,
 		setDetectionEnabled: detection.setEnabled,
+		contextKey: JSON.stringify([narratorId, scope]),
 		workspaceKey: target && typeof target !== "string" ? target.workspaceKey : null,
 		target,
 		selectWorkspace: selection.selectWorkspace,
@@ -905,9 +916,10 @@ function useGitFact<T>(
 	read: (target: GitTarget, signal: AbortSignal, fresh: boolean) => Promise<T>,
 ) {
 	const qc = useQueryClient();
+	const live = useContext(GitLiveUpdatesContext);
 	const subscriptions = useGitWorkspaceSubscription(target, view);
 	const key = gitTargetKey(target);
-	const pushed = !!target && subscriptions.isPush(target);
+	const pushed = live && !!target && subscriptions.isPush(target);
 	const denied = !!target && subscriptions.isDenied(target);
 	const snapshot = useQuery<GitWorkspaceSnapshot>({
 		queryKey: gitSnapshotKey(key, view),
