@@ -1,11 +1,11 @@
 import { afterAll, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narratorBufferedMessages, narratorMessages, narrators } from "../../db/schema";
 
-const { db, sqlite } = getTestDb();
-const realDbModule = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDbModule, db, sqlite, activeDatabaseBackend: "sqlite" }));
+// Share the preload-isolated file-backed DB with the real prefix/history workers.
+const { db, sqlite } = await import("../../db");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 const ws = { ...(await import("../../websocket/narrator-ws")) };
 mock.module("../../websocket/narrator-ws", () => ({ ...ws, broadcastToNarrator: () => {} }));
 mock.module("../agent-runtime/orchestrator", () => ({
@@ -20,7 +20,8 @@ const { getExecutionOwner } = await import("../agent-runtime/ownership");
 const { activeNarrators } = await import("../narrator-session-state");
 const { narratorService } = await import("../narrator-service");
 const time = "2026-09-09T00:00:00.000Z";
-beforeEach(() => {
+beforeEach(async () => {
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	db.insert(narrators)
 		.values({
@@ -32,11 +33,10 @@ beforeEach(() => {
 		})
 		.run();
 });
-afterAll(() => {
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 	getExecutionOwner("recipient")?.release();
-	mock.module("../../db", () => realDbModule);
 	mock.restore();
-	sqlite.close();
 });
 const active = { narratorId: "recipient", locale: "en", _replyInUserLanguage: false } as Parameters<
 	typeof resumeNextBufferedMessage

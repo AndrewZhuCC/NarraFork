@@ -1,5 +1,6 @@
 import { afterAll, afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
+import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import type { ContextUsageSnapshot } from "@shared/context-usage";
 import { createStreamingEditOrigin } from "@shared/streaming-edit-origin";
 import { eq } from "drizzle-orm";
@@ -21,6 +22,7 @@ const { db, sqlite } = getTestDb();
 const dbStub = {
 	db,
 	sqlite,
+	databaseMaintenance: createSqliteMaintenance(() => sqlite),
 	activeDatabaseBackend: "sqlite" as const,
 	startupShutdownState: { canSkipVerification: true },
 	markDatabaseCleanShutdown: () => true,
@@ -464,6 +466,65 @@ function makeMainContext(sseEmitter?: EventEmitter): EventHandlerContext {
 		sseEmitter,
 	};
 }
+
+test("sealing a streamed assistant retains final duration, TTFT and metering without inserting another reply", async () => {
+	const id = "stream-final-metadata";
+	const now = new Date().toISOString();
+	await db.insert(narrators).values({ id, createdAt: now, updatedAt: now });
+	const { createRuntimeEventContext } = await import("../agent-runtime/context");
+	const ctx = createRuntimeEventContext({
+		narratorId: id,
+		conversationId: "stream-session",
+		provider: "test",
+		model: "test-model",
+		locale: "en",
+		getTurnStartedAt: () => new Date(Date.now() - 2000).toISOString(),
+		getTtftMs: () => 125,
+	});
+	try {
+		await processEvent(
+			{
+				type: "block_complete",
+				block: { type: "text", id: "numbers", text: "[17,203]", revision: 1 },
+			},
+			ctx,
+		);
+		const partialId = ctx.getPartialMessageId();
+		expect(partialId).toBeDefined();
+		ctx.setContextUsagePct(25);
+		ctx.setMeterData(1.5, "credits");
+		await processEvent(
+			{
+				type: "assistant_message",
+				text: "[17,203]",
+				toolUses: [],
+				messageId: "upstream-id",
+				credentialId: "credential",
+			},
+			ctx,
+		);
+		const messages = await db
+			.select()
+			.from(narratorMessages)
+			.where(eq(narratorMessages.narratorId, id));
+		expect(messages).toHaveLength(1);
+		expect(messages[0]).toMatchObject({
+			id: partialId,
+			ttftMs: 125,
+			contextPercent: 25,
+			meterUsage: 1.5,
+			meterUnit: "credits",
+			credentialId: "credential",
+			messageUuid: "upstream-id",
+		});
+		expect(messages[0]?.durationMs).toBeGreaterThanOrEqual(2000);
+		expect(ctx.getPartialMessageId()).toBeUndefined();
+		expect(getStreamingSnapshot(id)?.streamingBlocks ?? []).toHaveLength(0);
+	} finally {
+		clearStreamingSnapshot(id);
+		await cleanupFileContextNarrator(id);
+	}
+});
 
 afterEach(() => {
 	clearStreamingSnapshot(PARENT_NARRATOR_ID);

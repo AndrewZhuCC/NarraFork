@@ -13,8 +13,13 @@ import {
 	parseCompactMessageBlock,
 	summarizeCodexRemoteItems,
 } from "@shared/compact-message";
+import type { MediaRef } from "@shared/media-attachments";
 import { logger } from "../logger";
 import { projectFileReferencesForModel } from "./file-reference-projection";
+import {
+	projectCurrentNativeMediaForModel,
+	projectUnsupportedNativeMediaForModel,
+} from "./native-media";
 import { restoreCompactUsers } from "./openai-provider";
 import {
 	type BuiltHistory,
@@ -49,6 +54,8 @@ function rememberRemoteCompactInjection(key: string): boolean {
 }
 export interface AdapterHistoryOptions {
 	narratorId?: string;
+	/** Only references actually sent in a separate current-input lane may be omitted from rows. */
+	currentMedia?: readonly MediaRef[];
 	/**
 	 * Loading state the request's `tools` array is built from, and the strategy
 	 * resolved for this model. Tool loads inside the history are rendered for it.
@@ -58,7 +65,7 @@ export interface AdapterHistoryOptions {
 
 /** Build `adapter`'s history for `model` (the bare id it resolved) from `rows`. */
 export async function buildAdapterHistory(
-	adapter: Pick<ProviderAdapter, "buildHistory">,
+	adapter: Pick<ProviderAdapter, "buildHistory" | "supportsNativeMediaInput">,
 	rows: readonly DbMessage[],
 	target: { provider: string; model: string },
 	options: AdapterHistoryOptions = {},
@@ -73,15 +80,23 @@ export async function buildAdapterHistory(
 	// producing them; strip on the in-memory copy only.
 	// Expand accepted file bytes after prose cleanup: citation-like strings in
 	// a source file are data and must not be rewritten by the citation sanitizer.
-	const cleanedMessages = projectFileReferencesForModel(stripCitationMarkersForModel(modelMessages));
+	const cleanedMessages = projectFileReferencesForModel(
+		stripCitationMarkersForModel(modelMessages),
+	);
 	// Some providers mint the same tool_use id for every call (e.g. "call_go_0"),
 	// which only breaks once several turns accumulate: the replayed history then
 	// carries duplicate ids and the API rejects the request with 400. Rename the
 	// later collisions in this in-memory copy — DB rows keep the original ids.
 	// Attribution is a model-only projection, after accepted file material. Roles and
 	// stored rows stay unchanged; every provider receives the same sender format.
+	const mediaProjection = projectUnsupportedNativeMediaForModel(
+		projectCurrentNativeMediaForModel(cleanedMessages, options.currentMedia, options.narratorId),
+		target.model,
+		adapter,
+		options.narratorId,
+	);
 	const uniqueMessages = uniquifyDbMessageToolUseIds(
-		cleanedMessages.map(projectMessageSenderForModel),
+		mediaProjection.messages.map(projectMessageSenderForModel),
 		{ narratorId: options.narratorId, provider: target.provider, model: target.model },
 	);
 	// Last, so builders see exactly these row objects (changes are keyed by row).
@@ -93,7 +108,16 @@ export async function buildAdapterHistory(
 				resolveLoadableToolDefinition,
 			)
 		: uniqueMessages;
-	const built = await adapter.buildHistory(projectedMessages, target.model, options.narratorId);
+	const result = await adapter.buildHistory(projectedMessages, target.model, options.narratorId);
+	const built = mediaProjection.warnings.length
+		? {
+				...result,
+				mediaFallbackWarnings: [
+					...(result.mediaFallbackWarnings ?? []),
+					...mediaProjection.warnings,
+				],
+			}
+		: result;
 	if (!isCodexRemoteCompactAdapter(adapter as ProviderAdapter)) return built;
 	let compact: { messageId: string; payload: CodexRemoteCompactPayload } | undefined;
 	for (const message of uniqueMessages) {

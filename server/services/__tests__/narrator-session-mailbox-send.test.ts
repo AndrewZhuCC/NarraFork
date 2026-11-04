@@ -3,15 +3,14 @@ import { realpathSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { asc, eq } from "drizzle-orm";
 import { requestInput, rowsAsHistory } from "../../../tests/fixtures/model-input";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narratorBufferedMessages, narratorMessages, narrators, users } from "../../db/schema";
 import type { ChatParams, ProviderAdapter } from "../../lib/agent/provider";
 import type { RuntimeQueuePort } from "../agent-runtime/runtime-queue-port";
 
-const { db, sqlite } = getTestDb();
-// This integration suite owns an in-memory database; importing the production
-// singleton here would start migrations and background upkeep before the mock.
-mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+// The snapshot worker shares the preload-isolated file-backed database.
+const { db, sqlite } = await import("../../db");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 const realProviderModule = { ...(await import("../../lib/agent/provider")) };
 
 for (const statement of [
@@ -158,6 +157,7 @@ async function waitForIdle(narratorId: string, expectedCalls = 1): Promise<void>
 
 beforeEach(async () => {
 	backgroundOccupancyStore.resetForTests();
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	await backgroundOccupancyStore.start();
 	providerCalls.length = 0;
@@ -1277,10 +1277,10 @@ test.each([
 		closeNarrator(narratorId);
 	}
 });
-afterAll(() => {
+afterAll(async () => {
 	backgroundOccupancyStore.resetForTests();
 	mock.module("../../lib/agent/provider", () => realProviderModule);
 	mock.restore();
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
-	sqlite.close();
 });

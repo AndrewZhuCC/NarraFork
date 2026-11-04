@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } 
 import { EventEmitter } from "node:events";
 import { eq } from "drizzle-orm";
 import { z } from "zod/v4";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	backgroundTasks,
 	fileChangeExecutionSegments,
@@ -20,11 +20,9 @@ import {
 import type { ExecuteLoopResult } from "../narrator-executor";
 import type { ActiveNarrator } from "../narrator-session-state";
 
-const { db, sqlite } = getTestDb();
-const realDb = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDb, db, sqlite }));
-const { activateSqliteRuntimePublication } = await import("../agent-runtime/publication");
-activateSqliteRuntimePublication(db);
+// Share the preload-isolated file-backed DB with the real prefix/history workers.
+const { db, sqlite } = await import("../../db");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 // Context now imports publication services; load it only after binding the isolated DB.
 const { createRuntimeEventContext } = await import("../agent-runtime/context");
 const { createRuntimeMapView, getExecutionOwner, setExecutionSuspended, tryClaimExecution } =
@@ -60,7 +58,8 @@ const CHILD = "runtime-owner-child";
 const SIBLING = "runtime-owner-sibling";
 const ids = [ROOT, CHILD, SIBLING];
 
-beforeEach(() => {
+beforeEach(async () => {
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	settings.agent.autoContinuationMode = "off";
 	const now = new Date().toISOString();
@@ -99,9 +98,9 @@ afterEach(() => {
 	}
 	mock.restore();
 });
-afterAll(() => {
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 	unregisterProvider();
-	mock.module("../../db", () => realDb);
 });
 
 function active(narratorId: string): ActiveNarrator {
@@ -1178,6 +1177,13 @@ describe("epoch CAS and legacy projections", () => {
 
 describe("shared event context", () => {
 	test("a delivering run's pass context carries its placement and pass-local state", async () => {
+		// Run-entry locale is display-only; seed the recipient's adopted model reply policy.
+		await db
+			.update(narrators)
+			.set({
+				replyContext: { locale: "zh-CN", replyInUserLanguage: true },
+			})
+			.where(eq(narrators.id, CHILD));
 		const contexts: Array<import("../narrator-event-handler").EventHandlerContext> = [];
 		spyOn(passExecutor, "executeAgentLoop").mockImplementation(async (options) => {
 			contexts.push(options.eventContext);

@@ -2,7 +2,11 @@ import type {
 	OutlineBacklinksResponse,
 	OutlineBlockHistoryResponse,
 	OutlineBlockViewResponse,
+	OutlineLockResponse,
 	OutlinePageListResponse,
+	OutlinePagePendingResponse,
+	OutlinePendingDecisionResponse,
+	OutlinePendingDetailResponse,
 	OutlineResolveResponse,
 	OutlineRevertResponse,
 	OutlineSearchResponse,
@@ -15,6 +19,15 @@ import type {
 	OutlineViewStatePutRequest,
 	OutlineViewStateResponse,
 } from "@shared/outline-api";
+import type {
+	NarratorCurrentTaskResponse,
+	OutlineBoardAddRequest,
+	OutlineBoardAddResponse,
+	OutlineBoardFinishedResponse,
+	OutlineBoardTaskUpdateRequest,
+	OutlineBoardTaskUpdateResponse,
+	OutlineTaskBoardResponse,
+} from "@shared/outline-task-board";
 import { request } from "./client";
 
 /** `?a=1&b=2` from the defined values, or "" when there are none. */
@@ -94,4 +107,59 @@ export const outlineApi = {
 		request<OutlineRevertResponse>(`/outline/commits/${enc(commitId)}/revert`, {
 			method: "POST",
 		}),
+	/** What waits for confirmation on a page, and its locked tasks. */
+	getOutlinePagePending: (spaceId: string, pageId: string) =>
+		request<OutlinePagePendingResponse>(
+			`/outline/spaces/${enc(spaceId)}/pages/${enc(pageId)}/pending`,
+		),
+	/** A pending change block by block. */
+	getOutlinePending: (pendingId: string) =>
+		request<OutlinePendingDetailResponse>(`/outline/pending/${enc(pendingId)}`),
+	confirmOutlinePending: (pendingId: string) =>
+		request<OutlinePendingDecisionResponse>(`/outline/pending/${enc(pendingId)}/confirm`, {
+			method: "POST",
+		}),
+	rejectOutlinePending: (pendingId: string, reason: string | null) =>
+		request<OutlinePendingDecisionResponse>(`/outline/pending/${enc(pendingId)}/reject`, {
+			method: "POST",
+			body: JSON.stringify({ reason }),
+		}),
+	/** Lock a task's tree, naming the session that may confirm on the caller's behalf. */
+	lockOutlineBlock: (spaceId: string, blockId: string, delegate: string | null) =>
+		request<OutlineLockResponse>(`/outline/spaces/${enc(spaceId)}/blocks/${enc(blockId)}/lock`, {
+			method: "POST",
+			body: JSON.stringify({ delegate }),
+		}),
+	unlockOutlineBlock: (spaceId: string, blockId: string) =>
+		request<OutlineLockResponse>(`/outline/spaces/${enc(spaceId)}/blocks/${enc(blockId)}/lock`, {
+			method: "DELETE",
+		}),
+	/** A session's task board (its dock tab). */
+	getSessionTaskBoard: (narratorId: string) =>
+		request<OutlineTaskBoardResponse>(`/outline/narrators/${enc(narratorId)}/tasks`),
+	/** A project's task board, a page of spaces at a time. */
+	getProjectTaskBoard: (projectId: string, cursor: string | null) =>
+		request<OutlineTaskBoardResponse>(
+			`/outline/projects/${enc(projectId)}/tasks${query({ cursor })}`,
+		),
+	/** A space's next finished tasks. */
+	getFinishedTasks: (spaceId: string, cursor: string) =>
+		request<OutlineBoardFinishedResponse>(
+			`/outline/spaces/${enc(spaceId)}/tasks/finished${query({ cursor })}`,
+		),
+	/** A person adds a task to a session. */
+	addBoardTask: (narratorId: string, body: OutlineBoardAddRequest) =>
+		request<OutlineBoardAddResponse>(`/outline/narrators/${enc(narratorId)}/tasks`, {
+			method: "POST",
+			body: JSON.stringify(body),
+		}),
+	/** A person changes one task on the board. */
+	updateBoardTask: (blockId: string, body: OutlineBoardTaskUpdateRequest) =>
+		request<OutlineBoardTaskUpdateResponse>(`/outline/tasks/${enc(blockId)}`, {
+			method: "PATCH",
+			body: JSON.stringify(body),
+		}),
+	/** The status bar's current task, from the session's task source (either backend). */
+	getNarratorCurrentTask: (narratorId: string) =>
+		request<NarratorCurrentTaskResponse>(`/narrators/${enc(narratorId)}/tasks/current`),
 };

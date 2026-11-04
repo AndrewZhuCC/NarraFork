@@ -8,8 +8,13 @@
  * from; blocks synthesized from row-level data use a stable suffix instead.
  */
 
-import { isBrokenToolOutput, toolOutputImages } from "../agent-protocol/tool-output";
+import {
+	isBrokenToolOutput,
+	toolOutputImages,
+	toolOutputMedia,
+} from "../agent-protocol/tool-output";
 import type { TextCitation } from "../citations";
+import { isMediaContentBlock } from "../media-attachments";
 import type { MessageOrigin } from "../message-origin";
 import {
 	contextBlockViews,
@@ -17,6 +22,7 @@ import {
 	modelTextFromContentBlocks,
 	NATIVE_MODEL_CONTEXT_BLOCK_TYPES,
 } from "../native-injection";
+import { contextUpdateOf } from "../prefix-context";
 import type {
 	BlockPart,
 	BlockPhase,
@@ -150,20 +156,24 @@ function toolState(call: DecodableToolCall | undefined): {
 	if (!call || !terminal(call.status)) return { phase: "open" };
 	if (isBrokenToolOutput(call.outputJson)) return { phase: "failed", result: { isError: true } };
 	const images = toolOutputImages(call.outputJson);
+	const media = toolOutputMedia(call.outputJson);
 	return {
 		phase: "done",
 		result: {
 			isError: call.status === "fail",
-			...(images.length
+			...(images.length || media.length
 				? {
-						parts: images.map((image) => ({
-							type: "image" as const,
-							assetId: image.imageId,
-							mediaType: image.mediaType,
-							...("data" in image
-								? { data: image.data }
-								: { uploadNarratorId: image.uploadNarratorId }),
-						})),
+						parts: [
+							...images.map((image) => ({
+								type: "image" as const,
+								assetId: image.imageId,
+								mediaType: image.mediaType,
+								...("data" in image
+									? { data: image.data }
+									: { uploadNarratorId: image.uploadNarratorId }),
+							})),
+							...media,
+						],
 					}
 				: {}),
 		},
@@ -502,6 +512,24 @@ function inputParts(raws: RawBlock[]): BlockPart[] {
 					},
 				];
 			}
+			case "audio":
+			case "video":
+				if (isMediaContentBlock(raw)) return [{ ...raw }];
+				// Like inline images, these bytes belong only to transient in-memory rows.
+				if (
+					raw.mediaId === undefined &&
+					typeof raw.mediaType === "string" &&
+					typeof (raw.base64 ?? raw.dataBase64) === "string"
+				)
+					return [
+						{
+							type: raw.type,
+							mediaType: raw.mediaType,
+							base64: String(raw.base64 ?? raw.dataBase64),
+							...(typeof raw.filename === "string" ? { filename: raw.filename } : {}),
+						},
+					];
+				throw new Error("Stored native media reference is invalid or incomplete.");
 			case "text_file":
 				return [
 					{
@@ -537,6 +565,19 @@ function decodeInputOrContext(message: DecodableMessage, raws: RawBlock[]): Cano
 	const first = raws[0];
 	const flat = message.contentText ?? "";
 	const blockText = modelTextFromContentBlocks(raws);
+
+	// Only a host-authored row can carry an authoritative context update. The text
+	// element is the frozen projection; metadata is never rendered a second time.
+	const contextUpdate =
+		message.role === "sys"
+			? contextUpdateOf(raws.find((raw) => raw.type === "context_update"))
+			: undefined;
+	if (contextUpdate) {
+		return contextBlock(message, "context_update", blockText || flat, {
+			payload: { body: { ...contextUpdate } },
+			contextUpdate,
+		});
+	}
 
 	if (first?.type === "tool_loaded" || first?.type === "tool_unloaded") {
 		return contextBlock(message, first.type, string(first.text) || flat, {

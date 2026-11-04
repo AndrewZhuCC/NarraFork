@@ -84,7 +84,7 @@ import {
 	useNarratorSubagentsCapability,
 } from "../../hooks/usePlatform";
 import { useProviderBalance } from "../../hooks/useProviderBalance";
-import { useSpecTasks } from "../../hooks/useSpec";
+import { useNarratorCurrentTask } from "../../hooks/useTaskBoard";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useTokenDanceBalance } from "../../hooks/useTokenDanceBalance";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
@@ -95,6 +95,7 @@ import {
 } from "../../hooks/useWorkspaceContext";
 import { ApiError, api } from "../../lib/api";
 import type { RevertActionConfirmOptions } from "../../lib/api/narrators";
+import type { SpecTaskItem } from "../../lib/api/spec";
 import { describeApiError } from "../../lib/api-error";
 import { statusRegistry } from "../../lib/constants";
 import { collectElementTextPreview, compactWhitespacePreview } from "../../lib/dom-text";
@@ -803,6 +804,8 @@ function NarratorPanelBody({
 			opts?: {
 				keepImageIds: string[];
 				newImages: File[];
+				keepMediaIds?: string[];
+				newMedia?: File[];
 				keepTextFilePaths: string[];
 				newTextFiles: File[];
 				fileReferences?: FileReference[];
@@ -964,6 +967,9 @@ function NarratorPanelBody({
 	const {
 		attachedImages,
 		attachedTextFiles,
+		attachedMedia,
+		attachedMediaRef,
+		updateAttachedMedia,
 		isDragging,
 		setIsDragging,
 		dragCounterRef,
@@ -986,6 +992,8 @@ function NarratorPanelBody({
 			sendingRef,
 			updateAttachedImages,
 			updateAttachedTextFiles,
+			updateAttachedMedia,
+			attachedMediaRef,
 			setIsDragging,
 			dragCounterRef,
 			captureInsertion: (origin) => composerRef.current?.captureAttachmentInsertion(origin),
@@ -1524,9 +1532,20 @@ function NarratorPanelBody({
 	// header (`toolbarEntryActive` / `activateToolbarEntry`), which also handles the
 	// off-dock drawer fallback.
 
-	// Dynamic Spec current task, for the compact status bar above the input.
-	const { data: specTasksData } = useSpecTasks(narratorId, firstScreenActivity);
-	const currentSpecTask = specTasksData?.compiled.currentTask ?? null;
+	// The current task, for the compact status bar above the input: from the session's task source
+	// (Dynamic Spec or the outline, outline P2 PR 5).
+	const { data: currentTaskData } = useNarratorCurrentTask(narratorId, firstScreenActivity);
+	const currentSpecTask = useMemo<SpecTaskItem | null>(
+		() =>
+			currentTaskData?.current
+				? {
+						text: currentTaskData.current.text,
+						status: "doing",
+						...(currentTaskData.current.protected ? { protected: true as const } : {}),
+					}
+				: null,
+		[currentTaskData],
+	);
 	// Terminal toggle: dock context takes precedence over onToggleTerminal.
 	const terminalToolAvailable = !!dock || !!onToggleTerminal;
 	const terminalToolOpened = dock ? dock.openToolTypes.has("terminal") : (terminalOpen ?? false);
@@ -1804,7 +1823,8 @@ function NarratorPanelBody({
 	// What the composer currently holds, split by ownership: the text flag comes
 	// from NarratorComposer (updates only on empty↔non-empty flips), attachments
 	// are panel state. An image-only draft behaves like a typed one everywhere below.
-	const composerHasAttachments = attachedImages.length + attachedTextFiles.length > 0;
+	const composerHasAttachments =
+		attachedImages.length + attachedTextFiles.length + attachedMedia.length > 0;
 	const composerSendable = composerHasText || composerHasAttachments;
 
 	// Index-based keyboard navigation for permission buttons. Kept lifted here:
@@ -2662,6 +2682,7 @@ function NarratorPanelBody({
 		attachmentsRestoreFailed,
 		attachedImages,
 		attachedTextFiles,
+		attachedMedia,
 		clearAttachedFilesAndDraft,
 		sendingRef,
 		setQueuedMessages,
@@ -2687,6 +2708,7 @@ function NarratorPanelBody({
 		onForkCommand: handleForkCommand,
 		onCompactCommand: handleCompactCommand,
 		onModelTraceStarted: (id) => {
+			void qc.invalidateQueries({ queryKey: ["modeltrace-narrator"] });
 			if (dock?.openSubagentPanel) dock.openSubagentPanel(id);
 			else navigate({ to: "/narrators/$narratorId", params: { narratorId: id } });
 		},
@@ -3587,6 +3609,8 @@ function NarratorPanelBody({
 						common={{ narratorId, narrator, isWorkspacePreview, isMobileViewport }}
 						attachedImages={attachedImages}
 						attachedTextFiles={attachedTextFiles}
+						attachedMedia={attachedMedia}
+						updateAttachedMedia={updateAttachedMedia}
 						attachmentsHydrating={attachmentsHydrating}
 						attachmentsRestoreFailed={attachmentsRestoreFailed}
 						onRetryAttachments={retryAttachmentRestore}
@@ -3635,6 +3659,13 @@ function NarratorPanelBody({
 								isRetrying,
 								isCompacting,
 								currentSpecTask,
+								awaitingConfirmation: currentTaskData
+									? {
+											total: currentTaskData.awaitingConfirmation,
+											yours: currentTaskData.awaitingYourConfirmation,
+											from: currentTaskData.awaitingFrom,
+										}
+									: null,
 								retryInfo,
 								compactingMarkerMessageId,
 								compactFailure,

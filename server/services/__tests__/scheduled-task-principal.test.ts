@@ -46,14 +46,14 @@ type ScheduledTaskRow = typeof scheduledTasks.$inferSelect;
  */
 const realNarratorSession = { ...(await import("../narrator-session")) };
 let sentTo: string | null = null;
-let sentEffort: Parameters<typeof realNarratorSession.sendMessage>[11];
+let sentEffort: Parameters<typeof realNarratorSession.sendMessage>[14];
 let busy = false;
 mock.module("../narrator-session", () => ({
 	...realNarratorSession,
 	isLoopRunning: (id: string) => busy || realNarratorSession.isLoopRunning(id),
 	sendMessage: async (...args: Parameters<typeof realNarratorSession.sendMessage>) => {
 		sentTo = args[0];
-		sentEffort = args[11];
+		sentEffort = args[14];
 		throw new Error("sentinel: sendMessage reached");
 	},
 }));

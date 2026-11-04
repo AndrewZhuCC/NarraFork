@@ -16,6 +16,7 @@ import type {
 import type { FileReference } from "@shared/file-reference";
 import type { GitWorkspaceSummary } from "@shared/git-workspace";
 import type { HumanAttentionPage } from "@shared/human-attention";
+import type { MediaRef } from "@shared/media-attachments";
 import type { NarratorNavigationSummary, NarratorPanelState } from "@shared/narrator-panel-state";
 import {
 	TEXT_DOCUMENT_PACKET_BYTES,
@@ -27,6 +28,7 @@ import type { RequestRecordingDetail, SavedRecording } from "@shared/request-rec
 import type { SubagentModelPools, SubagentModelUse } from "@shared/subagent-model-policy";
 import type { ToolEditPreview } from "@shared/tool-edit-preview";
 import type { WorkspaceContext } from "@shared/workspace-context";
+import i18next from "i18next";
 import { decodeBlockMessage, decodeBlockPage } from "../block-protocol";
 import { narratorLoadingMetrics } from "../narrator-loading-metrics";
 import { createSharedInflight, type SharedReadOptions } from "../shared-inflight";
@@ -41,6 +43,7 @@ import {
 	readFetchError,
 	request,
 } from "./client";
+import { mediaUploadError } from "./media-upload-validation";
 import type {
 	ApiEntity,
 	BlacklistCmd,
@@ -84,6 +87,7 @@ export interface ComposerDocumentDetail {
 		uploadNarratorId?: string;
 	}[];
 	textFiles?: { filename: string; size: number; filePath?: string; index?: number }[];
+	media?: MediaRef[];
 	text?: string;
 	fileReferences?: FileReference[];
 	bodyRevision?: number;
@@ -675,6 +679,15 @@ export const narratorsApi = {
 		request<{ id: string }>(`/narrators/${encodeURIComponent(narratorId)}/modeltrace`, {
 			method: "POST",
 		}),
+	retryModelTrace: (narratorId: string) =>
+		request<{ id: string }>(`/narrators/${encodeURIComponent(narratorId)}/modeltrace/retry`, {
+			method: "POST",
+		}),
+	/** 该模型是否已经有 ModelTrace 舱；没有跑过时为 null。 */
+	getModelTraceNarrator: (model: string) =>
+		request<{ narratorId: string | null }>(
+			`/narrators/modeltrace/lookup?model=${encodeURIComponent(model)}`,
+		),
 	saveRequestRecording: (narratorId: string, signal?: AbortSignal) =>
 		request<SavedRecording>(`/narrators/${encodeURIComponent(narratorId)}/request-recordings`, {
 			method: "POST",
@@ -1178,6 +1191,8 @@ export const narratorsApi = {
 		text: string,
 		opts?: {
 			keepImageIds?: string[];
+			keepMediaIds?: string[];
+			newMedia?: File[];
 			keepTextFiles?: { index: number; filename: string }[];
 			newImages?: File[];
 			newTextFiles?: File[];
@@ -1185,13 +1200,21 @@ export const narratorsApi = {
 			composerDocument?: ComposerDocument;
 		},
 	) => {
+		const uploadError = mediaUploadError({
+			media: opts?.newMedia,
+			otherFiles: [...(opts?.newImages ?? []), ...(opts?.newTextFiles ?? [])],
+			text,
+			keptMediaCount: opts?.keepMediaIds?.length,
+		});
+		if (uploadError) throw new Error(i18next.t(`narrator:${uploadError}`));
 		const path = `/narrators/${narratorId}/buffer/${messageId}`;
-		if (!opts?.newImages?.length && !opts?.newTextFiles?.length) {
+		if (!opts?.newImages?.length && !opts?.newTextFiles?.length && !opts?.newMedia?.length) {
 			return request<{ ok: boolean }>(path, {
 				method: "PATCH",
 				body: JSON.stringify({
 					text,
 					...(opts?.keepImageIds ? { keepImageIds: opts.keepImageIds } : {}),
+					...(opts?.keepMediaIds ? { keepMediaIds: opts.keepMediaIds } : {}),
 					...(opts?.keepTextFiles ? { keepTextFiles: opts.keepTextFiles } : {}),
 					fileReferences: opts?.fileReferences,
 					composerDocument: opts?.composerDocument,
@@ -1201,6 +1224,7 @@ export const narratorsApi = {
 		const formData = new FormData();
 		formData.append("text", text);
 		if (opts.keepImageIds) formData.append("keepImageIds", JSON.stringify(opts.keepImageIds));
+		if (opts.keepMediaIds) formData.append("keepMediaIds", JSON.stringify(opts.keepMediaIds));
 		if (opts.keepTextFiles) formData.append("keepTextFiles", JSON.stringify(opts.keepTextFiles));
 		if (opts.fileReferences !== undefined) {
 			formData.append("fileReferences", JSON.stringify(opts.fileReferences));
@@ -1210,6 +1234,7 @@ export const narratorsApi = {
 		}
 		for (const img of opts.newImages ?? []) formData.append("images", img);
 		for (const tf of opts.newTextFiles ?? []) formData.append("textFiles", tf);
+		for (const media of opts.newMedia ?? []) formData.append("media", media);
 		// Content-Type is left unset so the browser adds the multipart boundary.
 		const res = await authorizedFetch(`${apiBase()}${path}`, { method: "PATCH", body: formData });
 		if (!res.ok) {
@@ -1714,7 +1739,14 @@ export const narratorsApi = {
 		interrupt?: boolean,
 		queueMode?: "turn" | "tool" | "interrupt",
 		options?: { composerDocument?: ComposerDocument },
+		media?: File[],
 	) => {
+		const uploadError = mediaUploadError({
+			media,
+			otherFiles: [...(images ?? []), ...(textFiles ?? [])],
+			text: message,
+		});
+		if (uploadError) throw new Error(i18next.t(`narrator:${uploadError}`));
 		if (queueMode !== undefined) {
 			priority = queueMode !== "turn";
 			interrupt = queueMode === "interrupt";
@@ -1727,7 +1759,7 @@ export const narratorsApi = {
 
 		const url = `${apiBase()}/narrators/${narratorId}/messages`;
 		let res: Response;
-		if (images?.length || textFiles?.length) {
+		if (images?.length || textFiles?.length || media?.length) {
 			const formData = new FormData();
 			formData.append("message", message);
 			if (images) {
@@ -1736,6 +1768,7 @@ export const narratorsApi = {
 			if (textFiles) {
 				for (const tf of textFiles) formData.append("textFiles", tf);
 			}
+			for (const file of media ?? []) formData.append("media", file);
 			if (priority) formData.append("priority", "true");
 			if (interrupt) formData.append("interrupt", "true");
 			if (queueMode !== undefined) formData.append("queueMode", queueMode);
@@ -1892,6 +1925,8 @@ export const narratorsApi = {
 			scope?: RevertScope;
 			revertPlan?: RevertPlanConfirmation;
 			keepImageIds?: string[];
+			keepMediaIds?: string[];
+			newMedia?: File[];
 			newImages?: File[];
 			keepTextFilePaths?: string[];
 			newTextFiles?: File[];
@@ -1906,10 +1941,17 @@ export const narratorsApi = {
 		if (token) headers.Authorization = `Bearer ${token}`;
 		const inputBlockId = opts?.inputBlockId;
 
+		const uploadError = mediaUploadError({
+			media: opts?.newMedia,
+			otherFiles: [...(opts?.newImages ?? []), ...(opts?.newTextFiles ?? [])],
+			text: content,
+			keptMediaCount: opts?.keepMediaIds?.length,
+		});
+		if (uploadError) throw new Error(i18next.t(`narrator:${uploadError}`));
 		let body: BodyInit;
 		// Use multipart whenever new files (images or text files) are uploaded;
 		// kept-subset ids/paths ride along so the server drops removed attachments.
-		if (opts?.newImages?.length || opts?.newTextFiles?.length) {
+		if (opts?.newImages?.length || opts?.newTextFiles?.length || opts?.newMedia?.length) {
 			const formData = new FormData();
 			formData.append("content", content);
 			if (opts.skipRevert !== undefined) {
@@ -1920,6 +1962,7 @@ export const narratorsApi = {
 			if (opts.keepImageIds) {
 				formData.append("keepImageIds", JSON.stringify(opts.keepImageIds));
 			}
+			if (opts.keepMediaIds) formData.append("keepMediaIds", JSON.stringify(opts.keepMediaIds));
 			if (opts.keepTextFilePaths) {
 				formData.append("keepTextFilePaths", JSON.stringify(opts.keepTextFilePaths));
 			}
@@ -1931,6 +1974,7 @@ export const narratorsApi = {
 			}
 			for (const img of opts.newImages ?? []) formData.append("images", img);
 			for (const tf of opts.newTextFiles ?? []) formData.append("textFiles", tf);
+			for (const media of opts.newMedia ?? []) formData.append("media", media);
 			body = formData;
 		} else {
 			headers["Content-Type"] = "application/json";
@@ -1940,6 +1984,7 @@ export const narratorsApi = {
 				...(opts?.scope ? { scope: opts.scope } : {}),
 				...(opts?.revertPlan ? { revertPlan: opts.revertPlan } : {}),
 				...(opts?.keepImageIds ? { keepImageIds: opts.keepImageIds } : {}),
+				...(opts?.keepMediaIds ? { keepMediaIds: opts.keepMediaIds } : {}),
 				...(opts?.keepTextFilePaths ? { keepTextFilePaths: opts.keepTextFilePaths } : {}),
 				fileReferences: opts?.fileReferences,
 				composerDocument: opts?.composerDocument,
@@ -2322,6 +2367,28 @@ export const narratorsApi = {
 
 	// ── Prompt optimization ────────────────────────────────────────────────────
 
+	/**
+	 * Optimize prompt text that has no narrator yet (the "new session" dialog's
+	 * project-prompt box). Same styles and model as the composer's button, but there is
+	 * no session to authorize against or read conversation context from.
+	 */
+	optimizeDraftPrompt: (
+		text: string,
+		style: "clarify" | "concise" | "structured" | "translate_en",
+		options?: { signal?: AbortSignal },
+	) =>
+		request<{ text: string; model: string; reasoningSummary?: string }>(
+			// NOT under `/narrators`: that router resolves a `:id` for every sub-path it
+			// serves, so a narrator-less call there is read as a narrator id and answered
+			// with "Narrator not found". The draft route is its own group.
+			"/prompt-optimize/draft",
+			{
+				method: "POST",
+				body: JSON.stringify({ text, style }),
+				signal: options?.signal,
+			},
+		),
+
 	optimizePrompt: (
 		narratorId: string,
 		text: string,
@@ -2332,14 +2399,17 @@ export const narratorsApi = {
 			signal?: AbortSignal;
 		},
 	) =>
-		request<{ text: string; model: string }>(`/narrators/${narratorId}/optimize-prompt`, {
-			method: "POST",
-			body: JSON.stringify({
-				text,
-				style,
-				withContext: options?.withContext,
-				messageId: options?.messageId,
-			}),
-			signal: options?.signal,
-		}),
+		request<{ text: string; model: string; reasoningSummary?: string }>(
+			`/narrators/${narratorId}/optimize-prompt`,
+			{
+				method: "POST",
+				body: JSON.stringify({
+					text,
+					style,
+					withContext: options?.withContext,
+					messageId: options?.messageId,
+				}),
+				signal: options?.signal,
+			},
+		),
 };

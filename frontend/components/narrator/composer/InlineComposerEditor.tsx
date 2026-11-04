@@ -9,6 +9,8 @@ import {
 	IconFileText,
 	IconLoader2,
 	IconMessageCircle,
+	IconMovie,
+	IconMusic,
 	IconPaperclip,
 	IconPhoto,
 	IconQuote,
@@ -333,7 +335,11 @@ function ComposerAtomView({ node, selected, editor, getPos }: NodeViewProps) {
 				? IconFileText
 				: image
 					? IconPhoto
-					: IconPaperclip;
+					: asset?.kind === "audio"
+						? IconMusic
+						: asset?.kind === "video"
+							? IconMovie
+							: IconPaperclip;
 	return (
 		<NodeViewWrapper
 			as="span"

@@ -7,6 +7,11 @@ import type {
 	ReasoningProviderMetadata,
 	ReferencePricingSnapshot,
 } from "@shared/agent-protocol/types";
+import type {
+	MediaContentBlock,
+	NativeMediaFallbackWarning,
+	NativeMediaInput,
+} from "@shared/media-attachments";
 import type { StreamingEditOrigin } from "@shared/streaming-edit-origin";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { z } from "zod/v4";
@@ -343,19 +348,21 @@ export interface ToolResult {
 	fatal?: boolean;
 	/** Base64-encoded images to include in the tool result (for multimodal providers). */
 	images?: Array<{ format: string; base64: string }>;
+	/** Actual bytes for the next provider request, never persisted in events. */
+	media?: NativeMediaInput[];
+	/** Durable asset references used to reconstruct native media on history replay. */
+	mediaRefs?: MediaContentBlock[];
 }
 
 export interface ToolDefinition {
 	name: string;
-	description: string | ((config: AgentConfig) => string);
+	description: string;
 	parameters: z.ZodType;
 	/** Optional bounded, actionable validation feedback; never includes raw tool input. */
 	formatValidationError?: (error: z.ZodError) => string;
 	/** Pre-built JSON Schema to send to providers, bypassing zodToJsonSchema conversion.
 	 *  Used by MCP tools to preserve the original inputSchema without lossy Zod round-tripping. */
 	rawJsonSchema?: Record<string, unknown>;
-	/** Optional dynamic schema override for tools that depend on current agent config. */
-	getRawJsonSchema?: (config: AgentConfig) => Record<string, unknown>;
 	/** Declarative execution routing; absent means the tool is not filesystem/device routed. */
 	executionRouting?: ToolExecutionRouting;
 	execute: (args: Record<string, unknown>, ctx: ToolContext) => Promise<ToolResult>;
@@ -376,8 +383,8 @@ export interface ToolDefinition {
 	};
 }
 
-/** ToolDefinition with description resolved to a plain string (after dynamic evaluation) */
-export type ResolvedToolDefinition = ToolDefinition & { description: string };
+/** Compatibility alias: tool definitions are already static. */
+export type ResolvedToolDefinition = ToolDefinition;
 
 // === Permission ===
 
@@ -436,6 +443,7 @@ export type AllowPermissionResult = Extract<PermissionResult, { behavior: "allow
 // === Agent events (yielded by the loop) ===
 
 export type AgentEvent =
+	| { type: "media_fallback"; warnings: NativeMediaFallbackWarning[] }
 	| {
 			type: "assistant_message";
 			/** False when an errored/truncated response is retained for already-started tools. */
@@ -487,6 +495,7 @@ export type AgentEvent =
 			completedAt?: number;
 			brokenInputOverride?: Record<string, unknown>;
 			updatedInput?: Record<string, unknown>;
+			mediaRefs?: MediaContentBlock[];
 			metadata?: Record<string, unknown>;
 			/** Images the tool returned; the consumer saves them and stores references. */
 			images?: Array<{ format: string; base64: string }>;
@@ -972,6 +981,7 @@ export interface AgentHistoryReplacement {
 	history: unknown[];
 	/** The rows `history` was built from; they replace the loop's transcript. */
 	rows: readonly import("./provider").DbMessage[];
+	mediaFallbackWarnings?: NativeMediaFallbackWarning[];
 	systemPrompt?: string;
 	/** Persisted input rows the rebuilt history carries. */
 	replayedInjectionMessageIds?: readonly string[];
@@ -1054,6 +1064,12 @@ export interface AgentConfig {
 	signal: AbortSignal;
 	/** Resolved by server runtime assembly; DB authorization remains the final authority. */
 	runtimePolicy?: RuntimePolicy;
+	/**
+	 * Where this session's tasks live (`services/task-source`), resolved once per pass. Under
+	 * `outline` every tool route to `spec://` answers with a hint to use the outline tools
+	 * instead, and taskReflection never runs. Absent means spec.
+	 */
+	taskBackend?: "spec" | "outline";
 	/**
 	 * This narrator is a bot: people see only what it delivers with `Send({ user })`, so
 	 * Send offers that target. Shapes the offered schema only; the bot trait is re-read
@@ -1269,6 +1285,10 @@ export interface AgentConfig {
 		options?: PermissionHandlerOptions,
 	) => Promise<PermissionResult>;
 	onEvent?: (event: AgentEvent) => void;
+	/** Awaited before every actual provider request, including retries and auxiliary
+	 * reflections. Unlike history hooks, this survives reflection configuration and
+	 * does not require prefix/tool-loading state. Rejection must prevent dispatch. */
+	beforeProviderRequest?: () => Promise<void>;
 	/**
 	 * Called before each non-first turn in the agent loop.
 	 * If it returns a rebuilt history, the loop replaces its history and transcript —

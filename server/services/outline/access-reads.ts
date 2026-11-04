@@ -17,7 +17,8 @@
  * working-directory link index lives in SQLite so far.
  *
  * The space listing reuses the dialect-neutral readability predicates of `read/acl-sql.ts`, the
- * same text the project and narrator list queries are built from.
+ * same text the project and narrator list queries are built from; so does the candidate listing
+ * a session's readable spaces are judged from (`session-scope.ts`).
  *
  * THE EXECUTOR
  * ------------
@@ -33,7 +34,13 @@
 import { type SQL, sql } from "drizzle-orm";
 import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
 import { activeDatabaseBackend, db } from "../../db";
-import { bindPlaceholders, narratorReadableText, projectReadableForIdText } from "../read/acl-sql";
+import {
+	bindPlaceholders,
+	narratorProjectIdText,
+	narratorReadableText,
+	projectReadableForIdText,
+	projectReadableText,
+} from "../read/acl-sql";
 import type { OutlineSpaceKind } from "./model";
 import { chunked, type OutlineSpaceRow } from "./store/port";
 
@@ -159,6 +166,52 @@ export async function readJudgedNarrator(
 	return await readNarrator(row.aclRootNarratorId);
 }
 
+/** Where a narrator's tasks live, as its session decides it (`services/task-source`). */
+export interface NarratorTaskBackendRow {
+	/**
+	 * `narrators.task_backend` of the session: a subagent's root's (D31), anyone else's own. A
+	 * subagent whose root is not recorded or gone keeps the value it was created with.
+	 */
+	backend: string;
+	subagent: boolean;
+	/** The session: the narrator itself, or a subagent's root; null when that root is not known. */
+	sessionNarratorId: string | null;
+	/** The owner of that session. */
+	sessionOwnerUserId: string | null;
+}
+
+/**
+ * The task backend of a narrator's session: one statement, the narrator and (for a subagent) its
+ * root by primary key. Read on every turn by the task source, so it stays this small.
+ */
+export async function readNarratorTaskBackend(id: string): Promise<NarratorTaskBackendRow | null> {
+	const rows = await all(sql`
+		select n.id, n.type, n.task_backend, n.owner_user_id, r.id as root_id,
+			r.task_backend as root_task_backend, r.owner_user_id as root_owner_user_id
+		from narrators n
+		left join narrators r on n.type = 'subagent' and r.id = n.acl_root_narrator_id
+		where n.id = ${id} limit 1
+	`);
+	const row = rows[0];
+	if (!row) return null;
+	const subagent = text(row, "type") === "subagent";
+	const rootId = textOrNull(row, "root_id");
+	if (!subagent) {
+		return {
+			backend: text(row, "task_backend"),
+			subagent,
+			sessionNarratorId: text(row, "id"),
+			sessionOwnerUserId: textOrNull(row, "owner_user_id"),
+		};
+	}
+	return {
+		backend: rootId ? text(row, "root_task_backend") : text(row, "task_backend"),
+		subagent,
+		sessionNarratorId: rootId,
+		sessionOwnerUserId: rootId ? textOrNull(row, "root_owner_user_id") : null,
+	};
+}
+
 export async function readProject(id: string): Promise<ProjectAccessRow | null> {
 	const rows = await all(sql`
 		select id, owner_user_id, visibility from projects where id = ${id} limit 1
@@ -187,6 +240,19 @@ export async function readNarratorTitle(id: string): Promise<string | null> {
 export async function readUserExists(id: string): Promise<boolean> {
 	const rows = await all(sql`select id from users where id = ${id} limit 1`);
 	return rows.length > 0;
+}
+
+/** A user by exact username (the name an `@human:` assignment carries), or null. */
+export async function readUserByUsername(
+	username: string,
+): Promise<{ id: string; username: string; isAdmin: boolean } | null> {
+	const rows = await all(
+		sql`select id, username, role from users where username = ${username} limit 1`,
+	);
+	const row = rows[0];
+	return row
+		? { id: text(row, "id"), username: text(row, "username"), isAdmin: row.role === "admin" }
+		: null;
 }
 
 /**
@@ -347,6 +413,7 @@ function toSpace(row: Row): OutlineSpaceRow {
 		ownerUserId: textOrNull(row, "owner_user_id"),
 		nextSeq: Number(row.next_seq),
 		createdAt: text(row, "created_at"),
+		inProcessEpoch: Number(row.in_process_epoch ?? 0),
 	};
 }
 
@@ -383,10 +450,235 @@ export async function readReadableSpacePage(
 			)`;
 	const rows = await all(sql`
 		select s.id, s.key, s.kind, s.project_id, s.narrator_id, s.owner_user_id, s.next_seq,
+			s.in_process_epoch,
 			s.created_at
 		from outline_spaces s
 		where ${visible}
 			${options.kind ? sql`and s.kind = ${options.kind}` : sql``}
+			${options.afterId !== undefined ? sql`and ${id} > ${options.afterId}` : sql``}
+		order by ${id}
+		limit ${options.limit}
+	`);
+	return rows.map(toSpace);
+}
+
+/**
+ * A page of the session spaces of a project's sessions that the principal can read, in narrator
+ * id order after `afterNarratorId`: what the project's task board lists (outline P2 PR 5).
+ *
+ * A session is the project's through any of its links (primary or additional), or through its
+ * explicit project, as the project page's session list counts it (PostgreSQL knows the explicit
+ * project alone so far). Archived sessions are left out: their claims were released when they
+ * were archived. Readability is the narrator list's own predicate, judged on the session (a
+ * session space belongs to a root narrator); admins read every one. The filter runs in SQL,
+ * before the LIMIT. The ids come from the link index (`project_id, narrator_id`) and the explicit
+ * project column, each bounded by the project's sessions; a page is at most `limit` rows.
+ */
+export async function readProjectSessionSpacePage(
+	principal: { userId: string; isAdmin: boolean },
+	projectId: string,
+	options: { afterNarratorId?: string; limit: number },
+): Promise<OutlineSpaceRow[]> {
+	const pg = executor().dialect === "postgres";
+	const narratorId = pg ? sql.raw(`s.narrator_id collate "C"`) : sql.raw("s.narrator_id");
+	const visible = principal.isAdmin
+		? sql``
+		: sql`and ${bindPlaceholders(narratorReadableText("n"), principal.userId)}`;
+	const rows = await all(sql`
+		select s.id, s.key, s.kind, s.project_id, s.narrator_id, s.owner_user_id, s.next_seq,
+			s.in_process_epoch, s.created_at
+		from outline_spaces s
+		join narrators n on n.id = s.narrator_id
+		where s.kind = 'session'
+			and s.narrator_id in (
+				select npl.narrator_id from narrator_project_links npl where npl.project_id = ${projectId}
+				union
+				select n2.id from narrators n2 where n2.context_project_id = ${projectId}
+			)
+			and n.status <> 'archived'
+			${visible}
+			${options.afterNarratorId !== undefined ? sql`and ${narratorId} > ${options.afterNarratorId}` : sql``}
+		order by ${narratorId}
+		limit ${options.limit}
+	`);
+	return rows.map(toSpace);
+}
+
+/** What a session's write rule is decided from, for many sessions at once (the task board). */
+export interface SessionWriteFacts {
+	id: string;
+	ownerUserId: string | null;
+	writeAudience: string;
+	type: string;
+	/**
+	 * The project `resolveNarratorProjectId` gives (the explicit project, else on SQLite the primary
+	 * working-directory link; PostgreSQL knows the explicit project alone so far).
+	 */
+	gateProjectId: string | null;
+}
+
+/** The write facts of the given narrators, one statement per chunk of ids. */
+export async function readSessionWriteFacts(
+	narratorIds: readonly string[],
+): Promise<Map<string, SessionWriteFacts>> {
+	const pg = executor().dialect === "postgres";
+	const gate = sql.raw(pg ? "n.context_project_id" : narratorProjectIdText("n"));
+	const out = new Map<string, SessionWriteFacts>();
+	for (const chunk of chunked([...new Set(narratorIds)])) {
+		const rows = await all(sql`
+			select n.id, n.owner_user_id, n.write_audience, n.type, ${gate} as gate_project_id
+			from narrators n where n.id in (${idList(chunk)}) limit ${chunk.length}
+		`);
+		for (const row of rows) {
+			const id = text(row, "id");
+			out.set(id, {
+				id,
+				ownerUserId: textOrNull(row, "owner_user_id"),
+				writeAudience: text(row, "write_audience"),
+				type: text(row, "type"),
+				gateProjectId: textOrNull(row, "gate_project_id"),
+			});
+		}
+	}
+	return out;
+}
+
+/**
+ * Of the given narrators, those on which `userId` holds a write grant, directly or through the
+ * `user` role (domain credentials are never capabilities). One statement per chunk of ids.
+ */
+export async function readNarratorWriteGrants(
+	narratorIds: readonly string[],
+	userId: string,
+): Promise<Set<string>> {
+	const out = new Set<string>();
+	for (const chunk of chunked([...new Set(narratorIds)])) {
+		const rows = await all(sql`
+			select distinct scope_id from acl_grants
+			where scope_type = 'narrator' and scope_id in (${idList(chunk)}) and domain_kind is null
+				and capability = 'write'
+				and ((principal_type = 'user' and principal_id = ${userId})
+					or (principal_type = 'role' and principal_id = 'user'))
+			limit ${chunk.length}
+		`);
+		for (const row of rows) out.add(text(row, "scope_id"));
+	}
+	return out;
+}
+
+/**
+ * Where the spaces a session might read are looked for (`session-scope.ts` judges each one):
+ *
+ *   - `reader`: what one reader of the session might read (see {@link readSpaceCandidatePage});
+ *   - `open`: project spaces every signed-in user can read (public, or granted to the `user`
+ *     role); never a session space;
+ *   - `all`: every space of the kind with an owner left (sessions only admins read).
+ */
+export type OutlineSpaceCandidates =
+	| { kind: "reader"; userId: string }
+	| { kind: "open" }
+	| { kind: "all" };
+
+/** A project every signed-in user can read: the rule of `projectOpenToEveryone`. */
+function openProjectText(projectAlias: string): string {
+	return `(
+		${projectAlias}.visibility = 'public'
+		or exists (
+			select 1 from acl_grants rg
+			where rg.scope_type = 'project' and rg.scope_id = ${projectAlias}.id
+				and rg.domain_kind is null and rg.principal_type = 'role' and rg.principal_id = 'user'
+				and rg.capability in ('read','write','manage')
+		)
+	)`;
+}
+
+/**
+ * The narrator of session space `s` (judged on its root, as every decision about a subagent is),
+ * when the person (every `?`) might read it: `narratorUsersWith` widened so that it never leaves
+ * out a narrator that rule admits. The owner; a public narrator; otherwise past the project gate,
+ * a narrator visible to its project or granted to the person or to the `user` role. The gate
+ * passes a project the person reads or every signed-in user reads (a grant to the `user` role
+ * opens it in the rule, though not in the per-person list predicates).
+ *
+ * The gate's project is the one `resolveNarratorProjectId` gives on each backend
+ * (`gateProject`): on SQLite the explicit project, else the primary working-directory link
+ * (`narratorProjectIdText`), so sessions filed under someone's private project by their working
+ * directory, the usual way, are not offered to everyone; on PostgreSQL, which knows only the
+ * explicit project so far, that one alone.
+ */
+function sessionCandidateText(gateProject: string): string {
+	return `exists (
+		select 1 from narrators n
+		join narrators jn
+			on jn.id = case when n.type = 'subagent' then n.acl_root_narrator_id else n.id end
+		where n.id = s.narrator_id
+			and (
+				jn.owner_user_id = ?
+				or jn.visibility = 'public'
+				or (
+					not exists (
+						select 1 from projects gp
+						where gp.id = ${gateProject}
+							and not (${projectReadableText("gp")} or ${openProjectText("gp")})
+					)
+					and (
+						jn.visibility = 'project'
+						or exists (
+							select 1 from acl_grants ng
+							where ng.scope_type = 'narrator' and ng.scope_id = jn.id
+								and ng.domain_kind is null and ng.capability in ('read','write')
+								and (
+									(ng.principal_type = 'user' and ng.principal_id = ?)
+									or (ng.principal_type = 'role' and ng.principal_id = 'user')
+								)
+						)
+					)
+				)
+			)
+	)`;
+}
+
+/**
+ * A page of project or session spaces a session might read, in id order after `afterId`. The
+ * filter runs in SQL, before the LIMIT. Candidates only, and always a SUPERSET of what the
+ * verdicts of `session-scope.ts` admit (the access matrix holds it to that): a session reads
+ * only what each of its readers reads, so what one reader (`reader`) might read covers it.
+ *   - project spaces: projects the reader reads by the per-person predicate (owner, public, a
+ *     user grant), and projects every signed-in user reads (a grant to the `user` role);
+ *   - session spaces: {@link sessionCandidateText}.
+ */
+export async function readSpaceCandidatePage(
+	from: OutlineSpaceCandidates,
+	options: { kind: "project" | "session"; afterId?: string; limit: number },
+): Promise<OutlineSpaceRow[]> {
+	const pg = executor().dialect === "postgres";
+	const id = pg ? sql.raw(`s.id collate "C"`) : sql.raw("s.id");
+	let filter: SQL;
+	if (options.kind === "project") {
+		const open = sql.raw(
+			`exists (select 1 from projects op where op.id = s.project_id and ${openProjectText("op")})`,
+		);
+		filter =
+			from.kind === "all"
+				? sql`s.project_id is not null`
+				: from.kind === "open"
+					? open
+					: sql`(${bindPlaceholders(projectReadableForIdText("s.project_id"), from.userId)} or ${open})`;
+	} else {
+		if (from.kind === "open") return [];
+		filter =
+			from.kind === "all"
+				? sql`s.narrator_id is not null`
+				: bindPlaceholders(
+						sessionCandidateText(pg ? "jn.context_project_id" : narratorProjectIdText("jn")),
+						from.userId,
+					);
+	}
+	const rows = await all(sql`
+		select s.id, s.key, s.kind, s.project_id, s.narrator_id, s.owner_user_id, s.next_seq,
+			s.created_at
+		from outline_spaces s
+		where s.kind = ${options.kind} and ${filter}
 			${options.afterId !== undefined ? sql`and ${id} > ${options.afterId}` : sql``}
 		order by ${id}
 		limit ${options.limit}

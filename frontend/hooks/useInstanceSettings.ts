@@ -41,6 +41,7 @@ export interface InstanceSettingsState {
 	projectDir: string;
 	// TLS
 	tlsEnabled: boolean;
+	tlsAutoReissue: boolean;
 	tlsCertFile: string;
 	tlsKeyFile: string;
 	tlsPassphrase: string;
@@ -227,6 +228,7 @@ function makeDefaults(): InstanceSettingsState {
 		openBrowser: "app",
 		projectDir: "",
 		tlsEnabled: false,
+		tlsAutoReissue: true,
 		tlsCertFile: "",
 		tlsKeyFile: "",
 		tlsPassphrase: "",
@@ -331,6 +333,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				openBrowser: settings.server?.openBrowser ?? "app",
 				projectDir: settings.paths?.defaultProjectDir ?? "",
 				tlsEnabled: settings.server?.tls?.enabled ?? false,
+				tlsAutoReissue: settings.server?.tls?.autoReissue ?? true,
 				tlsCertFile: settings.server?.tls?.certFile ?? "",
 				tlsKeyFile: settings.server?.tls?.keyFile ?? "",
 				tlsPassphrase: "",
@@ -446,6 +449,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					openBrowser: state.openBrowser,
 					tls: {
 						enabled: state.tlsEnabled,
+						autoReissue: state.tlsAutoReissue,
 						certFile: state.tlsCertFile,
 						keyFile: state.tlsKeyFile,
 						...(state.tlsPassphrase && { passphrase: state.tlsPassphrase }),

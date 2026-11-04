@@ -226,6 +226,7 @@ function SettingsUsagePage() {
 		() =>
 			[
 				"narrator",
+				"modeltrace",
 				"compact",
 				"composer",
 				"context_ask",

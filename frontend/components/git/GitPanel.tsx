@@ -19,6 +19,7 @@ import {
 import { type ApiError, api } from "../../lib/api";
 import { type GitWorkspace, gitTargetKey } from "../../lib/api/git";
 import { ConfirmDialogProvider } from "../common/ConfirmDialogProvider";
+import { GitBranchBar } from "./GitBranchBar";
 import { GitChangesTab } from "./GitChangesTab";
 import { GitCommitGraph } from "./GitCommitGraph";
 
@@ -289,6 +290,7 @@ export function GitPanelContent({
 				</Alert>
 			)}
 			<Box style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+				<GitBranchBar target={target} readOnly={readOnly} />
 				<GitChangesTab target={target} onRefresh={refresh} />
 				<GitCommitGraph target={target} />
 			</Box>

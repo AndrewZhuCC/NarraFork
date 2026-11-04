@@ -8,6 +8,7 @@ import type {
 	BackgroundTaskListDelta,
 	BackgroundTaskProgressFrame,
 } from "@shared/background-task-list";
+import type { NativeMediaFallbackWarning } from "@shared/media-attachments";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import type { NOTIFICATION_CENTER_CHANGED_WS_TYPE } from "@shared/notification-center";
@@ -880,6 +881,8 @@ export type NarratorServerMessage =
 			type: "warning";
 			narratorId: string;
 			message: string;
+			warningCode?: "native_media_fallback";
+			mediaFallbackWarnings?: NativeMediaFallbackWarning[];
 			retryCount?: number;
 			maxRetries?: number;
 			delayMs?: number;
@@ -1095,6 +1098,8 @@ export type NarratorServerMessage =
 			narratorId: string;
 			subagentNarratorId: string;
 			message: string;
+			warningCode?: "native_media_fallback";
+			mediaFallbackWarnings?: NativeMediaFallbackWarning[];
 			retryCount?: number;
 			maxRetries?: number;
 			delayMs?: number;
@@ -1240,6 +1245,14 @@ export type NarratorServerMessage =
 			type: "subagent_attached";
 			narratorId: string;
 			subagentNarratorId: string;
+	  }
+	| {
+			/**
+			 * The tasks a session's task board shows changed (outline P2 PR 5): ids only, merged
+			 * within 250 ms; the board and the status bar read again over HTTP.
+			 */
+			type: "outline_tasks_changed";
+			narratorId: string;
 	  }
 	| {
 			type: "spec_changed";

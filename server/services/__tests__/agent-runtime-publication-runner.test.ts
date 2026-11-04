@@ -5,7 +5,8 @@
  */
 import { afterAll, afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
+import { db, sqlite } from "../../db";
 import {
 	narratorBufferedMessages,
 	narratorMessageRefs,
@@ -18,18 +19,13 @@ import type { ProviderAdapter } from "../../lib/agent/provider";
 import { registerExternalProviderResolver } from "../../lib/agent/provider";
 import { eventBus } from "../../lib/event-bus";
 import { generateId } from "../../lib/id";
-
-const { db, sqlite } = getTestDb();
-const realDb = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDb, db, sqlite, activeDatabaseBackend: "sqlite" }));
-const { activateSqliteRuntimePublication, getRuntimePublicationService, runtimePublication } =
-	await import("../agent-runtime/publication");
-activateSqliteRuntimePublication(db);
-const { getExecutionOwner } = await import("../agent-runtime/ownership");
-const { listDeliveringRuns, startNarratorRun } = await import("../agent-runtime/run");
-const { backgroundTaskService } = await import("../background-task-service");
-const session = await import("../narrator-session");
-const { activeNarrators } = await import("../narrator-session-state");
+import { getExecutionOwner } from "../agent-runtime/ownership";
+import { getRuntimePublicationService, runtimePublication } from "../agent-runtime/publication";
+import { listDeliveringRuns, startNarratorRun } from "../agent-runtime/run";
+import { backgroundTaskService } from "../background-task-service";
+import { closePrefixSnapshotStore } from "../narrator-prefix-snapshots";
+import * as session from "../narrator-session";
+import { activeNarrators } from "../narrator-session-state";
 
 const provider: ProviderAdapter = {
 	formatTools: () => [],
@@ -49,19 +45,19 @@ const unregisterProvider = registerExternalProviderResolver({
 
 runtimePublication.stop();
 const created: string[] = [];
-afterEach(() => {
+afterEach(async () => {
 	for (const id of created.splice(0)) {
 		getExecutionOwner(id)?.release();
 		activeNarrators.delete(id);
 	}
 	runtimePublication.setWake(undefined);
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 });
-afterAll(() => {
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 	unregisterProvider();
 	runtimePublication.stop();
-	sqlite.close();
-	mock.module("../../db", () => realDb);
 	mock.restore();
 });
 

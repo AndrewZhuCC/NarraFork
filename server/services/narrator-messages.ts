@@ -115,6 +115,7 @@ import {
 	deleteRecipientMessageRefs,
 	updateRecipientMessageRef,
 } from "./narrator-persistence";
+import { attachPrefixHistorySource } from "./narrator-prefix-state";
 import { reconcileQuestionHistoryInTransaction } from "./narrator-question-history";
 import {
 	ensureRefsCoverMessage,
@@ -128,7 +129,6 @@ import {
 	type ScopedRevertOptions,
 } from "./narrator-scoped-revert";
 import { withNarratorWorkAdmission } from "./narrator-session-state";
-import { narratorStore } from "./narrator-store";
 import { attachSendTargetDetails } from "./send-delivery-resolution";
 import {
 	assertSnapshotRevertComplete,
@@ -3398,6 +3398,23 @@ const narratorMessageQueriesUnlocked = {
 		return lastCompactRow[0]?.seq ?? null;
 	},
 
+	/**
+	 * When the narrator's latest compact marker was written (its message's `created_at`), or null
+	 * without one: one indexed read on the refs, one primary-key join.
+	 */
+	async getLatestCompactCreatedAt(narratorId: string): Promise<string | null> {
+		const rows = await db
+			.select({ createdAt: narratorMessages.createdAt })
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+			.where(
+				and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
+			)
+			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+			.limit(1);
+		return rows[0]?.createdAt ?? null;
+	},
+
 	async getMessagesSinceLastCompact(narratorId: string) {
 		const compactSeq = await this.getLatestCompactSeq(narratorId);
 
@@ -3648,8 +3665,8 @@ const narratorMessageQueriesUnlocked = {
 					}
 				: { backend: "sqlite" as const, sqlite: modelHistoryDatabase.sqlite };
 		const source = await loadModelHistorySource(backend, narratorId, { ...options, limit });
-		// Remote compaction payloads are model history, unlike lifecycle-only markers.
-		return source.messages
+		// Retain remote compact payloads and the prefix source receipt while filtering lifecycle-only rows.
+		const messages = source.messages
 			.filter(
 				(message) =>
 					(!isCompactLifecycleMessage(message) || hasRemoteCompactPayload(message.contentJson)) &&
@@ -3659,6 +3676,8 @@ const narratorMessageQueriesUnlocked = {
 				...message,
 				toolCalls: latestToolCallAttempts(message.toolCalls),
 			}));
+		attachPrefixHistorySource(messages, source);
+		return messages;
 	},
 
 	async getMessagesBefore(

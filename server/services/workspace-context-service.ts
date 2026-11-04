@@ -1,7 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { access, constants, realpath, stat } from "node:fs/promises";
 import { isAbsolute } from "node:path";
-import type { SwitchWorkingDirectoryRequest, WorkspaceContext } from "@shared/workspace-context";
+import {
+	type SwitchWorkingDirectoryRequest,
+	serializeWorkspaceContext,
+	type WorkspaceContext,
+} from "@shared/workspace-context";
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, projects } from "../db/schema";
@@ -168,7 +172,11 @@ export async function cacheLocalWorkspaceContext(
 	>,
 	context: WorkspaceContext,
 ): Promise<boolean> {
-	if (JSON.stringify(context) === JSON.stringify(row.workspaceContext)) return true;
+	if (
+		row.workspaceContext &&
+		serializeWorkspaceContext(context) === serializeWorkspaceContext(row.workspaceContext)
+	)
+		return true;
 	const saved = await db
 		.update(narrators)
 		.set({ workspaceContext: context })
@@ -503,7 +511,6 @@ export const workspaceContextService = {
 									defaultDeviceId: deviceId,
 									workspaceRevision: current.revision,
 									workspaceContext: current,
-									apiConversationId: null,
 									updatedAt: new Date().toISOString(),
 								})
 								.where(and(eq(narrators.id, id), eq(narrators.workspaceRevision, old.revision)))
@@ -523,8 +530,6 @@ export const workspaceContextService = {
 					active._bashBeforeStatus?.clear();
 					if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
 					active._gitTrackTimer = undefined;
-					active.conversationId = randomUUID();
-					active._resetUpstreamSessionOnNextRequest = true;
 				},
 				pause: () => {
 					const active = activeNarrators.get(id);
@@ -604,7 +609,6 @@ export const workspaceContextService = {
 								cwd: current.cwd,
 								workspaceRevision: current.revision,
 								workspaceContext: current,
-								apiConversationId: null,
 							})
 							.where(and(eq(narrators.id, id), eq(narrators.workspaceRevision, previous.revision)))
 							.returning({ id: narrators.id });
@@ -626,8 +630,6 @@ export const workspaceContextService = {
 				await updateActiveNarratorCwdAndSkillContext(id, current.cwd);
 				active._workspaceContext = current;
 				active._workspaceInstallFailed = false;
-				active.conversationId = randomUUID();
-				active._resetUpstreamSessionOnNextRequest = true;
 			},
 			pause: () => {
 				const active = activeNarrators.get(id);

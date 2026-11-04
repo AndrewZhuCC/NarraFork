@@ -1,5 +1,4 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
 import type { FileReferenceSnapshot } from "@shared/file-reference";
 import type { DangerInfo, PermissionResult, ReasoningEffort } from "../lib/agent";
@@ -230,6 +229,12 @@ export interface ActiveNarrator {
 	_continuationStallKey?: string;
 	/** Completed tool count used to keep the spec (tasks.json) reminder cadence across loop runs. */
 	_todoReminderCompletedToolCount?: number;
+	/**
+	 * An outline session's state when its current run started, for the turn-end note
+	 * (`maybeDeliverOutlineTurnEndNote`): the completed tool count and the revision of its open
+	 * tasks. Unset outside outline sessions, and once the note was left in this run.
+	 */
+	_outlineTurnStart?: { toolCount: number; revision: string | null };
 	/** Completed tool count when the tasks.json reminder was last injected. */
 	_lastTasksReminderCompletedToolCount?: number;
 	/** Completed tool count when the behavior fence was last injected. */
@@ -353,6 +358,7 @@ export interface BufferedMessage {
 	/** Server-accepted immutable bytes; summaries expose only reference metadata. */
 	fileReferences?: FileReferenceSnapshot[];
 	images?: ImageRef[];
+	media?: import("@shared/media-attachments").MediaRef[];
 	textFiles?: File[];
 	bufferedAt: string;
 	commandText?: string | null;
@@ -466,20 +472,20 @@ export const knowledgeInjectionCycleStates = hotSafe<Map<string, KnowledgeInject
  * Reset reusable upstream provider/session state for the active narrator before
  * its next model request. Returns false when the narrator is not currently active.
  *
- * Every caller reaches here right after an operation that cleared the persisted
- * `apiConversationId` (compact finalize, plan compact, clear-context), so the
- * teardown CAS baseline is moved to null in step. Without that, teardown would
- * compare against the pre-compact id, lose the CAS, and never persist the fresh
- * id — costing the next activation a needless cold upstream session. Claiming the
- * empty column is safe here precisely because the new id belongs to a session
- * that has only ever carried post-compact history.
+ * Breaking transport continuation is not a new cache identity. Compact and
+ * replay can require a full request while retaining the same conversation key.
+ * Callers that explicitly cleared persisted identity must opt into moving the
+ * teardown CAS baseline. Existing compact writers clear the stored id, so their
+ * callers pass persistedIdentityCleared while preserving the live conversation key.
  */
-export function resetActiveUpstreamSession(narratorId: string): boolean {
+export function resetActiveUpstreamSession(
+	narratorId: string,
+	options: { persistedIdentityCleared?: boolean } = {},
+): boolean {
 	const active = activeNarrators.get(narratorId);
 	if (!active?.alive) return false;
-	active.conversationId = randomUUID();
 	active._resetUpstreamSessionOnNextRequest = true;
-	active._persistedConversationId = null;
+	if (options.persistedIdentityCleared) active._persistedConversationId = null;
 	return true;
 }
 
@@ -831,20 +837,33 @@ function admissionWorkFor(narratorId: string): NarratorWorkAdmission[] {
 
 /** Resolve ownership from persisted parent links, never a request's broadcast/cwd hint. */
 export async function resolveNarratorAdmissionRoot(narratorId: string): Promise<string> {
-	const [{ db }, { narrators }, { eq }] = await Promise.all([
+	const [database, { narrators }, { eq }] = await Promise.all([
 		import("../db"),
 		import("../db/schema"),
 		import("drizzle-orm"),
 	]);
+	const { db } = database;
+	let postgresQuery: import("./context-composition-history").ContextQuery | undefined;
+	if (database.activeDatabaseBackend === "postgres") {
+		if (!database.postgresRuntime) throw new AppError("PostgreSQL runtime is not connected", 503);
+		const { postgresContextQuery } = await import("./context-composition-history");
+		postgresQuery = postgresContextQuery(database.postgresRuntime.client.sql);
+	}
 	const seen = new Set<string>();
 	let id = narratorId;
 	while (seen.size < 32 && !seen.has(id)) {
 		seen.add(id);
 		// Admission is a frequent metadata read; never load prompts or compact summaries.
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, id),
-			columns: { id: true, variant: true, parentNarratorId: true },
-		});
+		const narrator = postgresQuery
+			? await postgresQuery.get<{ id: string; variant: string; parentNarratorId: string | null }>(
+					`SELECT id, variant, parent_narrator_id AS "parentNarratorId"
+					 FROM narrators WHERE id = ?`,
+					[id],
+				)
+			: await db.query.narrators.findFirst({
+					where: eq(narrators.id, id),
+					columns: { id: true, variant: true, parentNarratorId: true },
+				});
 		if (!narrator) throw new NotFoundError("Narrator", id);
 		if (!isSubagentVariant(narrator.variant)) return id;
 		if (!narrator.parentNarratorId) break;

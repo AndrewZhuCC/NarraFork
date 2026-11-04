@@ -386,6 +386,15 @@ export function coercePermissionRoutingFields(
 	};
 }
 
+export interface NarratorWarningInfo {
+	message: string;
+	warningCode?: "native_media_fallback";
+	retryCount?: number;
+	maxRetries?: number;
+	delayMs?: number;
+	diagnostics?: Record<string, unknown>;
+}
+
 export interface NarratorWSCallbacks {
 	onMessage?: (data: { message?: TreeMessage; [key: string]: unknown }) => void;
 	onUserMessage?: (data: { message?: TreeMessage; [key: string]: unknown }) => void;
@@ -738,15 +747,7 @@ export interface NarratorWSCallbacks {
 		errorCode?: string,
 		diagnostics?: Record<string, unknown>,
 	) => void;
-	onNarratorWarning?: (info: {
-		message: string;
-		retryCount?: number;
-		maxRetries?: number;
-		delayMs?: number;
-		/** Structured cause of the retry. The server always sends this; dropping it
-		 *  here is what forced retry toasts to show raw English provider text. */
-		diagnostics?: Record<string, unknown>;
-	}) => void;
+	onNarratorWarning?: (info: NarratorWarningInfo) => void;
 	/** Leaked XML tool-call diagnostic. Not persisted. */
 	onLeakedToolCall?: (info: {
 		phase: "stream_captured" | "recovered" | "unrecovered";
@@ -807,15 +808,7 @@ export interface NarratorWSCallbacks {
 		toolUseId?: string;
 		takenOver: boolean;
 	}) => void;
-	onSubagentWarning?: (
-		subagentNarratorId: string,
-		info: {
-			message: string;
-			retryCount?: number;
-			maxRetries?: number;
-			delayMs?: number;
-		},
-	) => void;
+	onSubagentWarning?: (subagentNarratorId: string, info: NarratorWarningInfo) => void;
 	onSubagentConclusionUpdated?: (
 		subagentNarratorId: string,
 		toolUseId: string,
@@ -1542,6 +1535,8 @@ export function useNarratorWS(
 					case "warning":
 						callbackOwner.callbacks.onNarratorWarning?.({
 							message: data.message as string,
+							warningCode:
+								data.warningCode === "native_media_fallback" ? data.warningCode : undefined,
 							retryCount: data.retryCount as number | undefined,
 							maxRetries: data.maxRetries as number | undefined,
 							delayMs: data.delayMs as number | undefined,
@@ -1693,6 +1688,8 @@ export function useNarratorWS(
 					case "subagent_warning":
 						callbackOwner.callbacks.onSubagentWarning?.(data.subagentNarratorId as string, {
 							message: data.message as string,
+							warningCode:
+								data.warningCode === "native_media_fallback" ? data.warningCode : undefined,
 							retryCount: data.retryCount as number | undefined,
 							maxRetries: data.maxRetries as number | undefined,
 							delayMs: data.delayMs as number | undefined,

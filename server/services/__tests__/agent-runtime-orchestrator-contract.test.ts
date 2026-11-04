@@ -3,9 +3,11 @@ import { EventEmitter } from "node:events";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { MediaRef } from "@shared/media-attachments";
 import { eq } from "drizzle-orm";
 import { modelInputText } from "../../../tests/fixtures/model-input";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { wavBytes, webmBytes } from "../../../tests/fixtures/native-media";
+import { cleanDb } from "../../../tests/setup";
 import {
 	narratorBufferedMessages,
 	narratorMessageRefs,
@@ -15,6 +17,8 @@ import {
 	users,
 } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
+import { saveUploadedMedia } from "../../lib/media-uploads";
+import { setUploadsDirForTests } from "../../lib/uploads";
 import { createAgentMessageDelivery } from "../agent-message-delivery";
 import { readSqliteModelHistorySignature } from "../agent-runtime/model-history-revision";
 import { MODEL_HISTORY_REVISION_CONTRACT } from "../agent-runtime/model-history-revision-sql";
@@ -30,11 +34,9 @@ import type { ActiveNarrator } from "../narrator-session-state";
  * Those remain separate integration contracts; custom fallback below checks visibility,
  * not permission enforcement. Each file is intended to run in its own Bun process.
  */
-const { db, sqlite } = getTestDb();
-const realDb = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDb, db, sqlite }));
-const { activateSqliteRuntimePublication } = await import("../agent-runtime/publication");
-activateSqliteRuntimePublication(db);
+// Prefix/history workers must share the same file-backed DB as the real orchestrator.
+// Test preload supplies an isolated temporary database; do not replace it with :memory:.
+const { db, sqlite } = await import("../../db");
 const provider = await import("../../lib/agent/provider");
 const executor = await import("../narrator-executor");
 const orchestrator = await import("../agent-runtime/orchestrator");
@@ -51,6 +53,7 @@ const {
 type RunControl = import("../agent-runtime/ownership").RunControl;
 const { controlRun, startNarratorRun } = await import("../agent-runtime/run");
 const { activeNarrators } = await import("../narrator-session-state");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 const { settings } = await import("../../lib/settings");
 const { routerLoopExtension } = await import("../router/extension");
@@ -94,6 +97,8 @@ const { withRuntimePolicyTrait } = await import("../../lib/runtime-policy-trait"
 const childCeiling = withRuntimePolicyTrait([], await compileDelegationCeiling("general"));
 beforeEach(async () => {
 	backgroundOccupancyStore.resetForTests();
+	// A full fixture reset removes immutable assets; retire their worker/cache first.
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	await backgroundOccupancyStore.start();
 	settings.agent.autoContinuationMode = "off";
@@ -139,10 +144,10 @@ afterEach(async () => {
 	await backgroundOccupancyStore.flush();
 	mock.restore();
 });
-afterAll(() => {
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 	backgroundOccupancyStore.resetForTests();
 	unregister();
-	mock.module("../../db", () => realDb);
 });
 
 const finished: ExecuteLoopResult = {
@@ -230,7 +235,16 @@ function fixture(
 		owner,
 		session,
 		runControl,
-		run: (text = "same input") => runAgentLoopUnlocked(session, owner, text, undefined, runControl),
+		run: (text = "same input", media?: MediaRef[], prePromptBashCommand?: string) =>
+			runAgentLoopUnlocked(
+				session,
+				owner,
+				text,
+				undefined,
+				runControl,
+				prePromptBashCommand,
+				media,
+			),
 	};
 }
 
@@ -397,6 +411,50 @@ describe("tool Git status refresh", () => {
 	});
 });
 
+describe("outline task leases", () => {
+	test("a run keeps its session's leases alive from its start through its tool boundaries, and puts them on the idle lease at its end", async () => {
+		const tasks = await import("../outline/tasks");
+		const { outlineLeaseKeepersOf } = await import("../outline/lease-keeper");
+		const renew = spyOn(tasks, "renewOutlineTaskLeases").mockResolvedValue(0);
+		const idle = spyOn(tasks, "idleOutlineTaskClaims").mockResolvedValue(0);
+		const enabled = settings.outline.enabled;
+		settings.outline.enabled = true;
+		let during = -1;
+		const h = fixture(profiles[0], [
+			async (options) => {
+				during = outlineLeaseKeepersOf(h.session.narratorId);
+				// A tool result is a boundary: the keeper is touched (renewing at most every two
+				// minutes, so not again right after the start).
+				await options.hooks?.onToolResult?.({
+					type: "tool_result",
+					toolUseId: "read-1",
+					toolName: "Read",
+					output: "",
+					isError: false,
+				} as never);
+				return { ...finished };
+			},
+		]);
+		try {
+			await h.run();
+		} finally {
+			settings.outline.enabled = enabled;
+		}
+		expect(during).toBe(1);
+		expect(outlineLeaseKeepersOf(h.session.narratorId)).toBe(0);
+		expect(renew).toHaveBeenCalled();
+		expect(renew.mock.calls.every(([narratorId]) => narratorId === h.session.narratorId)).toBe(
+			true,
+		);
+		// The run's end (between turns, D41): once, for this session (not waited for by the run).
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(idle).toHaveBeenCalledTimes(1);
+		expect(idle.mock.calls[0]?.[0]).toBe(h.session.narratorId);
+		renew.mockRestore();
+		idle.mockRestore();
+	});
+});
+
 describe("subagent signed source projection", () => {
 	function seed() {
 		// cleanDb deletes fixture data, including the installation marker, but not shipped triggers.
@@ -470,6 +528,161 @@ describe("subagent signed source projection", () => {
 		expect(projected).toBe(true);
 		expect(h.calls).toHaveLength(1);
 	});
+});
+
+describe("native media input transitions follow the unified run control", () => {
+	const refs: MediaRef[] = [
+		{
+			mediaId: "current-audio",
+			filename: "voice.wav",
+			mediaType: "audio/wav",
+			size: 60,
+			uploadNarratorId: "contract-parent",
+		},
+		{
+			mediaId: "current-video",
+			filename: "clip.webm",
+			mediaType: "video/webm",
+			size: 36,
+			uploadNarratorId: "contract-parent",
+		},
+	];
+	for (const rich of [false, true])
+		test(`queued /new consumes the real mailbox and strips command layout (document=${rich})`, async () => {
+			const { enqueueBufferedMessage, getBufferedMessages } = await import("../narrator-buffer");
+			const { resumeNextBufferedMessage } = await import("../narrator-session");
+			const source = active("contract-primary");
+			const directory = mkdtempSync(join(tmpdir(), "nf-queued-new-media-"));
+			setUploadsDirForTests(directory);
+			const media = await Promise.all([
+				saveUploadedMedia(
+					"contract-parent",
+					new File([new Uint8Array(wavBytes())], "voice.wav", { type: "audio/wav" }),
+				),
+				saveUploadedMedia(
+					"contract-parent",
+					new File([new Uint8Array(webmBytes([3, 4]))], "clip.webm", { type: "video/webm" }),
+				),
+			]);
+			const completed = Promise.withResolvers<string>();
+			const document = rich
+				? {
+						version: 1 as const,
+						paragraphs: [{ children: [{ type: "text" as const, text: "/new hello" }] }],
+						assets: [],
+					}
+				: undefined;
+			const queued = await enqueueBufferedMessage(
+				"contract-primary",
+				"/new hello",
+				undefined,
+				undefined,
+				"principal-a",
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				document,
+				rich ? undefined : media,
+			);
+			expect(queued.ok).toBe(true);
+			spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+				expect(options.config.narratorId).not.toBe("contract-primary");
+				expect(modelInputText(options)).toContain("hello");
+				expect(modelInputText(options)).not.toContain("/new hello");
+				if (!rich)
+					for (const ref of media) {
+						expect(JSON.stringify(options.history.rows)).toContain(ref.mediaId);
+						expect(JSON.stringify(options.history.rows)).toContain(ref.uploadNarratorId as string);
+					}
+				completed.resolve(options.config.narratorId as string);
+				return finished;
+			});
+			await resumeNextBufferedMessage(source, "en");
+			const id = await completed.promise;
+			await getRunControl(id)?.terminal;
+			expect(getBufferedMessages("contract-primary")).toHaveLength(0);
+			expect(getBufferedMessages(id)).toHaveLength(0);
+			activeNarrators.delete(id);
+			getExecutionOwner(id)?.release();
+			setUploadsDirForTests(null);
+			rmSync(directory, { recursive: true, force: true });
+		});
+	for (const transition of ["permission-feedback", "workspace-replay"] as const) {
+		test(`${transition}: committed input does not inherit current native refs`, async () => {
+			const { pendingFeedback } = await import("../narrator-session-state");
+			const nextText = `committed ${transition} input`;
+			const h = fixture(profiles[0], [
+				async (options) => {
+					expect(options.media).toEqual(refs);
+					if (transition === "permission-feedback")
+						pendingFeedback.set("contract-primary", {
+							toolUseId: "approved-tool",
+							feedbackText: nextText,
+							userId: "principal-a",
+						});
+					if (transition === "workspace-replay") h.session._workspacePassInvalidated = true;
+					return finished;
+				},
+				async (options) => {
+					expect(options.media).toBeUndefined();
+					if (transition !== "workspace-replay")
+						expect(modelInputText(options)).toContain(nextText);
+					return finished;
+				},
+			]);
+			expect((await h.run("unpersisted current input", refs)).hasError).toBe(false);
+			expect(h.calls).toHaveLength(2);
+		});
+	}
+	for (const profile of profiles)
+		test(`${profile.kind}: startNarratorRun forwards refs into its owned pass`, async () => {
+			const id = profile.kind === "primary" ? "contract-primary" : "contract-child";
+			const session = active(id);
+			activeNarrators.set(id, session);
+			const execute = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+				expect(options.media).toEqual(refs);
+				expect(getExecutionOwner(id)).toBeDefined();
+				expect(getRunControl(id)).toBeDefined();
+				return finished;
+			});
+			const handle = await startNarratorRun({
+				narratorId: id,
+				locale: "en",
+				text: "unpersisted native input",
+				principal: "principal-a",
+				media: refs,
+				active: session,
+				deliver: false,
+			});
+			expect(handle.started).toBe(true);
+			expect((await handle.completion).hasError).toBe(false);
+			expect(execute).toHaveBeenCalledTimes(1);
+		});
+	for (const profile of profiles)
+		test(`${profile.kind}: pre-prompt Bash clears separate media without changing run ownership`, async () => {
+			const service = await import("../narrator-service");
+			const bash = spyOn(service, "handleBashCommand").mockResolvedValue({
+				type: "bash",
+				id: "native-media-bash",
+				output: "committed Bash result",
+				isError: false,
+			});
+			const h = fixture(profile, [
+				async (options) => {
+					expect(bash).toHaveBeenCalledTimes(1);
+					expect(options.media).toBeUndefined();
+					expect(getRunControl(h.session.narratorId)).toBe(h.runControl);
+					return finished;
+				},
+			]);
+			expect((await h.run("unpersisted current input", refs, "printf done")).hasError).toBe(false);
+			expect(h.calls).toHaveLength(1);
+		});
 });
 
 describe("real shared orchestrator profile contract", () => {
@@ -905,9 +1118,11 @@ describe("real shared orchestrator profile contract", () => {
 				.from(narratorMessages)
 				.where(eq(narratorMessages.narratorId, h.session.narratorId))
 				.all();
-			expect(rows.filter((row) => row.role === "user")).toHaveLength(1);
-			expect(rows[0].origin).toBe("system");
-			const content = rows[0].contentText;
+			// An epoch marker may precede the continuation; assert the actual prompt row.
+			const prompts = rows.filter((row) => row.role === "user");
+			expect(prompts).toHaveLength(1);
+			expect(prompts[0].origin).toBe("system");
+			const content = prompts[0].contentText;
 			if (!content) throw new Error("Continuation must persist nonempty prompt text");
 			expect(JSON.stringify(h.calls[1].history)).toContain(content);
 			expect(h.calls[1].config.model).toBe(h.calls[0].config.model);

@@ -1,4 +1,6 @@
+import type { NativeMediaInput } from "@shared/media-attachments";
 import { markRuntimeInstructions, reportInputCharacters } from "./input-characters";
+import { rejectNativeMedia, storedMessageMedia } from "./native-media";
 import type { ToolLoadingTarget } from "./tool-loading";
 
 // Codex Provider — uses the centralized CodexManager for multi-account OAuth
@@ -29,7 +31,6 @@ import {
 	streamCodexResponsesWebSocket,
 } from "./codex-websocket";
 import {
-	appendCodexNativeTools,
 	applyCodexReflectionTools,
 	applyOpenAIModelMetadata,
 	CODEX_DEFAULT_INSTRUCTIONS,
@@ -40,6 +41,7 @@ import {
 	OpenAIProvider,
 	resolveCodexRequestReasoningEffort,
 	stampReasoningSource,
+	withCodexNativeTools,
 } from "./openai-provider";
 import type {
 	BuiltHistory,
@@ -458,6 +460,13 @@ export class CodexProvider implements ProviderAdapter {
 		throw new Error("Codex request failed");
 	}
 
+	supportsNativeMediaInput(
+		_media: Pick<NativeMediaInput, "type" | "mediaType" | "filename">,
+		_model: string,
+	): boolean {
+		return false;
+	}
+
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
 		// Use a dummy provider just for formatting
 		const dummy = new OpenAIProvider({
@@ -507,6 +516,7 @@ export class CodexProvider implements ProviderAdapter {
 		model: string,
 		narratorId?: string,
 	): Promise<BuiltHistory> {
+		rejectNativeMedia("Codex Responses", dbMessages.flatMap(storedMessageMedia));
 		const ctx = await this.getContext();
 		const provider = this.createProvider(ctx);
 		return provider.buildHistory(dbMessages, model, narratorId);
@@ -534,6 +544,7 @@ export class CodexProvider implements ProviderAdapter {
 	}
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
+		rejectNativeMedia("Codex Responses", [params.media, params.history, params.toolResults]);
 		// Use WebSocket mode if enabled
 		if (this.useWebSocket) {
 			yield* this.chatWebSocket(params);
@@ -902,14 +913,12 @@ export class CodexProvider implements ProviderAdapter {
 		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
 		if (!instructions) markRuntimeInstructions(request);
 		const tools =
-			params.reflectionParentTools ?? (Array.isArray(params.tools) ? [...params.tools] : []);
-		if (!params.reflectionParentTools) {
-			appendCodexNativeTools(tools, params.model, {
+			params.reflectionParentTools ??
+			withCodexNativeTools(params.tools, params.model, {
 				webSearch:
 					this.useWebSearch && isNativeSearchChannelFirstEnabled(undefined, "codex", params.model),
 				imageGeneration: this.useImageGeneration,
 			});
-		}
 		request.tools = tools;
 
 		applyCodexStableRequestFields(request, {

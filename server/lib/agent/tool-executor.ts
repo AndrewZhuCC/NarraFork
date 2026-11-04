@@ -1,4 +1,8 @@
-import { isAdminToolExecutionAllowed, mcpServerMarker } from "@server/services/tool-load-markers";
+import {
+	isAdminToolExecutionAllowed,
+	mcpServerMarker,
+	mcpToolMarker,
+} from "@server/services/tool-load-markers";
 import {
 	beginToolStartAdmission,
 	convertToolStartGrantToExecution,
@@ -11,11 +15,22 @@ import {
 	waitUntilUpdateGateOpens,
 } from "@server/services/update-coordinator";
 import { resolveMcpLoadingMode } from "@shared/mcp-loading-mode";
+import type { MediaContentBlock, NativeMediaInput } from "@shared/media-attachments";
 import { logger } from "../logger";
-import { getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
+import {
+	getOutlineSpecUnavailableHint,
+	getToolMessage,
+	getToolMessageWithParams,
+	type Locale,
+} from "../prompt-i18n";
 import { shouldUseNativeSearch } from "../search/native";
 import { settings } from "../settings";
-import { assertSpecPath, assertToolSpecPaths, toolSpecPathError } from "../spec-uri";
+import {
+	assertSpecPath,
+	assertToolSpecPaths,
+	toolNamesSpecPath,
+	toolSpecPathError,
+} from "../spec-uri";
 import { checkToolDiskSafety, diskToolError } from "./disk-safety";
 import type { ExecutionBackend } from "./execution/backend";
 import { LOCAL_DEVICE_ID } from "./execution/backend";
@@ -72,6 +87,8 @@ export interface ToolExecResult {
 	metadata?: Record<string, unknown>;
 	/** Base64-encoded images to include in the tool result (for multimodal providers). */
 	images?: Array<{ format: string; base64: string }>;
+	media?: NativeMediaInput[];
+	mediaRefs?: MediaContentBlock[];
 	/** When the permission handler redirected the input (e.g. plan-mode file path),
 	 *  this holds the effective input that was actually executed. */
 	updatedInput?: Record<string, unknown>;
@@ -734,6 +751,25 @@ export function getReflectionToolRejection(
 	};
 }
 
+/**
+ * A tool call that names a `spec://` path in a session whose tasks live in the outline: the
+ * outline session has no Dynamic Spec (plan §3), so instead of reading or writing one it can no
+ * longer see, the call is answered with where its tasks, notes and behavior boundary are. That
+ * includes `spec://behavior_fence`: the session's boundary is the behavior page of its session
+ * space (plan PR 4), which the system keeps in its context. Spec sessions pass.
+ */
+export function getOutlineSpecRejection(
+	tu: AgentToolUse,
+	config: Pick<AgentConfig, "taskBackend" | "locale">,
+): ToolExecResult | undefined {
+	if (config.taskBackend !== "outline" || !toolNamesSpecPath(tu.name, tu.input)) return undefined;
+	return {
+		output: getOutlineSpecUnavailableHint((config.locale as Locale) ?? "en"),
+		isError: true,
+		durationMs: 0,
+	};
+}
+
 export async function executeTool(
 	tu: AgentToolUse,
 	config: AgentConfig,
@@ -743,6 +779,11 @@ export async function executeTool(
 	if (reflectionRejection) {
 		if (options.admissionState) releaseToolAdmissionState(options.admissionState);
 		return reflectionRejection;
+	}
+	const outlineSpecRejection = getOutlineSpecRejection(tu, config);
+	if (outlineSpecRejection) {
+		if (options.admissionState) releaseToolAdmissionState(options.admissionState);
+		return outlineSpecRejection;
 	}
 	const specError = toolSpecPathError(tu.name, tu.input);
 	if (specError) {
@@ -908,7 +949,8 @@ export async function executeTool(
 				(config.toolFilter && !config.toolFilter(tool)) ||
 				(config.toolLoading?.managed.size !== 0 &&
 					resolveMcpLoadingMode(server) === "auto" &&
-					config.isToolLoaded?.(mcpServerMarker(server.id)) !== true)
+					config.isToolLoaded?.(mcpServerMarker(server.id)) !== true &&
+					config.isToolLoaded?.(mcpToolMarker(server.id, tool.name)) !== true)
 			) {
 				return {
 					output: `MCP tool is disabled or not loaded: ${tu.name}`,
@@ -1714,6 +1756,8 @@ export async function executeTool(
 							pipelineCapturedBytes: captured.capture.bytes,
 						}),
 						images: result.images,
+						media: result.media,
+						mediaRefs: result.mediaRefs,
 						updatedInput: redirectedInput,
 						pipelineExitConfirmation,
 						pipelineExitConfirmationStateId,
@@ -1733,6 +1777,8 @@ export async function executeTool(
 					completedAt: Date.now(),
 					metadata: executionTargetMetadata(frozenExecution?.target, result.metadata),
 					images: result.images,
+					media: result.media,
+					mediaRefs: result.mediaRefs,
 					updatedInput: redirectedInput,
 					pipelineExitConfirmation,
 					pipelineExitConfirmationStateId,
@@ -1749,6 +1795,8 @@ export async function executeTool(
 				completedAt: Date.now(),
 				metadata: executionTargetMetadata(frozenExecution?.target, result.metadata),
 				images: result.images,
+				media: result.media,
+				mediaRefs: result.mediaRefs,
 				updatedInput: redirectedInput,
 				pipelineExitConfirmation,
 				pipelineExitConfirmationStateId,

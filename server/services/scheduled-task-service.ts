@@ -523,6 +523,9 @@ export const scheduledTaskService = {
 			null,
 			{ origin: "system", originLabel: formatOriginLabel("scheduledTask", task.name) },
 			undefined,
+			undefined,
+			undefined,
+			undefined,
 			task.reasoningEffort ?? undefined,
 		);
 

@@ -55,6 +55,7 @@ import { useGitIdentityVisibility } from "../../hooks/useGitIdentityVisibility";
 import { useArchiveNarrator } from "../../hooks/useNarrator";
 import type { NarratorListWSEvent } from "../../hooks/useNarratorWS";
 import { useFsRevealCapability } from "../../hooks/usePlatform";
+import { useNarratorIsOptimizingPrompt } from "../../hooks/usePromptOptimizeTask";
 import {
 	registerRecentTabKeyboardSource,
 	usePendingTabKey,
@@ -1346,6 +1347,13 @@ export function RecentTabList({
 
 /** Shared icon component for recent tabs — avoids duplicating icon logic across 4 components. */
 function TabIcon({ tab, size, iconColor }: { tab: RecentTab; size: number; iconColor?: string }) {
+	// Read from the optimize registry, not from tab props: the request outlives the
+	// composer that started it, so the sidebar has to learn about it from the same
+	// place the request lives. `TabIcon` is a component (not a render helper) so a
+	// hook is legal here even though it is called per row.
+	const narratorId = tab.type === "narrator" ? getRecentTabNarratorId(tab) : null;
+	const isOptimizingPrompt = useNarratorIsOptimizingPrompt(narratorId);
+
 	// The narrator bubble is shared verbatim with the narrator list page — see
 	// `NarratorStatusIcon`. It owns its corner markers and the centre shape overlay.
 	if (tab.type === "narrator") {
@@ -1358,6 +1366,7 @@ function TabIcon({ tab, size, iconColor }: { tab: RecentTab; size: number; iconC
 				activeBackgroundTaskCount={tab.activeBackgroundTaskCount}
 				hasDraft={tab.hasDraft}
 				isScheduled={tab.isScheduled}
+				isOptimizingPrompt={isOptimizingPrompt}
 			/>
 		);
 	}

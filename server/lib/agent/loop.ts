@@ -2,6 +2,13 @@ import { resolve } from "node:path";
 import type { ContextCharCache } from "@shared/context-composition";
 import type { ContextInputCharacters, ContextUsageSnapshot } from "@shared/context-usage";
 import { GEN_UI_STREAM_FIELDS } from "@shared/gen-ui-tool-policy";
+import {
+	MEDIA_MIME_TO_EXT,
+	type MediaContentBlock,
+	type MediaRef,
+	mediaRefToContentBlock,
+	type NativeMediaInput,
+} from "@shared/media-attachments";
 import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/progress-phase";
 import {
 	createStreamingEditOrigin,
@@ -36,8 +43,7 @@ import {
 	matchesSearchExecutionScope,
 	SearchExecutionBudgetExceededError,
 } from "../search/execution-scope";
-import { shouldUseNativeSearch, usesSideRequestNativeSearch } from "../search/native";
-import { hasUsableFunctionSearchChannelFor } from "../search/router";
+import { shouldUseNativeSearch } from "../search/native";
 import { getModelContextWindow, settings, usesStatefulModel } from "../settings";
 import { sideCarBodyWithText } from "../sidecar-templates";
 import { StreamStaleError } from "../stream-timeout";
@@ -62,6 +68,7 @@ import { countInputCharacters } from "./input-characters";
 import { LoopTranscript, type TranscriptImage } from "./loop-transcript";
 import { isMalformedRequestBodyError, summarizeRequestBody } from "./malformed-request";
 import { rememberModelTraceRequest } from "./modeltrace-request";
+import { assertNativeMediaPayload, splitNativeMediaReferences } from "./native-media";
 import { type ContentLane, OutputContentAccumulator } from "./output-content";
 import {
 	type ChatParams,
@@ -93,6 +100,7 @@ import {
 import {
 	executeTool,
 	freezeToolExecution,
+	getOutlineSpecRejection,
 	getReflectionToolRejection,
 	preAdmitToolExecution,
 	releaseToolAdmissionState,
@@ -104,6 +112,7 @@ import { ToolInputStream } from "./tool-input-stream";
 import {
 	formatRequestTools,
 	resolveAdapterToolLoadingStrategy,
+	ToolEpochError,
 	type ToolLoadingStrategy,
 	usesToolLoading,
 } from "./tool-loading";
@@ -151,11 +160,7 @@ import type {
 	ResolvedToolDefinition,
 	ToolDefinition,
 } from "./types";
-import {
-	PLAN_MODE_ALLOWED_TOOLS,
-	type ReasoningProviderMetadata,
-	TRANSIENT_RETRY_BASE_MS,
-} from "./types";
+import { type ReasoningProviderMetadata, TRANSIENT_RETRY_BASE_MS } from "./types";
 
 export { isRetryableError } from "./error-handling";
 
@@ -2115,8 +2120,15 @@ export async function shouldRunExitPlanModeReflectionLive(
 	});
 }
 
-export function shouldRunTaskReflection(config: Pick<AgentConfig, "reflectionLoop">): boolean {
-	return !config.reflectionLoop;
+/**
+ * taskReflection guards protected tasks in `spec://tasks.json`. It never runs in a reflection
+ * loop, nor in a session whose tasks live in the outline (plan §8 trade-off 3: outline sessions
+ * get no task reflection; their `spec://` is closed anyway).
+ */
+export function shouldRunTaskReflection(
+	config: Pick<AgentConfig, "reflectionLoop" | "taskBackend">,
+): boolean {
+	return !config.reflectionLoop && config.taskBackend !== "outline";
 }
 
 function normalizeEditText(text: string): string {
@@ -2551,6 +2563,13 @@ async function executeToolAfterReflections(
 		releaseToolAdmissionState(admissionState);
 		return reflectionRejection;
 	}
+	// Before admission, permission and the reflections: an outline session has no `spec://`,
+	// so neither a permission prompt nor taskReflection may start for one.
+	const outlineSpecRejection = getOutlineSpecRejection(tu, config);
+	if (outlineSpecRejection) {
+		releaseToolAdmissionState(admissionState);
+		return outlineSpecRejection;
+	}
 	let preFrozenExecution: Awaited<ReturnType<typeof freezeToolExecution>>;
 	let preAdmissionComplete = options.preAdmissionComplete === true;
 	if (!preAdmissionComplete || !admissionState.startGrant) {
@@ -2736,6 +2755,40 @@ async function executeToolAfterReflections(
 	}
 }
 
+/** Create per-execution durable media conversion with identity deduplication. */
+export function createDurableMediaReferences(config: Pick<AgentConfig, "narratorId" | "signal">) {
+	const savedMedia = new WeakMap<NativeMediaInput, Promise<MediaContentBlock>>();
+	return async (
+		inputs: readonly (MediaRef | NativeMediaInput)[] = [],
+	): Promise<MediaContentBlock[]> =>
+		Promise.all(
+			inputs.map(async (item) => {
+				if ("mediaId" in item) return mediaRefToContentBlock(item, config.narratorId);
+				let saved = savedMedia.get(item);
+				if (!saved) {
+					assertNativeMediaPayload(item);
+					config.signal.throwIfAborted();
+					const { saveUploadedMedia, deleteUploadedMedia } = await import("../media-uploads");
+					const filename = item.filename ?? `attachment${MEDIA_MIME_TO_EXT[item.mediaType] ?? ""}`;
+					saved = saveUploadedMedia(
+						config.narratorId,
+						new File([new Uint8Array(Buffer.from(item.base64, "base64"))], filename, {
+							type: item.mediaType,
+						}),
+					).then((ref) => {
+						if (config.signal.aborted) {
+							deleteUploadedMedia(config.narratorId, ref.mediaId);
+							config.signal.throwIfAborted();
+						}
+						return mediaRefToContentBlock(ref, config.narratorId);
+					});
+					savedMedia.set(item, saved);
+				}
+				return saved;
+			}),
+		);
+}
+
 /**
  * Core agent loop. Delegates all provider-specific logic to a ProviderAdapter.
  * Yields AgentEvent objects for the caller to consume.
@@ -2751,6 +2804,7 @@ async function* agentLoopInMetadataSnapshot(
 	userText: string,
 	initialHistory: AgentLoopHistory = { rows: [] },
 	images?: Array<{ format: string; base64: string }>,
+	media?: readonly (MediaRef | NativeMediaInput)[],
 ): AsyncGenerator<AgentEvent> {
 	const guidanceSignal =
 		config.guidanceSignal && config.urgentGuidanceSignal
@@ -2781,16 +2835,28 @@ async function* agentLoopInMetadataSnapshot(
 	);
 	const locale = (config.locale as Locale) ?? "en";
 
+	// Durable refs are the transcript's authority. Direct low-level byte inputs are
+	// validated and persisted once, never copied into rows or diagnostic events.
+	const durableMediaReferences = createDurableMediaReferences(config);
+	async function withDurableToolMedia(result: ToolExecResult): Promise<ToolExecResult> {
+		if (!result.media?.length || result.mediaRefs?.length) return result;
+		return { ...result, mediaRefs: await durableMediaReferences(result.media) };
+	}
+
 	/** The conversation this loop's requests are projected from (`loop-transcript.ts`). */
 	const transcript = new LoopTranscript(initialHistory.rows);
 	/** The turn's input until the model has answered it; then it is a transcript row. */
-	let uncommittedInput: { text: string; images?: readonly TranscriptImage[] } = { text: "" };
+	let uncommittedInput: {
+		text: string;
+		images?: readonly TranscriptImage[];
+		media?: readonly MediaRef[];
+	} = { text: "" };
 	/**
 	 * The rows the current request is projected from: the transcript plus the turn's
 	 * input. A reflection gating one of its calls starts from exactly these.
 	 */
 	const requestRows = (): DbMessage[] =>
-		transcript.withInput(uncommittedInput.text, uncommittedInput.images);
+		transcript.withInput(uncommittedInput.text, uncommittedInput.images, uncommittedInput.media);
 
 	// Permission checks must be serialized even when tools themselves are parallel-safe.
 	// This prevents concurrent permission prompts / reflection loops from racing each other.
@@ -2870,8 +2936,8 @@ async function* agentLoopInMetadataSnapshot(
 	function materializeToolCandidates(
 		candidates: readonly ToolDefinition[],
 	): ResolvedToolDefinition[] {
-		let resolved = candidates
-			.filter((t) => t.name && (!t.isAvailable || t.isAvailable()))
+		const resolved = candidates
+			.filter((t) => t.name)
 			// Last line of defence before the wire. Providers validate the whole `tools`
 			// array and reject the entire request when one name breaks their alphabet
 			// (OpenAI: `Invalid 'tools[19].function.name': ... '^[a-zA-Z0-9_-]+$'`), so a
@@ -2884,41 +2950,21 @@ async function* agentLoopInMetadataSnapshot(
 				if (isValidToolName(t.name)) return true;
 				logger.warn("Dropping tool with a provider-invalid name", { toolName: t.name });
 				return false;
-			})
-			.map((t) => ({
-				...t,
-				description: typeof t.description === "function" ? t.description(config) : t.description,
-				rawJsonSchema: t.getRawJsonSchema ? t.getRawJsonSchema(config) : t.rawJsonSchema,
-			}));
+			});
 
-		// Keep the wire-level tool list identical for primary and reflection requests so
-		// provider prompt caches can share the same prefix. Reflection permissions remain
-		// narrow: the reflection loop's permissionHandler and executeTool checks enforce
-		// `reflectionLoop.allowedTools` when the model actually attempts a call.
-		if (config.toolFilter) {
-			resolved = resolved.filter((tool) => tool.reflectionOnly || config.toolFilter?.(tool));
+		// A published declaration is immutable. Availability, device state and policy
+		// changes are prompt updates; execution still checks the live gates. Standalone
+		// callers without an epoch retain their initial declaration ceiling.
+		if (!config.toolLoading?.baseToolNames && config.toolFilter) {
+			return resolved.filter((tool) => tool.reflectionOnly || config.toolFilter?.(tool));
 		}
-
-		// Keep SwitchDevice available for a stale remote default so the model can
-		// recover by explicitly switching back to local. TransferFile still requires
-		// at least one online remote endpoint.
-		return filterDeviceTools(resolved, config);
+		return resolved;
 	}
 
 	// Only a standalone first request without host candidates materializes the registry.
 	let allTools = materializeToolCandidates(
 		inheritedTools ? [] : (config.toolCandidates ?? toolRegistry.all()),
 	);
-
-	/**
-	 * Whether plan mode should currently blank out the forbidden tools' descriptions.
-	 *
-	 * Read live, not frozen: plan mode can be toggled MANUALLY while this pass runs, and
-	 * `config.planMode`/`relaxedPlan` are getters on the session's live state.
-	 */
-	function planModeDisablesTools(): boolean {
-		return !!config.planMode && !config.relaxedPlan;
-	}
 
 	function resolveToolsForProvider(
 		providerName: string,
@@ -2927,37 +2973,8 @@ async function* agentLoopInMetadataSnapshot(
 		let resolved = allTools;
 		// Inline native search (Codex): the provider declares its own search tool in
 		// the main request, so the function-style WebSearch is hidden entirely.
-		if (shouldUseNativeSearch(providerName, modelName)) {
+		if (!config.toolLoading?.baseToolNames && shouldUseNativeSearch(providerName, modelName)) {
 			resolved = resolved.filter((t) => t.name !== "WebSearch");
-		} else if (
-			// Hide WebSearch when every enabled channel would deterministically fail
-			// for THIS session's provider (the global isAvailable check can't see the
-			// session, so a native-only channel list would otherwise advertise a tool
-			// that always errors on non-opted providers).
-			resolved.some((t) => t.name === "WebSearch") &&
-			!(searchScope || config.runtimePolicy?.searchOnly
-				? (!searchScope || matchesSearchExecutionScope(providerName, modelName)) &&
-					usesSideRequestNativeSearch(providerName, modelName)
-				: hasUsableFunctionSearchChannelFor(providerName))
-		) {
-			resolved = resolved.filter((t) => t.name !== "WebSearch");
-		}
-
-		// In plan mode, override descriptions for forbidden tools so the model knows not to
-		// call them. Applied here rather than baked into `allTools` because a manual toggle
-		// can flip plan mode between turns, and `allTools` is built once per pass.
-		// Tool NAMES are preserved (required by some APIs for history consistency).
-		// When relaxedPlan is enabled, skip this — tools remain fully available.
-		if (planModeDisablesTools()) {
-			const disabledDesc = getToolMessage("planModeToolDisabled", locale);
-			resolved = resolved.map((t) =>
-				PLAN_MODE_ALLOWED_TOOLS.has(t.name)
-					? t
-					: {
-							...t,
-							description: disabledDesc,
-						},
-			);
 		}
 		return resolved;
 	}
@@ -2983,9 +3000,11 @@ async function* agentLoopInMetadataSnapshot(
 	let toolLoadingStrategy: ToolLoadingStrategy =
 		inheritedTools?.toolLoadingStrategy ?? "replace_tools";
 	function formatRequestToolsForProvider(): unknown[] {
-		toolLoadingStrategy = usesToolLoading(config.toolLoading)
-			? resolveAdapterToolLoadingStrategy(provider, effectiveModel)
-			: "replace_tools";
+		toolLoadingStrategy =
+			config.toolLoading?.strategy ??
+			(usesToolLoading(config.toolLoading)
+				? resolveAdapterToolLoadingStrategy(provider, effectiveModel)
+				: "replace_tools");
 		return formatRequestTools(
 			(selected) => provider.formatTools(selected),
 			resolveToolsForProvider(effectiveProvider, effectiveModel),
@@ -2996,13 +3015,6 @@ async function* agentLoopInMetadataSnapshot(
 
 	let tools = inheritedTools?.tools ?? formatRequestToolsForProvider();
 	await reportToolsCharacters(tools);
-	/**
-	 * The plan-mode tool-description state `tools` was formatted with.
-	 *
-	 * Compared at each turn boundary so a manual toggle re-formats the tool array, while an
-	 * unchanged state skips the ~30-tool schema conversion `formatTools` performs.
-	 */
-	let toolsPlanModeDisabled = planModeDisablesTools();
 	let turnIndex = 0;
 	/**
 	 * The last round ran tools after which an empty reply is a finish, not a fault: any
@@ -3021,6 +3033,9 @@ async function* agentLoopInMetadataSnapshot(
 	 * the execution-group loop). They could only ever hold the same ids.
 	 */
 	const processedToolUseIds = new Set<string>();
+	// Keep the first planning nudge, without repeating it after every tool/turn in
+	// this run. A new agentLoop invocation (e.g. the next user message) re-arms it.
+	let relaxedPlanReminderQueued = false;
 	const pipelineExitConfirmationAttachedStateIds = new Set<string>();
 	// Knowledge-base entry ids already injected this compact cycle (point B de-dup; shared
 	// across tool outputs). Prefer the session-provided shared set so point A (user message)
@@ -3119,6 +3134,7 @@ async function* agentLoopInMetadataSnapshot(
 			updatedInput: brokenInputOverride ?? result.updatedInput,
 			metadata: overrides.metadata ?? result.metadata,
 			...(!result.broken && result.images?.length ? { images: result.images } : {}),
+			...(!result.broken && result.mediaRefs?.length ? { mediaRefs: result.mediaRefs } : {}),
 		};
 	}
 
@@ -3182,7 +3198,14 @@ async function* agentLoopInMetadataSnapshot(
 		// toward the completed-tool cadence, which measures productive work.
 		if (result.broken || result.fatal) return;
 
-		if (await shouldInjectRelaxedPlanToolReminder(tu, config)) {
+		if (
+			!relaxedPlanReminderQueued &&
+			(await shouldInjectRelaxedPlanToolReminder(tu, config)) &&
+			!relaxedPlanReminderQueued
+		) {
+			// Re-check after awaiting classification: parallel tool completions may
+			// reach this point together, but must still queue only one reminder.
+			relaxedPlanReminderQueued = true;
 			queueLoopInjection({
 				source: "relaxed_plan",
 				...sideCarBodyWithText(
@@ -3367,6 +3390,8 @@ async function* agentLoopInMetadataSnapshot(
 					: {}),
 			},
 		);
+		if (built.mediaFallbackWarnings?.length)
+			config.onEvent?.({ type: "media_fallback", warnings: built.mediaFallbackWarnings });
 		return withSystemPrompt(built.history);
 	}
 
@@ -3408,7 +3433,12 @@ async function* agentLoopInMetadataSnapshot(
 			throw new Error("A tool-loading history replacement must include tool candidates");
 		}
 		historyReplacements++;
-		if (!options.sameUpstreamSession) {
+		// Per-request rebuilds retain the conversation; changed prefix identity starts a new one.
+		const epochChanged =
+			replacement.toolLoading?.epochMarkerId !== config.toolLoading?.epochMarkerId;
+		const sameSystemPrompt =
+			replacement.systemPrompt === undefined || replacement.systemPrompt === config.systemPrompt;
+		if (epochChanged || !sameSystemPrompt || options.sameUpstreamSession === false) {
 			resetCacheDropBaseline(config.narratorId);
 			resetUpstreamSessionOnNextRequest = true;
 		}
@@ -3420,6 +3450,8 @@ async function* agentLoopInMetadataSnapshot(
 		}
 		hostHistory = withSystemPrompt(replacement.history);
 		transcript.replace(replacement.rows);
+		if (replacement.mediaFallbackWarnings?.length)
+			config.onEvent?.({ type: "media_fallback", warnings: replacement.mediaFallbackWarnings });
 		// Only a loading-aware rebuild may replace the request's tool view. Candidates and
 		// loading state move together; even an unchanged layout may carry a new tool/schema.
 		if (!inheritedTools && replacement.toolLoading && replacement.toolCandidates) {
@@ -3467,61 +3499,11 @@ async function* agentLoopInMetadataSnapshot(
 
 		if (!newModel && !reasoningChanged) return null;
 
+		let newResolved: ReturnType<typeof resolveProviderAndModel> | undefined;
 		try {
-			let providerChanged = false;
-			let modelChanged = false;
-			if (newModel) {
-				const newResolved = resolveProviderAndModel(newModel);
-				providerChanged = newResolved.provider !== effectiveProvider;
-				modelChanged = newResolved.model !== effectiveModel;
-				provider = newResolved.adapter;
-				effectiveModel = newResolved.model;
-				effectiveProvider = newResolved.provider;
-				config.model = newResolved.model;
-				config.provider = newResolved.provider;
-				if (providerChanged || modelChanged) {
-					tools = formatRequestToolsForProvider();
-					await reportToolsCharacters(tools);
-					// This re-format already applied the current plan-mode state; record it so the
-					// turn-boundary check does not immediately redo the same work.
-					toolsPlanModeDisabled = planModeDisablesTools();
-				}
-			}
-
-			if (hasReasoningOverride) {
-				config.reasoningEffort = nextReasoningEffort;
-			}
-
-			if (providerChanged || modelChanged) {
-				// Force history/tool-result rebuild so the next API call uses the new
-				// provider protocol even when this switch happens inside a retry loop.
-				const replacement = await config.onBeforeTurn?.(turnIndex, {
-					force: true,
-					cause: "model_switch",
-				});
-				if (replacement) applyHistoryReplacement(replacement);
-				// Without a rebuild the transcript is projected for the new protocol.
-				else hostHistory = null;
-			}
-
-			logger.info("Agent loop switched runtime settings before API call", {
-				narratorId: config.narratorId,
-				cause,
-				model: effectiveModel,
-				provider: effectiveProvider,
-				reasoningEffort: config.reasoningEffort,
-				modelChanged,
-				providerChanged,
-				reasoningChanged,
-			});
-			return {
-				type: "model_switched",
-				model: effectiveModel,
-				provider: effectiveProvider,
-				reasoningEffort: config.reasoningEffort ?? null,
-				cause,
-			};
+			if (newModel) newResolved = resolveProviderAndModel(newModel);
 		} catch (err) {
+			if (err instanceof ToolEpochError) throw err;
 			logger.warn("Failed to switch runtime settings during agent loop", {
 				narratorId: config.narratorId,
 				cause,
@@ -3531,6 +3513,55 @@ async function* agentLoopInMetadataSnapshot(
 			});
 			return null;
 		}
+
+		// Once the adapter or request state changes, preparation must succeed before
+		// dispatch. In particular, identity/storage failures cannot reuse the old
+		// prepared first attempt under a new model or provider.
+		let providerChanged = false;
+		let modelChanged = false;
+		if (newResolved) {
+			providerChanged = newResolved.provider !== effectiveProvider;
+			modelChanged = newResolved.model !== effectiveModel;
+			provider = newResolved.adapter;
+			effectiveModel = newResolved.model;
+			effectiveProvider = newResolved.provider;
+			config.model = newResolved.model;
+			config.provider = newResolved.provider;
+			if (providerChanged || modelChanged) {
+				tools = formatRequestToolsForProvider();
+				await reportToolsCharacters(tools);
+			}
+		}
+
+		if (hasReasoningOverride) config.reasoningEffort = nextReasoningEffort;
+
+		if (providerChanged || modelChanged) {
+			// Force history/tool-result rebuild even when switching inside a retry loop.
+			const replacement = await config.onBeforeTurn?.(turnIndex, {
+				force: true,
+				cause: "model_switch",
+			});
+			if (replacement) applyHistoryReplacement(replacement);
+			else hostHistory = null;
+		}
+
+		logger.info("Agent loop switched runtime settings before API call", {
+			narratorId: config.narratorId,
+			cause,
+			model: effectiveModel,
+			provider: effectiveProvider,
+			reasoningEffort: config.reasoningEffort,
+			modelChanged,
+			providerChanged,
+			reasoningChanged,
+		});
+		return {
+			type: "model_switched",
+			model: effectiveModel,
+			provider: effectiveProvider,
+			reasoningEffort: config.reasoningEffort ?? null,
+			cause,
+		};
 	}
 
 	turnLoop: while (turnIndex < maxTurns) {
@@ -3582,33 +3613,24 @@ async function* agentLoopInMetadataSnapshot(
 						const replacement = await config.rebuildRequestHistory();
 						// A new system prompt (a compact landed) changes what was already sent.
 						applyHistoryReplacement(replacement, {
-							sameUpstreamSession: replacement.systemPrompt === undefined,
+							sameUpstreamSession:
+								replacement.systemPrompt === undefined ||
+								replacement.systemPrompt === config.systemPrompt,
 						});
 					} catch (error) {
 						if (config.signal.aborted) {
 							yield { type: "error", message: "Aborted" };
 							return;
 						}
+						// Storage failed at a prefix boundary, or the old view is no longer current.
+						// Reusing that transcript would disguise changed definitions as the old epoch.
+						if (error instanceof ToolEpochError || config.toolLoading) throw error;
 						logger.warn("Request history rebuild failed; projecting the loop's transcript", {
 							narratorId: config.narratorId,
 							turnIndex,
 							error: String(error),
 						});
 					}
-				}
-
-				// A manual plan-mode toggle landed between turns: re-format the tool array so
-				// the forbidden tools carry (or drop) the disabled description. Checked after
-				// onBeforeTurn because a model switch there already re-formatted the tools.
-				const planModeDisabledNow = planModeDisablesTools();
-				if (!inheritedTools && planModeDisabledNow !== toolsPlanModeDisabled) {
-					toolsPlanModeDisabled = planModeDisabledNow;
-					tools = formatRequestToolsForProvider();
-					await reportToolsCharacters(tools);
-					logger.info("Re-formatted tools after a mid-loop plan-mode change", {
-						narratorId: config.narratorId,
-						planModeDisablesTools: planModeDisabledNow,
-					});
 				}
 			}
 
@@ -3617,10 +3639,15 @@ async function* agentLoopInMetadataSnapshot(
 			let content = combinePendingInput(baseContent, currentInputParts);
 			nextTurnContent = ""; // consume once
 			const turnImages = isFirstTurn ? images : undefined;
-			uncommittedInput = { text: content, images: turnImages };
+			const turnMedia = isFirstTurn ? await durableMediaReferences(media) : undefined;
+			uncommittedInput = { text: content, images: turnImages, media: turnMedia };
 			/** The model answered the turn's input: from now on it is part of the conversation. */
 			const commitInput = () => {
-				transcript.appendInput(uncommittedInput.text, uncommittedInput.images);
+				transcript.appendInput(
+					uncommittedInput.text,
+					uncommittedInput.images,
+					uncommittedInput.media,
+				);
 				uncommittedInput = { text: "" };
 			};
 
@@ -3792,7 +3819,9 @@ async function* agentLoopInMetadataSnapshot(
 					},
 				});
 				const execution = settleToolExecutionResult(
-					executeToolAfterReflections(tu, invocationConfig, requestRows(), locale),
+					executeToolAfterReflections(tu, invocationConfig, requestRows(), locale).then(
+						withDurableToolMedia,
+					),
 				);
 				earlyExecMap.set(tu.toolUseId, execution);
 				void execution.then((result) => {
@@ -4763,6 +4792,7 @@ async function* agentLoopInMetadataSnapshot(
 			// Settle every completed call through the normal permission/serial execution path
 			// before handing the interruption back to the caller's bounded retry budget.
 			let pendingResumableError: Extract<AgentEvent, { type: "resumable_error" }> | undefined;
+			let prefixPreparedForAttempt = true;
 			chatRetryLoop: for (;;) {
 				// Reset per-attempt accumulators so a retry starts with a clean slate.
 				// (On the first attempt these are already empty; on retries they may
@@ -4808,11 +4838,27 @@ async function* agentLoopInMetadataSnapshot(
 				// misleading "empty response" message.  It is cleared below when
 				// the attempt produces meaningful content.
 
+				const replacementsBeforeRetry = historyReplacements;
 				const retrySwitchEvent = await applyPendingRuntimeSettings("retry");
 				if (retrySwitchEvent) {
 					yield retrySwitchEvent;
 					resetRetryStateAfterModelSwitch();
 				}
+				// A retry is another provider request. Reconcile current context before
+				// sending it too, unless a model switch already rebuilt the same boundary.
+				if (
+					!prefixPreparedForAttempt &&
+					config.toolLoading?.baseToolNames &&
+					config.rebuildRequestHistory &&
+					historyReplacements === replacementsBeforeRetry
+				) {
+					applyHistoryReplacement(await config.rebuildRequestHistory());
+				}
+				prefixPreparedForAttempt = false;
+				// Reflection and legacy configurations may have no prefix/history hook.
+				// Every attempt still needs durable identity before dispatch. Keep this
+				// outside transport retry handling: a failed admission is not an API error.
+				await config.beforeProviderRequest?.();
 
 				// Generate unique request ID for this provider attempt (reset on each retry).
 				// The actual request start time is set by markRequestStarted() after the
@@ -5021,10 +5067,32 @@ async function* agentLoopInMetadataSnapshot(
 					// original fragments, not a previously filtered string, so both newly
 					// replayed and newly lifted-out rows are represented exactly once.
 					content = combinePendingInput(baseContent, currentInputParts);
-					uncommittedInput = { text: content, images: turnImages };
-					// A host-built history carries the rows and the input rides beside it as the
-					// current turn; otherwise the transcript plus the input is the whole request.
-					const requestContent = hostHistory ? content : "";
+					uncommittedInput = { text: content, images: turnImages, media: turnMedia };
+					// A host-built history carries prior rows, so separate current media rides
+					// beside it. Otherwise the single row projection handles all media, including
+					// tool results. Re-split the original refs on EVERY attempt/model switch.
+					let requestContent = hostHistory ? content : "";
+					let requestMedia: NativeMediaInput[] | undefined;
+					if (hostHistory && turnMedia?.length) {
+						const projected = splitNativeMediaReferences(
+							turnMedia,
+							effectiveModel,
+							provider,
+							config.narratorId,
+						);
+						if (projected.warnings.length)
+							config.onEvent?.({ type: "media_fallback", warnings: projected.warnings });
+						if (projected.fallbackText)
+							requestContent = [requestContent, projected.fallbackText]
+								.filter(Boolean)
+								.join("\n\n");
+						if (projected.nativeRefs.length) {
+							const { mediaToBase64 } = await import("../media-uploads");
+							requestMedia = await Promise.all(
+								projected.nativeRefs.map((ref) => mediaToBase64(ref, config.narratorId)),
+							);
+						}
+					}
 					const questionInput = projectQuestionModelInput(
 						hostHistory ?? (await projectRows(requestRows())),
 						requestContent,
@@ -5113,7 +5181,12 @@ async function* agentLoopInMetadataSnapshot(
 						resetUpstreamSession,
 						onRequestStart: (info) => {
 							if (!config.reflectionLoop) {
-								rememberModelTraceRequest(config.narratorId, provider, requestParams);
+								rememberModelTraceRequest(
+									config.narratorId,
+									provider,
+									requestParams,
+									effectiveProvider,
+								);
 							}
 							markRequestStarted(info);
 						},
@@ -5133,6 +5206,7 @@ async function* agentLoopInMetadataSnapshot(
 							}
 						},
 						...(hostHistory && turnImages?.length ? { images: turnImages } : {}),
+						...(requestMedia?.length ? { media: requestMedia } : {}),
 					};
 					const stream = provider.chat(requestParams);
 
@@ -7814,6 +7888,7 @@ async function* agentLoopInMetadataSnapshot(
 					output: result.output,
 					isError: result.isError,
 					images: result.images,
+					mediaRefs: result.mediaRefs,
 					broken: brokenToolUseIds.has(tu.toolUseId),
 				});
 			}

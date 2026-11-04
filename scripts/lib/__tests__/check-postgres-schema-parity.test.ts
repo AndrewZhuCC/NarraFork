@@ -523,10 +523,69 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 133 tables and 1745 columns including outline storage and local extensions", () => {
-		expect(target.tables.length).toBe(133);
-		// Upstream outline/token-accounting schema plus turnEndedAt and scheduled-task reasoningEffort.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1745);
+	test("covers 135 tables and 1789 columns including durable reply context and local extensions", () => {
+		expect(target.tables.length).toBe(135);
+		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
+		// plus the three PG-only insert_seq identity columns.
+		// The numeric context stats replace the 5-column page cache with pins (3) and stats (4).
+		// Block storage (P1) adds 45: narrator_blocks (19), narrator_block_assets (3),
+		// narrator_block_sync_queue (1), narrator_text_snapshots (4), narrator_turns (10), six
+		// envelope columns and two ledger columns. The P2 backfill adds narrator_block_backfill (6)
+		// and narrator_block_diagnostics (4).
+		// Bot narrators add chat_messages.sender_narrator_id and reply_to_sender_narrator_id (2).
+		// Retiring the narrative line drops six tables (102 columns) and 19 columns elsewhere; the
+		// project index adds narrator_project_links (7) and projects.root_key. auth_sessions adds 8.
+		// The block sync's cost bookkeeping adds narrator_block_index_queue (2),
+		// narrator_blocks.ledger_revision and narrator_messages.blocks_content_hash.
+		// Historical token recalculation adds api_requests.token_accounting_version (1).
+		// Outline storage adds seven tables (67): outline_spaces (8), outline_blocks (14),
+		// outline_block_versions (13), outline_links (8), outline_commits (12),
+		// outline_live_updates (7) and outline_view_state (5).
+		// Account-scoped Git identity entry visibility adds two user_preferences columns.
+		// Native media adds narrator_buffered_messages.media_json.
+		// Outline tasks (P2) add outline_task_claims (9), outline_blocks.in_process,
+		// outline_spaces.in_process_ready and outline_spaces.in_process_epoch.
+		// ModelTrace cabins add narrators.hidden_from_lists and narrators.modeltrace_key (2).
+		// The outline task source (P2) adds narrators.task_backend.
+		// Locks and pending confirmation (P2) add outline_pending (25).
+		// Durable reply language adds narrators.reply_context without a NOT NULL constraint.
+		// Retain selfuse turnEndedAt and scheduled-task reasoningEffort in addition to upstream.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1789);
+		expect(target.tables.find((table) => table.name === "narrators")?.columns).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					property: "replyContext",
+					name: "reply_context",
+					pgType: "text",
+					notNull: false,
+				}),
+				expect.objectContaining({
+					property: "hiddenFromLists",
+					name: "hidden_from_lists",
+					pgType: "boolean",
+					notNull: true,
+					defaultExpression: "false",
+				}),
+				expect.objectContaining({
+					property: "modeltraceKey",
+					name: "modeltrace_key",
+					pgType: "text",
+					notNull: false,
+				}),
+			]),
+		);
+		expect(
+			target.tables.find((table) => table.name === "narrator_buffered_messages")?.columns,
+		).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					property: "mediaJson",
+					name: "media_json",
+					pgType: "text",
+					notNull: false,
+				}),
+			]),
+		);
 		expect(
 			target.tables
 				.find((table) => table.name === "narrator_context_pins")

@@ -17,7 +17,12 @@ import { __resetGitFolderPrefsCache } from "../../hooks/useGitFolderPrefs";
 import { __resetGitGraphCollapsedCache } from "../../hooks/useGitGraphCollapsed";
 import { __resetGitViewModeCache } from "../../hooks/useGitViewMode";
 import { api } from "../../lib/api";
-import { type GitTarget, type GitWorkspace, gitTargetKey } from "../../lib/api/git";
+import {
+	type GitBranches,
+	type GitTarget,
+	type GitWorkspace,
+	gitTargetKey,
+} from "../../lib/api/git";
 import { GitWorkspaceSubscriptions } from "../../lib/git-workspace-subscription";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import commonLocale from "../../locales/en/common.json";
@@ -59,6 +64,9 @@ const GIT_DETECTION_PREF_PREFIX = "narrafork_git_detection_enabled:";
 let root: Root | undefined;
 let restoreGitApi: (() => void) | undefined;
 const originalGitLineStats = api.getGitLineStats;
+// The branch bar reads its own listing; every case here needs a stub or it would
+// reach the real HTTP endpoint during render.
+const originalGitBranches = api.getGitBranches;
 
 function installDom() {
 	const { window } = parseHTML("<!doctype html><html><head></head><body></body></html>");
@@ -208,6 +216,32 @@ function makeDeepStatus(): GitStatusSummary {
 		branch: "main",
 		linesAdded: 1,
 		linesRemoved: 0,
+	};
+}
+
+/** A branch listing whose single local branch is `branch`, as the bar renders it. */
+function makeBranches(branch = "main"): GitBranches {
+	return {
+		headSha: "abc1234",
+		branch,
+		detached: false,
+		local: [
+			{
+				name: branch,
+				sha: "abc1234",
+				committedAt: "2026-01-01T00:00:00.000Z",
+				subject: "seed",
+				upstream: `origin/${branch}`,
+				ahead: 0,
+				behind: 0,
+				upstreamGone: false,
+				worktreePath: null,
+			},
+		],
+		remote: [],
+		remotes: ["origin"],
+		defaultRemote: "origin",
+		truncated: false,
 	};
 }
 
@@ -362,6 +396,7 @@ describe("GitPanel", () => {
 			getGitLog: api.getGitLog,
 		};
 		api.getGitStatus = async () => makeStatus();
+		api.getGitBranches = async () => makeBranches();
 		api.getGitLog = async () => [
 			{
 				sha: "abc1234".padEnd(40, "0"),
@@ -380,6 +415,7 @@ describe("GitPanel", () => {
 		restoreGitApi?.();
 		restoreGitApi = undefined;
 		api.getGitLineStats = originalGitLineStats;
+		api.getGitBranches = originalGitBranches;
 		if (!root) return;
 		root.unmount();
 		root = undefined;
@@ -857,12 +893,13 @@ describe("GitPanel", () => {
 			configurable: true,
 			get: () => true,
 		});
-		const calls = { workspace: 0, status: 0, lines: 0, log: 0 };
+		const calls = { workspace: 0, status: 0, lines: 0, log: 0, branches: 0 };
 		const original = {
 			getGitWorkspace: api.getGitWorkspace,
 			getGitStatus: api.getGitStatus,
 			getGitLineStats: api.getGitLineStats,
 			getGitLog: api.getGitLog,
+			getGitBranches: api.getGitBranches,
 		};
 		api.getGitWorkspace = async (_id, _signal, _key, discover) => {
 			expect(discover).toBe(true);
@@ -881,6 +918,10 @@ describe("GitPanel", () => {
 		api.getGitLog = async () => {
 			calls.log++;
 			return [];
+		};
+		api.getGitBranches = async () => {
+			calls.branches++;
+			return makeBranches();
 		};
 		restoreGitApi = () => Object.assign(api, original);
 		const subscribe = spyOn(GitWorkspaceSubscriptions.prototype, "subscribe");
@@ -910,7 +951,7 @@ describe("GitPanel", () => {
 			);
 			await flushRender();
 			await flushRender();
-			expect(calls).toEqual({ workspace: 0, status: 0, lines: 0, log: 0 });
+			expect(calls).toEqual({ workspace: 0, status: 0, lines: 0, log: 0, branches: 0 });
 			const clickScan = () => {
 				const button = Array.from(container.querySelectorAll("button")).find(
 					(node) => node.textContent === "Scan once",
@@ -923,6 +964,7 @@ describe("GitPanel", () => {
 			expect(calls.workspace).toBe(1);
 			expect(calls.status).toBe(1);
 			expect(calls.lines).toBe(1);
+			expect(calls.branches).toBe(1);
 			expect(container.textContent).toContain("Changes");
 			expect(container.querySelector<HTMLInputElement>('input[type="checkbox"]')?.checked).toBe(
 				false,
@@ -944,6 +986,7 @@ describe("GitPanel", () => {
 			expect(calls.workspace).toBe(2);
 			expect(calls.status).toBe(2);
 			expect(calls.lines).toBe(2);
+			expect(calls.branches).toBe(2);
 			expect(subscribe).not.toHaveBeenCalled();
 			qc.setQueryData(["workspaceContext", "manual-git"], {
 				revision: 2,
@@ -1561,6 +1604,9 @@ describe("GitPanel", () => {
 	async function renderWithBranch(workspaceKey: string, branch: string) {
 		const status = makeStatus();
 		status.branch = branch;
+		// The bar prefers the listing's own branch over the status hint, so the stub
+		// has to agree with the branch under test.
+		api.getGitBranches = async () => makeBranches(branch);
 		const queryClient = new QueryClient({
 			defaultOptions: {
 				queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
@@ -1588,12 +1634,11 @@ describe("GitPanel", () => {
 	}
 
 	/**
-	 * The header answers "which branch am I staging into". It reads the SAME
-	 * `gitStatus` query the Changes tab already fetches, so seeding that key is all
-	 * the setup it needs — if it ever grows its own request, this test keeps
-	 * passing while a second round-trip appears, so the assertion below on the copy
-	 * payload is the part that matters: it must be the full branch name, not the
-	 * truncated text the row displays.
+	 * The branch bar answers "which branch am I staging into". It renders from the
+	 * `gitBranches` listing (stubbed above) and falls back to `gitStatus`, so both
+	 * sources have to agree for the assertion to mean anything. What this test is
+	 * really pinning is the copy payload: the full branch name, never the truncated
+	 * text the row displays.
 	 *
 	 * This covers the Clipboard API branch (secure context). The plain-http fallback
 	 * is a separate path and gets its own test below.

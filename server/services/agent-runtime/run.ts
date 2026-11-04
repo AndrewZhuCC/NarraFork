@@ -1,3 +1,5 @@
+import { ensureReplyContext, syncActiveReplyContext } from "../narrator-reply-context";
+
 /**
  * The one way a narrator run starts, is controlled, and ends.
  *
@@ -13,6 +15,8 @@
  * and the live {@link RunControl} on its owner record. A delegation is a caller that
  * registers those facts; any two sessions can be related the same way.
  */
+
+import type { MediaRef } from "@shared/media-attachments";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { and, eq } from "drizzle-orm";
 import { db } from "../../db";
@@ -70,6 +74,7 @@ export interface StartNarratorRunRequest {
 	locale: Locale;
 	text: string;
 	images?: ImageRef[];
+	media?: MediaRef[];
 	/** This run only; never persisted into the reusable session or narrator settings. */
 	reasoningEffort?: import("@shared/reasoning-effort").ReasoningEffort;
 	replyInUserLanguage?: boolean;
@@ -370,10 +375,21 @@ async function executeRun(
 	let publicationRun: PublicationRun | undefined;
 	let finished = false;
 	try {
+		// Notification locale is display-only. A trusted recovery snapshot may seed a legacy row.
+		const replyContext = await ensureReplyContext(
+			id,
+			req.recovered
+				? {
+						locale: req.locale,
+						replyInUserLanguage: req.replyInUserLanguage ?? false,
+					}
+				: undefined,
+		);
 		// The one session construction, outside every admission transaction.
 		active =
 			req.active ??
 			(await sessionModule.ensureNarrator(id, req.locale, req.replyInUserLanguage ?? false));
+		syncActiveReplyContext(id, replyContext);
 		const session = active;
 		const source = await readRunSource(id);
 		// Only human input or this session's own registration establishes identity.
@@ -547,6 +563,7 @@ async function executeRun(
 					req.images,
 					run,
 					req.prePromptBashCommand,
+					req.media,
 					req.reasoningEffort,
 				);
 		for (;;) {
@@ -590,6 +607,7 @@ async function executeRun(
 					input.images,
 					run,
 					input.prePromptBashCommand,
+					input.media,
 					req.reasoningEffort,
 				);
 		}
