@@ -171,6 +171,7 @@ frontend/
 
 涉及对应领域改动时先读：
 
+- 合并上游、升级 selfuse 自用版本 → [docs/SELFUSE_CHECKLIST.md](docs/SELFUSE_CHECKLIST.md)（固定功能保留、自测与部署收尾清单；只做相关定向验证，不跑本地全仓测试）
 - 跑测试/改测试基建、移动被守卫测试引用的文件 → `docs/TESTING.md`
 - 发布、changelog、stable 增量包、更新服务器（含个人测试服务器） → `docs/RELEASE.md`
 - 构建跨平台可执行文件 → `docs/BUILD.md`
