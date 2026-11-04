@@ -14,15 +14,15 @@ function sha256(path: string): string {
 }
 
 describe("validate-local-upgrade", () => {
-	test("validates the reviewed 0.9.8 chain and preserves local turn and effort values", async () => {
-		const root = mkdtempSync(join(tmpdir(), "nf-upgrade-098-"));
+	test("validates the reviewed 0.9.11 migration and preserves local turn and effort values", async () => {
+		const root = mkdtempSync(join(tmpdir(), "nf-upgrade-0911-"));
 		try {
 			const migrations = join(root, "drizzle");
 			cpSync(join(ROOT, "drizzle"), migrations, { recursive: true });
 			const journalPath = join(migrations, "meta/_journal.json");
 			const journal = JSON.parse(readFileSync(journalPath, "utf8"));
-			const boundary = journal.entries.findIndex((entry: { tag: string }) => entry.tag === "0213_block_storage");
-			if (boundary < 0) throw new Error("Missing 0.9.8 migration boundary");
+			const boundary = journal.entries.findIndex((entry: { tag: string }) => entry.tag === "0228_merge_selfuse_011");
+			if (boundary < 0) throw new Error("Missing 0.9.11 migration boundary");
 			writeFileSync(journalPath, JSON.stringify({ ...journal, entries: journal.entries.slice(0, boundary) }));
 			const original = join(root, "backup.db");
 			const db = new Database(original);
@@ -39,7 +39,6 @@ describe("validate-local-upgrade", () => {
 				["m098", "n098", "user", content, endedAt]);
 			db.run("INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq) VALUES (?, ?, ?, ?)",
 				["r098", "n098", "m098", 7]);
-			db.exec("CREATE VIRTUAL TABLE chapters_fts USING fts5(title, description, content='chapters', content_rowid='rowid', tokenize='trigram')");
 			db.close();
 			writeFileSync(journalPath, JSON.stringify(journal));
 			const validation = join(root, "validation.db");
@@ -51,7 +50,7 @@ describe("validate-local-upgrade", () => {
 				cmd: [process.execPath, join(ROOT, "scripts/validate-local-upgrade.ts"),
 					"--database", validation, "--migrations", migrations, "--online-database", online,
 					"--backup-original", original, "--backup-sha256", backupHash,
-					"--source-sha256", "b".repeat(64), "--commit", "c".repeat(40), "--version", "0.9.8"],
+					"--source-sha256", "b".repeat(64), "--commit", "c".repeat(40), "--version", "0.9.11"],
 				cwd: root,
 				env: { ...process.env, NARRAFORK_HOME: join(root, "home"), HOME: join(root, "home"), NARRAFORK_ALLOW_MULTIPLE: "1", NARRAFORK_LOG_LEVEL: "error" },
 				stdout: "pipe", stderr: "pipe", timeout: 60_000,
@@ -65,6 +64,9 @@ describe("validate-local-upgrade", () => {
 			expect(after.query("SELECT turn_ended_at FROM narrators WHERE id='n098'").get()).toEqual({ turn_ended_at: endedAt });
 			expect(after.query("SELECT reasoning_effort FROM scheduled_tasks WHERE id='s098'").get()).toEqual({ reasoning_effort: "max" });
 			expect(after.query("SELECT content_json FROM narrator_messages WHERE id='m098'").get()).toEqual({ content_json: content });
+			expect(after.query("SELECT hidden_from_lists, task_backend, modeltrace_key, reply_context FROM narrators WHERE id='n098'").get()).toEqual({
+				hidden_from_lists: 0, task_backend: "spec", modeltrace_key: null, reply_context: null,
+			});
 			after.close();
 		} finally {
 			rmSync(root, { recursive: true, force: true });

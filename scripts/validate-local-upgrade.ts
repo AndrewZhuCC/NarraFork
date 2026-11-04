@@ -22,6 +22,7 @@ const ALLOWED_TARGET_TAGS = new Set([
 	"0225_high_baron_zemo",
 	"0226_merge_selfuse_098",
 	"0227_merge_selfuse_099",
+	"0228_merge_selfuse_011",
 ]);
 const JOURNAL_TAIL_TAGS = new Set([
 	"0013_omniscient_dormammu",
@@ -36,8 +37,26 @@ const JOURNAL_TAIL_TAGS = new Set([
 	"0225_high_baron_zemo",
 	"0226_merge_selfuse_098",
 	"0227_merge_selfuse_099",
+	"0228_merge_selfuse_011",
 ]);
 const MAX_REPORT_BYTES = 64 * 1024;
+const MERGE_0911_NEW_TABLES = ["outline_pending", "outline_task_claims"];
+const MERGE_0911_ADDED_COLUMNS: Record<string, string[]> = {
+	narrator_buffered_messages: ["media_json"],
+	narrators: ["hidden_from_lists", "modeltrace_key", "task_backend", "reply_context"],
+	outline_blocks: ["in_process"],
+	outline_spaces: ["in_process_ready", "in_process_epoch"],
+	user_preferences: ["git_identity_context_menu", "git_identity_create_modal"],
+};
+const MERGE_0911_NEW_INDEXES = [
+	"idx_narrators_modeltrace_key",
+	"idx_outline_blocks_open_tasks",
+	"idx_outline_blocks_doing_tasks",
+	"idx_outline_blocks_locked",
+	"idx_outline_blocks_active_tasks",
+	"idx_outline_blocks_finished_tasks",
+	"idx_outline_spaces_in_process_pending",
+];
 const MERGE_099_NEW_TABLES = [
 	"outline_block_versions", "outline_blocks", "outline_commits", "outline_links",
 	"outline_live_updates", "outline_spaces", "outline_view_state",
@@ -274,6 +293,14 @@ function affectedSummary(
 	targetTag: string,
 	excludeNew: boolean,
 ): Record<string, unknown> {
+	if (targetTag === "0228_merge_selfuse_011") {
+		return Object.fromEntries(
+			Object.entries(MERGE_0911_ADDED_COLUMNS).map(([table, added]) => [
+				table,
+				tableDigest(db, table, excludeNew ? new Set(added) : new Set()),
+			]),
+		);
+	}
 	if (targetTag === "0227_merge_selfuse_099") {
 		return {
 			api_requests: tableDigest(
@@ -444,6 +471,23 @@ function narratorRefsIndexShape(db: Database) {
 }
 
 function schemaShape(db: Database, targetTag?: string): Record<string, unknown> {
+	if (targetTag === "0228_merge_selfuse_011") {
+		return {
+			...Object.fromEntries(
+				MERGE_0911_NEW_TABLES.map((table) => [table, tableSchemaShape(db, table)]),
+			),
+			columns: Object.fromEntries(
+				Object.entries(MERGE_0911_ADDED_COLUMNS).map(([table, added]) => [
+					table,
+					Object.fromEntries(added.map((column) => [column, columnShape(db, table, column)])),
+				]),
+			),
+			indexes: Object.fromEntries(MERGE_0911_NEW_INDEXES.map((name) => [
+				name,
+				db.query("SELECT sql FROM sqlite_master WHERE type='index' AND name=?").get(name),
+			])),
+		};
+	}
 	if (targetTag === "0227_merge_selfuse_099") {
 		return {
 			...Object.fromEntries(MERGE_099_NEW_TABLES.map((table) => [table, tableSchemaShape(db, table)])),
@@ -736,7 +780,8 @@ async function main() {
 			throw new Error("Target migration hash was not applied");
 		}
 		const expectedCounts = { ...beforeCounts };
-		const newTables = target.tag === "0227_merge_selfuse_099" ? MERGE_099_NEW_TABLES :
+		const newTables = target.tag === "0228_merge_selfuse_011" ? MERGE_0911_NEW_TABLES :
+			target.tag === "0227_merge_selfuse_099" ? MERGE_099_NEW_TABLES :
 			merge098Chain ? MERGE_098_NEW_TABLES :
 			target.tag === "0012_curved_bloodstorm"
 				? ["file_change_scope_recoveries"]
