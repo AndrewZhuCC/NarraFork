@@ -1265,6 +1265,9 @@ export async function* streamCodexResponsesWebSocket(
 	const ephemeral = !cachedSession || cachedSession.busy;
 	const session = cachedSession && !ephemeral ? cachedSession : createSessionState();
 	if (cachedSession?.busy) {
+		// Keep same-turn routing affinity, never the busy connection or its response chain.
+		session.turnState = cachedSession.turnState;
+		session.workTurnId = cachedSession.workTurnId;
 		logger.info("Codex Responses WebSocket session busy; using an ephemeral connection", {
 			sessionKey: options.sessionKey,
 			credentialId: options.credentialId,

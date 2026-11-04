@@ -1367,6 +1367,7 @@ test("a nested request on a busy session runs on an ephemeral socket without tou
 	activeServer = startServer(({ requestIndex, body, send }) => {
 		const input = body.input as Array<{ content: Array<{ text: string }> }>;
 		const text = input.at(-1)?.content[0]?.text ?? "";
+		if (requestIndex === 0) send(turnStateFrame());
 		for (const frame of completedFrames(`resp-${requestIndex}`, `echo:${text}`)) send(frame);
 	});
 	const server = activeServer;
@@ -1379,6 +1380,7 @@ test("a nested request on a busy session runs on an ephemeral socket without tou
 			conversationId: "conv-1",
 			credentialId: "cred-1",
 			model: "gpt-5.3-codex",
+			workTurnId: "work-turn-1",
 			request: {
 				model: "gpt-5.3-codex",
 				input: input.map(userMessage) as never,
@@ -1408,6 +1410,7 @@ test("a nested request on a busy session runs on an ephemeral socket without tou
 	expect(server.connectionCount()).toBe(2);
 	expect(server.requests[1]?.connectionIndex).toBe(1);
 	expect(server.requests[1]?.body.previous_response_id).toBeUndefined();
+	expect(requestTurnState(server, 1)).toBe("sticky-1");
 
 	const restParentEvents: ParsedStreamEvent[] = [];
 	for await (const event of parent) {
@@ -1421,6 +1424,7 @@ test("a nested request on a busy session runs on an ephemeral socket without tou
 	}
 	expect(server.requests[2]?.connectionIndex).toBe(2);
 	expect(server.requests[2]?.body.previous_response_id).toBeUndefined();
+	expect(requestTurnState(server, 2)).toBeUndefined();
 	expect(privateFrames.some((frame) => frame.type === "response.completed")).toBe(true);
 
 	// The parent's cached chain survived both private requests.
