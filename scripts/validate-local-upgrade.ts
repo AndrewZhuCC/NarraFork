@@ -23,6 +23,7 @@ const ALLOWED_TARGET_TAGS = new Set([
 	"0226_merge_selfuse_098",
 	"0227_merge_selfuse_099",
 	"0228_merge_selfuse_011",
+	"0229_merge_selfuse_0912",
 ]);
 const JOURNAL_TAIL_TAGS = new Set([
 	"0013_omniscient_dormammu",
@@ -38,8 +39,23 @@ const JOURNAL_TAIL_TAGS = new Set([
 	"0226_merge_selfuse_098",
 	"0227_merge_selfuse_099",
 	"0228_merge_selfuse_011",
+	"0229_merge_selfuse_0912",
 ]);
 const MAX_REPORT_BYTES = 64 * 1024;
+const MERGE_0912_NEW_TABLES = ["outline_questions"];
+const MERGE_0912_ADDED_COLUMNS: Record<string, string[]> = {
+	api_requests: ["decode_ms"],
+	outline_block_versions: ["ask_json"],
+	outline_blocks: ["ask_json"],
+	outline_pending: ["digest_seen_at"],
+	user_preferences: ["narrator_line_height_v2_percent"],
+	user_recent_tabs: ["folder_id", "folder_icon", "folder_color", "folder_preview_count"],
+	user_recent_tabs_meta: ["folders_migrated"],
+};
+const MERGE_0912_NEW_INDEXES = [
+	"idx_outline_pending_digest",
+	"idx_user_recent_tabs_user_folder",
+];
 const MERGE_0911_NEW_TABLES = ["outline_pending", "outline_task_claims"];
 const MERGE_0911_ADDED_COLUMNS: Record<string, string[]> = {
 	narrator_buffered_messages: ["media_json"],
@@ -266,13 +282,16 @@ function tableDigest(
 	db: Database,
 	table: string,
 	excluded: ReadonlySet<string> = new Set(),
-	key = "id",
+	key: string | readonly string[] = "id",
 ): Record<string, unknown> {
 	if (!tableExists(db, table)) throw new Error(`Missing required table: ${table}`);
 	const selected = columns(db, table).filter((column) => !excluded.has(column)).sort();
-	if (!selected.includes(key)) throw new Error(`Missing stable row key: ${table}.${key}`);
+	const keys = typeof key === "string" ? [key] : key;
+	if (!keys.every((column) => selected.includes(column))) {
+		throw new Error(`Missing stable row key: ${table}.${keys.join(",")}`);
+	}
 	const statement = db.prepare(
-		`SELECT ${selected.map(quoteIdentifier).join(", ")} FROM ${quoteIdentifier(table)} ORDER BY ${quoteIdentifier(key)}`,
+		`SELECT ${selected.map(quoteIdentifier).join(", ")} FROM ${quoteIdentifier(table)} ORDER BY ${keys.map(quoteIdentifier).join(", ")}`,
 	);
 	const hash = createHash("sha256");
 	hash.update(`${JSON.stringify(selected)}\n`);
@@ -293,11 +312,15 @@ function affectedSummary(
 	targetTag: string,
 	excludeNew: boolean,
 ): Record<string, unknown> {
-	if (targetTag === "0228_merge_selfuse_011") {
+	if (targetTag === "0228_merge_selfuse_011" || targetTag === "0229_merge_selfuse_0912") {
+		const addedColumns = targetTag === "0229_merge_selfuse_0912"
+			? MERGE_0912_ADDED_COLUMNS : MERGE_0911_ADDED_COLUMNS;
 		return Object.fromEntries(
-			Object.entries(MERGE_0911_ADDED_COLUMNS).map(([table, added]) => [
+			Object.entries(addedColumns).map(([table, added]) => [
 				table,
-				tableDigest(db, table, excludeNew ? new Set(added) : new Set()),
+				tableDigest(db, table, excludeNew ? new Set(added) : new Set(),
+					table === "outline_block_versions" ? ["block_id", "from_seq"] :
+						table === "user_recent_tabs_meta" ? "user_id" : "id"),
 			]),
 		);
 	}
@@ -471,18 +494,20 @@ function narratorRefsIndexShape(db: Database) {
 }
 
 function schemaShape(db: Database, targetTag?: string): Record<string, unknown> {
-	if (targetTag === "0228_merge_selfuse_011") {
+	const merge0912 = targetTag === "0229_merge_selfuse_0912";
+	if (merge0912 || targetTag === "0228_merge_selfuse_011") {
+		const newTables = merge0912 ? MERGE_0912_NEW_TABLES : MERGE_0911_NEW_TABLES;
+		const addedColumns = merge0912 ? MERGE_0912_ADDED_COLUMNS : MERGE_0911_ADDED_COLUMNS;
+		const newIndexes = merge0912 ? MERGE_0912_NEW_INDEXES : MERGE_0911_NEW_INDEXES;
 		return {
-			...Object.fromEntries(
-				MERGE_0911_NEW_TABLES.map((table) => [table, tableSchemaShape(db, table)]),
-			),
+			...Object.fromEntries(newTables.map((table) => [table, tableSchemaShape(db, table)])),
 			columns: Object.fromEntries(
-				Object.entries(MERGE_0911_ADDED_COLUMNS).map(([table, added]) => [
+				Object.entries(addedColumns).map(([table, added]) => [
 					table,
 					Object.fromEntries(added.map((column) => [column, columnShape(db, table, column)])),
 				]),
 			),
-			indexes: Object.fromEntries(MERGE_0911_NEW_INDEXES.map((name) => [
+			indexes: Object.fromEntries(newIndexes.map((name) => [
 				name,
 				db.query("SELECT sql FROM sqlite_master WHERE type='index' AND name=?").get(name),
 			])),
@@ -780,7 +805,8 @@ async function main() {
 			throw new Error("Target migration hash was not applied");
 		}
 		const expectedCounts = { ...beforeCounts };
-		const newTables = target.tag === "0228_merge_selfuse_011" ? MERGE_0911_NEW_TABLES :
+		const newTables = target.tag === "0229_merge_selfuse_0912" ? MERGE_0912_NEW_TABLES :
+			target.tag === "0228_merge_selfuse_011" ? MERGE_0911_NEW_TABLES :
 			target.tag === "0227_merge_selfuse_099" ? MERGE_099_NEW_TABLES :
 			merge098Chain ? MERGE_098_NEW_TABLES :
 			target.tag === "0012_curved_bloodstorm"
