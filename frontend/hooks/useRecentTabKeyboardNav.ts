@@ -1,5 +1,12 @@
 import { useNavigate, useRouterState } from "@tanstack/react-router";
-import { useCallback, useEffect, useSyncExternalStore } from "react";
+import { useEffect, useRef, useSyncExternalStore } from "react";
+import {
+	activeNavRowKey,
+	navRowElement,
+	navRowUrl,
+	nextNavRow,
+	readNavRows,
+} from "../components/nav/recent-tab-keyboard-nav";
 import { getRecentTabNarratorId, isTabActive } from "../components/nav/recent-tabs-logic";
 import {
 	matchesShortcut,
@@ -12,12 +19,15 @@ import { useNarratorShortcuts } from "./useNarratorShortcuts";
 import { RECENT_TABS_QUERY_KEY, type RecentTab } from "./useRecentTabs";
 
 const DEBOUNCE_MS = 400;
+/** The sidebar's session list; directional shortcuts walk its rendered rows. */
+const LIST_SELECTOR = "[data-recent-tab-list]";
+
 let pendingKey: string | null = null;
 const listeners = new Set<() => void>();
 let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 const tabSources = new Set<() => RecentTab[]>();
 
-/** The sidebar supplies its rendered order, including collapsed groups and workspace children. */
+/** Numbered narrator shortcuts use the sidebar's rendered, deduplicated session order. */
 export function registerRecentTabKeyboardSource(source: () => RecentTab[]): () => void {
 	tabSources.add(source);
 	return () => {
@@ -38,7 +48,7 @@ function currentTabs(): RecentTab[] {
 		const tabs = narratorShortcutTabs(source());
 		if (tabs.length) return tabs;
 	}
-	// A mounted but empty/collapsed list has no targets. Never navigate hidden members.
+	// A mounted but empty/collapsed list has no numbered targets.
 	if (tabSources.size) return [];
 	return narratorShortcutTabs(queryClient.getQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY) ?? []);
 }
@@ -59,14 +69,16 @@ function subscribe(listener: () => void) {
 export function usePendingTabKey() {
 	return useSyncExternalStore(subscribe, () => pendingKey);
 }
-export function cancelPendingTabNavigation(): void {
+function cancelDebounce() {
 	if (debounceTimer) clearTimeout(debounceTimer);
 	debounceTimer = null;
+}
+export function cancelPendingTabNavigation(): void {
+	cancelDebounce();
 	setPendingKey(null);
 }
-function navigateToTab(tab: RecentTab, navigate: (destination: { to: string }) => unknown) {
-	const id = getRecentTabNarratorId(tab);
-	if (id) navigate({ to: `/narrators/${id}` });
+function navigationUrl(key: string): string | null {
+	return navRowUrl(key) ?? (key.startsWith("subagent:") ? `/narrators/${key.slice(9)}` : null);
 }
 export function handleRecentTabShortcut(
 	event: KeyboardEvent,
@@ -76,10 +88,10 @@ export function handleRecentTabShortcut(
 ): void {
 	if (shortcutTargetBlocked(event)) return;
 	const direction = matchesShortcut(event, bindings.previous)
-		? -1
+		? "up"
 		: matchesShortcut(event, bindings.next)
-			? 1
-			: 0;
+			? "down"
+			: null;
 	const slot = SHORTCUT_ACTIONS.filter((action) => action.startsWith("narrator")).findIndex(
 		(action) => matchesShortcut(event, bindings[action]),
 	);
@@ -88,55 +100,128 @@ export function handleRecentTabShortcut(
 	if (!event.ctrlKey && !event.metaKey && !event.altKey && shortcutTargetBlocked(event, true))
 		return;
 	const tabs = currentTabs();
-	if (!tabs.length) return;
 	if (slot >= 0) {
 		const tab = tabs[slot];
 		if (!tab) return;
 		event.preventDefault();
 		cancelPendingTabNavigation();
-		navigateToTab(tab, navigate);
+		navigate({ to: `/narrators/${getRecentTabNarratorId(tab)}` });
 		return;
 	}
-	let base = pendingKey ? tabs.findIndex((tab) => `${tab.type}:${tab.id}` === pendingKey) : -1;
-	if (base < 0) base = tabs.findIndex((tab) => isTabActive(tab, pathname));
-	const index =
-		base < 0
-			? direction > 0
-				? 0
-				: tabs.length - 1
-			: (base + direction + tabs.length) % tabs.length;
-	const tab = tabs[index];
+	if (!direction) return;
+	const root = document.querySelector(LIST_SELECTOR);
+	const rows = root
+		? readNavRows(root)
+		: tabs.map((tab) => ({ key: `${tab.type}:${tab.id}`, kind: "tab" as const }));
+	const activeTab = root ? null : tabs.find((tab) => isTabActive(tab, pathname));
+	const from =
+		pendingKey ??
+		(root ? activeNavRowKey(root) : activeTab ? `${activeTab.type}:${activeTab.id}` : null);
+	const next = nextNavRow(rows, from, direction);
+	if (!next) return;
 	event.preventDefault();
-	const nextKey = `${tab.type}:${tab.id}`;
-	setPendingKey(nextKey);
-	document
-		.querySelector(`[data-tab-sort-id="${globalThis.CSS.escape(nextKey)}"]`)
-		?.scrollIntoView({ block: "nearest", behavior: "smooth" });
-	if (debounceTimer) clearTimeout(debounceTimer);
+	setPendingKey(next.key);
+	if (root) navRowElement(root, next.key)?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+	cancelDebounce();
+	// A folder header or "N more" row waits for Enter instead of opening a page.
+	if (next.kind !== "tab") return;
 	debounceTimer = setTimeout(() => {
 		const key = pendingKey;
 		cancelPendingTabNavigation();
-		const current = currentTabs().find((item) => `${item.type}:${item.id}` === key);
-		if (current) navigateToTab(current, navigate);
+		if (!key) return;
+		const list = document.querySelector(LIST_SELECTOR);
+		if (
+			list
+				? !navRowElement(list, key)
+				: !currentTabs().some((tab) => `${tab.type}:${tab.id}` === key)
+		)
+			return;
+		const url = navigationUrl(key);
+		if (url) navigate({ to: url });
 	}, DEBOUNCE_MS);
 }
 
-/** One global listener, mounted by AppRootLayout. */
+/** Inside a text field: Enter and the plain arrows remain the field's. */
+function isTyping(target: EventTarget | null): boolean {
+	if (!(target instanceof HTMLElement)) return false;
+	return target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable;
+}
+
+/**
+ * Walk sidebar sessions, folder headers and "N more" rows with the configured keys.
+ * Enter opens the highlighted session now, or toggles a folder row. On "N more", plain
+ * arrows resize its preview. Escape, a pointer press or a page change ends navigation.
+ */
 export function useRecentTabKeyboardNav() {
-	const pathname = useRouterState({ select: (state) => state.location.pathname });
 	const navigate = useNavigate();
+	const pathname = useRouterState({ select: (state) => state.location.pathname });
 	const { bindings } = useNarratorShortcuts();
-	const handleKeyDown = useCallback(
-		(event: KeyboardEvent) => {
-			handleRecentTabShortcut(event, pathname, navigate, bindings);
-		},
-		[pathname, navigate, bindings],
-	);
+	const latest = useRef({ navigate, pathname, bindings });
+	latest.current = { navigate, pathname, bindings };
+
+	// biome-ignore lint/correctness/useExhaustiveDependencies: re-run on page change only
 	useEffect(() => {
-		document.addEventListener("keydown", handleKeyDown);
+		cancelPendingTabNavigation();
+	}, [pathname]);
+
+	useEffect(() => {
+		const end = () => {
+			if (pendingKey !== null) cancelPendingTabNavigation();
+		};
+		window.addEventListener("pointerdown", end, true);
+		return () => window.removeEventListener("pointerdown", end, true);
+	}, []);
+
+	useEffect(() => {
+		const list = () => document.querySelector(LIST_SELECTOR);
+		const onKeyDown = (event: KeyboardEvent) => {
+			if (event.defaultPrevented || shortcutTargetBlocked(event)) return;
+			if (pendingKey !== null && !event.altKey && !event.shiftKey && !event.metaKey) {
+				if (
+					!event.ctrlKey &&
+					(event.key === "ArrowUp" || event.key === "ArrowDown") &&
+					pendingKey.startsWith("strip:") &&
+					!isTyping(event.target)
+				) {
+					const root = list();
+					const el = root && navRowElement(root, pendingKey);
+					if (el instanceof HTMLElement && el !== event.target) {
+						event.preventDefault();
+						el.dispatchEvent(new KeyboardEvent("keydown", { key: event.key, bubbles: true }));
+					}
+					return;
+				}
+				if (event.key === "Escape") {
+					cancelPendingTabNavigation();
+					return;
+				}
+				if (event.key === "Enter" && !event.isComposing && !isTyping(event.target)) {
+					event.preventDefault();
+					const key = pendingKey;
+					const root = list();
+					const el = root && navRowElement(root, key);
+					const url = navigationUrl(key);
+					if (url) {
+						cancelPendingTabNavigation();
+						latest.current.navigate({ to: url });
+					} else if (el instanceof HTMLElement) {
+						cancelDebounce();
+						(el.matches("button") ? el : el.querySelector<HTMLElement>("button"))?.click();
+					}
+					return;
+				}
+			}
+			handleRecentTabShortcut(
+				event,
+				latest.current.pathname,
+				latest.current.navigate,
+				latest.current.bindings,
+			);
+		};
+		document.addEventListener("keydown", onKeyDown);
 		return () => {
-			document.removeEventListener("keydown", handleKeyDown);
+			document.removeEventListener("keydown", onKeyDown);
 			cancelPendingTabNavigation();
 		};
-	}, [handleKeyDown]);
+	}, []);
 }

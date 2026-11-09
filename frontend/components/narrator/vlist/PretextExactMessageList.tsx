@@ -1060,7 +1060,11 @@ export const PretextExactMessageList = memo(
 									_sendDeliveryTargets: call._sendDeliveryTargets,
 									targetCount: call._sendDeliveryTargetCount ?? metadata?.targetCount,
 								}
-							: summaryInputMetadata;
+							: getCategory(call.toolName) === "outline"
+								? // An outline call says a change happened only once it did (still running,
+									// failed: `outlineToolSummary` words it so).
+									{ ...summaryInputMetadata, _toolStatus: call.status }
+								: summaryInputMetadata;
 					return getSummary(call.toolName, call.inputJson, summaryMetadata, vlistLabels);
 				},
 				[vlistLabels],
@@ -1740,6 +1744,18 @@ export const PretextExactMessageList = memo(
 			const permissionCapability = useNarratorPermissionsCapability();
 			const canDecidePermissions =
 				permissionCapability.supported && permissionCapability.approveDeny;
+			// The outline plan's decision labels, in the reader's language: they decide where the
+			// card's button bar wraps (outline P2 PR 8, review round 1 U1).
+			const planButtonLabels = useMemo(
+				() => [t("outlinePlan.draft"), t("outlinePlan.lock"), t("outlinePlan.return")],
+				[t],
+			);
+			const planButtonLabelsRef = useRef(planButtonLabels);
+			planButtonLabelsRef.current = planButtonLabels;
+			// Its empty feedback box is as tall as its placeholder (outline P2 PR 8b review round 1).
+			const planFeedbackPlaceholder = t("outlinePlan.feedbackPlaceholder");
+			const planFeedbackPlaceholderRef = useRef(planFeedbackPlaceholder);
+			planFeedbackPlaceholderRef.current = planFeedbackPlaceholder;
 			const permissionPredictionsByToolUseId = useMemo(() => {
 				const map = new Map<string, InlinePermissionData>();
 				const innerWidth = toolCardInnerWidth(contentWidth, false);
@@ -1748,11 +1764,19 @@ export const PretextExactMessageList = memo(
 					const prediction = predictInlinePermission(perm, {
 						innerWidth,
 						canDecide: canDecidePermissions,
+						planButtonLabels,
+						planFeedbackPlaceholder,
 					});
 					if (prediction) map.set(perm.toolUseId, prediction);
 				}
 				return map;
-			}, [permCb?.pendingPermissions, contentWidth, canDecidePermissions]);
+			}, [
+				permCb?.pendingPermissions,
+				contentWidth,
+				canDecidePermissions,
+				planButtonLabels,
+				planFeedbackPlaceholder,
+			]);
 			const resolvePermissionFormPrediction = useCallback(
 				(toolUseId: string | undefined) =>
 					toolUseId ? permissionPredictionsByToolUseId.get(toolUseId) : undefined,
@@ -1786,6 +1810,8 @@ export const PretextExactMessageList = memo(
 						const prediction = predictInlinePermission(perm, {
 							innerWidth: toolCardInnerWidth(width, false),
 							canDecide: canDecidePermissionsRef.current,
+							planButtonLabels: planButtonLabelsRef.current,
+							planFeedbackPlaceholder: planFeedbackPlaceholderRef.current,
 						});
 						if (!prediction) return undefined;
 						const painted = resizeFormHeightsRef.current.get(toolUseId);
@@ -5034,6 +5060,13 @@ export const PretextExactMessageList = memo(
 					// An injection bubble speaks FOR somebody; its spec carries the verbatim
 					// model-facing copy (`modelFacing`) plus the speaker/source label, which the
 					// inspector shows so the reader can audit what the agent actually received.
+					// A task notice (a system card) carries the same copy: its rows are the reader's
+					// projection, the model got the text.
+					const taskNotice =
+						item.spec.kind === "system-text" &&
+						(item.spec.data as { kind?: unknown } | null)?.kind === "tasks_notice"
+							? (item.spec.data as { modelFacing?: unknown; title?: unknown })
+							: null;
 					const injectionData =
 						item.spec.kind === "injection-bubble"
 							? (item.spec.data as {
@@ -5041,7 +5074,9 @@ export const PretextExactMessageList = memo(
 									speaker?: unknown;
 									source?: unknown;
 								} | null)
-							: null;
+							: taskNotice
+								? { modelFacing: taskNotice.modelFacing, speaker: taskNotice.title }
+								: null;
 					const modelFacing =
 						typeof injectionData?.modelFacing === "string" ? injectionData.modelFacing : "";
 					const inspectContent =

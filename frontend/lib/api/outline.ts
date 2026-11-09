@@ -1,12 +1,19 @@
 import type {
+	OutlineAnswerRequest,
+	OutlineAnswerResponse,
 	OutlineBacklinksResponse,
 	OutlineBlockHistoryResponse,
 	OutlineBlockViewResponse,
+	OutlineDigestResponse,
 	OutlineLockResponse,
 	OutlinePageListResponse,
 	OutlinePagePendingResponse,
 	OutlinePendingDecisionResponse,
 	OutlinePendingDetailResponse,
+	OutlinePlanDecisionRequest,
+	OutlinePlanDecisionResponse,
+	OutlinePlanDiffResponse,
+	OutlineQuestionGroupResponse,
 	OutlineResolveResponse,
 	OutlineRevertResponse,
 	OutlineSearchResponse,
@@ -133,6 +140,36 @@ export const outlineApi = {
 	unlockOutlineBlock: (spaceId: string, blockId: string) =>
 		request<OutlineLockResponse>(`/outline/spaces/${enc(spaceId)}/blocks/${enc(blockId)}/lock`, {
 			method: "DELETE",
+		}),
+	/**
+	 * A plan against the version it is compared with (`from`: a seq, 0 for nothing), without the
+	 * plan reviews written since (the server finds them).
+	 */
+	getOutlinePlanDiff: (spaceId: string, blockId: string, from: number) =>
+		request<OutlinePlanDiffResponse>(
+			`/outline/spaces/${enc(spaceId)}/plans/${enc(blockId)}/diff?from=${from}`,
+		),
+	/** The caller's decision on a submitted plan (a waiting ExitPlanMode of an outline session). */
+	decideOutlinePlan: (requestId: string, body: OutlinePlanDecisionRequest) =>
+		request<OutlinePlanDecisionResponse>(`/narrators/permissions/${enc(requestId)}/plan`, {
+			method: "POST",
+			body: JSON.stringify(body),
+		}),
+	/** The questions under a block (or a question and its sub-questions). */
+	getOutlineQuestions: (blockId: string) =>
+		request<OutlineQuestionGroupResponse>(`/outline/blocks/${enc(blockId)}/questions`),
+	/** Answer questions put to the caller, of one space, at once. */
+	answerOutlineQuestions: (body: OutlineAnswerRequest) =>
+		request<OutlineAnswerResponse>("/outline/questions/answer", {
+			method: "POST",
+			body: JSON.stringify(body),
+		}),
+	/** What agents confirmed on the caller's behalf and they have not acknowledged. */
+	getOutlineDigest: () => request<OutlineDigestResponse>("/outline/digest"),
+	markOutlineDigestSeen: (pendingIds: string[]) =>
+		request<{ marked: number }>("/outline/digest/seen", {
+			method: "POST",
+			body: JSON.stringify({ pendingIds }),
 		}),
 	/** A session's task board (its dock tab). */
 	getSessionTaskBoard: (narratorId: string) =>

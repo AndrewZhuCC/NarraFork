@@ -1307,6 +1307,7 @@ export const userPreferences = pgTable("user_preferences", {
 	narratorLineHeightScalePercent: integer("narrator_line_height_scale_percent")
 		.notNull()
 		.default(100),
+	narratorLineHeightV2Percent: integer("narrator_line_height_v2_percent"),
 	narratorParagraphScalePercent: integer("narrator_paragraph_scale_percent").notNull().default(100),
 	recentTabs: text("recent_tabs").notNull().default("[]"),
 	addSubagentToRecentTabs: boolean("add_subagent_to_recent_tabs").notNull().default(true),
@@ -1452,6 +1453,10 @@ export const userRecentTabs = pgTable(
 		representedNarratorId: text("represented_narrator_id"),
 		parentNarratorId: text("parent_narrator_id"),
 		workspaceId: text("workspace_id"),
+		folderId: text("folder_id"),
+		folderIcon: text("folder_icon"),
+		folderColor: text("folder_color"),
+		folderPreviewCount: integer("folder_preview_count"),
 		title: text("title").notNull(),
 		subtitle: text("subtitle"),
 		status: text("status"),
@@ -1476,6 +1481,7 @@ export const userRecentTabs = pgTable(
 			table.workspaceId,
 			table.sortOrder,
 		),
+		index("idx_user_recent_tabs_user_folder").on(table.userId, table.folderId, table.sortOrder),
 		index("idx_user_recent_tabs_narrator").on(table.representedNarratorId, table.userId),
 		index("idx_user_recent_tabs_entity").on(table.type, table.entityId, table.userId),
 	],
@@ -1487,6 +1493,7 @@ export const userRecentTabsMeta = pgTable("user_recent_tabs_meta", {
 		.notNull()
 		.references((): PgColumn => users.id, { onDelete: "cascade" }),
 	revision: integer("revision").notNull().default(0),
+	foldersMigrated: boolean("folders_migrated").notNull().default(false),
 	migratedAt: text("migrated_at").notNull(),
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
@@ -2089,6 +2096,7 @@ export const apiRequests = pgTable(
 		reasoningTokens: integer("reasoning_tokens").notNull().default(0),
 		ttftMs: integer("ttft_ms"),
 		durationMs: integer("duration_ms"),
+		decodeMs: integer("decode_ms"),
 		costUsd: doublePrecision("cost_usd"),
 		costStatus: text("cost_status"),
 		costMissingFields: jsonText("cost_missing_fields"),
@@ -3498,6 +3506,7 @@ export const outlineBlocks = pgTable(
 		contentHash: text("content_hash").notNull(),
 		alias: text("alias"),
 		taskJson: jsonText("task_json"),
+		askJson: jsonText("ask_json"),
 		authorKind: text("author_kind").notNull(),
 		authorId: text("author_id").notNull(),
 		versionSeq: integer("version_seq").notNull(),
@@ -3581,6 +3590,7 @@ export const outlineBlockVersions = pgTable(
 		orderKey: text("order_key").notNull(),
 		content: text("content"),
 		taskJson: jsonText("task_json"),
+		askJson: jsonText("ask_json"),
 		alias: text("alias"),
 		contentHash: text("content_hash").notNull(),
 		changeFlags: integer("change_flags").notNull(),
@@ -3669,6 +3679,7 @@ export const outlinePending = pgTable(
 		decisionCommitId: text("decision_commit_id"),
 		reason: text("reason"),
 		reportedAt: text("reported_at"),
+		digestSeenAt: text("digest_seen_at"),
 	},
 	(table) => [
 		index("idx_outline_pending_space").on(table.spaceId),
@@ -3686,6 +3697,46 @@ export const outlinePending = pgTable(
 			.on(table.deciderUserId)
 			.where(sql.raw("\"status\" = 'open'")),
 		uniqueIndex("uq_outline_pending_decision_commit").on(table.decisionCommitId),
+		index("idx_outline_pending_digest")
+			.on(table.deciderUserId)
+			.where(
+				sql.raw(
+					"\"status\" = 'confirmed' AND \"digest_seen_at\" IS NULL AND (\"decided_by_json\"::jsonb #>> '{kind}') = 'agent'",
+				),
+			),
+	],
+);
+
+export const outlineQuestions = pgTable(
+	"outline_questions",
+	{
+		blockId: text("block_id")
+			.primaryKey()
+			.notNull()
+			.references((): PgColumn => outlineBlocks.id, { onDelete: "cascade" }),
+		spaceId: text("space_id").notNull(),
+		state: text("state").notNull(),
+		proceed: boolean("proceed").notNull().default(false),
+		toUserId: text("to_user_id"),
+		askerNarratorId: text("asker_narrator_id"),
+		askerUserId: text("asker_user_id"),
+		askerToolCallId: text("asker_tool_call_id"),
+		createdAt: text("created_at").notNull(),
+		answeredAt: text("answered_at"),
+		answerCommitId: text("answer_commit_id"),
+		deliveredAt: text("delivered_at"),
+	},
+	(table) => [
+		index("idx_outline_questions_to_open").on(table.toUserId).where(sql.raw("\"state\" = 'open'")),
+		index("idx_outline_questions_space_open")
+			.on(table.spaceId)
+			.where(sql.raw("\"state\" = 'open'")),
+		index("idx_outline_questions_asker_open")
+			.on(table.askerNarratorId)
+			.where(sql.raw("\"state\" = 'open'")),
+		index("idx_outline_questions_undelivered")
+			.on(table.answeredAt)
+			.where(sql.raw('"state" = \'answered\' AND "delivered_at" IS NULL')),
 	],
 );
 
@@ -4182,8 +4233,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 135,
-  "columnCount": 1789,
+  "tableCount": 136,
+  "columnCount": 1811,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -11482,6 +11533,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "defaultExpression": "100"
         },
         {
+          "property": "narratorLineHeightV2Percent",
+          "name": "narrator_line_height_v2_percent",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "narratorParagraphScalePercent",
           "name": "narrator_paragraph_scale_percent",
           "kind": "integer",
@@ -12490,6 +12550,42 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "folderId",
+          "name": "folder_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "folderIcon",
+          "name": "folder_icon",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "folderColor",
+          "name": "folder_color",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "folderPreviewCount",
+          "name": "folder_preview_count",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "title",
           "name": "title",
           "kind": "text",
@@ -12615,6 +12711,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "name": "idx_user_recent_tabs_user_folder",
+          "columns": [
+            "userId",
+            "folderId",
+            "sortOrder"
+          ],
+          "unique": false
+        },
+        {
           "name": "idx_user_recent_tabs_narrator",
           "columns": [
             "representedNarratorId",
@@ -12668,6 +12773,18 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false,
           "defaultValue": "0",
           "defaultExpression": "0"
+        },
+        {
+          "property": "foldersMigrated",
+          "name": "folders_migrated",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
         },
         {
           "property": "migratedAt",
@@ -15924,6 +16041,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         {
           "property": "durationMs",
           "name": "duration_ms",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "decodeMs",
+          "name": "decode_ms",
           "kind": "integer",
           "pgType": "integer",
           "notNull": false,
@@ -24387,6 +24513,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "askJson",
+          "name": "ask_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "authorKind",
           "name": "author_kind",
           "kind": "text",
@@ -24759,6 +24895,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         {
           "property": "taskJson",
           "name": "task_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "askJson",
+          "name": "ask_json",
           "kind": "text",
           "mode": "json",
           "pgType": "text",
@@ -25305,6 +25451,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "notNull": false,
           "primary": false,
           "unique": false
+        },
+        {
+          "property": "digestSeenAt",
+          "name": "digest_seen_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
         }
       ],
       "indexes": [
@@ -25363,6 +25518,177 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "decisionCommitId"
           ],
           "unique": true
+        },
+        {
+          "name": "idx_outline_pending_digest",
+          "columns": [
+            "deciderUserId"
+          ],
+          "unique": false,
+          "predicate": "\"status\" = 'confirmed' AND \"digest_seen_at\" IS NULL AND (\"decided_by_json\"::jsonb #>> '{kind}') = 'agent'"
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "outlineQuestions",
+      "name": "outline_questions",
+      "columns": [
+        {
+          "property": "blockId",
+          "name": "block_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false,
+          "references": {
+            "table": "outlineBlocks",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_questions_block_id_outline_blocks_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "spaceId",
+          "name": "space_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "state",
+          "name": "state",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "proceed",
+          "name": "proceed",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
+        },
+        {
+          "property": "toUserId",
+          "name": "to_user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "askerNarratorId",
+          "name": "asker_narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "askerUserId",
+          "name": "asker_user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "askerToolCallId",
+          "name": "asker_tool_call_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "answeredAt",
+          "name": "answered_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "answerCommitId",
+          "name": "answer_commit_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "deliveredAt",
+          "name": "delivered_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_outline_questions_to_open",
+          "columns": [
+            "toUserId"
+          ],
+          "unique": false,
+          "predicate": "\"state\" = 'open'"
+        },
+        {
+          "name": "idx_outline_questions_space_open",
+          "columns": [
+            "spaceId"
+          ],
+          "unique": false,
+          "predicate": "\"state\" = 'open'"
+        },
+        {
+          "name": "idx_outline_questions_asker_open",
+          "columns": [
+            "askerNarratorId"
+          ],
+          "unique": false,
+          "predicate": "\"state\" = 'open'"
+        },
+        {
+          "name": "idx_outline_questions_undelivered",
+          "columns": [
+            "answeredAt"
+          ],
+          "unique": false,
+          "predicate": "\"state\" = 'answered' AND \"delivered_at\" IS NULL"
         }
       ],
       "checks": [],

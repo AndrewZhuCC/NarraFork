@@ -2,6 +2,7 @@ import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import type { Locale } from "@server/lib/prompt-i18n";
 import { outputToText } from "@shared/agent-protocol/tool-output";
 import type { AgentToolUse, DbMessage, ProviderAdapter } from "../provider";
+import { resolveToolJsonSchema } from "../tool-registry";
 import type { ExitPlanReflectionDecision } from "../tools/exit-plan-reflection";
 import type { AgentConfig } from "../types";
 
@@ -24,6 +25,7 @@ function settledResults(rows: readonly DbMessage[]): Request["toolResults"] {
 	);
 }
 const pending = new Map<string, (decision: ExitPlanReflectionDecision) => void>();
+let reflectedToolCallId: string | undefined;
 const lifecycle: string[] = [];
 const failureOptions: Array<{ failed?: boolean } | undefined> = [];
 let cancellationMode: "normal" | "delayed" | "human" = "normal";
@@ -32,7 +34,13 @@ let releaseCancellation: (() => void) | undefined;
 let cancellationFinished: Promise<void> | undefined;
 
 const provider: ProviderAdapter = {
-	formatTools: (tools) => tools,
+	formatTools: (tools) =>
+		tools.map((tool) => ({
+			type: "function",
+			name: tool.name,
+			description: tool.description,
+			parameters: resolveToolJsonSchema(tool),
+		})),
 	buildHistory: async (rows) => {
 		projectedRows = rows;
 		return { history: [] };
@@ -82,10 +90,12 @@ mock.module("@server/services/narrator-permission", () => ({
 // retry restrictions and final user-facing tool result all use production code.
 mock.module("../tools/exit-plan-reflection", () => ({
 	...realReflectionModule,
-	createExitPlanReflectionDecision: (requestId: string) =>
-		new Promise<ExitPlanReflectionDecision>((resolve) => {
+	createExitPlanReflectionDecision: (requestId: string, meta?: { toolCallId?: string }) => {
+		reflectedToolCallId = meta?.toolCallId;
+		return new Promise<ExitPlanReflectionDecision>((resolve) => {
 			pending.set(requestId, resolve);
-		}),
+		});
+	},
 	markExitPlanReflectionStarted: async () => true,
 	broadcastPlanReflectionProgress: async () => {},
 	isExitPlanReflectionWaitingForUser: () => false,
@@ -140,6 +150,7 @@ afterAll(() => {
 beforeEach(() => {
 	requests.length = 0;
 	pending.clear();
+	reflectedToolCallId = undefined;
 	lifecycle.length = 0;
 	failureOptions.length = 0;
 	cancellationMode = "normal";
@@ -167,7 +178,14 @@ async function runGate(locale: Locale) {
 		name: "ExitPlanMode",
 		input: {},
 	};
-	const result = await resolveExitPlanModeReflection(config, [], toolUse);
+	const result = await resolveExitPlanModeReflection(
+		config,
+		[],
+		toolUse,
+		undefined,
+		"saved-plan-call",
+	);
+	expect(reflectedToolCallId).toBe("saved-plan-call");
 	expect(result.decision.action).toBe("revise");
 	if (result.decision.action !== "revise") throw new Error("Expected a revision gate decision");
 	expect(requests).toHaveLength(2);

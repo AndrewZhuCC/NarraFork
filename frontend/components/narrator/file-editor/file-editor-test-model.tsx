@@ -108,6 +108,7 @@ export class TestEditorModel {
 		});
 	};
 	focus = () => {};
+	cancelReveal = () => {};
 	getEditor = () => this as unknown as editor.IStandaloneCodeEditor;
 }
 export const mountedTestModels = new Map<string, TestEditorModel>();

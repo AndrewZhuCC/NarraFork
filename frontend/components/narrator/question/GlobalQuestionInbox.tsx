@@ -30,15 +30,7 @@ import {
 import { IconClockPause, IconInbox } from "@tabler/icons-react";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import {
-	lazy,
-	type ReactNode,
-	Suspense,
-	useCallback,
-	useEffect,
-	useRef,
-	useState,
-} from "react";
+import { lazy, type ReactNode, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { globalQuestionsQueryKey } from "../../../hooks/useAsyncQuestions";
 import {
@@ -52,7 +44,10 @@ import {
 } from "../../../hooks/useHumanAttention";
 import { useMobileDrawerHistory } from "../../../hooks/useMobileDrawerHistory";
 import { api } from "../../../lib/api";
+import { outlineRouterLink, useOutlineRouterNavigate } from "../../../lib/outline-router";
 import { readSession, writeSession } from "../../../lib/session-store";
+import { OutlineAttentionDetail } from "../../outline/OutlineQuestions";
+import { OutlineNavProvider } from "../../outline/outline-nav";
 import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import { InlinePermission } from "../permission/InlinePermission";
 import { PermEnterHintCtx } from "../tool-call/tool-call-contexts";
@@ -337,7 +332,12 @@ export function HumanAttentionInboxContent({
 							{t("inboxGroupCurrentSession")}
 						</Text>
 						{current.map((item) => (
-							<HumanAttentionRow key={item.id} item={item} onOpenSession={openSession} />
+							<HumanAttentionRow
+								key={item.id}
+								item={item}
+								onOpenSession={openSession}
+								onClose={onClose}
+							/>
 						))}
 					</Stack>
 				)}
@@ -350,7 +350,12 @@ export function HumanAttentionInboxContent({
 							</Text>
 						)}
 						{others.map((item) => (
-							<HumanAttentionRow key={item.id} item={item} onOpenSession={openSession} />
+							<HumanAttentionRow
+								key={item.id}
+								item={item}
+								onOpenSession={openSession}
+								onClose={onClose}
+							/>
 						))}
 					</Stack>
 				)}
@@ -406,15 +411,81 @@ function OwnerLink({
 	);
 }
 
+/** What an outline row says (its group's title, the change's summary, the digest's count). */
+function outlineRowText(
+	t: (key: string, options?: Record<string, unknown>) => string,
+	item: HumanAttentionItem,
+) {
+	const ref = item.outline;
+	if (!ref) return item.summary;
+	if (ref.what === "digest") return t("outlineAttention.digest", { count: ref.count });
+	if (ref.what === "pending")
+		return t("outlineAttention.pending", { summary: item.summary, count: ref.count });
+	return t("outlineAttention.questions", { title: item.summary, count: ref.count });
+}
+
 function HumanAttentionRow({
 	item,
 	onOpenSession,
+	onClose,
 }: {
 	item: HumanAttentionItem;
 	onOpenSession: (narratorId: string) => void;
+	onClose: () => void;
 }) {
 	const { t } = useTranslation("narrator");
 	const [expanded, setExpanded] = useState(false);
+	// Links of an outline row go through the app's routes (the outline's components are router-free).
+	const navigateOutline = useOutlineRouterNavigate();
+	if (item.source === "outline") {
+		return (
+			<Paper withBorder p="sm" data-attention-id={item.id} data-attention-kind={item.kind}>
+				<Stack gap="xs">
+					<Group gap="xs">
+						<Badge size="xs" variant="light" color="teal">
+							{t(`humanAttentionKind.${item.kind}`)}
+						</Badge>
+						{!item.canAct && (
+							<Badge size="xs" color="gray" variant="outline">
+								{t("humanAttentionReadOnly")}
+							</Badge>
+						)}
+					</Group>
+					<Text size="sm" style={{ overflowWrap: "anywhere" }}>
+						{outlineRowText(t, item)}
+					</Text>
+					{item.outline?.sessionHidden ? (
+						<Text size="xs" c="dimmed">
+							{t("outlineAttention.fromHidden")}
+						</Text>
+					) : (
+						item.narratorId && (
+							<Text size="xs" c="dimmed">
+								{t("outlineAttention.from", { narrator: item.narratorTitle || item.narratorId })}
+							</Text>
+						)
+					)}
+					<Group justify="space-between">
+						<Button
+							size="compact-xs"
+							variant="light"
+							aria-expanded={expanded}
+							onClick={() => setExpanded((value) => !value)}
+							data-testid="outline-attention-review"
+						>
+							{t(expanded ? "humanAttentionCollapse" : "humanAttentionReview")}
+						</Button>
+						{item.narratorId && <OwnerLink item={item} onOpenSession={onOpenSession} />}
+					</Group>
+					{expanded && (
+						<OutlineNavProvider onNavigate={navigateOutline} renderLink={outlineRouterLink}>
+							<OutlineAttentionDetail item={item} onOpen={onClose} />
+						</OutlineNavProvider>
+					)}
+				</Stack>
+			</Paper>
+		);
+	}
 	return (
 		<Paper withBorder p="sm" data-attention-id={item.id}>
 			<Stack gap="xs">

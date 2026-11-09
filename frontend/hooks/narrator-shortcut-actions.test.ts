@@ -84,8 +84,8 @@ describe("narrator navigation", () => {
 		const targets = narratorShortcutTabs([
 			tab("project", { type: "project" }),
 			tab("pinned", { pinned: true }),
-			tab("ws", { type: "workspace" }),
-			tab("child", { workspaceId: "ws" }),
+			tab("folder", { type: "folder" }),
+			tab("child", { folderId: "folder" }),
 			tab("bound-narrator", { type: "subagent" }),
 			tab("bound-narrator"),
 		]);

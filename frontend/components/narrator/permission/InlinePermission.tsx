@@ -23,15 +23,16 @@ import {
 	Stack,
 	Text,
 	Textarea,
-	Tooltip,
 } from "@mantine/core";
-import { type CSSProperties, useContext, useEffect, useRef, useState } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNarratorPermissionsCapability } from "../../../hooks/usePlatform";
+import { isOutlinePlanApproval, OutlinePlanApproval } from "../../outline/plan/OutlinePlanApproval";
 import { DiffView } from "../diff/DiffView";
 import { MESSAGE_SELECTION_IGNORE_ATTR } from "../message/MessageSelectionCtx";
 import { AskUserQuestionBanner, coerceQuestions } from "../question/AskUserQuestionBanner";
 import { PermEnterHintCtx } from "../tool-call/tool-call-contexts";
+import { type PermButton, PermButtonBar } from "./PermButtonBar";
 import { PermissionRuleRequestDetails } from "./PermissionRuleRequestDetails";
 
 const noop = () => {};
@@ -106,81 +107,6 @@ function StructSedChangePreview({ permission }: { permission: PendingPermission 
 				</Text>
 			) : null}
 		</Stack>
-	);
-}
-
-// --- Permission button bar with keyboard navigation ---
-
-interface PermButton {
-	label: string;
-	color: string;
-	variant?: string;
-	tooltip?: string;
-	loading?: boolean;
-	disabled?: boolean;
-	onClick: () => void;
-}
-
-/**
- * Renders a row of permission buttons with keyboard-driven focus highlight.
- * Reports button count to the parent via setButtonCount so the global
- * keydown handler knows the navigation range.
- */
-function PermButtonBar({
-	buttons,
-	focusIndex,
-	setButtonCount,
-	registerActions,
-}: {
-	buttons: PermButton[];
-	focusIndex: number | null;
-	setButtonCount: (n: number) => void;
-	registerActions: (actions: (() => void)[]) => void;
-}) {
-	useEffect(() => {
-		setButtonCount(buttons.length);
-		registerActions(buttons.map((b) => b.onClick));
-	}, [buttons, setButtonCount, registerActions]);
-
-	return (
-		<Group gap="sm">
-			{buttons.map((btn, i) => {
-				const focused = focusIndex === i;
-				const button = (
-					<Button
-						key={`${btn.label}-${btn.color}`}
-						size="sm"
-						color={btn.color}
-						variant={btn.variant as "light" | "subtle" | undefined}
-						onClick={btn.onClick}
-						loading={btn.loading}
-						disabled={btn.disabled}
-						className={focused ? "perm-btn-pulse" : undefined}
-						style={
-							focused
-								? ({
-										"--perm-pulse-color": `var(--mantine-color-${btn.color}-filled)`,
-									} as CSSProperties)
-								: undefined
-						}
-					>
-						{btn.label}
-						{focused && (
-							<Text span size="xs" ml={4} opacity={0.7}>
-								⏎
-							</Text>
-						)}
-					</Button>
-				);
-				return btn.tooltip ? (
-					<Tooltip key={`${btn.label}-${btn.color}`} label={btn.tooltip} multiline>
-						{button}
-					</Tooltip>
-				) : (
-					button
-				);
-			})}
-		</Group>
 	);
 }
 
@@ -323,6 +249,18 @@ export function InlinePermission({
 	const [pendingCompactAfter, setPendingCompactAfter] = useState<boolean | undefined>();
 	const [planReflecting, setPlanReflecting] = useState(false);
 	const [planReflectionFailed, setPlanReflectionFailed] = useState(false);
+	const handlePlanReflect = async () => {
+		if (!onPlanReflect || planReflecting) return;
+		setPlanReflecting(true);
+		setPlanReflectionFailed(false);
+		try {
+			await onPlanReflect(permission.id);
+		} catch {
+			setPlanReflectionFailed(true);
+		} finally {
+			setPlanReflecting(false);
+		}
+	};
 
 	// ExitPlanMode plan content is rendered by the tool card itself. The permission
 	// area only exposes approval controls and an explicit edit mode.
@@ -347,6 +285,19 @@ export function InlinePermission({
 		permission.toolName === "AskUserQuestion"
 			? coerceQuestions(permission.inputJson?.questions)
 			: [];
+	// An outline session's plan (outline P2 PR 8): its own approval, against the diff from the
+	// previous version, with the three choices.
+	if (isOutlinePlanApproval(permission)) {
+		return (
+			<OutlinePlanApproval
+				permission={permission}
+				readOnly={effectiveReadOnly}
+				onPlanReflect={onPlanReflect ? handlePlanReflect : undefined}
+				planReflecting={planReflecting}
+				planReflectionFailed={planReflectionFailed}
+			/>
+		);
+	}
 	if (permission.toolName === "AskUserQuestion" && askQuestions.length > 0) {
 		return (
 			<Box mt="xs" {...{ [MESSAGE_SELECTION_IGNORE_ATTR]: "" }}>
@@ -406,19 +357,6 @@ export function InlinePermission({
 			setEditedPlan(planText);
 		}
 		setEditing(true);
-	};
-
-	const handlePlanReflect = async () => {
-		if (!onPlanReflect || planReflecting) return;
-		setPlanReflecting(true);
-		setPlanReflectionFailed(false);
-		try {
-			await onPlanReflect(permission.id);
-		} catch {
-			setPlanReflectionFailed(true);
-		} finally {
-			setPlanReflecting(false);
-		}
 	};
 
 	// Regular permission: feedback textarea + Allow/Deny buttons

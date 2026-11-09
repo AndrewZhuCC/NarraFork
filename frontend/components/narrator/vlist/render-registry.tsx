@@ -403,6 +403,7 @@ export function renderElement(
 					actions={extra.specCarryoverActions as never}
 					errorActions={extra.errorNoticeActions as never}
 					injectionGuardActions={extra.injectionGuardActions as never}
+					onToggle={extra.onToggle as (() => void) | undefined}
 					headerAction={
 						reference?.narratorId && reference.questionId ? (
 							<QuestionEventAction
@@ -465,6 +466,7 @@ export function renderElement(
 					labels={extra.labels as never}
 					narratorId={extra.narratorId as string | undefined}
 					onToggle={extra.onToggle as (() => void) | undefined}
+					onTogglePrompt={extra.onTogglePrompt as (() => void) | undefined}
 					onOpenSession={extra.onOpenSession as (() => void) | undefined}
 					onTerminate={extra.onTerminate as (() => void) | undefined}
 					onUpdateTimeout={extra.onUpdateTimeout as ((timeoutMs: number) => void) | undefined}

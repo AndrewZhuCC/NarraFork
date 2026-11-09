@@ -3,6 +3,8 @@ import type { Locale } from "@shared/i18n-locales";
 import type { ProviderReadiness } from "@shared/provider-readiness";
 import type {
 	PersistedRecentTab,
+	RecentTabFolderColor,
+	RecentTabFolderIcon,
 	RecentTabsMutationResult,
 	RecentTabsPageResult,
 	RecentTabsRuntimeResult,
@@ -68,11 +70,29 @@ export type RecentTabUpsertInput = PersistedRecentTab & {
 	afterKey?: string;
 };
 
-export type RecentTabMoveTarget =
+/**
+ * Where a move lands. `folderId` changes folder membership in the same move: omitted =
+ * unchanged, `null` = leave the folder, an id = join that folder (next to the anchor,
+ * which must then be a member, or at its end when no anchor is given).
+ */
+export type RecentTabMoveTarget = (
 	| { beforeKey: string }
 	| { afterKey: string }
 	| { position: "top" | "above_idle" }
-	| { toIndex: number };
+	| { toIndex: number }
+	| Record<never, never>
+) & {
+	folderId?: string | null;
+	/** A top-level unit dragged across the pin divider takes this pinned state. */
+	pinned?: boolean;
+};
+
+export interface RecentTabFolderPatch {
+	title?: string;
+	icon?: RecentTabFolderIcon | null;
+	color?: RecentTabFolderColor | null;
+	previewCount?: number | null;
+}
 
 export type ModelTestNetworkErrorCategory =
 	| "http"
@@ -321,10 +341,14 @@ export const settingsApi = {
 			/** Narrator transcript typography, as percentages of the built-in defaults. */
 			narratorFontScalePercent: number;
 			narratorLetterSpacingPercent: number;
-			narratorLineHeightScalePercent: number;
+			/**
+			 * Line height on the current scale (100 = the Mantine ratios × 1.2,
+			 * LINE_HEIGHT_BASELINE_PERCENT). The server also returns the old-scale
+			 * `narratorLineHeightScalePercent` for older clients; this one never reads it.
+			 */
+			narratorLineHeightV2Percent: number;
 			narratorParagraphScalePercent: number;
 			addSubagentToRecentTabs: boolean;
-			recentTabsGroupMode: "flat" | "directory";
 			// Notification preferences
 			notifyOnDone: boolean;
 			notifyOnWaiting: boolean;
@@ -388,10 +412,9 @@ export const settingsApi = {
 		terminalFontSize?: number;
 		narratorFontScalePercent?: number;
 		narratorLetterSpacingPercent?: number;
-		narratorLineHeightScalePercent?: number;
+		narratorLineHeightV2Percent?: number;
 		narratorParagraphScalePercent?: number;
 		addSubagentToRecentTabs?: boolean;
-		recentTabsGroupMode?: "flat" | "directory";
 		// Notification preferences
 		notifyOnDone?: boolean;
 		notifyOnWaiting?: boolean;
@@ -506,17 +529,26 @@ export const settingsApi = {
 			method: "PATCH",
 			body: JSON.stringify({ key, pinned }),
 		}),
-	/**
-	 * Record the member order of ONE directory group. Writes only `dirSortOrder`, so it
-	 * cannot be replaced by a sequence of `moveRecentTab` calls: those rewrite the flat
-	 * recency order, which the `above_idle` auto-promote then overwrites.
-	 */
-	setRecentTabDirectoryOrder: (keys: string[], signal?: AbortSignal) =>
-		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs/dir-order", {
-			method: "PATCH",
-			body: JSON.stringify({ keys }),
-			signal,
-		}),
+	/** Create a folder by dropping `sourceKey` onto `targetKey`; the folder takes the target's slot. */
+	createRecentTabFolder: (
+		input: { targetKey: string; sourceKey: string; title: string },
+		signal?: AbortSignal,
+	) =>
+		request<RecentTabsMutationResponse & { folderId?: string }>(
+			"/user-preferences/recent-tabs/folders",
+			{ method: "POST", body: JSON.stringify(input), signal },
+		),
+	updateRecentTabFolder: (folderId: string, patch: RecentTabFolderPatch) =>
+		request<RecentTabsMutationResponse>(
+			`/user-preferences/recent-tabs/folders/${encodeURIComponent(folderId)}`,
+			{ method: "PATCH", body: JSON.stringify(patch) },
+		),
+	/** Remove a folder, keeping its members in place. */
+	dissolveRecentTabFolder: (folderId: string) =>
+		request<RecentTabsMutationResponse>(
+			`/user-preferences/recent-tabs/folders/${encodeURIComponent(folderId)}/dissolve`,
+			{ method: "POST" },
+		),
 	clearRecentTabs: (scope: "all" | "projects" | "inactive_narrators", keepTabKey?: string) =>
 		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs/clear", {
 			method: "POST",

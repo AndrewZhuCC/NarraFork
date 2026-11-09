@@ -129,6 +129,7 @@ import { Z } from "../../lib/z-index";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
 import { SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
+import { MobileNavButton } from "../nav/MobileNavButton";
 import { buildPluginDockPanelOpenRequest } from "../plugins/PluginContributionPicker";
 import { usePluginUiSurface } from "../plugins/PluginUiSurfaceContext";
 import { NarratorProjectSettingsModal } from "../project/NarratorProjectSettings";
@@ -624,6 +625,10 @@ function NarratorPanelBody({
 		onMinimize,
 		onBack,
 	});
+	// The panel is the phone's whole page (the route hands it the horizontal safe areas
+	// for exactly that case), so its header is the top of the screen and carries the
+	// menu button: phones have no header row of their own.
+	const showMobileNav = ownsHorizontalSafeArea && isMobileViewport;
 
 	// Resolve the effective model: when following default, use the actual default
 	// model value; when using a model aggregation, resolve to a representative
@@ -3189,6 +3194,7 @@ function NarratorPanelBody({
 					<NarratorHeaderLayout
 						titleFullWidth={headerTitleFullWidth}
 						showBack={showLeadingChrome}
+						showMenu={showMobileNav}
 						showTitleActions={!hostOwnsTitle && !isWorkspacePreview}
 						surfacedToolCount={toolbarController.toolbarSurfacedDefs.length}
 						showClose={!!onClose}
@@ -3209,6 +3215,8 @@ function NarratorPanelBody({
 										overflow: "hidden",
 									}}
 								>
+									{/* Phones: this row is the top of the screen, so it opens the drawer. */}
+									{showMobileNav && <MobileNavButton />}
 									{showLeadingChrome &&
 										(onBack ? (
 											<ActionIcon size="sm" variant="subtle" color="gray" onClick={onBack}>

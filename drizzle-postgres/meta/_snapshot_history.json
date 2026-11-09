@@ -432,6 +432,14 @@
 			"prevId": "81304305-168a-41ef-8fc3-187e57817aed",
 			"version": "7",
 			"snapshotDigest": "fdd7c4b9e72b6788b8cabb1bf4253ab2ce7cc4e188ca77c62e63daf33678b7e6"
+		},
+		{
+			"idx": 54,
+			"tag": "0054_merge_selfuse_0912",
+			"id": "3581d3c5-0b68-456e-a4f4-13bd219a7f7c",
+			"prevId": "39df33b9-9d1a-4f90-9eaa-99a4bea13899",
+			"version": "7",
+			"snapshotDigest": "9ae3373ffa9241fde2c7d4b78a63726c33f706e2bc6e0f07fb4599ade6d47f0c"
 		}
 	]
 }
