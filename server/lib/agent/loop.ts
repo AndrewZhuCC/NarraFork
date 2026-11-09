@@ -2120,9 +2120,14 @@ export async function resolveExitPlanModeReflection(
 			}),
 	]);
 	if (!reflectionDone) {
-		reflectionPromise.catch((err) => {
+		const reflectionCleanup = reflectionPromise.catch((err) => {
 			logger.warn("ExitPlanMode reflection loop cleanup failed", { err: String(err) });
 		});
+		// Approval restarts the parent loop. Finish this request's usage tail first;
+		// the existing linger bound and immediate user/parent cancellation still apply.
+		if (decision.action === "confirm" || decision.action === "confirm_compact") {
+			await reflectionCleanup;
+		}
 	}
 	config.signal.removeEventListener("abort", onPreparationAbort);
 	cleanupExitPlanReflection(requestId);

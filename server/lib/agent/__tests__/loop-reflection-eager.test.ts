@@ -3,6 +3,7 @@ import { z } from "zod/v4";
 import * as apiRequestTracker from "../../api-request-tracker";
 import type { ProviderAdapter } from "../provider";
 import { toolRegistry } from "../tool-registry";
+import { exitPlanConfirmAndCompactTool, exitPlanConfirmTool } from "../tools/exit-plan-reflection";
 import type { AgentConfig } from "../types";
 
 /**
@@ -23,7 +24,9 @@ let gateAbort = new AbortController();
 let decisions: string[] = [];
 let streamCompleted = false;
 let releaseTail: (() => void) | undefined;
-let scenario: "self-decision" | "takeover" | "double-decision" = "self-decision";
+let scenario: "self-decision" | "takeover" | "double-decision" | "plan-approval" = "self-decision";
+let planDecisionTool = exitPlanConfirmTool;
+let requestFinished = Promise.withResolvers<void>();
 
 const provider: ProviderAdapter = {
 	formatTools: (tools) => tools.map(({ name, description }) => ({ name, description })),
@@ -33,7 +36,13 @@ const provider: ProviderAdapter = {
 		params.onRequestStart?.();
 		const tail = Promise.withResolvers<void>();
 		releaseTail = tail.resolve;
-		if (scenario === "takeover") yield { text: "still thinking" };
+		if (scenario === "plan-approval")
+			yield {
+				toolUses: [
+					{ toolUseId: "tu-plan-decision", name: planDecisionTool.name, input: { confirm: true } },
+				],
+			};
+		else if (scenario === "takeover") yield { text: "still thinking" };
 		else
 			yield {
 				toolUses: [
@@ -63,7 +72,10 @@ const provider: ProviderAdapter = {
 
 // Observe the durable completion boundary without needing a persisted narrator fixture.
 const finishedRequests = spyOn(apiRequestTracker, "finishApiRequest").mockImplementation(
-	async (handle) => handle.id,
+	async (handle) => {
+		requestFinished.resolve();
+		return handle.id;
+	},
 );
 // mock.restore() alone does not restore Bun's module mocks.
 const realProviderModule = { ...(await import("../provider")) };
@@ -78,7 +90,29 @@ mock.module("../provider", () => ({
 		model: "test:model",
 	}),
 }));
-const { runReflectionLoop } = await import("../loop");
+const realPermissionModule = { ...(await import("@server/services/narrator-permission")) };
+mock.module("@server/services/narrator-permission", () => ({
+	...realPermissionModule,
+	resolveExitPlanModeInputWithBackend: async () => ({
+		ok: true,
+		input: { plan: "Reply PLAN_USAGE_OK after approval. No file changes." },
+	}),
+}));
+const { runReflectionLoop, resolveExitPlanModeReflection } = await import("../loop");
+
+const planTools = [exitPlanConfirmTool, exitPlanConfirmAndCompactTool];
+const originalPlanTools = planTools.map((tool) => toolRegistry.get(tool.name));
+for (const tool of planTools) {
+	toolRegistry.register({
+		...tool,
+		execute: async (input, ctx) => {
+			const result = await tool.execute(input, ctx);
+			// Let approval settle first, while the provider's usage tail is still pending.
+			setImmediate(() => releaseTail?.());
+			return result;
+		},
+	});
+}
 
 for (const name of [DECISION_TOOL, SECOND_DECISION_TOOL]) {
 	toolRegistry.register({
@@ -101,7 +135,13 @@ for (const name of [DECISION_TOOL, SECOND_DECISION_TOOL]) {
 afterAll(() => {
 	finishedRequests.mockRestore();
 	mock.module("../provider", () => realProviderModule);
+	mock.module("@server/services/narrator-permission", () => realPermissionModule);
 	for (const name of [DECISION_TOOL, SECOND_DECISION_TOOL]) toolRegistry.unregister(name);
+	for (const [index, tool] of planTools.entries()) {
+		const original = originalPlanTools[index];
+		if (original) toolRegistry.register(original);
+		else toolRegistry.unregister(tool.name);
+	}
 	mock.restore();
 });
 
@@ -110,6 +150,7 @@ beforeEach(() => {
 	decisions = [];
 	streamCompleted = false;
 	releaseTail = undefined;
+	requestFinished = Promise.withResolvers<void>();
 	finishedRequests.mockClear();
 });
 
@@ -178,4 +219,33 @@ describe("reflection decisions made mid-stream", () => {
 		expect(observed.errors).toEqual([]);
 		expectNaturalCompletion();
 	});
+});
+
+describe("plan approval waits for reflection usage", () => {
+	for (const tool of planTools) {
+		test(`${tool.name} finishes its request before the parent restarts`, async () => {
+			scenario = "plan-approval";
+			planDecisionTool = tool;
+			const parentAbort = new AbortController();
+			const result = await resolveExitPlanModeReflection(
+				{
+					...parentConfig(),
+					signal: parentAbort.signal,
+					planReflectionAllowAutoCompact: tool === exitPlanConfirmAndCompactTool,
+				},
+				[],
+				{ toolUseId: "tu-exit-plan", name: "ExitPlanMode", input: {} },
+			).then((decision) => {
+				// Match applyPlanApproval: allowing ExitPlanMode restarts the parent loop.
+				parentAbort.abort();
+				return decision;
+			});
+			await requestFinished.promise;
+
+			expect(result.decision.action).toBe(
+				tool === exitPlanConfirmAndCompactTool ? "confirm_compact" : "confirm",
+			);
+			expectNaturalCompletion();
+		});
+	}
 });
