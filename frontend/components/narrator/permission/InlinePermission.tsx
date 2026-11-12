@@ -34,6 +34,7 @@ import { AskUserQuestionBanner, coerceQuestions } from "../question/AskUserQuest
 import { PermEnterHintCtx } from "../tool-call/tool-call-contexts";
 import { type PermButton, PermButtonBar } from "./PermButtonBar";
 import { PermissionRuleRequestDetails } from "./PermissionRuleRequestDetails";
+import { usePermissionTextareaStyle } from "./permission-textarea-typography";
 
 const noop = () => {};
 
@@ -196,9 +197,17 @@ export function InlinePermission({
 	const permissionTargetDeviceId = permissionTarget?.deviceId ?? permission.executionDeviceId;
 	const permissionTargetCwd = permissionTarget?.cwd ?? permission.executionCwd;
 	const permissionLexicalPath = permissionTarget?.lexicalPath ?? permission.resolvedFilePath;
-	const { focusIndex, setButtonCount, setHasFeedback, registerActions, activePermissionId } =
-		useContext(PermEnterHintCtx);
+	const {
+		focusIndex,
+		setFocusIndex,
+		setButtonCount,
+		setHasFeedback,
+		registerActions,
+		activePermissionId,
+	} = useContext(PermEnterHintCtx);
 	const isActivePermission = permission.id === activePermissionId;
+	// In the transcript both textareas paint the rows its height model counts (D49).
+	const textareaStyle = usePermissionTextareaStyle();
 	const draftKey = permission.id;
 	const storedDraftRef = useRef<StoredPermissionDraft | null | undefined>(undefined);
 	const getStoredDraft = () => {
@@ -431,7 +440,13 @@ export function InlinePermission({
 					minRows={8}
 					maxRows={30}
 					disabled={effectiveReadOnly || !permissionInputSupported}
-					styles={{ input: { fontFamily: "monospace", fontSize: "var(--mantine-font-size-xs)" } }}
+					styles={{
+						input: {
+							fontFamily: "monospace",
+							fontSize: "var(--mantine-font-size-xs)",
+							...textareaStyle,
+						},
+					}}
 				/>
 			)}
 			{localizedDecisionReason && (
@@ -442,6 +457,7 @@ export function InlinePermission({
 			<Textarea
 				size="xs"
 				placeholder={t("feedbackPlaceholder")}
+				data-testid="permission-feedback"
 				value={feedback}
 				onChange={(e) => setFeedback(e.currentTarget.value)}
 				onKeyDown={(e) => {
@@ -457,6 +473,7 @@ export function InlinePermission({
 				maxRows={3}
 				mb="xs"
 				disabled={effectiveReadOnly}
+				styles={textareaStyle ? { input: textareaStyle } : undefined}
 			/>
 			{effectiveReadOnly ? (
 				<Text size="xs" c="dimmed">
@@ -465,6 +482,7 @@ export function InlinePermission({
 			) : (
 				<PermButtonBar
 					focusIndex={isActivePermission ? focusIndex : null}
+					setFocusIndex={isActivePermission ? setFocusIndex : undefined}
 					buttons={(() => {
 						const btns: PermButton[] = [];
 						if (!editing) {

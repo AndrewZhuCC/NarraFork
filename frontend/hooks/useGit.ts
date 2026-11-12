@@ -154,6 +154,8 @@ export interface WorkspaceModificationView {
 }
 
 // Workspace facts share a cache across narrators, never across devices/worktrees.
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
+
 const GIT_QUERY_GC_TIME_MS = 60_000;
 const GIT_WORKSPACE_RECOVERY_INTERVAL_MS = 30_000;
 export const GIT_FACT_QUERIES = [
@@ -392,7 +394,7 @@ export function useGitWorkspaceSubscription(
 	const workspaceKey = gitTargetKey(target);
 	useSyncExternalStore(subscriptions.watch, subscriptions.getRevision, subscriptions.getRevision);
 	useEffect(() => {
-		if (!live || !workspaceKey || !narratorId) return;
+		if (REMOTE_BUILD || !live || !workspaceKey || !narratorId) return;
 		return subscriptions.subscribe({ narratorId, workspaceKey, canWrite: false }, view);
 	}, [subscriptions, narratorId, workspaceKey, view, live]);
 	return subscriptions;
@@ -555,6 +557,7 @@ async function readWorkspace<T>(
 	read: () => Promise<T>,
 	reprobeUnavailable = true,
 ): Promise<T> {
+	if (REMOTE_BUILD) throw new Error("Git is unavailable in remote access");
 	try {
 		return await read();
 	} catch (error) {
@@ -603,7 +606,7 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 	const { data: executionContext } = useWorkspaceContext(narratorId ?? "");
 	const detection = useGitDetectionPreference(narratorId);
 	useEffect(
-		() => (narratorId && detection.enabled ? subscribeGitAccess(qc) : undefined),
+		() => (!REMOTE_BUILD && narratorId && detection.enabled ? subscribeGitAccess(qc) : undefined),
 		[qc, narratorId, detection.enabled],
 	);
 	const workspaceRevision = Math.max(
@@ -658,7 +661,7 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 				throw error;
 			}
 		},
-		enabled: !!narratorId && detection.enabled && !!narrator && !denied,
+		enabled: !REMOTE_BUILD && !!narratorId && detection.enabled && !!narrator && !denied,
 		retry: false,
 		staleTime: 5_000,
 		gcTime: GIT_QUERY_GC_TIME_MS,
@@ -730,6 +733,7 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 		},
 		// Summary data never seeds this query: only this probe authorizes operations.
 		enabled:
+			!REMOTE_BUILD &&
 			!!narratorId &&
 			detection.enabled &&
 			(!!narrator || narratorError) &&
@@ -792,6 +796,7 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 	// Remember which grant this render observed so a stale refusal cannot re-block a newer grant.
 	const grantsAtRender = narratorId ? gitAccessGrantCount(qc, narratorId) : 0;
 	useEffect(() => {
+		if (REMOTE_BUILD) return;
 		if (narratorId && accessFailure && gitAccessGrantCount(qc, narratorId) === grantsAtRender) {
 			blockGitSummary(qc, narratorId);
 			void qc.cancelQueries({ queryKey: ["gitWorkspace", narratorId] });
@@ -947,7 +952,7 @@ function useGitFact<T>(
 				() => read(target as GitTarget, signal, takeFreshGitRead(qc, key, kind)),
 				kind === "status",
 			),
-		enabled: !!target && !denied && !pushed && subscriptions.isVisible(),
+		enabled: !REMOTE_BUILD && !!target && !denied && !pushed && subscriptions.isVisible(),
 		staleTime: 5_000,
 		refetchOnWindowFocus: false,
 		refetchOnReconnect: false,
@@ -971,7 +976,7 @@ function useGitFact<T>(
 		isLoading: !data && !error && (query.isLoading || updating),
 		updating,
 		refetch: () => {
-			if (target && subscriptions.refresh(target))
+			if (live && target && subscriptions.refresh(target))
 				return Promise.resolve({ ...query, data, error });
 			requestFreshGitRead(qc, key, kind);
 			return query.refetch();
@@ -1020,7 +1025,7 @@ export function useGitBranches(target: GitTarget | undefined | null, enabled = t
 		queryKey: ["gitBranches", key],
 		queryFn: ({ signal }) =>
 			readWorkspace(qc, target, () => api.getGitBranches(target as GitTarget, signal)),
-		enabled: Boolean(target && key) && enabled,
+		enabled: !REMOTE_BUILD && Boolean(target && key) && enabled,
 		// Short enough that reopening the panel re-reads, long enough that the bar and
 		// the picker share one response instead of racing each other.
 		staleTime: 10_000,
@@ -1046,6 +1051,7 @@ const GIT_BADGE_REFRESH_MIN_INTERVAL_MS = 2_000;
 export function useGitBadgeRefresh() {
 	const qc = useQueryClient();
 	useEffect(() => {
+		if (REMOTE_BUILD) return;
 		let lastRefreshAt = 0;
 		const refresh = () => {
 			const now = Date.now();
@@ -1094,7 +1100,7 @@ export function useGitFileModifications(target: GitTarget | undefined | null, fi
 					) as Promise<WorkspaceModificationView>,
 				false,
 			),
-		enabled: !!target,
+		enabled: !REMOTE_BUILD && !!target,
 		retry: false,
 		staleTime: GIT_FILE_ATTRIBUTION_STALE_MS,
 		gcTime: GIT_QUERY_GC_TIME_MS,
@@ -1112,7 +1118,7 @@ export function useGitLog(
 		queryKey: ["gitLog", gitTargetKey(target), limit, skip],
 		queryFn: ({ signal }) =>
 			readWorkspace(qc, target, () => api.getGitLog(target as GitTarget, limit, skip, signal)),
-		enabled: !!target && enabled,
+		enabled: !REMOTE_BUILD && !!target && enabled,
 		retry: false,
 		gcTime: GIT_QUERY_GC_TIME_MS,
 	});
@@ -1124,7 +1130,7 @@ export function useGitStashList(target: GitTarget | undefined | null) {
 		queryKey: ["gitStashList", gitTargetKey(target)],
 		queryFn: ({ signal }) =>
 			readWorkspace(qc, target, () => api.getGitStashList(target as GitTarget, signal)),
-		enabled: !!target,
+		enabled: !REMOTE_BUILD && !!target,
 		retry: false,
 		gcTime: GIT_QUERY_GC_TIME_MS,
 	});
@@ -1142,7 +1148,7 @@ export function useGitDiff(
 			readWorkspace(qc, target, () =>
 				api.getGitDiff(target as GitTarget, file as string, staged, signal),
 			),
-		enabled: !!target && !!file,
+		enabled: !REMOTE_BUILD && !!target && !!file,
 		retry: false,
 		gcTime: 30_000,
 	});
@@ -1158,7 +1164,7 @@ export function useGitCommitDetail(target: GitTarget | undefined | null, sha: st
 			readWorkspace(qc, target, () =>
 				api.getGitCommitDetail(target as GitTarget, sha as string, signal),
 			),
-		enabled: !!target && !!sha,
+		enabled: !REMOTE_BUILD && !!target && !!sha,
 		retry: false,
 		staleTime: Number.POSITIVE_INFINITY,
 		gcTime: GIT_QUERY_GC_TIME_MS,
@@ -1185,7 +1191,7 @@ export function useGitCommitDiff(
 			readWorkspace(qc, target, () =>
 				api.getGitCommitDiff(target as GitTarget, sha as string, file as string, oldPath, signal),
 			),
-		enabled: !!target && !!sha && !!file,
+		enabled: !REMOTE_BUILD && !!target && !!sha && !!file,
 		retry: false,
 		staleTime: Number.POSITIVE_INFINITY,
 		gcTime: GIT_QUERY_GC_TIME_MS,
@@ -1199,7 +1205,8 @@ function useGitMutation<T, R>(
 ) {
 	const qc = useQueryClient();
 	return useMutation({
-		mutationFn: run,
+		mutationFn: (value: T) =>
+			REMOTE_BUILD ? Promise.reject(new Error("Git is unavailable in remote access")) : run(value),
 		retry: false,
 		onSettled: () => {
 			invalidateWorkspaceQueries(qc, target, false);

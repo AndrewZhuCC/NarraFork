@@ -1,3 +1,4 @@
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { ActionIcon, Indicator, Menu, Tooltip } from "@mantine/core";
 import { PluginContributionPicker } from "../../plugins/PluginContributionPicker";
 import { usePluginUiSurface } from "../../plugins/PluginUiSurfaceContext";
@@ -16,6 +17,7 @@ export type ToolbarInlineControls = Pick<
 	UseHeaderToolbarOptions,
 	| "executionDevicesQuery"
 	| "updateExecutionDeviceMutation"
+	| "onRequireDeviceDirectory"
 	| "renderLod"
 	| "renderLodIsDefault"
 	| "handleSelectLod"
@@ -44,6 +46,7 @@ export function NarratorToolbarItem({
 	mode = "inline",
 }: NarratorToolbarItemProps) {
 	const hostSurface = usePluginUiSurface()?.hostContext.surface ?? "focus";
+	if (REMOTE_BUILD && def.id !== "lodlevel") return null;
 	const Icon = def.icon;
 	const title = t(def.labelKey, { ns: def.namespace ?? "narrator" });
 	const label =
@@ -79,9 +82,12 @@ export function NarratorToolbarItem({
 				label={t("executionDeviceSelector")}
 				localLabel={t("executionTargetLocal")}
 				offlineLabel={t("executionDeviceOffline")}
+				noDirectoryLabel={t("executionDeviceNoDirectory")}
+				directories={inlineControls.executionDevicesQuery.data?.directories}
 				devices={inlineControls.executionDevicesQuery.data?.devices ?? []}
 				currentDeviceId={inlineControls.executionDevicesQuery.data?.defaultDeviceId ?? "local"}
 				pending={inlineControls.updateExecutionDeviceMutation.isPending}
+				onRequireDirectory={inlineControls.onRequireDeviceDirectory}
 				onSelect={(deviceId) => inlineControls.updateExecutionDeviceMutation.mutate(deviceId)}
 			/>
 		);

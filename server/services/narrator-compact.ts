@@ -1073,7 +1073,7 @@ async function doRunCustomCompact({
 					resolutionError !== undefined ||
 					(!!resolvedCompact && isCodexRemoteCompactEnabled(resolvedCompact.adapter)),
 			})
-		: await narratorService.getModelHistorySinceLastCompact(narratorId);
+		: [...(await narratorService.getModelHistorySinceLastCompact(narratorId))];
 	if (
 		resolutionError !== undefined &&
 		messages.some(

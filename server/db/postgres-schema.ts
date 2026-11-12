@@ -253,6 +253,7 @@ export const narrators = pgTable(
 			.notNull()
 			.default("inherit"),
 		dangerReflectionOverride: text("danger_reflection_override").notNull().default("inherit"),
+		questionReflectionOverride: text("question_reflection_override").notNull().default("inherit"),
 		autoContinuationOverride: text("auto_continuation_override").notNull().default("inherit"),
 		behaviorFenceIntervalOverride: integer("behavior_fence_interval_override"),
 		tasksReminderIntervalOverride: integer("tasks_reminder_interval_override"),
@@ -270,6 +271,9 @@ export const narrators = pgTable(
 		cwd: text("cwd"),
 		workspaceRevision: integer("workspace_revision").notNull().default(0),
 		workspaceContext: jsonText("workspace_context"),
+		workspaceDirectories: jsonText("workspace_directories")
+			.notNull()
+			.default(sql.raw("'{}'::text")),
 		errorMessage: text("error_message"),
 		errorRetryable: boolean("error_retryable"),
 		refsInheritedFrom: text("refs_inherited_from").references((): PgColumn => narrators.id, {}),
@@ -325,12 +329,20 @@ export const narrators = pgTable(
 		),
 		index("idx_narrators_parent").on(table.parentNarratorId),
 		index("idx_narrators_origin_tool_call").on(table.originToolCallId),
+		index("idx_narrators_status").on(table.status),
 		index("idx_narrators_owner").on(table.ownerUserId),
 		index("idx_narrators_visibility").on(table.visibility),
 		index("idx_narrators_write_audience").on(table.writeAudience),
 		index("idx_narrators_acl_root").on(table.aclRootNarratorId),
 		index("idx_narrators_policy_source").on(table.policySourceNarratorId),
 		index("idx_narrators_variant_updated").on(table.variant, table.updatedAt, table.id),
+		index("idx_narrators_variant_list").on(
+			table.variant,
+			table.hiddenFromLists,
+			table.status,
+			table.updatedAt,
+			table.id,
+		),
 		index("idx_narrators_handle").on(table.handle),
 		uniqueIndex("idx_narrators_handle_fold").on(table.handleFold),
 		uniqueIndex("idx_narrators_modeltrace_key").on(table.modeltraceKey),
@@ -1300,6 +1312,7 @@ export const userPreferences = pgTable("user_preferences", {
 	replyInUserLanguage: boolean("reply_in_user_language").notNull().default(true),
 	showTokenUsage: boolean("show_token_usage").notNull().default(false),
 	showOutputStats: boolean("show_output_stats").notNull().default(true),
+	compactAuxiliaryContent: boolean("compact_auxiliary_content").notNull().default(true),
 	terminalTheme: text("terminal_theme").notNull().default("auto"),
 	terminalFontSize: integer("terminal_font_size").notNull().default(14),
 	narratorFontScalePercent: integer("narrator_font_scale_percent").notNull().default(100),
@@ -1310,6 +1323,7 @@ export const userPreferences = pgTable("user_preferences", {
 	narratorLineHeightV2Percent: integer("narrator_line_height_v2_percent"),
 	narratorParagraphScalePercent: integer("narrator_paragraph_scale_percent").notNull().default(100),
 	recentTabs: text("recent_tabs").notNull().default("[]"),
+	recentTabsShowDirectory: boolean("recent_tabs_show_directory").notNull().default(false),
 	addSubagentToRecentTabs: boolean("add_subagent_to_recent_tabs").notNull().default(true),
 	recentTabsGroupMode: text("recent_tabs_group_mode").notNull().default("flat"),
 	notifyOnDone: boolean("notify_on_done").notNull().default(true),
@@ -1337,9 +1351,14 @@ export const userPreferences = pgTable("user_preferences", {
 	narratorToolbarLayout: text("narrator_toolbar_layout").notNull().default("{}"),
 	gitIdentityContextMenu: boolean("git_identity_context_menu").notNull().default(false),
 	gitIdentityCreateModal: boolean("git_identity_create_modal").notNull().default(false),
+	gitIdentityFolderContextMenu: boolean("git_identity_folder_context_menu")
+		.notNull()
+		.default(false),
 	specTabLayout: text("spec_tab_layout").notNull().default("{}"),
 	traits: jsonText("traits").notNull().default(sql.raw("'[]'::text")),
 	tutorialProgress: text("tutorial_progress").notNull().default("{}"),
+	outlineDigestTimeZone: text("outline_digest_time_zone"),
+	outlineDigestTime: text("outline_digest_time"),
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
 });
@@ -1484,6 +1503,44 @@ export const userRecentTabs = pgTable(
 		index("idx_user_recent_tabs_user_folder").on(table.userId, table.folderId, table.sortOrder),
 		index("idx_user_recent_tabs_narrator").on(table.representedNarratorId, table.userId),
 		index("idx_user_recent_tabs_entity").on(table.type, table.entityId, table.userId),
+	],
+);
+
+export const recentTabArchiveMarks = pgTable(
+	"recent_tab_archive_marks",
+	{
+		id: text("id").primaryKey().notNull(),
+		userId: text("user_id")
+			.notNull()
+			.references((): PgColumn => users.id, { onDelete: "cascade" }),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
+		folderId: text("folder_id"),
+		archivedAt: text("archived_at").notNull(),
+	},
+	(table) => [uniqueIndex("idx_recent_tab_archive_mark").on(table.userId, table.narratorId)],
+);
+
+export const folderGitIdentityBindings = pgTable(
+	"folder_git_identity_bindings",
+	{
+		id: text("id").primaryKey().notNull(),
+		folderId: text("folder_id").notNull(),
+		userId: text("user_id")
+			.notNull()
+			.references((): PgColumn => users.id, { onDelete: "cascade" }),
+		identityId: text("identity_id").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_folder_git_identity_unique").on(table.folderId, table.userId),
+		index("idx_folder_git_identity_user").on(table.userId),
+		foreignKey({
+			name: "folder_git_identity_bindings_identity_id_user_git_b105c2a3b2_fk",
+			columns: [table.identityId],
+			foreignColumns: [userGitIdentities.id],
+		}).onDelete("cascade"),
 	],
 );
 
@@ -2039,6 +2096,8 @@ export const workspaces = pgTable(
 			.notNull()
 			.references((): PgColumn => users.id, { onDelete: "cascade" }),
 		title: text("title").notNull(),
+		titleSource: text("title_source").notNull().default("manual"),
+		titleRevision: integer("title_revision").notNull().default(0),
 		tree: text("tree").notNull(),
 		layoutRevision: integer("layout_revision").notNull().default(0),
 		createdAt: bigint("created_at", { mode: "number" }).notNull(),
@@ -2067,6 +2126,7 @@ export const workspacePanels = pgTable(
 		index("idx_workspace_panels_workspace").on(table.workspaceId, table.sortOrder),
 		uniqueIndex("idx_workspace_panels_narrator").on(table.workspaceId, table.narratorId),
 		index("idx_workspace_panels_narrator_lookup").on(table.narratorId),
+		index("idx_workspace_panels_kind_workspace").on(table.kind, table.workspaceId, table.id),
 	],
 );
 
@@ -2075,6 +2135,8 @@ export const apiRequests = pgTable(
 	{
 		id: text("id").primaryKey().notNull(),
 		userId: text("user_id"),
+		billingUserId: text("billing_user_id"),
+		projectId: text("project_id"),
 		narratorId: text("narrator_id").references((): PgColumn => narrators.id, {
 			onDelete: "cascade",
 		}),
@@ -2138,6 +2200,37 @@ export const userUsageTotals = pgTable("user_usage_totals", {
 	firstUsedAt: text("first_used_at").notNull(),
 	lastUsedAt: text("last_used_at").notNull(),
 });
+
+export const usageDaily = pgTable(
+	"usage_daily",
+	{
+		id: text("id").primaryKey().notNull(),
+		day: text("day").notNull(),
+		billingUserId: text("billing_user_id").notNull(),
+		projectId: text("project_id").notNull(),
+		provider: text("provider").notNull(),
+		credentialId: text("credential_id").notNull(),
+		model: text("model").notNull(),
+		requestCount: integer("request_count").notNull().default(0),
+		inputTokens: integer("input_tokens").notNull().default(0),
+		outputTokens: integer("output_tokens").notNull().default(0),
+		cachedInputTokens: integer("cached_input_tokens").notNull().default(0),
+		cacheCreationTokens: integer("cache_creation_tokens").notNull().default(0),
+		reasoningTokens: integer("reasoning_tokens").notNull().default(0),
+		costUsd: doublePrecision("cost_usd").notNull().default(0),
+		unpricedRequestCount: integer("unpriced_request_count").notNull().default(0),
+	},
+	(table) => [
+		uniqueIndex("idx_usage_daily_key").on(
+			table.day,
+			table.billingUserId,
+			table.projectId,
+			table.provider,
+			table.credentialId,
+			table.model,
+		),
+	],
+);
 
 export const credentialUsageTotals = pgTable(
 	"credential_usage_totals",
@@ -3245,6 +3338,7 @@ export const knowledgeSubmissions = pgTable(
 		verdict: text("verdict"),
 		findingsJson: jsonText("findings_json"),
 		reviewedAt: text("reviewed_at"),
+		authorReadAt: text("author_read_at"),
 		mergedRevisionId: text("merged_revision_id"),
 		createdAt: text("created_at").notNull(),
 	},
@@ -3257,6 +3351,7 @@ export const knowledgeSubmissions = pgTable(
 		index("idx_ks_reviewer_user").on(table.reviewerUserId),
 		index("idx_ks_collection").on(table.collectionId),
 		index("idx_ks_draft").on(table.draftId),
+		index("idx_ks_submitter_author_read").on(table.submitterUserId, table.authorReadAt),
 	],
 );
 
@@ -3470,9 +3565,14 @@ export const outlineSpaces = pgTable(
 		createdAt: text("created_at").notNull(),
 		inProcessReady: boolean("in_process_ready").notNull().default(false),
 		inProcessEpoch: integer("in_process_epoch").notNull().default(0),
+		lastCommitAt: text("last_commit_at"),
 	},
 	(table) => [
 		uniqueIndex("uq_outline_spaces_key").on(table.key),
+		index("idx_outline_spaces_last_commit").on(table.lastCommitAt, table.id),
+		index("idx_outline_spaces_unstamped")
+			.on(table.id)
+			.where(sql.raw('"last_commit_at" IS NULL AND "next_seq" > 1')),
 		index("idx_outline_spaces_in_process_pending")
 			.on(table.id)
 			.where(sql.raw('"in_process_ready" = FALSE')),
@@ -3766,12 +3866,58 @@ export const outlineViewState = pgTable(
 			.notNull()
 			.references((): PgColumn => outlineBlocks.id, { onDelete: "cascade" }),
 		collapsedJson: jsonText("collapsed_json").notNull().default(sql.raw("'[]'::text")),
+		expandedJson: jsonText("expanded_json"),
 		layout: text("layout").notNull().default("right"),
 		updatedAt: text("updated_at").notNull(),
 	},
 	(table) => [
 		index("idx_outline_view_state_page").on(table.pageBlockId),
 		primaryKey({ columns: [table.userId, table.pageBlockId] }),
+	],
+);
+
+export const outlineTaskSeen = pgTable(
+	"outline_task_seen",
+	{
+		userId: text("user_id")
+			.notNull()
+			.references((): PgColumn => users.id, { onDelete: "cascade" }),
+		taskBlockId: text("task_block_id")
+			.notNull()
+			.references((): PgColumn => outlineBlocks.id, { onDelete: "cascade" }),
+		seenSeq: integer("seen_seq").notNull(),
+		seenAt: text("seen_at").notNull(),
+	},
+	(table) => [
+		index("idx_outline_task_seen_block").on(table.taskBlockId),
+		index("idx_outline_task_seen_user_at").on(table.userId, table.seenAt),
+		primaryKey({ columns: [table.userId, table.taskBlockId] }),
+	],
+);
+
+export const outlineDigests = pgTable(
+	"outline_digests",
+	{
+		id: text("id").primaryKey().notNull(),
+		userId: text("user_id")
+			.notNull()
+			.references((): PgColumn => users.id, { onDelete: "cascade" }),
+		kind: text("kind").notNull(),
+		periodKey: text("period_key").notNull(),
+		timeZone: text("time_zone").notNull(),
+		periodStart: text("period_start").notNull(),
+		periodEnd: text("period_end").notNull(),
+		countsJson: jsonText("counts_json").notNull(),
+		itemCount: integer("item_count").notNull().default(0),
+		itemsJson: jsonText("items_json").notNull(),
+		rangesJson: jsonText("ranges_json").notNull(),
+		truncated: boolean("truncated").notNull().default(false),
+		createdAt: text("created_at").notNull(),
+		seenAt: text("seen_at"),
+	},
+	(table) => [
+		uniqueIndex("uq_outline_digests_user_period").on(table.userId, table.kind, table.periodKey),
+		index("idx_outline_digests_unseen").on(table.userId).where(sql.raw('"seen_at" IS NULL')),
 	],
 );
 
@@ -4233,8 +4379,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 136,
-  "columnCount": 1811,
+  "tableCount": 141,
+  "columnCount": 1868,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -5583,6 +5729,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "defaultExpression": "\"inherit\""
         },
         {
+          "property": "questionReflectionOverride",
+          "name": "question_reflection_override",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"inherit\"",
+          "defaultExpression": "\"inherit\""
+        },
+        {
           "property": "autoContinuationOverride",
           "name": "auto_continuation_override",
           "kind": "text",
@@ -5736,6 +5893,18 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "notNull": false,
           "primary": false,
           "unique": false
+        },
+        {
+          "property": "workspaceDirectories",
+          "name": "workspace_directories",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "{}",
+          "defaultExpression": "sql.raw(\"'{}'::text\")"
         },
         {
           "property": "errorMessage",
@@ -6148,6 +6317,13 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "name": "idx_narrators_status",
+          "columns": [
+            "status"
+          ],
+          "unique": false
+        },
+        {
           "name": "idx_narrators_owner",
           "columns": [
             "ownerUserId"
@@ -6186,6 +6362,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_narrators_variant_updated",
           "columns": [
             "variant",
+            "updatedAt",
+            "id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_narrators_variant_list",
+          "columns": [
+            "variant",
+            "hiddenFromLists",
+            "status",
             "updatedAt",
             "id"
           ],
@@ -11478,6 +11665,18 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "defaultExpression": "true"
         },
         {
+          "property": "compactAuxiliaryContent",
+          "name": "compact_auxiliary_content",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "true",
+          "defaultExpression": "true"
+        },
+        {
           "property": "terminalTheme",
           "name": "terminal_theme",
           "kind": "text",
@@ -11562,6 +11761,18 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false,
           "defaultValue": "\"[]\"",
           "defaultExpression": "\"[]\""
+        },
+        {
+          "property": "recentTabsShowDirectory",
+          "name": "recent_tabs_show_directory",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
         },
         {
           "property": "addSubagentToRecentTabs",
@@ -11869,6 +12080,18 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "defaultExpression": "false"
         },
         {
+          "property": "gitIdentityFolderContextMenu",
+          "name": "git_identity_folder_context_menu",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
+        },
+        {
           "property": "specTabLayout",
           "name": "spec_tab_layout",
           "kind": "text",
@@ -11901,6 +12124,24 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false,
           "defaultValue": "\"{}\"",
           "defaultExpression": "\"{}\""
+        },
+        {
+          "property": "outlineDigestTimeZone",
+          "name": "outline_digest_time_zone",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "outlineDigestTime",
+          "name": "outline_digest_time",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
         },
         {
           "property": "createdAt",
@@ -12732,6 +12973,173 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "columns": [
             "type",
             "entityId",
+            "userId"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "recentTabArchiveMarks",
+      "name": "recent_tab_archive_marks",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "userId",
+          "name": "user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "users",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "recent_tab_archive_marks_user_id_users_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "narratorId",
+          "name": "narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "recent_tab_archive_marks_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "folderId",
+          "name": "folder_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "archivedAt",
+          "name": "archived_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_recent_tab_archive_mark",
+          "columns": [
+            "userId",
+            "narratorId"
+          ],
+          "unique": true
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "folderGitIdentityBindings",
+      "name": "folder_git_identity_bindings",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "folderId",
+          "name": "folder_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "userId",
+          "name": "user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "users",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "folder_git_identity_bindings_user_id_users_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "identityId",
+          "name": "identity_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "userGitIdentities",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "folder_git_identity_bindings_identity_id_user_git_b105c2a3b2_fk"
+          },
+          "emitAsTableConstraint": true
+        },
+        {
+          "property": "updatedAt",
+          "name": "updated_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_folder_git_identity_unique",
+          "columns": [
+            "folderId",
+            "userId"
+          ],
+          "unique": true
+        },
+        {
+          "name": "idx_folder_git_identity_user",
+          "columns": [
             "userId"
           ],
           "unique": false
@@ -15663,6 +16071,28 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "titleSource",
+          "name": "title_source",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"manual\"",
+          "defaultExpression": "\"manual\""
+        },
+        {
+          "property": "titleRevision",
+          "name": "title_revision",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
           "property": "tree",
           "name": "tree",
           "kind": "text",
@@ -15834,6 +16264,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "narratorId"
           ],
           "unique": false
+        },
+        {
+          "name": "idx_workspace_panels_kind_workspace",
+          "columns": [
+            "kind",
+            "workspaceId",
+            "id"
+          ],
+          "unique": false
         }
       ],
       "checks": [],
@@ -15858,6 +16297,24 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         {
           "property": "userId",
           "name": "user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "billingUserId",
+          "name": "billing_user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "projectId",
+          "name": "project_id",
           "kind": "text",
           "pgType": "text",
           "notNull": false,
@@ -16370,6 +16827,182 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         }
       ],
       "indexes": [],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "usageDaily",
+      "name": "usage_daily",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "day",
+          "name": "day",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "billingUserId",
+          "name": "billing_user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "projectId",
+          "name": "project_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "provider",
+          "name": "provider",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "credentialId",
+          "name": "credential_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "model",
+          "name": "model",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "requestCount",
+          "name": "request_count",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "inputTokens",
+          "name": "input_tokens",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "outputTokens",
+          "name": "output_tokens",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "cachedInputTokens",
+          "name": "cached_input_tokens",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "cacheCreationTokens",
+          "name": "cache_creation_tokens",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "reasoningTokens",
+          "name": "reasoning_tokens",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "costUsd",
+          "name": "cost_usd",
+          "kind": "real",
+          "pgType": "double precision",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "unpricedRequestCount",
+          "name": "unpriced_request_count",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_usage_daily_key",
+          "columns": [
+            "day",
+            "billingUserId",
+            "projectId",
+            "provider",
+            "credentialId",
+            "model"
+          ],
+          "unique": true
+        }
+      ],
       "checks": [],
       "checkDefinitions": [],
       "foreignKeys": [],
@@ -23061,6 +23694,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "authorReadAt",
+          "name": "author_read_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "mergedRevisionId",
           "name": "merged_revision_id",
           "kind": "text",
@@ -23135,6 +23777,14 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_ks_draft",
           "columns": [
             "draftId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_ks_submitter_author_read",
+          "columns": [
+            "submitterUserId",
+            "authorReadAt"
           ],
           "unique": false
         }
@@ -24340,6 +24990,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false,
           "defaultValue": "0",
           "defaultExpression": "0"
+        },
+        {
+          "property": "lastCommitAt",
+          "name": "last_commit_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
         }
       ],
       "indexes": [
@@ -24349,6 +25008,22 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "key"
           ],
           "unique": true
+        },
+        {
+          "name": "idx_outline_spaces_last_commit",
+          "columns": [
+            "lastCommitAt",
+            "id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_outline_spaces_unstamped",
+          "columns": [
+            "id"
+          ],
+          "unique": false,
+          "predicate": "\"last_commit_at\" IS NULL AND \"next_seq\" > 1"
         },
         {
           "name": "idx_outline_spaces_in_process_pending",
@@ -25836,6 +26511,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "defaultExpression": "sql.raw(\"'[]'::text\")"
         },
         {
+          "property": "expandedJson",
+          "name": "expanded_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "layout",
           "name": "layout",
           "kind": "text",
@@ -25877,6 +26562,262 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           ]
         }
       ]
+    },
+    {
+      "exportName": "outlineTaskSeen",
+      "name": "outline_task_seen",
+      "columns": [
+        {
+          "property": "userId",
+          "name": "user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "users",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_task_seen_user_id_users_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "taskBlockId",
+          "name": "task_block_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "outlineBlocks",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_task_seen_task_block_id_outline_blocks_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "seenSeq",
+          "name": "seen_seq",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "seenAt",
+          "name": "seen_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_outline_task_seen_block",
+          "columns": [
+            "taskBlockId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_outline_task_seen_user_at",
+          "columns": [
+            "userId",
+            "seenAt"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": [
+        {
+          "columns": [
+            "userId",
+            "taskBlockId"
+          ]
+        }
+      ]
+    },
+    {
+      "exportName": "outlineDigests",
+      "name": "outline_digests",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "userId",
+          "name": "user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "users",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_digests_user_id_users_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "kind",
+          "name": "kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "periodKey",
+          "name": "period_key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "timeZone",
+          "name": "time_zone",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "periodStart",
+          "name": "period_start",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "periodEnd",
+          "name": "period_end",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "countsJson",
+          "name": "counts_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "itemCount",
+          "name": "item_count",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "itemsJson",
+          "name": "items_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "rangesJson",
+          "name": "ranges_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "truncated",
+          "name": "truncated",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "seenAt",
+          "name": "seen_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "uq_outline_digests_user_period",
+          "columns": [
+            "userId",
+            "kind",
+            "periodKey"
+          ],
+          "unique": true
+        },
+        {
+          "name": "idx_outline_digests_unseen",
+          "columns": [
+            "userId"
+          ],
+          "unique": false,
+          "predicate": "\"seen_at\" IS NULL"
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
     },
     {
       "exportName": "scheduledTasks",

@@ -29,6 +29,7 @@ import {
 	outlineQuestions,
 	outlineSpaces,
 	outlineTaskClaims,
+	outlineTaskSeen,
 	outlineViewState,
 } from "@server/db/postgres-schema";
 import type { OutlineAskJson, OutlineTaskJson } from "@server/db/schema";
@@ -43,6 +44,7 @@ import {
 	inArray,
 	isNotNull,
 	isNull,
+	lt,
 	lte,
 	ne,
 	notInArray,
@@ -94,12 +96,14 @@ import {
 	OutlineStaleWriteError,
 	type OutlineStore,
 	type OutlineTaskClaimRow,
+	type OutlineTaskSeenRow,
 	type OutlineVersionRow,
 	type OutlineViewStateRow,
 	oldestClaimsFirst,
 	pendingAsExpected,
 	writesAsExpected,
 } from "./port";
+import { createPostgresOutlineDigests } from "./postgres-digest";
 import { createPostgresOutlineReads } from "./postgres-read";
 
 /** Transaction handle as produced by `db.transaction(async (tx) => …)`. */
@@ -152,8 +156,9 @@ function askOf(value: unknown): OutlineAskJson | null {
 }
 
 function toSpace(row: SpaceSelect): OutlineSpaceRow {
-	// `in_process_ready` is bookkeeping of the in-process rebuild, not part of a space's row.
-	const { inProcessReady: _ready, ...space } = row;
+	// `in_process_ready` is bookkeeping of the in-process rebuild, and `last_commit_at` the
+	// reports' (read through `listSpacesCommittedSince`): neither is part of a space's row.
+	const { inProcessReady: _ready, lastCommitAt: _last, ...space } = row;
 	return { ...space, kind: row.kind as OutlineSpaceKind };
 }
 
@@ -183,15 +188,47 @@ type ViewStateSelect = typeof outlineViewState.$inferSelect;
 
 function toViewState(row: ViewStateSelect): OutlineViewStateRow {
 	const collapsed = row.collapsedJson;
+	const expanded = row.expandedJson;
 	return {
 		userId: row.userId,
 		pageBlockId: row.pageBlockId,
 		collapsed: Array.isArray(collapsed)
 			? collapsed.filter((id): id is string => typeof id === "string")
 			: [],
+		expanded: Array.isArray(expanded)
+			? expanded.filter((id): id is string => typeof id === "string")
+			: [],
 		layout: row.layout === "down" ? "down" : "right",
 		updatedAt: row.updatedAt,
 	};
+}
+
+/**
+ * Record the finished tasks a person has seen (each at the latest version seen) and drop their
+ * marks seen before `pruneBefore`.
+ */
+async function putTaskSeenSection(
+	tx: PgTransaction,
+	userId: string,
+	rows: readonly OutlineTaskSeenRow[],
+	at: string,
+	pruneBefore: string,
+): Promise<void> {
+	for (const chunk of chunked(rows)) {
+		await tx
+			.insert(outlineTaskSeen)
+			.values(chunk.map((row) => ({ userId, ...row, seenAt: at })))
+			.onConflictDoUpdate({
+				target: [outlineTaskSeen.userId, outlineTaskSeen.taskBlockId],
+				set: {
+					seenSeq: sql`greatest(excluded.seen_seq, ${outlineTaskSeen.seenSeq})`,
+					seenAt: at,
+				},
+			});
+	}
+	await tx
+		.delete(outlineTaskSeen)
+		.where(and(eq(outlineTaskSeen.userId, userId), lt(outlineTaskSeen.seenAt, pruneBefore)));
 }
 
 /** Write a person's view state of a page and drop their oldest pages beyond the cap. */
@@ -206,12 +243,18 @@ async function putViewStateSection(
 			userId: row.userId,
 			pageBlockId: row.pageBlockId,
 			collapsedJson: row.collapsed,
+			expandedJson: row.expanded,
 			layout: row.layout,
 			updatedAt: row.updatedAt,
 		})
 		.onConflictDoUpdate({
 			target: [outlineViewState.userId, outlineViewState.pageBlockId],
-			set: { collapsedJson: row.collapsed, layout: row.layout, updatedAt: row.updatedAt },
+			set: {
+				collapsedJson: row.collapsed,
+				expandedJson: row.expanded,
+				layout: row.layout,
+				updatedAt: row.updatedAt,
+			},
 		});
 	// The person's oldest pages beyond the cap (found by the primary key's prefix, at most
 	// `keepPerUser + 2` rows).
@@ -385,6 +428,8 @@ async function applyCommitSection(
 		.update(outlineSpaces)
 		.set({
 			nextSeq: sql`${outlineSpaces.nextSeq} + 1`,
+			// Which spaces had commits when (the reports, P2 PR 11): no extra statement.
+			lastCommitAt: plan.commit.createdAt,
 			...(plan.inProcessStale
 				? { inProcessReady: false, inProcessEpoch: sql`${outlineSpaces.inProcessEpoch} + 1` }
 				: {}),
@@ -828,6 +873,7 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 	const store: OutlineStore = {
 		backendId: "postgres",
 		...createPostgresOutlineReads(db),
+		...createPostgresOutlineDigests(db),
 
 		async ensureSpace(scope, now) {
 			for (let attempt = 0; attempt < SPACE_KEY_ATTEMPTS; attempt++) {
@@ -1125,6 +1171,31 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 			});
 		},
 
+		async getTaskSeen(userId, taskBlockIds) {
+			const out: OutlineTaskSeenRow[] = [];
+			for (const chunk of chunked([...new Set(taskBlockIds)])) {
+				out.push(
+					...(await db
+						.select({
+							taskBlockId: outlineTaskSeen.taskBlockId,
+							seenSeq: outlineTaskSeen.seenSeq,
+						})
+						.from(outlineTaskSeen)
+						.where(
+							and(eq(outlineTaskSeen.userId, userId), inArray(outlineTaskSeen.taskBlockId, chunk)),
+						)),
+				);
+			}
+			return out;
+		},
+
+		async putTaskSeen(userId, rows, at, pruneBefore) {
+			await withPgRetry(
+				() => db.transaction((tx) => putTaskSeenSection(tx, userId, rows, at, pruneBefore)),
+				{ label: "outline.putTaskSeen" },
+			);
+		},
+
 		async applyCommit(plan) {
 			let outcome: "applied" | "stale" | "claims" | "pending";
 			try {
@@ -1401,6 +1472,24 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 			return out;
 		},
 
+		async listOpenQuestionBlocksOnPage(spaceId, pageId, limit) {
+			const rows = await db
+				.select({ id: outlineQuestions.blockId })
+				.from(outlineQuestions)
+				.innerJoin(outlineBlocks, eq(outlineBlocks.id, outlineQuestions.blockId))
+				.where(
+					and(
+						eq(outlineQuestions.spaceId, spaceId),
+						sql`${outlineQuestions.state} = 'open'`,
+						eq(outlineBlocks.pageId, pageId),
+						eq(outlineBlocks.deleted, false),
+					),
+				)
+				.orderBy(desc(outlineQuestions.createdAt), sql`${outlineQuestions.blockId} COLLATE "C"`)
+				.limit(limit);
+			return rows.map((row) => row.id);
+		},
+
 		async listOpenQuestionsForUser(userId, limit) {
 			const rows = await db
 				.select()
@@ -1635,7 +1724,7 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 				.limit(limit);
 		},
 
-		async listSessionTaskClaims(narratorId, limit) {
+		async listSessionTaskClaims(narratorId, limit, options) {
 			const held = (holder: SQL) =>
 				db
 					.select({ claim: outlineTaskClaims, spaceId: outlineBlocks.spaceId })
@@ -1648,7 +1737,9 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 						sql`${outlineTaskClaims.taskBlockId} COLLATE "C"`,
 					)
 					.limit(limit);
-			const own = await held(eq(outlineTaskClaims.holderNarratorId, narratorId));
+			const own = options?.subagentsOnly
+				? []
+				: await held(eq(outlineTaskClaims.holderNarratorId, narratorId));
 			const subagents = await held(
 				inArray(
 					outlineTaskClaims.holderNarratorId,

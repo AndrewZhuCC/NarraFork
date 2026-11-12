@@ -181,7 +181,7 @@ export interface DbMessage {
 	contentText: string | null;
 	parentToolUseId: string | null;
 	messageUuid: string | null;
-	toolCalls?: DbToolCall[];
+	toolCalls?: readonly DbToolCall[];
 }
 
 export interface DbToolCall {
@@ -318,7 +318,10 @@ export interface ParsedStreamEvent {
 	/** Image generation lifecycle event from Responses API (Codex native image_generation tool) */
 	imageGeneration?: {
 		id: string;
+		/** Lifecycle status; `completed` is authoritative only with `final` and `result`. */
 		status: string;
+		error?: string;
+		errorCode?: string;
 		/** Revised prompt used by the model (available on completion) */
 		revisedPrompt?: string;
 		/** Base64-encoded image data (available on completion) */

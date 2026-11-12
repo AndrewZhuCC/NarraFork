@@ -104,6 +104,20 @@ export type NarratorPanelStateResponse = NarratorPanelState<
 	BufferMessageSummary
 >;
 
+/** One selectable execution device, as reported before a session exists. */
+export interface WorkspaceDeviceListResponse {
+	devices: Array<
+		NarratorExecutionDevice & { ownedByActingUser?: boolean; scope: "global" | "project" }
+	>;
+}
+
+/** deviceId → its recorded working directory (see `shared/workspace-directories`). */
+export type WorkspaceDirectoryEntry = {
+	cwd: string;
+	pathFlavor: "posix" | "windows";
+};
+export type WorkspaceDirectoryMap = Record<string, WorkspaceDirectoryEntry>;
+
 export type NarratorDetail = ApiEntity & {
 	navigationSummary?: NarratorNavigationSummary;
 };
@@ -1031,10 +1045,13 @@ export const narratorsApi = {
 		relaxedPlan?: boolean;
 		planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 		dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
+		questionReflectionOverride?: "inherit" | "on" | "off";
 		autoContinuationOverride?: "inherit" | "always" | "blockStop" | "protectedOnly" | "off";
 		behaviorFenceIntervalOverride?: number | null;
 		behaviorFenceAttachOverride?: "inherit" | "on" | "off";
 		cwd?: string;
+		/** Execution device the session starts on. Omit/"local" for this server. */
+		deviceId?: string | null;
 		title?: string;
 		makeNamed?: boolean;
 		handle?: string;
@@ -1042,6 +1059,34 @@ export const narratorsApi = {
 	}) => request<ApiEntity>("/narrators", { method: "POST", body: JSON.stringify(data) }),
 	createSubagent: (parentNarratorId: string) =>
 		request<ApiEntity>(`/narrators/${parentNarratorId}/subagents`, { method: "POST" }),
+	/**
+	 * Devices this caller may start a session on.
+	 *
+	 * Creation needs the list before the narrator exists, so this cannot use the
+	 * per-narrator device endpoint. Authorization is the caller's own visibility, the
+	 * same list their tool routing uses.
+	 */
+	getWorkspaceDevices: (projectId?: string | null) => {
+		const qs = projectId ? `?projectId=${encodeURIComponent(projectId)}` : "";
+		return request<WorkspaceDeviceListResponse>(`/narrators/workspace-devices${qs}`);
+	},
+	/**
+	 * List one level of a device directory before the session exists.
+	 *
+	 * Non-admins are confined to the device's declared workspace root; a refusal comes
+	 * back as 403 and never reaches the device.
+	 */
+	browseWorkspaceDirectory: (
+		deviceId: string,
+		path?: string,
+		opts?: { showHidden?: boolean; projectId?: string | null },
+	) => {
+		const params = new URLSearchParams({ deviceId });
+		if (path) params.set("path", path);
+		if (opts?.showHidden) params.set("showHidden", "1");
+		if (opts?.projectId) params.set("projectId", opts.projectId);
+		return request<RemoteDirectoryListing>(`/narrators/workspace-directory-browse?${params}`);
+	},
 	/**
 	 * Spawn a Setup Assistant narrator that installs the missing system
 	 * dependencies on this machine. Returns `created: false` when nothing
@@ -1646,9 +1691,12 @@ export const narratorsApi = {
 			{ method: "DELETE" },
 		),
 	getNarratorExecutionDevices: (id: string) =>
-		request<{ defaultDeviceId: string | null; devices: NarratorExecutionDevice[] }>(
-			`/narrators/${id}/execution-devices`,
-		),
+		request<{
+			defaultDeviceId: string | null;
+			devices: NarratorExecutionDevice[];
+			/** Working directory recorded per device; absence means "not configured". */
+			directories?: WorkspaceDirectoryMap;
+		}>(`/narrators/${id}/execution-devices`),
 	/**
 	 * Browse one level of a device's filesystem through a narrator's device
 	 * authorization, so non-admin users can use the remote path picker.
@@ -1814,6 +1862,7 @@ export const narratorsApi = {
 		data: {
 			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
+			questionReflectionOverride?: "inherit" | "on" | "off";
 			autoContinuationOverride?: "inherit" | "always" | "blockStop" | "protectedOnly" | "off";
 			tasksReminderIntervalOverride?: number | null;
 		},
@@ -1948,7 +1997,7 @@ export const narratorsApi = {
 			}
 		} else {
 			headers["Content-Type"] = "application/json";
-			res = await fetch(url, {
+			res = await authorizedFetch(url, {
 				method: "POST",
 				headers,
 				body: JSON.stringify({
@@ -2169,7 +2218,7 @@ export const narratorsApi = {
 			});
 		}
 
-		const res = await fetch(
+		const res = await authorizedFetch(
 			inputBlockId
 				? `${apiBase()}/narrators/${narratorId}/blocks/${encodeURIComponent(inputBlockId)}/edit-and-regenerate`
 				: `${apiBase()}/narrators/${narratorId}/edit-and-regenerate/${messageId}`,

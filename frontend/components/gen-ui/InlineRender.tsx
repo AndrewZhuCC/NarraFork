@@ -107,6 +107,7 @@ export function InlineRender({
 	runtime: recorded,
 	formToolUseId,
 	stateKey,
+	onSubmitted,
 }: {
 	narratorId: string;
 	source: string;
@@ -121,6 +122,8 @@ export function InlineRender({
 	formToolUseId?: string;
 	/** Identifies the card: frames with the same key share what the reader entered. */
 	stateKey?: string;
+	/** The answer reached the waiting call: the card has nothing left to ask. */
+	onSubmitted?: () => void;
 }) {
 	const { t } = useTranslation("narrator");
 	const [contentHeight, setContentHeight] = useState<number | null>(null);
@@ -236,6 +239,7 @@ export function InlineRender({
 					answeredForms.add(toolUseId);
 					if (answeredForms.size > 100)
 						answeredForms.delete(answeredForms.values().next().value as string);
+					onSubmitted?.();
 					return;
 				}
 				if (tries > 0 && formNow.current === toolUseId) {
@@ -251,7 +255,7 @@ export function InlineRender({
 			});
 			return true;
 		},
-		[narratorId, send],
+		[narratorId, send, onSubmitted],
 	);
 
 	const post = useCallback(() => {

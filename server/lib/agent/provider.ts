@@ -39,8 +39,10 @@ import { buildCommandCodeProvider } from "./commandcode-provider";
 import { GeminiInteractionsProvider } from "./gemini-interactions-provider";
 import { GeminiProvider } from "./gemini-provider";
 import { GrokProvider } from "./grok-provider";
+import type { ImageGenerationRequest, ImageGenerationResponse } from "./image-generation-api";
 import { NugProvider } from "./nug-provider";
 import { OpenAIProvider } from "./openai-provider";
+import { PooledProvider, usableProviderKeys, withProviderKey } from "./pooled-provider";
 import {
 	connectionForProtocolSwitch,
 	type ProtocolConnectionFields,
@@ -57,6 +59,7 @@ import { TokenDanceProvider } from "./tokendance-provider";
 // layer and bundled plugin code can use them without importing anything under
 // `server/`. Re-exported here to keep existing host import paths working.
 
+export type { ImageGenerationRequest, ImageGenerationResponse } from "./image-generation-api";
 export type {
 	AgentToolUse,
 	ApiRequestDiagnosticSource,
@@ -352,6 +355,12 @@ export interface ProviderAdapter {
 	generate(text: string, model: string): Promise<string>;
 
 	/**
+	 * Send one image generation request without replay/failover. Returns an unconsumed
+	 * response, including non-2xx; the caller owns streaming, limits, and error parsing.
+	 */
+	generateImage?(params: ImageGenerationRequest): Promise<ImageGenerationResponse>;
+
+	/**
 	 * Like generate() but also returns contextUsagePercentage if available.
 	 * `systemInstruction` is optional and lets providers with a native system/developer
 	 * channel place instructions outside the user text.
@@ -482,31 +491,43 @@ function registerCredentialProviderSource<
 	create: (config: T) => ProviderAdapter,
 	isComplete: (config: T) => boolean = (config) => !!config.apiKey?.trim(),
 ): void {
+	const adapterFor = (prefix: string, model: string, config: T): ProviderAdapter => {
+		// 逐模型协议覆盖：协议和这条连接本来的适配器不同时，换一族适配器，但留下代理和指纹。
+		const protocol = resolveModelProtocol(prefix, model);
+		const connection = config as ProtocolConnectionFields;
+		if (protocol && !protocolMatchesConnection(kind, connection, protocol)) {
+			try {
+				const shared = connectionForProtocolSwitch(connection, model);
+				if (protocol === "anthropic-messages") return new AnthropicProvider(shared);
+				if (protocol === "gemini-compatible") return createGeminiProvider(shared);
+				return new OpenAIProvider({
+					...shared,
+					apiMode: protocol === "openai-responses" ? "responses" : "completions",
+				});
+			} catch (error) {
+				logger.warn("Model protocol override fell back to the provider default", {
+					prefix,
+					protocol,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+		return create(config);
+	};
 	builtinProviderSources.register(kind, {
 		resolve: (prefix, model) => {
 			const config = getConfig(prefix);
 			if (!config) return null;
-			// 逐模型协议覆盖：协议和这条连接本来的适配器不同时，换一族适配器，但留下代理和指纹。
-			const protocol = resolveModelProtocol(prefix, model);
-			const connection = config as ProtocolConnectionFields;
-			if (protocol && !protocolMatchesConnection(kind, connection, protocol)) {
-				try {
-					const shared = connectionForProtocolSwitch(connection, model);
-					if (protocol === "anthropic-messages") return new AnthropicProvider(shared);
-					if (protocol === "gemini-compatible") return createGeminiProvider(shared);
-					return new OpenAIProvider({
-						...shared,
-						apiMode: protocol === "openai-responses" ? "responses" : "completions",
-					});
-				} catch (error) {
-					logger.warn("Model protocol override fell back to the provider default", {
-						prefix,
-						protocol,
-						error: error instanceof Error ? error.message : String(error),
-					});
-				}
-			}
-			return create(config);
+			// Custom API providers can hold several keys. One plain key (the one settings
+			// shows, with no network identity of its own) keeps the direct adapter.
+			const keys = kind === "nug" ? [] : usableProviderKeys(config.id);
+			const plain =
+				keys.length === 0 ||
+				(keys.length === 1 && keys[0]?.apiKey === config.apiKey && !keys[0]?.network);
+			if (plain) return adapterFor(prefix, model, config);
+			return new PooledProvider(config.id, (key) =>
+				adapterFor(prefix, model, withProviderKey(config, key)),
+			);
 		},
 		listReadiness: () =>
 			listConfigs().map((config) => ({

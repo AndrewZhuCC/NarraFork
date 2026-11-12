@@ -49,7 +49,8 @@ describe("WCO title-bar rows", () => {
 		const page = await Bun.file(
 			new URL("../routes/narrators/$narratorId.tsx", import.meta.url),
 		).text();
-		expect(page).toContain("data-nf-wco-titlebar=");
+		expect(page).toMatch(/data-nf-wco-titlebar\s/);
+		expect(page).toContain("useWcoTitlebarRows(!narratorLoading && !!narrator)");
 		// A ref callback, so the marks follow the root across session switches (the page
 		// remounts its root per session); a ref object kept the detached first root.
 		expect(page).toContain("useWcoTitlebarRows(");
@@ -62,5 +63,8 @@ describe("WCO title-bar rows", () => {
 		expect(workspace).toContain("data-nf-titlebar-candidate");
 		expect(workspace).toContain("useWcoTitlebarRows(");
 		expect(workspace).toContain("ref={titlebarRootRef}");
+		// The editing entry point must be a semantic button: a plain Group with onClick
+		// stays in the drag region and cannot receive the click in a native WCO window.
+		expect(workspace).toContain("<UnstyledButton onClick={startEditing}>");
 	});
 });

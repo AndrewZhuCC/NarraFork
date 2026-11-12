@@ -11,6 +11,7 @@
  *   │             → row height = max(icon16, badge16, xs line17, chevron12) = 17  │
  *   │  description Text xs mt2 ml21  — collapsed: truncate SINGLE line 🟢         │
  *   │                                  expanded : wraps 🔴 (pretext)             │
+ *   │  [task row]  sent with an outline task (P2 PR 9b) → mt2 + one xs line 🟢   │
  *   │  [result preview]  !expanded && terminal && result → truncate single line  │
  *   │  collapsed header ≈ 56 (no preview) .. 75 (with preview) px                 │
  *   └────────────────────────────────────────────────────────────────────────────┘
@@ -51,6 +52,7 @@
  */
 
 import { prepareRichInline, type RichInlineItem } from "@chenglou/pretext/rich-inline";
+import type { SubagentDelegation } from "@shared/outline-report-note";
 // The recent-call rows ARE trace rows, so their height comes from the shared row
 // metrics rather than a second copy of it. Sourced from `row-metrics` directly
 // (NOT `./measure-tool-run`, which merely re-exports it): measure-tool-run now
@@ -142,6 +144,11 @@ export const DESC_LEFT = 21;
 export const DESC_FONT = `${FONT_WEIGHT.regular} ${FONT_SIZE.xs}px ${SANS_FAMILY}`;
 /** result-preview Text mt={2} (collapsed only). */
 export const RESULT_PREVIEW_MARGIN_TOP = 2;
+/**
+ * The task row's top margin (outline P2 PR 9b): "Task: <title>" under the description of an
+ * agent sent with an outline task, one truncating xs line whatever the card's state.
+ */
+export const DELEGATION_ROW_MARGIN_TOP = 2;
 
 // ── Recent Calls (Box px="xs" pb="xs" — NO top padding) ──────────────────────
 /** Title row height when the "open session" button is present (compact-xs 18). */
@@ -354,6 +361,12 @@ export interface SubagentCardData {
 	liveOutputChars?: number;
 	/** Description line (collapsed: truncated single line; expanded: wraps). */
 	description: string;
+	/**
+	 * The outline task the agent was sent with (outline P2 PR 9b): adds the task row under the
+	 * description (HEIGHT-AFFECTING by its presence: one fixed line), and a late result's badge on
+	 * the fixed badge row (height-neutral, painted from the cached payload: `subagentRevision`).
+	 */
+	delegation?: SubagentDelegation;
 	/** Prompt text — presence enables the prompt toggle block. */
 	prompt?: string;
 	promptBody?: ToolCappedDetail;
@@ -434,6 +447,7 @@ export interface SubagentCardData {
 }
 
 export interface SubagentMeasureOpts {
+	compactAuxiliaryContent?: boolean;
 	/** Whether this is a recent card (L5 layering). Default true. */
 	isRecent?: boolean;
 	/** User/soleInRun expand state (L1-L3 + L5-recent). Default false. */
@@ -466,6 +480,8 @@ export interface MeasuredSubagent extends MeasuredElement {
 	descriptionHeight: number;
 	/** Whether the collapsed result-preview line is included. */
 	hasResultPreview: boolean;
+	/** The task row's height (margin + one line), 0 for an agent sent without a task. */
+	delegationRowHeight: number;
 	/** Recent-calls region height (0 when no activity calls). */
 	recentCallsHeight: number;
 	/** Number of recent rows drawn (min(count, 3)). */
@@ -582,6 +598,7 @@ function measureWrappedText(text: string, innerWidth: number, className: string)
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface SubagentExpandInput {
+	compactAuxiliaryContent?: boolean;
 	isActive: boolean;
 	hasSelfPermission: boolean;
 	pendingPermissionCount: number;
@@ -600,6 +617,12 @@ export interface SubagentExpandInput {
 export function resolveSubagentExpanded(lod: RenderLod, input: SubagentExpandInput): boolean {
 	const lodExempt = input.isActive || input.hasSelfPermission || input.pendingPermissionCount > 0;
 	if (lodExempt || input.lodUserOverride) return true;
+	if (input.compactAuxiliaryContent) {
+		if (input.userCollapsed) return false;
+		if (lod >= 5) return true;
+		if (lod === 4) return input.isRecent && input.opened;
+		return false;
+	}
 	if (lod === 1) return false;
 	// L2–L5 stay expanded regardless of recency, unless the reader folds the card.
 	return !input.userCollapsed;
@@ -628,10 +651,11 @@ export function measureSubagentCard(
 	const pendingCount =
 		data.pendingPermissions?.length ?? Math.max(0, opts.pendingPermissionCount ?? 0);
 	const isRecent = opts.isRecent ?? true;
-	const opened = opts.opened ?? false;
+	const opened = opts.opened ?? opts.compactAuxiliaryContent === true;
 	const inRun = opts.inRun === true;
 
 	const effectiveExpanded = resolveSubagentExpanded(lod, {
+		compactAuxiliaryContent: opts.compactAuxiliaryContent,
 		isActive,
 		hasSelfPermission,
 		pendingPermissionCount: pendingCount,
@@ -659,11 +683,15 @@ export function measureSubagentCard(
 		? descriptionMeasured.frame.contentHeight
 		: typographyMetrics().line.xs;
 
+	const delegationRowHeight = data.delegation
+		? DELEGATION_ROW_MARGIN_TOP + typographyMetrics().line.xs
+		: 0;
 	const headerHeight =
 		CARD_PADDING * 2 +
 		badgeRowHeight() +
 		DESC_MARGIN_TOP +
 		descriptionHeight +
+		delegationRowHeight +
 		(hasResultPreview ? RESULT_PREVIEW_MARGIN_TOP + typographyMetrics().line.xs : 0);
 
 	// ── File changes (expanded only; row COUNT is the whole height model) ───────
@@ -807,6 +835,7 @@ export function measureSubagentCard(
 		headerHeight,
 		descriptionHeight,
 		hasResultPreview,
+		delegationRowHeight,
 		recentCallsHeight,
 		recentRowCount,
 		hasRecentCallsButton,

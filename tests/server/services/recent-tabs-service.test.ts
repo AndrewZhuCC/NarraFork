@@ -468,6 +468,45 @@ describe("recent-tabs pagination and folders", () => {
 		).rejects.toMatchObject({ statusCode: 409, code: "STALE_CURSOR" });
 	});
 
+	it("pages the pinned block first even when stored sort keys disagree", async () => {
+		const tabs = Array.from({ length: 6 }, (_, index) => makeTab(`n-${index}`));
+		seedLegacyTabs(tabs);
+		await recentTabs.ensureMigrated("user-1");
+		// Rows written before the pinned block was enforced: pinned rows below unpinned ones.
+		db.update(userRecentTabs)
+			.set({ pinned: true })
+			.where(eq(userRecentTabs.tabKey, "narrator:n-4"))
+			.run();
+		db.update(userRecentTabs)
+			.set({ pinned: true })
+			.where(eq(userRecentTabs.tabKey, "narrator:n-2"))
+			.run();
+
+		// Page by page across the pin boundary: nothing skipped, nothing repeated.
+		const seen: string[] = [];
+		let cursor: string | undefined;
+		do {
+			const page = await recentTabs.listPage("user-1", "work", cursor, 2);
+			seen.push(...page.items.map((tab) => `${tab.pinned ? "*" : ""}${tab.id}`));
+			cursor = page.nextCursor ?? undefined;
+		} while (cursor);
+		expect(seen).toEqual(["*n-2", "*n-4", "n-0", "n-1", "n-3", "n-5"]);
+		// Reading never writes.
+		expect(broadcasts).toHaveLength(0);
+	});
+
+	it("answers a cursor without the pinned position as stale", async () => {
+		seedLegacyTabs([makeTab("n-1"), makeTab("n-2")]);
+		const revision = await recentTabs.ensureMigrated("user-1");
+		const legacy = Buffer.from(
+			JSON.stringify({ s: "work", r: revision, o: 0, k: "narrator:n-1" }),
+		).toString("base64url");
+		await expect(recentTabs.listPage("user-1", "work", legacy, 1)).rejects.toMatchObject({
+			statusCode: 409,
+			code: "STALE_CURSOR",
+		});
+	});
+
 	it("does not split a folder at a page boundary", async () => {
 		const tabs = Array.from({ length: 49 }, (_, index) => makeTab(`n-${index}`));
 		tabs.push(makeTab("ws-1", { type: "folder", title: "Folder" }));
@@ -924,6 +963,46 @@ describe("recent-tabs folder deltas replay on the client", () => {
 		);
 		expect(reduceRecentTabsOperations(before, "work", result.operations)).toEqual(persisted);
 	}
+
+	it("dissolving a pinned folder keeps its members pinned, and undo brings the folder back", async () => {
+		seedLegacyTabs(["a", "b", "c"].map((id) => makeTab(id)));
+		await recentTabs.ensureMigrated("user-1");
+		const created = await recentTabs.createRecentTabFolder("user-1", {
+			targetKey: "narrator:b",
+			sourceKey: "narrator:c",
+			title: "F",
+		});
+		const folderId = created.folderId ?? "";
+		// The folder into the pinned block: its members go with it.
+		await recentTabs.pinRecentTab("user-1", `folder:${folderId}`, true);
+		const before = await recentTabs.listAllRecentTabs("user-1");
+		expect(before.filter((tab) => tab.type === "folder").map((tab) => tab.pinned)).toEqual([true]);
+
+		const dissolved = await recentTabs.dissolveRecentTabFolder("user-1", folderId);
+		expect(dissolved.changed).toBe(true);
+		expect(dissolved.undoToken).toBeString();
+
+		const after = await recentTabs.listAllRecentTabs("user-1");
+		expect(after.some((tab) => tab.type === "folder")).toBe(false);
+		// The members stayed in the pinned block they were released from.
+		expect(
+			after.filter((tab) => tab.id === "b" || tab.id === "c").map((tab) => !!tab.pinned),
+		).toEqual([true, true]);
+
+		const restored = await recentTabs.restoreRecentTabs("user-1", {
+			token: dissolved.undoToken,
+		});
+		expect(restored.changed).toBe(true);
+		const restoredTabs = await recentTabs.listAllRecentTabs("user-1");
+		const folder = restoredTabs.find((tab) => tab.type === "folder");
+		expect(folder?.pinned).toBe(true);
+		expect(
+			restoredTabs
+				.filter((tab) => tab.folderId === folderId)
+				.map((tab) => tab.id)
+				.sort(),
+		).toEqual(["b", "c"]);
+	});
 
 	it("create, join, reorder, pin, leave, dissolve and close", async () => {
 		seedLegacyTabs(["a", "b", "c", "d", "e"].map((id) => makeTab(id)));

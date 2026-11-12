@@ -641,6 +641,7 @@ export interface NarratorWSCallbacks {
 	onReflectionOverridesChanged?: (overrides: {
 		planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 		dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
+		questionReflectionOverride?: "inherit" | "on" | "off";
 	}) => void;
 	onCompacting?: (mode?: "blocking" | "background") => void;
 	onCompactProgress?: (progress: CompactProgressEvent) => void;
@@ -704,10 +705,11 @@ export interface NarratorWSCallbacks {
 		providerId?: string;
 		providerPrefix?: string;
 		nugModelId?: string;
-		waitKind?: "credentials" | "quota";
+		waitKind?: "credentials" | "quota" | "capacity" | "rate_limit";
 		/** Which plan a `quota` wait belongs to; `kimi` when omitted. */
 		quotaProvider?: "kimi" | "opencode";
-		/** Epoch ms the quota window resets at (`quota` waits only). */
+		quotaBucket?: string;
+		/** Epoch ms the timed refusal can be retried. */
 		resumeAt?: number;
 	}) => void;
 	/**
@@ -717,7 +719,7 @@ export interface NarratorWSCallbacks {
 	onModelUnavailableRecovered?: (info: {
 		model: string;
 		nugModelId?: string;
-		waitKind?: "credentials" | "quota";
+		waitKind?: "credentials" | "quota" | "capacity" | "rate_limit";
 		/** Which plan a `quota` wait belongs to; `kimi` when omitted. */
 		quotaProvider?: "kimi" | "opencode";
 	}) => void;
@@ -732,7 +734,7 @@ export interface NarratorWSCallbacks {
 	) => void;
 	onImageGeneration?: (
 		id: string,
-		status: "in_progress" | "generating" | "completed",
+		status: string,
 		revisedPrompt?: string,
 		outputIndex?: number,
 		partialImageIndex?: number,
@@ -741,6 +743,8 @@ export interface NarratorWSCallbacks {
 		width?: number,
 		height?: number,
 		parentToolUseId?: string,
+		error?: string,
+		errorCode?: string,
 	) => void;
 	onNarratorError?: (
 		error: string,
@@ -867,6 +871,8 @@ export interface NarratorWSCallbacks {
 					type: "image_generation";
 					id: string;
 					status: string;
+					error?: string;
+					errorCode?: string;
 					revisedPrompt?: string;
 					result?: string;
 					partialImageIndex?: number;
@@ -1370,6 +1376,11 @@ export function useNarratorWS(
 								| "standard"
 								| "strict"
 								| undefined,
+							questionReflectionOverride: data.questionReflectionOverride as
+								| "inherit"
+								| "on"
+								| "off"
+								| undefined,
 						});
 						break;
 					case "compacting":
@@ -1477,16 +1488,27 @@ export function useNarratorWS(
 							providerId: data.providerId as string | undefined,
 							providerPrefix: data.providerPrefix as string | undefined,
 							nugModelId: data.nugModelId as string | undefined,
-							waitKind: data.waitKind as "credentials" | "quota" | undefined,
+							waitKind: data.waitKind as
+								| "credentials"
+								| "quota"
+								| "capacity"
+								| "rate_limit"
+								| undefined,
 							quotaProvider: data.quotaProvider as "kimi" | "opencode" | undefined,
 							resumeAt: data.resumeAt as number | undefined,
+							quotaBucket: data.quotaBucket as string | undefined,
 						});
 						break;
 					case "model_unavailable_recovered":
 						callbackOwner.callbacks.onModelUnavailableRecovered?.({
 							model: data.model as string,
 							nugModelId: data.nugModelId as string | undefined,
-							waitKind: data.waitKind as "credentials" | "quota" | undefined,
+							waitKind: data.waitKind as
+								| "credentials"
+								| "quota"
+								| "capacity"
+								| "rate_limit"
+								| undefined,
 							quotaProvider: data.quotaProvider as "kimi" | "opencode" | undefined,
 						});
 						break;
@@ -1510,7 +1532,7 @@ export function useNarratorWS(
 					case "image_generation":
 						callbackOwner.callbacks.onImageGeneration?.(
 							data.id as string,
-							data.status as "in_progress" | "generating" | "completed",
+							data.status as string,
 							data.revisedPrompt as string | undefined,
 							data.outputIndex as number | undefined,
 							data.partialImageIndex as number | undefined,
@@ -1519,6 +1541,8 @@ export function useNarratorWS(
 							data.width as number | undefined,
 							data.height as number | undefined,
 							data.parentToolUseId as string | undefined,
+							data.error as string | undefined,
+							data.errorCode as string | undefined,
 						);
 						break;
 					case "narrator_error":
@@ -1788,8 +1812,15 @@ export function useNarratorWS(
 										type: "image_generation";
 										id: string;
 										status: string;
+										error?: string;
+										errorCode?: string;
 										revisedPrompt?: string;
 										result?: string;
+										partialImageIndex?: number;
+										partialSavedPath?: string;
+										savedPath?: string;
+										width?: number;
+										height?: number;
 										outputIndex?: number;
 								  }
 								| {

@@ -9,6 +9,7 @@
  */
 
 import type { GitIdentity } from "@frontend/lib/api/auth";
+import { REMOTE_BUILD } from "@frontend/lib/build-target";
 import { notifications } from "@mantine/notifications";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
@@ -46,7 +47,7 @@ export function useGitIdentities(enabled = true) {
 		queryKey: IDENTITIES_KEY,
 		queryFn: () => api.listGitIdentities(),
 		staleTime: 30_000,
-		enabled,
+		enabled: !REMOTE_BUILD && enabled,
 	});
 }
 
@@ -55,7 +56,7 @@ export function useNarratorGitIdentity(narratorId: string | null) {
 	return useQuery({
 		queryKey: narratorGitIdentityQueryKey(narratorId ?? ""),
 		queryFn: () => api.getNarratorGitIdentity(narratorId as string),
-		enabled: !!narratorId,
+		enabled: !REMOTE_BUILD && !!narratorId,
 		staleTime: 30_000,
 	});
 }
@@ -105,6 +106,35 @@ export function useSetNarratorGitIdentity(narratorId: string) {
 	return useMutation({
 		mutationFn: (identityId: string | null) => api.setNarratorGitIdentity(narratorId, identityId),
 		onSuccess: () => qc.invalidateQueries({ queryKey: narratorGitIdentityQueryKey(narratorId) }),
+		onError,
+	});
+}
+
+/** Query key for one caller's pick on one sidebar folder. */
+export function folderGitIdentityQueryKey(folderId: string) {
+	return [...IDENTITIES_KEY, "folder", folderId] as const;
+}
+
+/** The caller's pick for one sidebar folder, together with the identities to choose from. */
+export function useFolderGitIdentity(folderId: string | null) {
+	return useQuery({
+		queryKey: folderGitIdentityQueryKey(folderId ?? ""),
+		queryFn: () => api.getFolderGitIdentity(folderId as string),
+		enabled: !REMOTE_BUILD && !!folderId,
+		staleTime: 30_000,
+	});
+}
+
+/**
+ * Pick which of the caller's identities commits inside one sidebar folder
+ * (null = no folder pick, so sessions there follow the default).
+ */
+export function useSetFolderGitIdentity(folderId: string) {
+	const qc = useQueryClient();
+	const onError = useIdentityWriteFailure();
+	return useMutation({
+		mutationFn: (identityId: string | null) => api.setFolderGitIdentity(folderId, identityId),
+		onSuccess: () => qc.invalidateQueries({ queryKey: folderGitIdentityQueryKey(folderId) }),
 		onError,
 	});
 }

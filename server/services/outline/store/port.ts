@@ -43,6 +43,7 @@ import type {
 	OutlineTaskActorRef,
 	OutlineTaskJson,
 } from "../model";
+import type { OutlineDigestPort } from "./digest-port";
 import type { OutlineReadPort } from "./read-port";
 
 export { WriteConflictError } from "@server/db/backend/write-port";
@@ -154,13 +155,15 @@ export interface OutlineLiveUpdateRow {
 }
 
 /**
- * One person's view state of one page (`outline_view_state`, design §7.1): folded blocks and the
- * mind map's direction. Personal and outside history: never versioned, never part of a commit.
+ * One person's view state of one page (`outline_view_state`, design §7.1): the blocks they
+ * closed, the blocks they opened, and the mind map's direction. Personal and outside history: never versioned, never part of a commit.
  */
 export interface OutlineViewStateRow {
 	userId: string;
 	pageBlockId: string;
 	collapsed: string[];
+	/** Blocks the reader opened that are closed by default (`shared/outline-fold.ts`). */
+	expanded: string[];
 	layout: "right" | "down";
 	updatedAt: string;
 }
@@ -624,7 +627,7 @@ export interface OutlineClaimedTask {
 // The port
 // ─────────────────────────────────────────────────────────────────────────────
 
-export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
+export interface OutlineStore extends WritePortIdentity, OutlineReadPort, OutlineDigestPort {
 	/**
 	 * The space of a project, user or narrator, created on first use. Concurrent callers get
 	 * the same row (one per scope, enforced by a unique index). New spaces start at seq 1.
@@ -760,11 +763,14 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 	 * Claims held by a session or by one of its subagents (`acl_root_narrator_id` is the session),
 	 * whatever their lease, oldest claim first, at most `limit`, with the space of the task: what
 	 * archiving or deleting the session releases. Two indexed reads (the session's own claims,
-	 * its subagents' through the narrators' root index), each with the limit.
+	 * its subagents' through the narrators' root index), each with the limit. With
+	 * `subagentsOnly`, only the second: the tasks the session's subagents hold (the current-tasks
+	 * view's "delegated" section, outline P2 PR 9b).
 	 */
 	listSessionTaskClaims(
 		narratorId: string,
 		limit: number,
+		options?: { subagentsOnly?: boolean },
 	): Promise<Array<{ claim: OutlineTaskClaimRow; spaceId: string }>>;
 	/**
 	 * Move the lease of the claims a session holds (at most {@link OUTLINE_RENEW_LIMIT}) to
@@ -935,6 +941,12 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 		spaceIds: readonly string[],
 		limitPerSpace: number,
 	): Promise<OutlineQuestionRow[]>;
+	/**
+	 * Block ids of the open questions that are live blocks of one page, newest first, at most
+	 * `limit`: the page's own, whatever else the space has open (a folded row of the page counts
+	 * the ones it hides). The space's open questions by their index, each block by primary key.
+	 */
+	listOpenQuestionBlocksOnPage(spaceId: string, pageId: string, limit: number): Promise<string[]>;
 	/** Open questions put to a person, oldest first, at most `limit`. */
 	listOpenQuestionsForUser(userId: string, limit: number): Promise<OutlineQuestionRow[]>;
 	/** Open questions a session asked, oldest first, at most `limit`. */
@@ -986,6 +998,28 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 	 * written is never dropped, even when a clock stepped back makes it the oldest.
 	 */
 	putViewState(row: OutlineViewStateRow, keepPerUser: number): Promise<void>;
+
+	// ── tasks a person saw finished (`outline_task_seen`, outline P2 PR 9b, the board's 「新完成」) ──
+
+	/** The person's rows of the given tasks: the version each was seen finished at (primary key). */
+	getTaskSeen(userId: string, taskBlockIds: readonly string[]): Promise<OutlineTaskSeenRow[]>;
+	/**
+	 * Record that the person saw these tasks finished at these versions (a row already there keeps
+	 * the higher version), then delete the person's rows seen before `pruneBefore` (by the
+	 * `(user_id, seen_at)` index). One transaction.
+	 */
+	putTaskSeen(
+		userId: string,
+		rows: readonly OutlineTaskSeenRow[],
+		at: string,
+		pruneBefore: string,
+	): Promise<void>;
+}
+
+/** A task a person saw finished, and the version they saw (`outline_task_seen`). */
+export interface OutlineTaskSeenRow {
+	taskBlockId: string;
+	seenSeq: number;
 }
 
 /** Claims one renewal moves at most. */

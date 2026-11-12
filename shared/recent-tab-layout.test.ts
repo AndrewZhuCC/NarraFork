@@ -39,6 +39,33 @@ describe("regroupFolders", () => {
 		expect(regroupFolders(grouped)).toBe(grouped);
 	});
 
+	test("puts every pinned top-level unit ahead of the unpinned ones, stably", () => {
+		const tabs = [
+			tab("a"),
+			tab("p1", { pinned: true }),
+			tab("b"),
+			folder("f", { pinned: true }),
+			tab("m1", { folderId: "f" }),
+			tab("p2", { pinned: true }),
+		];
+		expect(shape(regroupFolders(tabs))).toEqual(["*p1", "*[f]", "m1>f", "*p2", "a", "b"]);
+		expect(shape(regroupFolders(tabs, { prune: true }))).toEqual([
+			"*p1",
+			"*[f]",
+			"m1>f",
+			"*p2",
+			"a",
+			"b",
+		]);
+	});
+
+	test("an orphan member keeps the block of the unit before it", () => {
+		// A partial client window can hold members whose header is on another page; their
+		// own pin is an in-folder pin and must not pull them into the top-level pinned block.
+		const tabs = [tab("p", { pinned: true }), tab("a"), tab("o", { folderId: "x", pinned: true })];
+		expect(regroupFolders(tabs)).toBe(tabs);
+	});
+
 	test("without prune keeps orphans and empty folders; with prune drops both", () => {
 		const tabs = [folder("empty"), tab("orphan", { folderId: "gone" }), tab("x")];
 		expect(shape(regroupFolders(tabs))).toEqual(["[empty]", "orphan>gone", "x"]);
@@ -66,26 +93,45 @@ describe("folder operations", () => {
 
 	test("pinning a member moves it inside its folder only", () => {
 		expect(shape(applyRecentTabPin(base(), "narrator:m2", true))).toEqual([
-			"a",
 			"*[f]",
 			"*m1>f",
 			"*m2>f",
 			"*b",
+			"a",
 		]);
 		expect(shape(applyRecentTabPin(base(), "narrator:m1", false))).toEqual([
-			"a",
 			"*[f]",
 			"m1>f",
 			"m2>f",
 			"*b",
+			"a",
 		]);
 	});
 
-	test("dissolve keeps members in place, unpinned; remove takes a folder's members along", () => {
-		expect(shape(applyRecentTabFolderDissolve(base(), "f"))).toEqual(["a", "m1", "m2", "*b"]);
+	test("dissolve keeps members in place, in the folder's own section", () => {
+		// The folder is pinned: its members stay pinned, where the user was looking, instead
+		// of dropping into the unpinned area below.
+		expect(shape(applyRecentTabFolderDissolve(base(), "f"))).toEqual(["a", "*m1", "*m2", "*b"]);
+		const unpinnedFolder = [
+			tab("a", { pinned: true }),
+			folder("f"),
+			tab("m1", { folderId: "f", pinned: true }),
+			tab("m2", { folderId: "f" }),
+		];
+		expect(shape(applyRecentTabFolderDissolve(unpinnedFolder, "f"))).toEqual(["*a", "m1", "m2"]);
 		expect(shape(applyRecentTabRemove(base(), "folder:f"))).toEqual(["a", "*b"]);
 		const single = applyRecentTabRemove(base(), "narrator:m1");
 		expect(shape(applyRecentTabRemove(single, "narrator:m2"))).toEqual(["a", "*b"]);
+	});
+
+	test("keepEmptyFolder leaves an emptied folder header in place", () => {
+		// 归档是可撤销的：最后一条记录离开时，文件夹不该跟着消失。
+		const tabs = [tab("a"), folder("f"), tab("m1", { folderId: "f" })];
+		expect(shape(applyRecentTabRemove(tabs, "narrator:m1"))).toEqual(["a"]);
+		expect(shape(applyRecentTabRemove(tabs, "narrator:m1", { keepEmptyFolder: true }))).toEqual([
+			"a",
+			"[f]",
+		]);
 	});
 
 	test("operations never mutate their input", () => {
@@ -125,7 +171,7 @@ describe("moves across the pin divider", () => {
 		];
 		expect(
 			shape(applyRecentTabMove(tabs, "folder:f", { beforeKey: "narrator:p", pinned: true })),
-		).toEqual(["a", "*[f]", "*m1>f", "m2>f", "*p"]);
+		).toEqual(["*[f]", "*m1>f", "m2>f", "*p", "a"]);
 	});
 
 	test("a member leaving a folder into the pinned block is pinned at the top level", () => {

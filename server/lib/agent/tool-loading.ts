@@ -33,6 +33,7 @@
  */
 
 import type { DbMessage } from "@shared/agent-protocol/types";
+import { TOOL_LOADING_MODES, type ToolLoadingMode } from "@shared/model-catalog/override";
 import { parseModelId } from "@shared/model-id";
 import type { PrefixSnapshot } from "@shared/prefix-context";
 import {
@@ -41,21 +42,14 @@ import {
 	parseClaudeModel,
 } from "@shared/reasoning-effort-support";
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../builtin-routines";
+import { AppError } from "../errors";
 import { isModelProtocol, type ModelProtocol } from "../settings/types";
 import type { ProviderAdapter } from "./provider";
 import { effectiveModelProfile } from "./provider-model-metadata";
 import { resolveToolJsonSchema, toolRegistry } from "./tool-registry";
 import type { ResolvedToolDefinition, ToolDefinition } from "./types";
 
-export const TOOL_LOADING_MODES = [
-	"anthropic_tool_addition",
-	"anthropic_deferred_tail",
-	"openai_additional_tools",
-	"kimi_system_tools",
-	"custom_injection",
-] as const;
-
-export type ToolLoadingMode = (typeof TOOL_LOADING_MODES)[number];
+export { TOOL_LOADING_MODES, type ToolLoadingMode } from "@shared/model-catalog/override";
 
 /** A mode, or the fallback that rewrites `tools` on every change. */
 export type ToolLoadingStrategy = ToolLoadingMode | "replace_tools";
@@ -317,6 +311,8 @@ export interface ToolLoadingEpoch {
 	target?: string;
 	/** The wire protocol the epoch opened on; absent on epochs written before it was recorded. */
 	protocol?: ModelProtocol;
+	/** {@link EpochRecord.baselineDisplays}. */
+	baselineDisplays?: Readonly<Record<string, unknown>>;
 }
 
 /**
@@ -339,10 +335,17 @@ export function classifyToolAdditions(
 	return { allowed, blocked };
 }
 
-/** A persisted epoch boundary failed; do not fall back to a transcript from the old epoch. */
+/** Request preparation failed; do not fall back to a transcript from the old epoch. */
 export class ToolEpochError extends Error {
 	constructor(cause: unknown) {
-		super("Could not save the tool epoch. Retry when message storage is available.", { cause });
+		// AppError already marks public prose; raw driver errors may contain credentials or SQL.
+		const message =
+			cause instanceof AppError
+				? cause.message
+				: cause instanceof Error && cause.name === "AbortError"
+					? "Request preparation cancelled."
+					: "Could not prepare tool and context state. See server logs for details.";
+		super(message, { cause });
 		this.name = "ToolEpochError";
 	}
 }
@@ -362,6 +365,14 @@ export interface EpochRecord {
 	compactMessageId?: string | null;
 	baseToolNames?: string[];
 	strategy?: ToolLoadingStrategy;
+	/**
+	 * Reader-only summaries of context parts as the prefix baseline held them (`ContextPart.display`,
+	 * by key; `null` for a part the baseline went without): what the epoch's FIRST `context_update`
+	 * row of such a part is compared with to say what changed (`context-display-refiners.ts`).
+	 * Never part of the prefix, its hashes or anything the model reads. Absent on epochs written
+	 * before it existed: their first row has nothing to compare with.
+	 */
+	baselineDisplays?: Record<string, unknown>;
 }
 
 /** The epoch a stored element opens: a marker `{type:"epoch"}` or a compact with `epoch`. */
@@ -390,6 +401,11 @@ export function epochRecordOf(block: unknown): EpochRecord | undefined {
 		...(typeof epoch.strategy === "string"
 			? { strategy: epoch.strategy as ToolLoadingStrategy }
 			: {}),
+		...(epoch.baselineDisplays &&
+		typeof epoch.baselineDisplays === "object" &&
+		!Array.isArray(epoch.baselineDisplays)
+			? { baselineDisplays: epoch.baselineDisplays as Record<string, unknown> }
+			: {}),
 	};
 }
 
@@ -414,6 +430,7 @@ export function latestToolLoadingEpoch(
 				strategy: epoch.strategy,
 				...(epoch.target ? { target: epoch.target } : {}),
 				...(epoch.protocol ? { protocol: epoch.protocol } : {}),
+				...(epoch.baselineDisplays ? { baselineDisplays: epoch.baselineDisplays } : {}),
 			};
 	}
 	return undefined;

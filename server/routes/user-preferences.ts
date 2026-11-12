@@ -23,11 +23,18 @@ import {
 	recentTabsRuntimeSchema,
 	removeRecentTabSchema,
 	restoreRecentTabsSchema,
+	setNarratorGitIdentitySchema,
 	specTabLayoutPatchSchema,
 	updateRecentTabFolderSchema,
 	updateUserPreferencesSchema,
 	upsertRecentTabSchema,
 } from "../lib/validators";
+import {
+	getFolderGitIdentityPick,
+	listUserGitIdentities,
+	setFolderGitIdentityPick,
+} from "../services/git-identities";
+import { serverTimeZone } from "../services/outline/digest-time";
 import {
 	clearRecentTabs,
 	createRecentTabFolder,
@@ -58,6 +65,7 @@ const DEFAULTS = {
 	replyInUserLanguage: true,
 	showTokenUsage: false,
 	showOutputStats: true,
+	compactAuxiliaryContent: true,
 	terminalTheme: "auto",
 	terminalFontSize: 14,
 	// Narrator transcript typography. Sourced from the shared neutral setting rather
@@ -70,6 +78,7 @@ const DEFAULTS = {
 	narratorLineHeightV2Percent: DEFAULT_TYPOGRAPHY.lineHeightScalePercent,
 	narratorParagraphScalePercent: DEFAULT_TYPOGRAPHY.paragraphScalePercent,
 	recentTabs: "[]",
+	recentTabsShowDirectory: false,
 	addSubagentToRecentTabs: true,
 	recentTabsGroupMode: "flat" as const,
 	// Notification defaults
@@ -101,6 +110,10 @@ const DEFAULTS = {
 	// Git 提交身份入口的显示位置（跟账号走）
 	gitIdentityContextMenu: false,
 	gitIdentityCreateModal: false,
+	gitIdentityFolderContextMenu: false,
+	// The outline's daily report (P2 PR 11): null is the server's time zone and 07:00.
+	outlineDigestTimeZone: null as string | null,
+	outlineDigestTime: null as string | null,
 };
 
 /** Mask a secret/webhook URL for safe display (show last 4 chars). */
@@ -153,6 +166,7 @@ const INSERT_COLUMNS = [
 	"reply_in_user_language",
 	"show_token_usage",
 	"show_output_stats",
+	"compact_auxiliary_content",
 	"terminal_theme",
 	"terminal_font_size",
 	"narrator_font_scale_percent",
@@ -186,6 +200,10 @@ const INSERT_COLUMNS = [
 	"narrator_toolbar_layout",
 	"git_identity_context_menu",
 	"git_identity_create_modal",
+	"git_identity_folder_context_menu",
+	"recent_tabs_show_directory",
+	"outline_digest_time_zone",
+	"outline_digest_time",
 	"created_at",
 	"updated_at",
 ] as const;
@@ -345,6 +363,7 @@ function serializeUserPreferences(
 			pref.narratorLineHeightScalePercent,
 		),
 		setupWizardCompleted: instanceSetupWizardCompleted(),
+		outlineDigestServerTimeZone: serverTimeZone(),
 		...(recentTabs === undefined ? {} : { recentTabs }),
 		commands: parseJsonArray(pref.commands),
 		notifyDingtalkWebhook: maskSecret(pref.notifyDingtalkWebhook),
@@ -372,6 +391,7 @@ userPreferencesRoutes.get("/", async (c) => {
 		return c.json({
 			...DEFAULTS,
 			setupWizardCompleted: instanceSetupWizardCompleted(),
+			outlineDigestServerTimeZone: serverTimeZone(),
 			recentTabs,
 			commands: [],
 			gatewayConfig: {},
@@ -455,6 +475,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 		   reply_in_user_language = COALESCE(?, reply_in_user_language),
 		   show_token_usage = COALESCE(?, show_token_usage),
 		   show_output_stats = COALESCE(?, show_output_stats),
+		   compact_auxiliary_content = COALESCE(?, compact_auxiliary_content),
 		   terminal_theme = COALESCE(?, terminal_theme),
 		   terminal_font_size = COALESCE(?, terminal_font_size),
 		   narrator_font_scale_percent = COALESCE(?, narrator_font_scale_percent),
@@ -488,6 +509,10 @@ userPreferencesRoutes.patch("/", async (c) => {
 		   narrator_toolbar_layout = COALESCE(?, narrator_toolbar_layout),
 		   git_identity_context_menu = COALESCE(?, git_identity_context_menu),
 		   git_identity_create_modal = COALESCE(?, git_identity_create_modal),
+		   git_identity_folder_context_menu = COALESCE(?, git_identity_folder_context_menu),
+		   recent_tabs_show_directory = COALESCE(?, recent_tabs_show_directory),
+		   outline_digest_time_zone = CASE WHEN ? THEN ? ELSE outline_digest_time_zone END,
+		   outline_digest_time = CASE WHEN ? THEN ? ELSE outline_digest_time END,
 		   updated_at = ?`,
 			[
 				// INSERT values
@@ -503,6 +528,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 				(d.replyInUserLanguage ?? DEFAULTS.replyInUserLanguage) ? 1 : 0,
 				(d.showTokenUsage ?? DEFAULTS.showTokenUsage) ? 1 : 0,
 				(d.showOutputStats ?? DEFAULTS.showOutputStats) ? 1 : 0,
+				(d.compactAuxiliaryContent ?? DEFAULTS.compactAuxiliaryContent) ? 1 : 0,
 				d.terminalTheme ?? DEFAULTS.terminalTheme,
 				d.terminalFontSize ?? DEFAULTS.terminalFontSize,
 				d.narratorFontScalePercent ?? DEFAULTS.narratorFontScalePercent,
@@ -536,6 +562,10 @@ userPreferencesRoutes.patch("/", async (c) => {
 				narratorToolbarLayoutJson ?? DEFAULTS.narratorToolbarLayout,
 				(d.gitIdentityContextMenu ?? DEFAULTS.gitIdentityContextMenu) ? 1 : 0,
 				(d.gitIdentityCreateModal ?? DEFAULTS.gitIdentityCreateModal) ? 1 : 0,
+				(d.gitIdentityFolderContextMenu ?? DEFAULTS.gitIdentityFolderContextMenu) ? 1 : 0,
+				(d.recentTabsShowDirectory ?? DEFAULTS.recentTabsShowDirectory) ? 1 : 0,
+				d.outlineDigestTimeZone ?? DEFAULTS.outlineDigestTimeZone,
+				d.outlineDigestTime ?? DEFAULTS.outlineDigestTime,
 				now,
 				now,
 				// ON CONFLICT UPDATE values (null = keep existing)
@@ -549,6 +579,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 				d.replyInUserLanguage != null ? (d.replyInUserLanguage ? 1 : 0) : null,
 				d.showTokenUsage != null ? (d.showTokenUsage ? 1 : 0) : null,
 				d.showOutputStats != null ? (d.showOutputStats ? 1 : 0) : null,
+				d.compactAuxiliaryContent != null ? (d.compactAuxiliaryContent ? 1 : 0) : null,
 				d.terminalTheme ?? null,
 				d.terminalFontSize ?? null,
 				d.narratorFontScalePercent ?? null,
@@ -582,6 +613,13 @@ userPreferencesRoutes.patch("/", async (c) => {
 				narratorToolbarLayoutJson,
 				d.gitIdentityContextMenu != null ? (d.gitIdentityContextMenu ? 1 : 0) : null,
 				d.gitIdentityCreateModal != null ? (d.gitIdentityCreateModal ? 1 : 0) : null,
+				d.gitIdentityFolderContextMenu != null ? (d.gitIdentityFolderContextMenu ? 1 : 0) : null,
+				d.recentTabsShowDirectory != null ? (d.recentTabsShowDirectory ? 1 : 0) : null,
+				// Unlike the columns above, null is a value here (back to the default): absent keeps.
+				d.outlineDigestTimeZone !== undefined ? 1 : 0,
+				d.outlineDigestTimeZone ?? null,
+				d.outlineDigestTime !== undefined ? 1 : 0,
+				d.outlineDigestTime ?? null,
 				now,
 			],
 		);
@@ -591,6 +629,29 @@ userPreferencesRoutes.patch("/", async (c) => {
 		});
 	});
 	return c.json(updated ? serializeUserPreferences(updated) : updated);
+});
+
+// === Sidebar folder git identity ===
+// Which of MY identities commits inside one of MY sidebar folders. Same personal-scope rule
+// as the per-narrator pick: the folder is looked up in the caller's own recent tabs, so
+// another user's layout can neither be bound nor probed through here.
+
+userPreferencesRoutes.get("/git-identity/folders/:folderId", async (c) => {
+	const userId = c.get("user").sub;
+	const folderId = c.req.param("folderId");
+	const [identities, selectedId] = await Promise.all([
+		listUserGitIdentities(userId),
+		getFolderGitIdentityPick(userId, folderId),
+	]);
+	return c.json({ identities, selectedId });
+});
+
+userPreferencesRoutes.put("/git-identity/folders/:folderId", async (c) => {
+	const parsed = setNarratorGitIdentitySchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const userId = c.get("user").sub;
+	await setFolderGitIdentityPick(userId, c.req.param("folderId"), parsed.data.identityId);
+	return c.json({ ok: true });
 });
 
 // === Recent Tabs endpoints ===
@@ -639,13 +700,18 @@ userPreferencesRoutes.delete("/recent-tabs/:type/:id", async (c) => {
 		id: c.req.param("id"),
 		// `?cascade=1` marks entity-teardown cleanups (project deleted, narrator archived).
 		cascade: c.req.query("cascade") === "1" ? true : undefined,
+		// 归档是 cascade，但会话可以撤销归档回来：文件夹要留着。
+		keepEmptyFolder: c.req.query("keepEmptyFolder") === "1" ? true : undefined,
 	});
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const type = parsed.data.type === "session" ? "narrator" : parsed.data.type;
 	// User-initiated close (swipe / context menu / middle-click) mints an undo token;
 	// cascade cleanups must not (they would clobber a pending user undo).
 	return c.json(
-		await removeRecentTab(userId, type, parsed.data.id, { storeUndo: !parsed.data.cascade }),
+		await removeRecentTab(userId, type, parsed.data.id, {
+			storeUndo: !parsed.data.cascade,
+			keepEmptyFolder: parsed.data.keepEmptyFolder,
+		}),
 	);
 });
 

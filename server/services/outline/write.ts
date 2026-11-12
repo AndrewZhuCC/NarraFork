@@ -73,8 +73,22 @@
  * work is recorded: the commit's summary and the result's `ended` say whose work it ended. A
  * session's decision rests on the claim rows as it read them, so a takeover landing before its
  * commit makes it plan again. Rewriting a task that stays in progress (its text, its place)
- * neither claims nor ends it. Which late result to accept by its claim generation is the
- * delegation's to decide (plan PR 9).
+ * neither claims nor ends it.
+ *
+ * Handing a task on (outline P2 PR 10a, design §E.1): an agent's write that gives a task in
+ * progress to someone else (a person, `@human:name`; or another session, `@agent:<its id or
+ * handle>`; not the writer's own session, not whoever is doing it, and not an `@agent:` name no
+ * session has, which stays a label) ends the work in the same commit: the task goes back to to-do, which releases the claim as above (and
+ * is refused as above when someone else is doing it). The new executor claims it when it starts,
+ * with the next claim generation, so a result the previous one still hands in is told as late
+ * (`delegation.ts`). Reported as a `handed-over` adjustment. The board does the same for a person
+ * (`person-tasks.ts`); a person's edit elsewhere is written as it is.
+ *
+ * A delegation (`delegation.ts`, outline P2 PR 9a) is the one write that moves a claim within a
+ * session: `OutlineWriteOptions.delegateClaim` hands the task to the subagent sent to do it, on the
+ * running lease, with the next claim generation, whoever of the session held it; anyone else
+ * doing it refuses the write as above. The generation is what tells a subagent's result, when it
+ * comes, whether the task is still the one it was sent with (a late result otherwise).
  *
  * LOCKED PLANS AND PENDING CONFIRMATION
  * -------------------------------------
@@ -132,6 +146,7 @@ import {
 } from "@shared/outline";
 import {
 	OutlineBusyError,
+	OutlineClaimChangedError,
 	type OutlineClaimHolder,
 	OutlineConflictError,
 	OutlineLeaseNotExpiredError,
@@ -197,6 +212,7 @@ import {
 	OutlineStaleWriteError,
 	type OutlineStore,
 	type OutlineTaskClaimRow,
+	sameClaimRow,
 	WriteConflictError,
 } from "./store/port";
 import { canonicalTaskJson, sameTaskJson, sameTaskLock } from "./task-json";
@@ -399,7 +415,12 @@ export type OutlineAdjustment =
 	 * back someone else's lock, which the writer may not do: the task's lock stays as it was
 	 * before the commit (`blockId`), the rest is written.
 	 */
-	| { kind: "lock-kept"; blockId: string };
+	| { kind: "lock-kept"; blockId: string }
+	/**
+	 * An agent gave a task in progress another assignee: the work ended in the same commit (the
+	 * task is to do, its claim released), so the new executor claims it afresh (`blockId`).
+	 */
+	| { kind: "handed-over"; blockId: string };
 
 /**
  * A task someone else was doing that this commit finished or reopened: a person's commit, or a
@@ -534,6 +555,21 @@ export interface OutlineWriteOptions {
 	 * turn's one-shot grant in it. People and system writes are never asked.
 	 */
 	agentBehaviorGrant?: () => boolean;
+	/**
+	 * Internal to `delegation.ts` (outline P2 PR 9a): this commit hands the task `blockId` to the
+	 * subagent `holderNarratorId` sent to do it. A system write for the delegating session
+	 * (`narratorId`) that sets the task in progress: the claim goes to the subagent on the running
+	 * lease with generation `epoch`, whoever of the session held it. The generation is the one the
+	 * delegation read plus one: a claim that moved on since rejects the write with
+	 * `OutlineClaimChangedError`, and anyone else doing the task with `OutlineTaskClaimedError`.
+	 */
+	delegateClaim?: { blockId: string; holderNarratorId: string; epoch: number };
+	/**
+	 * Internal to `delegation.ts`: claim rows the commit rests on (null: no row), checked when the
+	 * plan is made and written only while still exactly as given; otherwise the write rejects with
+	 * `OutlineClaimChangedError`, writing nothing (the caller decides again).
+	 */
+	expectClaims?: ReadonlyArray<{ taskBlockId: string; expect: OutlineTaskClaimRow | null }>;
 }
 
 /** Content normalized before `writeOutline` was called; see `OutlineWriteOptions.canonical`. */
@@ -1164,6 +1200,8 @@ interface PlannerExtra {
 	/** Asked when an agent's commit writes the session's behavior page; see `agentBehaviorGrant`. */
 	behaviorGrant?: () => boolean;
 	question?: OutlineWriteOptions["question"];
+	delegateClaim?: OutlineWriteOptions["delegateClaim"];
+	expectClaims?: OutlineWriteOptions["expectClaims"];
 }
 
 class OutlinePlanner {
@@ -2695,6 +2733,7 @@ class OutlinePlanner {
 
 	private async assemble(): Promise<Planned | null> {
 		this.checkQuestionsAreNotTasks();
+		await this.endHandedOverWork();
 		this.leaveUnclaimedToDo();
 		await this.guardLocks();
 		await this.checkRepage();
@@ -3200,13 +3239,31 @@ class OutlinePlanner {
 		}
 		const ending = all.filter((b) => doingBefore(b) && !doingNow(b));
 		const expiring = new Set(this.leaseExpiry?.blockIds ?? []);
-		const ids = [...new Set([...started.keys(), ...ending.map((b) => b.id), ...expiring])];
+		const delegate = this.extra.delegateClaim;
+		const expected = this.extra.expectClaims ?? [];
+		const ids = [
+			...new Set([
+				...started.keys(),
+				...ending.map((b) => b.id),
+				...expiring,
+				...expected.map((e) => e.taskBlockId),
+			]),
+		];
 		const rows = new Map(
 			(ids.length > 0 ? await this.store.getTaskClaims(ids) : []).map((r) => [r.taskBlockId, r]),
 		);
 		const roots = await this.sessionRoots(rows.values());
 		const own = (row: OutlineTaskClaimRow) => ownClaim(row, claimer, roots);
 		const plan: OutlineClaimPlan = { put: [], release: [], expire: [], verify: [] };
+		// What the caller decided on must still hold now, and still when the commit is written.
+		for (const { taskBlockId, expect } of expected) {
+			if (!sameClaimRow(rows.get(taskBlockId) ?? null, expect))
+				throw new OutlineClaimChangedError(taskBlockId);
+			plan.verify.push({ taskBlockId, expect });
+		}
+		if (delegate && !started.has(delegate.blockId)) {
+			throw invalid("a delegation sets its task in progress", null);
+		}
 		const holderOf = (row: OutlineTaskClaimRow): OutlineClaimHolder =>
 			row.holderUserId !== null
 				? { kind: "human", userId: row.holderUserId }
@@ -3268,6 +3325,32 @@ class OutlinePlanner {
 		for (const [id, opIndex] of started) {
 			const block = this.block(id);
 			const row = rows.get(id) ?? null;
+			if (delegate?.blockId === id) {
+				// A delegation: the subagent takes it from whoever of its session held it, with the
+				// generation the delegation read plus one. It starts work, never resumes a task that
+				// was finished meanwhile (the caller's base version makes that a conflict first).
+				const before = block.base?.deleted ? null : (block.base?.taskJson?.status ?? null);
+				if (before !== "todo" && before !== "doing") throw new OutlineClaimChangedError(id);
+				if (row && !own(row) && liveClaim(row, this.now)) {
+					throw new OutlineTaskClaimedError(id, this.address(block.sid), holderOf(row), opIndex);
+				}
+				if ((row?.epoch ?? 0) + 1 !== delegate.epoch) throw new OutlineClaimChangedError(id);
+				plan.put.push({
+					row: {
+						taskBlockId: id,
+						holderNarratorId: delegate.holderNarratorId,
+						holderUserId: null,
+						epoch: delegate.epoch,
+						taskVersionAtClaim: versioned.has(id) ? seq : (block.base?.versionSeq ?? seq),
+						claimedAt: this.now,
+						expiresAt: outlineLeaseEnd(this.now),
+						lastHolderNarratorId: null,
+						lastHolderUserId: null,
+					},
+					expect: row,
+				});
+				continue;
+			}
 			if (row && own(row)) {
 				// Its own (or its session's): a running lease stays as it is; a lapsed one runs
 				// again, held by the writer, only while the row is still as read.
@@ -3361,6 +3444,61 @@ class OutlinePlanner {
 		if (session === null || this.endedSessions.has(session)) return null;
 		const root = roots.get(session);
 		return root === undefined ? null : { narratorId: root };
+	}
+
+	/**
+	 * An agent's hand-over (see TASK CLAIMS in the header): a task in progress before and after
+	 * the commit whose assignee the commit changed to a person or a session that is neither the
+	 * writer's session nor whoever is doing it goes back to to-do. Reads the claims of those tasks only, and the
+	 * sessions and people they and the new assignees name; a write that changes no assignee of a
+	 * task in progress reads nothing.
+	 */
+	private async endHandedOverWork(): Promise<void> {
+		if (this.input.actor.kind !== "agent" || this.commitKind !== "edit") return;
+		if (this.leaseExpiry || this.extra.delegateClaim) return;
+		const moved = [...this.blocks.values()].filter((block) => {
+			if (!doingBefore(block) || block.deleted || block.taskJson?.status !== "doing") return false;
+			const after = block.taskJson.assignee ?? null;
+			return after !== null && after !== (block.base?.taskJson?.assignee ?? null);
+		});
+		if (moved.length === 0) return;
+		const writer = this.claimer?.narratorId;
+		const rows = new Map(
+			(await this.store.getTaskClaims(moved.map((b) => b.id))).map((r) => [r.taskBlockId, r]),
+		);
+		const { assigneeNamesSession, assigneeNamesUser, resolveAgentAssignee } = await import(
+			"./assignee"
+		);
+		for (const block of moved) {
+			const assignee = block.taskJson?.assignee as string;
+			// An `@agent:` name no session has is a label, as it always was: nobody takes over.
+			if (
+				assignee.startsWith("agent:") &&
+				!(await resolveAgentAssignee(assignee, { store: this.store }))
+			)
+				continue;
+			// The writer names itself: it is taking the task up, not handing it on.
+			if (writer && (await assigneeNamesSession(assignee, writer, this.store))) continue;
+			const row = rows.get(block.id);
+			if (row && liveClaim(row, this.now)) {
+				// Whoever is doing it is named: nothing changes hands.
+				if (
+					row.holderNarratorId !== null &&
+					(await assigneeNamesSession(assignee, row.holderNarratorId, this.store))
+				)
+					continue;
+				if (row.holderUserId !== null && (await assigneeNamesUser(assignee, row.holderUserId)))
+					continue;
+			}
+			block.taskJson = canonicalTaskJson({ ...block.taskJson, status: "todo" });
+			this.claimIntent.delete(block.id);
+			const opIndex = this.taskOp.get(block.id);
+			const result = opIndex === undefined ? undefined : this.results[opIndex];
+			if (result) {
+				const adjustment: OutlineAdjustment = { kind: "handed-over", blockId: block.id };
+				result.adjustments = [...(result.adjustments ?? []), adjustment];
+			}
+		}
 	}
 
 	/**
@@ -3550,6 +3688,13 @@ async function writePrepared(
 	const store = options.store ?? outlineStore;
 	const compensating = options.compensating;
 	const attempts = options.maxAttempts ?? DEFAULT_ATTEMPTS;
+	// A delegation's claim and the claims a commit rests on are the system's own decisions.
+	if ((options.delegateClaim || options.expectClaims) && input.actor.kind !== "system") {
+		throw invalid("only the system hands a task to a subagent or rests a commit on claims", null);
+	}
+	if (options.delegateClaim && !input.narratorId) {
+		throw invalid("a delegation is written for the delegating session", null);
+	}
 	const commitKind: OutlineCommitKind = compensating
 		? "revert"
 		: options.confirm
@@ -3602,6 +3747,8 @@ async function writePrepared(
 					confirm: options.confirm,
 					behaviorGrant,
 					question: options.question,
+					delegateClaim: options.delegateClaim,
+					expectClaims: options.expectClaims,
 				},
 			);
 			let outcome: Planned | Hold | null;
@@ -3703,6 +3850,8 @@ async function writePrepared(
 			pageIds: planned.pageIds,
 			actorKind: commit.actorKind,
 			actorId: commit.actorId,
+			// An agent's write names its session even when the caller left `narratorId` out.
+			narratorId: commit.narratorId ?? (commit.actorKind === "agent" ? commit.actorId : null),
 		});
 		const pendingPages = new Set(planned.pendingPageIds);
 		if (hold) pendingPages.add(hold.put.row.pageId);

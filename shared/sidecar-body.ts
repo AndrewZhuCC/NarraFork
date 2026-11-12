@@ -143,6 +143,8 @@ export interface SideCarInboundMessage {
 	revision?: number;
 	/** Team channel only: the message went to everyone. */
 	isBroadcast?: boolean;
+	/** Display intent only; false or absent messages remain user-readable, never private. */
+	showToUser?: boolean;
 	text: string;
 }
 
@@ -253,11 +255,17 @@ export type SideCarBody =
 	 * A notice about the session's outline tasks, beside its model-facing text (which the producer
 	 * wrote and no template renders): `turnEnd`, a long turn ended with a task still in progress
 	 * (`outline_task_turn_end`); `edited`, people changed tasks of the session
-	 * (`outline_task_edit`). The reader sees the tasks as titled outline links with status chips.
+	 * (`outline_task_edit`); `finished`, tasks the session created were finished by another
+	 * session or a person (`outline_task_finished`, outline P2 PR 9b); `activity`, what other
+	 * sessions and people did around the session's tasks since its last turn
+	 * (`outline_team_activity`, outline P2 PR 10b), each item with who did it; `team`, one commit
+	 * of someone else that concerns the session in more than one way (`outline_team`, outline P2
+	 * PR 10a: assigned to it, a prerequisite ended, a task it created ended). The reader sees the
+	 * tasks as titled outline links with status chips.
 	 */
 	| {
 			kind: "outlineTasks";
-			variant: "turnEnd" | "edited";
+			variant: "turnEnd" | "edited" | "finished" | "activity" | "team";
 			items: OutlineTaskNoticeItem[];
 			/** Tasks (or changes) the notice counts without naming. */
 			more?: number;
@@ -308,8 +316,17 @@ export function coerceSideCarBody(value: unknown): SideCarBody | undefined {
 			return typeof body.text === "string" ? body : undefined;
 		case "knowledge":
 			return Array.isArray(body.hits) ? body : undefined;
-		case "tasksDone":
 		case "messages":
+			return Array.isArray(body.items) &&
+				body.items.every(
+					(item) =>
+						item !== null &&
+						typeof item === "object" &&
+						(item.showToUser === undefined || typeof item.showToUser === "boolean"),
+				)
+				? body
+				: undefined;
+		case "tasksDone":
 		case "specUpdates":
 		case "asyncQuestionAnswers":
 			return Array.isArray(body.items) ? body : undefined;
@@ -326,7 +343,13 @@ export function coerceSideCarBody(value: unknown): SideCarBody | undefined {
 			const more = typeof body.more === "number" && body.more > 0 ? Math.floor(body.more) : 0;
 			return {
 				kind: "outlineTasks",
-				variant: body.variant === "edited" ? "edited" : "turnEnd",
+				variant:
+					body.variant === "edited" ||
+					body.variant === "finished" ||
+					body.variant === "activity" ||
+					body.variant === "team"
+						? body.variant
+						: "turnEnd",
 				items: boundOutlineTaskNoticeItems(body.items),
 				...(more > 0 ? { more } : {}),
 			};
@@ -456,6 +479,9 @@ export const SIDECAR_PRESENTATION_FALLBACKS: Readonly<Record<string, string>> = 
 	// Outline task notices (`outlineTasks`).
 	outlineTaskTurnEndHeading: "Still in progress — tick it done when it is",
 	outlineTaskEditedHeading: "{n} task(s) changed by people",
+	outlineTaskFinishedHeading: "{n} task(s) this session created were finished elsewhere",
+	outlineTaskActivityHeading: "Team activity: {n} change(s)",
+	outlineTaskTeamHeading: "{n} task event(s) for this session",
 	outlineTaskMore: "{n} more not listed",
 	outlineAnswersHeading: "{who} answered {n} question(s)",
 	outlineAnswersSomeone: "Someone",
@@ -629,8 +655,14 @@ function projectSideCarBody(
 			// (a buffered user message) has no name and its own first line is the best
 			// headline. Either way the full text stays in `lines`, because the headline
 			// is a one-line flattening and the reader must be able to see the rest.
+			// The opening brief of a session opened for a task (outline P2 PR 10c-1) is headed by
+			// its first line, the task's title; the rest (up to 16 KiB) unfolds.
 			const headline =
-				source === "behavior_fence" ? label(labels, "proseFenceHeading") : flatten(body.text);
+				source === "behavior_fence"
+					? label(labels, "proseFenceHeading")
+					: source === "outline_task_brief"
+						? flatten((body.text.split("\n", 1)[0] ?? "").replace(/^#+\s*/, ""))
+						: flatten(body.text);
 			return { headline, lines: proseLines(body.text) };
 		}
 
@@ -783,7 +815,19 @@ function projectSideCarBody(
 						? labelWith(labels, "outlineTaskEditedHeading", {
 								n: body.items.length + (body.more ?? 0),
 							})
-						: label(labels, "outlineTaskTurnEndHeading"),
+						: body.variant === "finished"
+							? labelWith(labels, "outlineTaskFinishedHeading", {
+									n: body.items.length + (body.more ?? 0),
+								})
+							: body.variant === "activity"
+								? labelWith(labels, "outlineTaskActivityHeading", {
+										n: body.items.length + (body.more ?? 0),
+									})
+								: body.variant === "team"
+									? labelWith(labels, "outlineTaskTeamHeading", {
+											n: body.items.length + (body.more ?? 0),
+										})
+									: label(labels, "outlineTaskTurnEndHeading"),
 				lines,
 			};
 		}
@@ -1175,6 +1219,8 @@ export function sideCarBodyToPlainText(
 const PLAIN_TICKLESS_SOURCES: ReadonlySet<string> = new Set([
 	"outline_task_turn_end",
 	"outline_task_edit",
+	"outline_task_finished",
+	"outline_team",
 	"interrupt_task_guard",
 ]);
 

@@ -34,9 +34,11 @@
 import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
 import { compareOrderKeys, isAlias, parseAddress, serializeBody } from "@shared/outline";
+import { getNarratorMessageRefsPort } from "../narrator-refs/store";
 import { readDisplayNames } from "./access-reads";
 import { OutlineLeaseNotExpiredError } from "./errors";
 import { isOutlineEnabled } from "./feature";
+import { type OutlineHandoffSubject, planOutlineHandoffs } from "./handoff";
 import { OUTLINE_TEXT } from "./messages";
 import {
 	OUTLINE_LIMITS,
@@ -299,19 +301,59 @@ export async function expireOutlineTaskLeases(
 	const names = await holderNames([
 		...new Set(expired.map((e) => e.claim.holderNarratorId as string)),
 	]);
+	// A task of a project space comes back with a handoff, as one given back at a run's end does
+	// (outline P2 PR 10c-2); any other task with the plain note.
+	const handoffs = await leaseHandoffs(store, expired, nowDate);
 	return await reopenTasks(
 		store,
 		expired.map(({ claim, spaceId }) => {
 			const holder = claim.holderNarratorId as string;
+			const handoff = handoffs.get(claim.taskBlockId);
 			return {
 				taskBlockId: claim.taskBlockId,
 				spaceId,
 				note: outlineLeaseExpiredNote(holder, names.get(holder) ?? null),
+				...(handoff ? { ops: handoff.ops, clearAssignee: handoff.clearAssignee } : {}),
 			};
 		}),
 		nowDate,
 		{ summary: OUTLINE_TEXT.leaseExpiredSummary },
 	);
+}
+
+/**
+ * Whether sessions run on this store (they do not on PostgreSQL): where they do not, nothing of
+ * the release and handoff of outline P2 PR 10c-2 happens, and the lease job writes what it
+ * always wrote. A binding that cannot be resolved counts as "no".
+ */
+export function outlineSessionsRunHere(): boolean {
+	try {
+		return !getNarratorMessageRefsPort();
+	} catch {
+		return false;
+	}
+}
+
+/** The handoffs of expired claims on tasks of project spaces; none when they cannot be planned. */
+async function leaseHandoffs(
+	store: OutlineStore,
+	expired: ReadonlyArray<{ claim: OutlineTaskClaimRow; spaceId: string }>,
+	at: Date,
+): Promise<Awaited<ReturnType<typeof planOutlineHandoffs>>> {
+	if (!outlineSessionsRunHere()) return new Map();
+	try {
+		const spaces = new Map<string, OutlineSpaceRow | null>();
+		for (const spaceId of new Set(expired.map((e) => e.spaceId)))
+			spaces.set(spaceId, await store.getSpace(spaceId));
+		const subjects = expired.flatMap(({ claim, spaceId }): OutlineHandoffSubject[] => {
+			const space = spaces.get(spaceId);
+			return space?.kind === "project" ? [{ claim, space }] : [];
+		});
+		return await planOutlineHandoffs(store, subjects, { reason: "lease", at });
+	} catch (error) {
+		logger.warn("Outline lease expiry: handoffs unavailable", { error: String(error) });
+		return new Map();
+	}
 }
 
 /** Where the next scan for tasks nobody holds starts (in memory; a restart starts over). */
@@ -470,11 +512,18 @@ function resting(taskId: string, nowMs: number): boolean {
 	return (expiryBackoff.get(taskId)?.until ?? 0) > nowMs;
 }
 
-interface Reopening {
+export interface Reopening {
 	taskBlockId: string;
 	spaceId: string;
 	/** The block written last under the task: why it is open again. */
 	note: string;
+	/**
+	 * Written in place of `note` (a handoff, `handoff.ts`; none at all for a task under another
+	 * one given back with it). When they cannot be written, the task is reopened without them.
+	 */
+	ops?: readonly OutlineOp[];
+	/** The task's assignment (to the session giving it back, by name) is cleared with it. */
+	clearAssignee?: boolean;
 }
 
 /**
@@ -484,7 +533,7 @@ interface Reopening {
  * is written task by task, a task that cannot take its note is reopened without it, and one that
  * cannot be reopened at all is left alone for a while (`failed`, logged once).
  */
-async function reopenTasks(
+export async function reopenTasks(
 	store: OutlineStore,
 	items: readonly Reopening[],
 	nowDate: Date,
@@ -492,6 +541,10 @@ async function reopenTasks(
 		/** Sessions whose claims are released whatever their lease (archived or deleted). */
 		sessions?: readonly string[];
 		summary: (n: number) => string;
+		/** The system actor of the commits; the lease job's by default. */
+		actor?: string;
+		/** The person the commits are written for (a session's owner giving its tasks back). */
+		responsibleUserId?: string | null;
 	},
 ): Promise<OutlineLeaseExpiryResult> {
 	const now = nowDate.toISOString();
@@ -507,9 +560,10 @@ async function reopenTasks(
 			const setTodo: OutlineOp = {
 				op: "setTask",
 				block: { id: item.taskBlockId },
-				task: { status: "todo" },
+				task: { status: "todo", ...(item.clearAssignee ? { assignee: null } : {}) },
 			};
 			if (!withNote) return [setTodo];
+			if (item.ops) return [setTodo, ...item.ops];
 			return [
 				setTodo,
 				{
@@ -524,8 +578,8 @@ async function reopenTasks(
 			{
 				spaceId,
 				ops,
-				actor: { kind: "system", id: OUTLINE_LEASE_ACTOR },
-				responsibleUserId: null,
+				actor: { kind: "system", id: how.actor ?? OUTLINE_LEASE_ACTOR },
+				responsibleUserId: how.responsibleUserId ?? null,
 				summary: how.summary(batch.length),
 			},
 			{
@@ -977,7 +1031,9 @@ export interface OutlineContinuationCandidates {
  * A task with unfinished tasks under it is a `container`: listed (it is still open, and counts as
  * the person's work when it is theirs) but never the one continuation names or starts. A plan that
  * is not approved yet (`task_json.plan.state = planning`) is left out with every task under it: it
- * is never executed (D48 Q3).
+ * is never executed (D48 Q3). So is every task under a task a subagent of this session is doing
+ * (a delegation, outline P2 PR 9a): that tree is the subagent's while it runs, and comes back
+ * when its claim does.
  */
 export async function findContinuationCandidates(options: {
 	narratorId: string;
@@ -1071,9 +1127,10 @@ export async function findContinuationCandidates(options: {
 		return out;
 	};
 	const chains = new Map(live.map((block) => [block.id, above(block)]));
+	const delegated = await delegatedTasksAbove(store, chains, claims, options.narratorId, now);
 	const hidden = (block: OutlineBlockMeta): boolean =>
 		isPlanningRoot(block.taskJson) ||
-		(chains.get(block.id) ?? []).some((a) => isPlanningRoot(a.taskJson));
+		(chains.get(block.id) ?? []).some((a) => isPlanningRoot(a.taskJson) || delegated.has(a.id));
 	const shown = inOrder.filter((block) => !hidden(block));
 	const containers = new Set<string>();
 	for (const block of shown) {
@@ -1140,6 +1197,42 @@ export async function findContinuationCandidates(options: {
 			wait: isWaiting(waits.get(block.id)) ? (waits.get(block.id) as OutlineTaskWait) : null,
 		}));
 	return { candidates, waiting, ordered: all, truncated, personWork };
+}
+
+/**
+ * Of the open tasks above the blocks read, those a subagent of `narratorId`'s session is doing
+ * (its lease running): what is under them is the subagent's work while it runs. Their claims are
+ * read in one indexed batch (those not read already), and the holders' sessions in one more; at
+ * most {@link OUTLINE_TASK_LIMITS.candidateScan} tasks are considered.
+ */
+async function delegatedTasksAbove(
+	store: OutlineStore,
+	chains: ReadonlyMap<string, readonly OutlineBlockMeta[]>,
+	claims: Map<string, OutlineTaskClaimRow>,
+	narratorId: string,
+	now: string,
+): Promise<Set<string>> {
+	const ids = new Set<string>();
+	for (const chain of chains.values()) {
+		for (const a of chain) {
+			if (ids.size >= OUTLINE_TASK_LIMITS.candidateScan) break;
+			if (a.taskJson && isOpenTask(a.taskJson)) ids.add(a.id);
+		}
+	}
+	if (ids.size === 0) return new Set();
+	const unread = [...ids].filter((id) => !claims.has(id));
+	for (const [id, claim] of await getOutlineTaskClaims(unread, { store })) claims.set(id, claim);
+	const held = new Map<string, string>();
+	for (const id of ids) {
+		const claim = claims.get(id);
+		const holder = claim?.holderNarratorId;
+		if (holder && holder !== narratorId && isClaimLive(claim, now)) held.set(id, holder);
+	}
+	if (held.size === 0) return new Set();
+	const roots = await store.getNarratorRoots([...new Set(held.values())]);
+	const out = new Set<string>();
+	for (const [id, holder] of held) if (roots.get(holder)?.root === narratorId) out.add(id);
+	return out;
 }
 
 /**

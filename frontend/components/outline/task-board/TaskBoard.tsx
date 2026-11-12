@@ -11,6 +11,13 @@
  *     cancelling it from the menu is not offered meanwhile, so no waiting change is left behind.
  *   - Cancelled tasks are folded under their count until opened.
  *   - Every task opens in the outline.
+ *   - A task of the project's space that can be started has "Open a new session for this" (outline
+ *     P2 PR 10c-1, D54; `OpenTaskSession.tsx`): a new session takes it and starts on it; the row
+ *     then says which session is on it. Such tasks are grouped as "Ready to start".
+ *   - A task the reader manages that an agent finished is marked 「新完成」 (D50 ④, outline P2
+ *     PR 9b) until they have seen it: once its row has been on screen, the board tells the server
+ *     (`useNewlyDoneMarks`); the mark stays for as long as this board is open, and is gone the
+ *     next time the board is read.
  *
  * Changes are the person's writes; the board re-reads after each, and when the session's tasks
  * change (`outline_tasks_changed`).
@@ -34,41 +41,44 @@ import {
 	UnstyledButton,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import type {
-	OutlineBoardAssignTarget,
-	OutlineBoardExecutor,
-	OutlineBoardSection,
-	OutlineBoardTask,
-	OutlineTaskBoardResponse,
+import {
+	OUTLINE_TASK_BOARD_LIMITS,
+	type OutlineBoardAssignTarget,
+	type OutlineBoardExecutor,
+	type OutlineBoardSection,
+	type OutlineBoardTask,
+	type OutlineTaskBoardResponse,
 } from "@shared/outline-task-board";
 import {
 	IconArrowBackUp,
-	IconCheck,
+	IconArrowsExchange,
 	IconChevronDown,
 	IconChevronRight,
-	IconCircle,
-	IconCircleDot,
-	IconCircleX,
 	IconDots,
 	IconExternalLink,
-	IconHourglass,
 	IconLock,
 	IconPlayerPlay,
 	IconUser,
 	IconUserShare,
 } from "@tabler/icons-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { type ReactNode, useEffect, useMemo, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useOutlinePendingDetail } from "../../../hooks/useOutline";
 import {
 	invalidateTaskBoards,
+	taskBoardKeys,
 	useAddBoardTask,
 	useUpdateBoardTask,
 } from "../../../hooks/useTaskBoard";
 import { ApiError, api } from "../../../lib/api";
+import { observePageLifecycle } from "../../../lib/page-lifecycle";
 import { ensureTypographyCssVars, TYPE_ROLE_STYLE } from "../../../lib/typography-css-vars";
+import { useEditorPanelVisible } from "../../narrator/narrator-panel-visibility";
 import { DiffEntry } from "../OutlinePendingPanel";
+import { OutlineStatusChip, OutlineStatusIcon } from "../OutlineStatusIcon";
+import { OpenSessionForm, useOpenSessionControl } from "./OpenTaskSession";
+import { TransferSessions } from "./TransferSessions";
 
 // Task text paints with the reader's typography variables (TYPE_ROLE_STYLE).
 ensureTypographyCssVars();
@@ -137,6 +147,7 @@ function executorLabel(
 	executor: OutlineBoardExecutor,
 	ownSession: string | null,
 	me: string,
+	scopeKind?: "session" | "project",
 ): string {
 	switch (executor.kind) {
 		case "session":
@@ -148,23 +159,192 @@ function executorLabel(
 		case "agent":
 			return t("board.agent", { name: executor.name });
 		default:
-			return t("board.nobody");
+			// A project's unassigned tasks wait for someone to open a session for them (D54).
+			return scopeKind === "project" ? t("board.readyToStart") : t("board.nobody");
 	}
 }
 
+/** A status group's badge: the same one a task's checkbox is drawn as everywhere else. */
 const STATUS_ICON: Record<StatusGroup, ReactNode> = {
-	doing: <IconCircleDot size={14} color="var(--mantine-color-indigo-5)" />,
-	waiting: <IconHourglass size={14} color="var(--mantine-color-orange-5)" />,
-	todo: <IconCircle size={14} color="var(--mantine-color-gray-5)" />,
-	done: <IconCheck size={14} color="var(--mantine-color-green-5)" />,
-	cancelled: <IconCircleX size={14} color="var(--mantine-color-gray-6)" />,
+	doing: <OutlineStatusIcon status="doing" />,
+	waiting: <OutlineStatusIcon status="waiting" />,
+	todo: <OutlineStatusIcon status="todo" />,
+	done: <OutlineStatusIcon status="done" />,
+	cancelled: <OutlineStatusIcon status="cancelled" />,
 };
+
+/** A 「新完成」 mark: the task at the version it was shown finished. */
+const markKey = (task: Pick<OutlineBoardTask, "id" | "versionSeq">) =>
+	`${task.id}:${task.versionSeq}`;
+
+/** How long the board gathers marks seen before it tells the server, in one request. */
+export const NEWLY_DONE_SEEN_FLUSH_MS = 600;
+
+/** How often a mark in view but hidden by its host (nothing said so) is looked at again. */
+const NEWLY_DONE_RECHECK_MS = 1000;
+
+/**
+ * A board read with 「新完成」 dropped from the tasks the reader saw, each at the version seen
+ * (`markKey`): a version read since is left as the server marked it.
+ */
+export function withoutNewlyDone(
+	board: OutlineTaskBoardResponse,
+	seen: ReadonlySet<string>,
+): OutlineTaskBoardResponse {
+	const strip = (task: OutlineBoardTask): OutlineBoardTask => {
+		if (!task.newlyDone || !seen.has(markKey(task))) return task;
+		const { newlyDone: _seen, ...rest } = task;
+		return rest;
+	};
+	return {
+		...board,
+		sections: board.sections.map((section) => ({
+			...section,
+			open: section.open.map(strip),
+			finished: section.finished.map(strip),
+		})),
+	};
+}
+
+/**
+ * The board's 「新完成」 marks: shown for the tasks the server marks, and kept for as long as the
+ * board stays mounted (a read after the reader saw them no longer marks them); `seen` gathers the
+ * marks that were on screen and tells the server in one request (again on unmount), then drops
+ * them from the cached reads so a board opened again does not show them.
+ */
+function useNewlyDoneMarks(tasks: readonly OutlineBoardTask[]) {
+	const queryClient = useQueryClient();
+	// The board is on screen: its dock tab is the shown one and the page is in the foreground.
+	const visible = useEditorPanelVisible();
+	const [shown, setShown] = useState<ReadonlySet<string>>(() => new Set());
+	useEffect(() => {
+		const marked = tasks.filter((task) => task.newlyDone).map(markKey);
+		if (marked.some((key) => !shown.has(key))) setShown((prev) => new Set([...prev, ...marked]));
+	}, [tasks, shown]);
+	const pending = useRef(new Map<string, number>());
+	const told = useRef(new Set<string>());
+	const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const flush = useCallback(
+		(options: { keepalive?: boolean } = {}) => {
+			if (timer.current) clearTimeout(timer.current);
+			timer.current = null;
+			const all = [...pending.current].map(([id, versionSeq]) => ({ id, versionSeq }));
+			pending.current.clear();
+			// A request names at most so many; a board seldom shows more at once.
+			const size = OUTLINE_TASK_BOARD_LIMITS.seenPerRequest;
+			for (let start = 0; start < all.length; start += size) {
+				const batch = all.slice(start, start + size);
+				const keys = new Set(batch.map(markKey));
+				api
+					.markBoardTasksSeen({ tasks: batch }, options)
+					.then(() =>
+						queryClient.setQueriesData<OutlineTaskBoardResponse>(
+							{ queryKey: taskBoardKeys.all },
+							(board) => (board?.sections ? withoutNewlyDone(board, keys) : board),
+						),
+					)
+					.catch(() => {
+						// Not recorded: told again the next time they are seen.
+						for (const task of batch) told.current.delete(markKey(task));
+					});
+			}
+		},
+		[queryClient],
+	);
+	const seen = useCallback(
+		(task: OutlineBoardTask) => {
+			const key = markKey(task);
+			if (told.current.has(key)) return;
+			told.current.add(key);
+			pending.current.set(task.id, task.versionSeq);
+			timer.current ??= setTimeout(() => flush(), NEWLY_DONE_SEEN_FLUSH_MS);
+		},
+		[flush],
+	);
+	useEffect(() => () => flush(), [flush]);
+	// A page closed or sent to the background right after a mark was seen still records it.
+	useEffect(() => observePageLifecycle({ onHidden: () => flush({ keepalive: true }) }), [flush]);
+	const isNew = useCallback(
+		(task: OutlineBoardTask) =>
+			task.status === "done" && (task.newlyDone === true || shown.has(markKey(task))),
+		[shown],
+	);
+	return { isNew, seen, visible };
+}
+
+type NewlyDoneMarks = ReturnType<typeof useNewlyDoneMarks>;
+
+/**
+ * 「新完成」 on a task's row: reported seen once it is on screen. That is: the board is shown (its
+ * dock tab is the visible one, the page in the foreground: `visible`; a board in a tab behind
+ * another stays mounted, hidden), the row intersects the viewport, and in the frame after that
+ * the page is visible and nothing hides the row (`checkVisibility`; a host that hides it without
+ * saying so is looked at again every second while the row stays in view). The board shown again
+ * looks again at once. Without IntersectionObserver, once it is drawn while shown.
+ */
+function NewlyDoneBadge({
+	task,
+	visible,
+	onSeen,
+}: {
+	task: OutlineBoardTask;
+	visible: boolean;
+	onSeen: (task: OutlineBoardTask) => void;
+}) {
+	const { t } = useTranslation("outline");
+	const ref = useRef<HTMLDivElement>(null);
+	useEffect(() => {
+		const element = ref.current;
+		if (!element || !visible) return;
+		const shown = () =>
+			document.visibilityState === "visible" &&
+			element.checkVisibility?.({ visibilityProperty: true, opacityProperty: true }) !== false;
+		if (typeof IntersectionObserver === "undefined") {
+			if (shown()) onSeen(task);
+			return;
+		}
+		let intersecting = false;
+		let frame = 0;
+		let retry: ReturnType<typeof setTimeout> | undefined;
+		const check = () => {
+			cancelAnimationFrame(frame);
+			clearTimeout(retry);
+			if (!intersecting) return;
+			// A frame runs only while the page is shown: a board opened in a hidden tab waits for it.
+			frame = requestAnimationFrame(() => {
+				if (!intersecting) return;
+				if (shown()) onSeen(task);
+				// Hidden by a host that does not say so (its `visibility: hidden`): look again later.
+				else retry = setTimeout(check, NEWLY_DONE_RECHECK_MS);
+			});
+		};
+		const observer = new IntersectionObserver((entries) => {
+			intersecting = entries.some((entry) => entry.isIntersecting);
+			check();
+		});
+		observer.observe(element);
+		return () => {
+			cancelAnimationFrame(frame);
+			clearTimeout(retry);
+			observer.disconnect();
+		};
+	}, [task, visible, onSeen]);
+	return (
+		<Tooltip label={t("board.newlyDoneHint")} withinPortal openDelay={300} multiline maw={260}>
+			<OutlineStatusChip ref={ref} status="newly_done" data-testid="task-badge-newly-done">
+				{t("board.newlyDone")}
+			</OutlineStatusChip>
+		</Tooltip>
+	);
+}
 
 export interface TaskBoardProps {
 	/** One board response, or the pages of a project board. */
 	pages: readonly OutlineTaskBoardResponse[];
 	/** Open a task in the outline (the host decides where: a dock panel, the outline page). */
 	onOpenTask?: (task: OutlineBoardTask) => void;
+	/** Open a session (the one doing a task); without it the row links to the session's page. */
+	onOpenSession?: (narratorId: string) => void;
 	/** A project board's next page of spaces. */
 	onLoadMoreSpaces?: () => void;
 	hasMoreSpaces?: boolean;
@@ -174,6 +354,7 @@ export interface TaskBoardProps {
 export function TaskBoard({
 	pages,
 	onOpenTask,
+	onOpenSession,
 	onLoadMoreSpaces,
 	hasMoreSpaces,
 	loadingMoreSpaces,
@@ -215,6 +396,7 @@ export function TaskBoard({
 		return out;
 	}, [sections, extra]);
 	const groups = useMemo(() => groupTasks(tasks, ownSession, me), [tasks, ownSession, me]);
+	const newly = useNewlyDoneMarks(tasks);
 
 	const loadFinished = useMutation({
 		mutationFn: async (spaceId: string) => {
@@ -252,11 +434,13 @@ export function TaskBoard({
 				<ExecutorGroupView
 					key={group.key}
 					group={group}
-					label={executorLabel(t, group.executor, ownSession, me)}
+					label={executorLabel(t, group.executor, ownSession, me, scope?.kind)}
 					sectionOf={sectionOf}
 					scopeKind={scope?.kind ?? "session"}
 					me={me}
+					newly={newly}
 					onOpenTask={onOpenTask}
+					onOpenSession={onOpenSession}
 				/>
 			))}
 			{truncated.map((section) => (
@@ -307,14 +491,18 @@ function ExecutorGroupView({
 	sectionOf,
 	scopeKind,
 	me,
+	newly,
 	onOpenTask,
+	onOpenSession,
 }: {
 	group: ExecutorGroup;
 	label: string;
 	sectionOf: Map<string, OutlineBoardSection>;
 	scopeKind: "session" | "project";
 	me: string;
+	newly: NewlyDoneMarks;
 	onOpenTask?: (task: OutlineBoardTask) => void;
+	onOpenSession?: (narratorId: string) => void;
 }) {
 	const { t } = useTranslation("outline");
 	const [showCancelled, setShowCancelled] = useState(false);
@@ -382,7 +570,9 @@ function ExecutorGroupView({
 										section={sectionOf.get(task.spaceId)}
 										scopeKind={scopeKind}
 										me={me}
+										newly={newly}
 										onOpenTask={onOpenTask}
+										onOpenSession={onOpenSession}
 									/>
 								))}
 						</Stack>
@@ -398,18 +588,39 @@ function TaskRow({
 	section,
 	scopeKind,
 	me,
+	newly,
 	onOpenTask,
+	onOpenSession,
 }: {
 	task: OutlineBoardTask;
 	section: OutlineBoardSection | undefined;
 	scopeKind: "session" | "project";
 	me: string;
+	newly: NewlyDoneMarks;
 	onOpenTask?: (task: OutlineBoardTask) => void;
+	onOpenSession?: (narratorId: string) => void;
 }) {
 	const { t } = useTranslation("outline");
 	const queryClient = useQueryClient();
 	const update = useUpdateBoardTask();
-	const [assigning, setAssigning] = useState(false);
+	const session = useOpenSessionControl(task, t);
+	// The session doing a project task: the one this row just opened, or the one the board names.
+	const doingSession =
+		session.opened ??
+		(scopeKind === "project" &&
+		section?.space.kind === "project" &&
+		task.status === "doing" &&
+		task.executor.kind === "session"
+			? task.executor.narratorId
+			: null);
+	const doingTitle =
+		session.opened !== null
+			? task.title
+			: task.executor.kind === "session"
+				? task.executor.title
+				: null;
+	// The popover under the menu: a username to hand to, or the sessions to hand to.
+	const [assigning, setAssigning] = useState<false | "user" | "session">(false);
 	const [username, setUsername] = useState("");
 	const canWrite = section?.canWrite ?? false;
 	const sessionSpace = section?.space.kind === "session";
@@ -426,9 +637,17 @@ function TaskRow({
 		update.mutate(
 			{ blockId: task.id, body: { baseVersionSeq: task.versionSeq, ...body } },
 			{
-				onSuccess: () => {
+				onSuccess: (result) => {
 					setAssigning(false);
 					setUsername("");
+					// 「转交并开始」: whether the session was started, and why not.
+					if (body.start && body.assign?.kind === "narrator")
+						notifications.show({
+							color: result.started ? "green" : "yellow",
+							message: result.started
+								? t("board.transfer.started")
+								: t(`board.transfer.notStarted.${result.notStarted ?? "not_started"}`),
+						});
 				},
 				onError: (error) => {
 					const conflict = error instanceof ApiError && error.status === 409;
@@ -451,6 +670,7 @@ function TaskRow({
 			data-task-id={task.id}
 			data-status={task.status}
 			data-title={task.title}
+			data-newly-done={newly.isNew(task) ? "true" : undefined}
 		>
 			<Group gap={6} wrap="nowrap" align="flex-start">
 				<Stack gap={2} style={{ flex: 1, minWidth: 0 }}>
@@ -462,10 +682,35 @@ function TaskRow({
 						{task.title}
 					</Text>
 					<Group gap={4}>
+						{newly.isNew(task) && (
+							<NewlyDoneBadge task={task} visible={newly.visible} onSeen={newly.seen} />
+						)}
 						{task.humanCreated && (
 							<Badge size="xs" variant="light" color="indigo" data-testid="task-badge-human">
 								{t("board.humanCreated")}
 							</Badge>
+						)}
+						{task.handoffs !== undefined && task.handoffs > 0 && (
+							<Tooltip
+								label={
+									task.handoffs >= 3
+										? t("board.handoffsManyHint", { count: task.handoffs })
+										: t("board.handoffsHint")
+								}
+								withinPortal
+								openDelay={300}
+								multiline
+								maw={260}
+							>
+								<Badge
+									size="xs"
+									variant="light"
+									color={task.handoffs >= 3 ? "orange" : "gray"}
+									data-testid="task-badge-handoffs"
+								>
+									{t("board.handoffs", { count: task.handoffs })}
+								</Badge>
+							</Tooltip>
 						)}
 						{task.plan?.state === "planning" && (
 							<Badge size="xs" variant="light" color="yellow" data-testid="task-badge-planning">
@@ -473,38 +718,35 @@ function TaskRow({
 							</Badge>
 						)}
 						{task.lock && (
-							<Badge
-								size="xs"
-								variant="light"
-								color="grape"
-								leftSection={<IconLock size={10} />}
-								data-testid="task-badge-locked"
-							>
+							<OutlineStatusChip status="locked" data-testid="task-badge-locked">
 								{task.lock.by.name
 									? t("board.locked", { name: task.lock.by.name })
 									: t("board.lockedSomeone")}
-							</Badge>
+							</OutlineStatusChip>
 						)}
 						{task.waiting && task.waiting.prerequisites > 0 && (
-							<Badge size="xs" variant="light" color="orange">
+							<OutlineStatusChip status="waiting">
 								{t("board.waitPrerequisites", { count: task.waiting.prerequisites })}
-							</Badge>
+							</OutlineStatusChip>
 						)}
 						{task.waiting?.people && (
-							<Badge size="xs" variant="light" color="orange">
-								{t("board.waitPeople")}
-							</Badge>
+							<OutlineStatusChip status="waiting">{t("board.waitPeople")}</OutlineStatusChip>
 						)}
 						{task.waiting?.confirmation && (
-							<Badge size="xs" variant="light" color="orange" data-testid="task-badge-confirmation">
+							<OutlineStatusChip status="waiting" data-testid="task-badge-confirmation">
 								{t("board.waitConfirmation")}
-							</Badge>
+							</OutlineStatusChip>
 						)}
-						{task.assignee && (
-							<Text size="xs" c="dimmed" style={TYPE_ROLE_STYLE.xs}>
-								@{task.assignee}
-							</Text>
-						)}
+						{/* Handed to a session by its id: the group it is under names that session. */}
+						{task.assignee &&
+							!(
+								task.executor.kind === "session" &&
+								task.assignee === `agent:${task.executor.narratorId}`
+							) && (
+								<Text size="xs" c="dimmed" style={TYPE_ROLE_STYLE.xs}>
+									@{task.assignee}
+								</Text>
+							)}
 						<Text size="xs" c="dimmed" ff="monospace" style={TYPE_ROLE_STYLE.code}>
 							{task.address}
 						</Text>
@@ -519,8 +761,90 @@ function TaskRow({
 							</Text>
 						)}
 					</Group>
+					{(session.offered || doingSession) && (
+						<Group gap={4} justify="flex-end" wrap="wrap" data-testid="task-open-session-row">
+							{session.offered && (
+								<Popover
+									opened={session.formOpen}
+									onChange={session.setFormOpen}
+									withinPortal
+									position="bottom-end"
+									shadow="md"
+								>
+									<Popover.Target>
+										<Button.Group>
+											<Button
+												size="compact-xs"
+												leftSection={<IconPlayerPlay size={12} />}
+												loading={session.pending}
+												onClick={() => session.submit()}
+												data-testid="task-open-session"
+											>
+												{t("board.openSession.button")}
+											</Button>
+											<Button
+												size="compact-xs"
+												px={4}
+												disabled={session.pending}
+												aria-label={t("board.openSession.options")}
+												aria-expanded={session.formOpen}
+												onClick={() => session.setFormOpen(!session.formOpen)}
+												data-testid="task-open-session-options"
+											>
+												<IconChevronDown size={12} />
+											</Button>
+										</Button.Group>
+									</Popover.Target>
+									<Popover.Dropdown>
+										<OpenSessionForm control={session} task={task} t={t} />
+									</Popover.Dropdown>
+								</Popover>
+							)}
+							{doingSession && (
+								<Button
+									component="a"
+									href={`/narrators/${encodeURIComponent(doingSession)}`}
+									size="compact-xs"
+									variant="light"
+									leftSection={<IconExternalLink size={12} />}
+									onClick={(event) => {
+										if (!onOpenSession) return;
+										event.preventDefault();
+										onOpenSession(doingSession);
+									}}
+									styles={{ label: { whiteSpace: "normal", textAlign: "left" } }}
+									h="auto"
+									mih={22}
+									data-testid="task-open-session-doing"
+									data-narrator-id={doingSession}
+								>
+									{doingTitle
+										? t("board.openSession.doing", { title: doingTitle })
+										: t("board.openSession.doingUntitled")}
+								</Button>
+							)}
+						</Group>
+					)}
+					{session.error && !session.formOpen && (
+						<Text
+							size="xs"
+							c="red"
+							role="alert"
+							style={TYPE_ROLE_STYLE.xs}
+							data-testid="task-open-session-error"
+						>
+							{session.error}
+						</Text>
+					)}
 				</Stack>
-				<Popover opened={assigning} onChange={setAssigning} withinPortal position="bottom-end">
+				<Popover
+					opened={assigning !== false}
+					onChange={(opened) => {
+						if (!opened) setAssigning(false);
+					}}
+					withinPortal
+					position="bottom-end"
+				>
 					<Popover.Target>
 						<div>
 							<Menu shadow="md" position="bottom-end" withinPortal>
@@ -537,11 +861,32 @@ function TaskRow({
 									</ActionIcon>
 								</Menu.Target>
 								<Menu.Dropdown>
+									{session.offered && (
+										<>
+											<Menu.Item
+												leftSection={<IconPlayerPlay size={14} />}
+												disabled={session.pending}
+												onClick={() => session.submit()}
+												data-testid="task-action-open-session"
+											>
+												{t("board.openSession.button")}
+											</Menu.Item>
+											<Menu.Item
+												leftSection={<IconChevronDown size={14} />}
+												disabled={session.pending}
+												onClick={() => session.setFormOpen(true)}
+												data-testid="task-action-open-session-options"
+											>
+												{t("board.openSession.options")}
+											</Menu.Item>
+											<Menu.Divider />
+										</>
+									)}
 									{canWrite && open && (
 										<>
 											{ending && (
 												<Menu.Item
-													leftSection={<IconCheck size={14} />}
+													leftSection={<OutlineStatusIcon status="done" />}
 													onClick={() => change({ status: "done" })}
 													data-testid="task-action-done"
 												>
@@ -559,7 +904,7 @@ function TaskRow({
 											)}
 											{ending && (
 												<Menu.Item
-													leftSection={<IconCircleX size={14} />}
+													leftSection={<OutlineStatusIcon status="cancelled" />}
 													onClick={() => change({ status: "cancelled" })}
 													data-testid="task-action-cancel"
 												>
@@ -602,11 +947,21 @@ function TaskRow({
 											)}
 											<Menu.Item
 												leftSection={<IconUserShare size={14} />}
-												onClick={() => setAssigning(true)}
+												onClick={() => setAssigning("user")}
 												data-testid="task-action-user"
 											>
 												{t("board.action.assignUser")}
 											</Menu.Item>
+											{/* A session space's task goes to others by handing it out (a later PR). */}
+											{!sessionSpace && (
+												<Menu.Item
+													leftSection={<IconArrowsExchange size={14} />}
+													onClick={() => setAssigning("session")}
+													data-testid="task-action-transfer"
+												>
+													{t("board.action.transferSession")}
+												</Menu.Item>
+											)}
 											{task.assignee && (
 												<Menu.Item
 													leftSection={<IconArrowBackUp size={14} />}
@@ -622,7 +977,11 @@ function TaskRow({
 									{onOpenTask && (
 										<Menu.Item
 											leftSection={<IconExternalLink size={14} />}
-											onClick={() => onOpenTask(task)}
+											onClick={() => {
+												// Opening it is seeing it.
+												if (newly.isNew(task)) newly.seen(task);
+												onOpenTask(task);
+											}}
 											data-testid="task-action-open"
 										>
 											{t("board.action.open")}
@@ -633,7 +992,16 @@ function TaskRow({
 						</div>
 					</Popover.Target>
 					<Popover.Dropdown>
-						<Group gap={4} wrap="nowrap">
+						{assigning === "session" && (
+							<TransferSessions
+								task={task}
+								pending={update.isPending}
+								onTransfer={(narratorId, start) =>
+									change({ assign: { kind: "narrator", narratorId }, ...(start ? { start } : {}) })
+								}
+							/>
+						)}
+						<Group gap={4} wrap="nowrap" display={assigning === "session" ? "none" : undefined}>
 							<TextInput
 								size="xs"
 								placeholder={t("board.action.usernamePlaceholder")}

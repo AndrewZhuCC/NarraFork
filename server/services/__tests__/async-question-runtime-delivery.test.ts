@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb, getTestDb, readTestMessageContent } from "../../../tests/setup";
 import {
 	narratorBufferedMessages,
 	narratorMessageRefs,
@@ -23,6 +23,7 @@ const {
 	interruptNarrator,
 } = await import("../narrator-session");
 const { activeNarrators } = await import("../narrator-session-state");
+const { MAILBOX_LIMITS } = await import("../agent-runtime/limits");
 const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 const time = "2026-10-05T00:00:00.000Z";
 const narratorId = "question-runtime";
@@ -279,6 +280,18 @@ describe("async question receipt runtime adoption", () => {
 		expect(rows[0]?.state).toBe("queued");
 		expect(db.select().from(narratorMessages).all()).toHaveLength(1);
 	});
+	test("超长回答降级成摘要与指针后仍能入箱", async () => {
+		// 回执正文上限 80KB，但通知预算只有 4KB：直接塞全文会让这次投递永远失败。
+		const text = persistAnswer("answer", "长".repeat(3000));
+		const result = await scheduleQuestionAnswerDelivery(narratorId, "answer", text, undefined);
+		expect(result).toEqual({ ready: true, started: false });
+		const row = db.select().from(narratorBufferedMessages).get();
+		expect(row?.state).toBe("queued");
+		expect(Buffer.byteLength(row?.text ?? "", "utf8")).toBeLessThanOrEqual(
+			MAILBOX_LIMITS.publicationBytes,
+		);
+		expect(row?.text).toContain("完整回答见消息 answer");
+	});
 	test("safe tool boundary supplies the receipt once, preserving human origin", async () => {
 		const text = persistAnswer();
 		await scheduleQuestionAnswerDelivery(narratorId, "answer", text, undefined);
@@ -305,6 +318,16 @@ describe("async question receipt runtime adoption", () => {
 		expect(await drainAndPersistPendingInjections(active())).toContain(text);
 		expect(await drainAndPersistPendingInjections(active())).toBeNull();
 		expect(db.select().from(narratorMessages).all()).toHaveLength(1);
+	});
+	test("a person's answer taken up marks the run as a person's (outline P2 PR 10c-2); other drains do not", async () => {
+		const idle = active();
+		expect(await drainAndPersistPendingInjections(idle)).toBeNull();
+		expect(idle._runPersonActed).toBeUndefined();
+		const text = persistAnswer();
+		await scheduleQuestionAnswerDelivery(narratorId, "answer", text, undefined);
+		const running = active();
+		expect(await drainAndPersistPendingInjections(running)).toContain(text);
+		expect(running._runPersonActed).toBe(true);
 	});
 	test("receipt landing between the pre-pass drain and history read is not supplied twice", async () => {
 		const text = persistAnswer();
@@ -453,6 +476,7 @@ describe("async question receipt runtime adoption", () => {
 			.where(eq(narratorMessages.id, answer.record.answerMessageId))
 			.get();
 		if (!row) throw new Error("receipt missing");
+		row.contentJson = readTestMessageContent(sqlite, row.id);
 		const replay = [
 			{
 				...row,
@@ -548,6 +572,7 @@ describe("async question receipt runtime adoption", () => {
 			.where(eq(narratorMessages.id, answer.record.answerMessageId))
 			.get();
 		if (!row) throw new Error("receipt missing");
+		row.contentJson = readTestMessageContent(sqlite, row.id);
 		const { questionModelReceipts } = await import("../agent-runtime/history");
 		const receipts = questionModelReceipts([row]);
 		const evidence = await captureAwaitRequests(running, question.id, [1, 1], receipts);

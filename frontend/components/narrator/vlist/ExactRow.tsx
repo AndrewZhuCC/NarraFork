@@ -21,6 +21,7 @@
 
 import { narratorsApi } from "@frontend/lib/api/narrators";
 import { notifications } from "@mantine/notifications";
+import { coerceInjectionTarget } from "@shared/pretext-layout/injection-target";
 import { memo, type ReactNode, useLayoutEffect, useMemo, useRef } from "react";
 import { QUOTE_ROLE_ATTR } from "../composer/quote-source-attrs";
 import { MessageIdentityCtx } from "../MessageIdentityCtx";
@@ -36,6 +37,7 @@ import type {
 	InjectionGuardActions,
 	SpecCarryoverActions,
 } from "./render/RenderSystemText";
+import type { ContentTargetResolver } from "./render/RenderToolCall";
 import type { TraceRowInteractionSlot } from "./render/RenderToolRun";
 import { renderElement, resolveRenderExtra } from "./render-registry";
 import { renderLabelsForKind, type VListRenderLabels } from "./useVListLabels";
@@ -58,7 +60,11 @@ import {
 	TOGGLEABLE_CARD_KINDS,
 	TRACE_KINDS,
 } from "./vlist-exact-row-state";
-import { type InjectionNavigation, injectInjectionBubbleChrome } from "./vlist-injection-header";
+import {
+	type InjectionNavigation,
+	injectInjectionBubbleChrome,
+	resolveInjectionOpener,
+} from "./vlist-injection-header";
 import { VListInteractionRowBoundsContext } from "./vlist-interaction-admission-context";
 import { traceRowFoldChannel } from "./vlist-interaction-state";
 import type { VListItem } from "./vlist-pipeline";
@@ -204,6 +210,8 @@ export interface ExactRowProps {
 	 * after paint (see `onUnknownHeight`) instead of predicted arithmetically.
 	 */
 	permissionSlot?: ReactNode;
+	/** Collapsible Outline Ask detail, replacing the static question snapshot. */
+	outlineAskSlot?: ReactNode;
 	/**
 	 * Live permission form nodes for DRILLED-IN cards inside this row's trace, keyed by
 	 * trace row key. A call blocked on a request now stays a row of its activity trace
@@ -378,6 +386,7 @@ export const ExactRow = memo(
 		narratorId,
 		onOpenUISend,
 		permissionSlot,
+		outlineAskSlot,
 		traceRowPermissionSlots,
 		onPermissionFormHeight,
 		editorSlot,
@@ -405,11 +414,14 @@ export const ExactRow = memo(
 		onQuoteJump,
 	}: ExactRowProps) {
 		const extra = resolveRenderExtra(item.spec);
+		const resolveContentTarget: ContentTargetResolver = (target) =>
+			resolveInjectionOpener(target, injectionNavigation);
 		const kind = item.spec.kind;
 		if (kind === "markdown") {
 			extra.openUIStateKey = `${currentUserId ?? "public"}:${narratorId}:${item.spec.key}`;
 			if (messageRole === "assistant") extra.onOpenUISend = onOpenUISend;
 		}
+		if (kind === "auxiliary-content") extra.resolveTargetOpener = resolveContentTarget;
 		// Read-only shares retain this reader-owned fold without enabling mutation/menu actions.
 		extra.textPreviewLabels = renderLabels.textPreview;
 		extra.onToggleTextExpanded = toggles.onToggleTextExpanded;
@@ -622,7 +634,11 @@ export const ExactRow = memo(
 				// the take-over button's row is reserved by measure-reflection-notice
 				// whenever `hasTakeOver` is set. Nothing here can move the row, so the
 				// zero-DOM height prediction is untouched.
-				if (onTerminate && canTerminateTool(card.toolName)) {
+				if (
+					row.cardKind !== "auxiliary-content" &&
+					onTerminate &&
+					canTerminateTool(card.toolName)
+				) {
 					cardExtra.onTerminate = onTerminate;
 				}
 				// "Open full session" for an Await-agent / single-target Send row. The
@@ -659,7 +675,13 @@ export const ExactRow = memo(
 						cardExtra.viewControls = viewControls;
 					}
 				}
-				return renderElement("tool-call", card, cardExtra);
+				if (row.cardKind === "auxiliary-content")
+					cardExtra.resolveTargetOpener = resolveContentTarget;
+				return renderElement(
+					row.cardKind === "auxiliary-content" ? "auxiliary-content" : "tool-call",
+					card,
+					cardExtra,
+				);
 			};
 		}
 		// The recovery card owns a checkbox list plus two submit buttons. Its rows
@@ -769,6 +791,8 @@ export const ExactRow = memo(
 		// An outline card's fold (raw input, model result) rides the prompt-fold channel, keyed by
 		// the card: see `rawOpen` in segment-adapter's buildToolCardData.
 		if (kind === "tool-call") extra.onTogglePrompt = toggles.onTogglePrompt;
+		// An outline plan card's tree (its nodes, texts, 「全部展开」), keyed by the card.
+		if (kind === "tool-call") extra.onPlanTree = toggles.onPlanTree;
 		if (kind === "subagent-card") {
 			if (interaction?.toolActions?.onViewSubagentSession) {
 				extra.onOpenSession = interaction.toolActions.onViewSubagentSession;
@@ -804,6 +828,7 @@ export const ExactRow = memo(
 				extra.onUpdateTimeout = resolveUpdateTimeout(measured.toolUseId);
 			}
 		}
+		if (outlineAskSlot !== undefined) extra.outlineAskSlot = outlineAskSlot;
 		// A live permission form (pending-permission tool/subagent card) is injected
 		// as a slot; the pure renderer draws it in place of the zero-DOM copy.
 		if (permissionSlot !== undefined) {
@@ -894,6 +919,7 @@ export const ExactRow = memo(
 			extra.isActive === true ||
 			specTaskLive === true ||
 			permissionSlot != null ||
+			outlineAskSlot != null ||
 			editorSlot != null ||
 			(traceRowPermissionSlots?.size ?? 0) > 0 ||
 			askInPassingPending != null ||
@@ -913,9 +939,18 @@ export const ExactRow = memo(
 			) : (
 				body
 			);
+		const sourceTarget =
+			kind === "auxiliary-content"
+				? coerceInjectionTarget((item.spec.data as { target?: unknown })?.target)
+				: undefined;
+		const openSource = sourceTarget ? resolveContentTarget(sourceTarget) : undefined;
+		const interactionActions =
+			interaction && openSource
+				? { ...interaction.actions, onJumpToSource: openSource }
+				: interaction?.actions;
 		const interactiveBody =
 			interaction && editorSlot === undefined ? (
-				<MessageContextMenuCtx.Provider value={interaction.actions}>
+				<MessageContextMenuCtx.Provider value={interactionActions ?? interaction.actions}>
 					<MessageIdentityCtx.Provider
 						value={{ messageId: interaction.messageId, messageSeq, role: messageRole }}
 					>
@@ -927,7 +962,7 @@ export const ExactRow = memo(
 							blockIndex={interaction.blockIndex}
 							blockIndices={interaction.blockIndices}
 							copyText={interaction.copyText}
-							actions={interaction.actions}
+							actions={interactionActions ?? interaction.actions}
 							narratorId={narratorId}
 							toolUseId={interaction.toolUseId}
 							toolDetailRef={interaction.toolDetailRef}
@@ -1084,6 +1119,7 @@ export const ExactRow = memo(
 		// Authorship decides the bubble's side; a row must repaint if the viewer changes.
 		prev.currentUserId === next.currentUserId &&
 		prev.permissionSlot === next.permissionSlot &&
+		prev.outlineAskSlot === next.outlineAskSlot &&
 		prev.traceRowPermissionSlots === next.traceRowPermissionSlots &&
 		prev.onPermissionFormHeight === next.onPermissionFormHeight &&
 		prev.editorSlot === next.editorSlot &&

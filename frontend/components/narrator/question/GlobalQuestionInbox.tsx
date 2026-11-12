@@ -20,6 +20,8 @@ import {
 	Text,
 } from "@mantine/core";
 import type { HumanAttentionItem } from "@shared/human-attention";
+import { isOutlinePlanInput, outlinePlanSubmissionOf } from "@shared/outline-plan-submission";
+import { parsePlanTree } from "@shared/outline-plan-tree";
 import {
 	getReflectionSuggestion,
 	type ReflectionKind,
@@ -30,7 +32,16 @@ import {
 import { IconClockPause, IconInbox } from "@tabler/icons-react";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { lazy, type ReactNode, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import {
+	lazy,
+	type ReactNode,
+	Suspense,
+	useCallback,
+	useEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { globalQuestionsQueryKey } from "../../../hooks/useAsyncQuestions";
 import {
@@ -44,10 +55,15 @@ import {
 } from "../../../hooks/useHumanAttention";
 import { useMobileDrawerHistory } from "../../../hooks/useMobileDrawerHistory";
 import { api } from "../../../lib/api";
-import { outlineRouterLink, useOutlineRouterNavigate } from "../../../lib/outline-router";
+import {
+	outlineRouterLink,
+	useOutlineRouterHrefNavigate,
+	useOutlineRouterNavigate,
+} from "../../../lib/outline-router";
 import { readSession, writeSession } from "../../../lib/session-store";
 import { OutlineAttentionDetail } from "../../outline/OutlineQuestions";
 import { OutlineNavProvider } from "../../outline/outline-nav";
+import { OutlinePlanTree } from "../../outline/plan/OutlinePlanTree";
 import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import { InlinePermission } from "../permission/InlinePermission";
 import { PermEnterHintCtx } from "../tool-call/tool-call-contexts";
@@ -418,7 +434,18 @@ function outlineRowText(
 ) {
 	const ref = item.outline;
 	if (!ref) return item.summary;
-	if (ref.what === "digest") return t("outlineAttention.digest", { count: ref.count });
+	if (ref.what === "digest") {
+		// Unread reports (P2 PR 11) and confirmations made on the person's behalf share the row.
+		const parts = [
+			...(ref.reports
+				? [t("outlineAttention.reports", { count: ref.reports, items: ref.reportItems ?? 0 })]
+				: []),
+			...(ref.count > 0 || !ref.reports
+				? [t("outlineAttention.digest", { count: ref.count })]
+				: []),
+		];
+		return parts.join(" · ");
+	}
 	if (ref.what === "pending")
 		return t("outlineAttention.pending", { summary: item.summary, count: ref.count });
 	return t("outlineAttention.questions", { title: item.summary, count: ref.count });
@@ -437,6 +464,7 @@ function HumanAttentionRow({
 	const [expanded, setExpanded] = useState(false);
 	// Links of an outline row go through the app's routes (the outline's components are router-free).
 	const navigateOutline = useOutlineRouterNavigate();
+	const navigateHref = useOutlineRouterHrefNavigate();
 	if (item.source === "outline") {
 		return (
 			<Paper withBorder p="sm" data-attention-id={item.id} data-attention-kind={item.kind}>
@@ -478,7 +506,11 @@ function HumanAttentionRow({
 						{item.narratorId && <OwnerLink item={item} onOpenSession={onOpenSession} />}
 					</Group>
 					{expanded && (
-						<OutlineNavProvider onNavigate={navigateOutline} renderLink={outlineRouterLink}>
+						<OutlineNavProvider
+							onNavigate={navigateOutline}
+							renderLink={outlineRouterLink}
+							onNavigateHref={navigateHref}
+						>
 							<OutlineAttentionDetail item={item} onOpen={onClose} />
 						</OutlineNavProvider>
 					)}
@@ -570,6 +602,15 @@ function PermissionReviewContext({
 			: null;
 	const plan =
 		permission.toolName === "ExitPlanMode" && typeof record?.plan === "string" ? record.plan : null;
+	// An outline session's plan (its submission, or its declared mode) is a task tree.
+	const planTree = useMemo(
+		() =>
+			plan !== null &&
+			(outlinePlanSubmissionOf(record ?? undefined) !== null || isOutlinePlanInput(record))
+				? parsePlanTree(previewPlan ?? plan)
+				: null,
+		[plan, previewPlan, record],
+	);
 	// The question banner below IS this tool's input; listing it again is pure noise.
 	const inputOwnedByForm = permission.toolName === "AskUserQuestion";
 	// Commands and file content need literal line breaks, not JSON's escaped strings.
@@ -596,9 +637,16 @@ function PermissionReviewContext({
 	const targets = showExecutionTarget ? reviewTargets(permission) : [];
 	return (
 		<Stack gap="xs">
-			{plan !== null && (
-				<ReviewMarkdown label={t("humanAttentionPlan")} value={previewPlan ?? plan} />
-			)}
+			{plan !== null &&
+				(planTree ? (
+					// An outline plan reads as its outline (plan readability): the root and two
+					// levels, deeper ones folded, as on its card in the session.
+					<ReviewBlock label={t("humanAttentionPlan")}>
+						<OutlinePlanTree tree={planTree} />
+					</ReviewBlock>
+				) : (
+					<ReviewMarkdown label={t("humanAttentionPlan")} value={previewPlan ?? plan} />
+				))}
 			{fields.map(([key, label]) => (
 				<ReviewText key={key} label={t(label)} value={String(record?.[key])} />
 			))}

@@ -60,7 +60,7 @@ const oldEntry = {
 		outputPreview: "old done result",
 	},
 };
-mock.module("../../db", () => ({ db, sqlite }));
+mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
 const { backgroundTaskService: tasks } = await import("../background-task-service");
 const { runtimePublication: publisher, activateSqliteRuntimePublication } = await import(
 	"../agent-runtime/publication"

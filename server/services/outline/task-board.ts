@@ -20,6 +20,22 @@
  * name; else, for an open task of a session space, that session (it will take it up: continuation
  * starts the first to-do, §4.8); else nobody. A finished task: whoever last held it, when known.
  *
+ * NEWLY DONE FOR YOU (「新完成」, D50 ④; outline P2 PR 9b)
+ * -----------------------------------------------------
+ * A done task the reader manages (`task_json.manager` is them) that an agent finished is
+ * `newlyDone` until they have seen it. The finish is the version that made it done (walked back
+ * from the current one, at most {@link OUTLINE_BOARD_NEW_DONE.versionsBack} versions: later
+ * edits of a done task leave it found; one edited more often since is not marked). Its commit is
+ * an agent's (or a system commit for a session: a confirmation), or another person's while a
+ * session was doing it (as the report counts it), never one the reader wrote; and it is within
+ * {@link OUTLINE_BOARD_NEW_DONE.windowDays} days. A later version the reader wrote means they
+ * have seen it. "Seen" is otherwise a row of `outline_task_seen` at the finish's version or later,
+ * written when a board showed it to them ({@link markOutlineTasksSeen}); a task finished again
+ * later is new again, an agent rewording it is not. Cost: nothing more for a board without such
+ * a task; otherwise at most `versionsBack - 1` batched version reads (primary-key seeks, without
+ * content), one commit read per space (by `(space_id, seq)`) and one read of the reader's rows
+ * (primary key), all bounded by the finished tasks shown.
+ *
  * COMPLETION (D26b)
  * -----------------
  * A locked task whose being done or cancelled waits for confirmation carries `completion`: the
@@ -33,10 +49,14 @@
  * every space in one compound statement each (a bounded seek per space), ancestors one level at a
  * time for all of them, titles as the head of each block's content only, claims, names and the
  * open changes (by the tasks' lock roots) in one read each, and whether the person may write each
- * session space from the sessions' write facts and one grant read (`writableSpaces`).
+ * session space from the sessions' write facts and one grant read (`writableSpaces`). The one
+ * exception is 「新完成」: the commits of the reader's own finished tasks are read per space that
+ * has one (at most the page's spaces), and not at all when none does.
  */
+import { stat } from "node:fs/promises";
 import { NotFoundError, ValidationError } from "@server/lib/errors";
 import { blockTitle } from "@shared/outline";
+import type { OutlineBoardSeenRequest } from "@shared/outline-task-board";
 import {
 	OUTLINE_TASK_BOARD_LIMITS,
 	type OutlineBoardExecutor,
@@ -44,7 +64,13 @@ import {
 	type OutlineBoardTask,
 	type OutlineTaskBoardResponse,
 } from "@shared/outline-task-board";
-import { canReadSpace, canWriteSpace, type OutlinePrincipal, projectUsersWith } from "./access";
+import {
+	canReadSpace,
+	canWriteSpace,
+	narratorVisibility,
+	type OutlinePrincipal,
+	projectUsersWith,
+} from "./access";
 import {
 	readDisplayNames,
 	readNarratorWriteGrants,
@@ -52,6 +78,8 @@ import {
 	readProjectSessionSpacePage,
 	readSessionWriteFacts,
 } from "./access-reads";
+import { agentAssigneeName } from "./assignee";
+import { handoffBlockIdsOf, previousSessionDirectory } from "./handoff";
 import {
 	OUTLINE_BEHAVIOR_ALIAS,
 	OUTLINE_LIMITS,
@@ -62,13 +90,17 @@ import {
 import { findCompletionsAwaitingConfirmation, pendingRightOf } from "./pending";
 import { isOrphanedSpace, resolveSessionSpaceNarrator } from "./spaces";
 import { outlineStore } from "./store";
+import type { OutlineVersionMeta } from "./store/digest-port";
 import type {
 	OutlineBlockMeta,
+	OutlineCommitRow,
 	OutlinePendingHead,
 	OutlineSpaceRow,
 	OutlineStore,
 	OutlineTaskClaimRow,
 } from "./store/port";
+import { isPlanningRoot, outlineTaskStartBlocker } from "./task-json";
+import { outlineTaskSessionProjectDir, outlineTaskSessionsAvailable } from "./task-session";
 import { deriveOutlineTaskWaits, inDocumentOrder, isClaimLive } from "./tasks";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -111,13 +143,220 @@ function decodeSpaceCursor(cursor: string): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Newly done for the reader (「新完成」)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const OUTLINE_BOARD_NEW_DONE = {
+	/** Tasks finished longer ago than this are never marked. */
+	windowDays: 14,
+	/**
+	 * Versions of a done task looked at, newest first, to find the one that finished it. Each
+	 * step back past the first two is one batched keyed read, only for the tasks still looking
+	 * (at most the finished tasks a board shows).
+	 */
+	versionsBack: 8,
+	/** A person's seen rows older than this are pruned when they write more. */
+	keepSeenDays: 30,
+} as const;
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** Whether the commit that wrote a task's current version finished it as an agent's work. */
+function finishedByAgent(
+	commit: OutlineCommitRow,
+	claim: OutlineTaskClaimRow | undefined,
+	readerId: string,
+): boolean {
+	if (commit.actorKind === "agent") return true;
+	if (commit.actorKind === "system") return commit.narratorId !== null;
+	// A person's commit: the reader's own never is; another person's when a session was doing it.
+	if (commit.actorId === readerId) return false;
+	return !!(claim?.holderNarratorId ?? claim?.lastHolderNarratorId);
+}
+
+/**
+ * The versions of each task, newest first, back to the one that made it done (or
+ * {@link OUTLINE_BOARD_NEW_DONE.versionsBack} of them): one batched read per step back, only for
+ * the tasks still looking.
+ */
+async function finishingChains(
+	store: OutlineStore,
+	tasks: readonly OutlineBlockMeta[],
+): Promise<Map<string, OutlineVersionMeta[]>> {
+	const chains = new Map<string, OutlineVersionMeta[]>(tasks.map((m) => [m.id, []]));
+	const found = (chain: readonly OutlineVersionMeta[]) => {
+		const last = chain.at(-1);
+		const before = chain.at(-2);
+		return !!before && isFinishVersion(before) && !!last && !isFinishVersion(last);
+	};
+	// First the current version and the one before it, then one more each step.
+	let keys = tasks.flatMap((m) =>
+		m.versionSeq > 1
+			? [
+					{ blockId: m.id, seq: m.versionSeq },
+					{ blockId: m.id, seq: m.versionSeq - 1 },
+				]
+			: [{ blockId: m.id, seq: m.versionSeq }],
+	);
+	for (let step = 0; keys.length > 0 && step < OUTLINE_BOARD_NEW_DONE.versionsBack; step++) {
+		const grew = new Set<string>();
+		for (const version of await store.listVersionMetasAt(keys)) {
+			const chain = chains.get(version.blockId);
+			if (!chain || chain.some((v) => v.fromSeq === version.fromSeq)) continue;
+			chain.push(version);
+			grew.add(version.blockId);
+		}
+		for (const chain of chains.values()) chain.sort((a, b) => b.fromSeq - a.fromSeq);
+		keys = [];
+		for (const [blockId, chain] of chains) {
+			// Nothing older was found: the start of the block's history.
+			if (!grew.has(blockId)) continue;
+			const last = chain.at(-1);
+			// Stop at the finish, at the start of the block's history, or at the bound.
+			if (!last || found(chain) || chain.length >= OUTLINE_BOARD_NEW_DONE.versionsBack) continue;
+			if (last.fromSeq <= 1 || last.deleted || last.taskJson?.status !== "done") continue;
+			keys.push({ blockId, seq: last.fromSeq - 1 });
+		}
+	}
+	return chains;
+}
+
+/** A version whose task is done (a finish, when the version before it is not). */
+function isFinishVersion(version: OutlineVersionMeta): boolean {
+	return !version.deleted && version.taskJson?.status === "done";
+}
+
+/**
+ * Of the given finished tasks, those newly done for the reader (see the module header): read only
+ * when one of them is done and theirs.
+ */
+async function newlyDoneFor(
+	ctx: Context,
+	metas: readonly OutlineBlockMeta[],
+	claims: ReadonlyMap<string, OutlineTaskClaimRow>,
+	now: Date,
+): Promise<Set<string>> {
+	const readerId = ctx.principal.userId;
+	const candidates = metas.filter(
+		(m) =>
+			!m.deleted &&
+			m.taskJson?.status === "done" &&
+			m.taskJson.manager?.kind === "human" &&
+			m.taskJson.manager.id === readerId,
+	);
+	const out = new Set<string>();
+	if (candidates.length === 0) return out;
+	const { store } = ctx;
+	const chains = await finishingChains(store, candidates);
+	// Each task's finish, and the versions written after it.
+	const finishes = new Map<string, { finish: OutlineVersionMeta; after: OutlineVersionMeta[] }>();
+	for (const m of candidates) {
+		const chain = chains.get(m.id) ?? [];
+		for (let i = 0; i + 1 < chain.length; i++) {
+			const version = chain[i] as OutlineVersionMeta;
+			if (!isFinishVersion(version)) break;
+			if (isFinishVersion(chain[i + 1] as OutlineVersionMeta)) continue;
+			// The one before was not done (to do, in progress, cancelled; not deleted): the finish.
+			if (!(chain[i + 1] as OutlineVersionMeta).deleted)
+				finishes.set(m.id, { finish: version, after: chain.slice(0, i) });
+			break;
+		}
+	}
+	if (finishes.size === 0) return out;
+	const seqsBySpace = new Map<string, Set<number>>();
+	for (const m of candidates) {
+		const found = finishes.get(m.id);
+		if (!found) continue;
+		const seqs = seqsBySpace.get(m.spaceId) ?? new Set<number>();
+		for (const version of [found.finish, ...found.after]) seqs.add(version.fromSeq);
+		seqsBySpace.set(m.spaceId, seqs);
+	}
+	const commits = new Map<string, OutlineCommitRow>();
+	for (const [spaceId, seqs] of seqsBySpace)
+		for (const commit of await store.getCommitsBySeqs(spaceId, [...seqs]))
+			commits.set(`${spaceId}:${commit.seq}`, commit);
+	const seen = new Map(
+		(await store.getTaskSeen(readerId, [...finishes.keys()])).map((row) => [
+			row.taskBlockId,
+			row.seenSeq,
+		]),
+	);
+	const since = new Date(now.getTime() - OUTLINE_BOARD_NEW_DONE.windowDays * DAY_MS).toISOString();
+	const byReader = (commit: OutlineCommitRow | undefined) =>
+		commit?.actorKind === "human" && commit.actorId === readerId;
+	for (const m of candidates) {
+		const found = finishes.get(m.id);
+		if (!found) continue;
+		const commit = commits.get(`${m.spaceId}:${found.finish.fromSeq}`);
+		if (!commit || commit.createdAt < since) continue;
+		if ((seen.get(m.id) ?? -1) >= found.finish.fromSeq) continue;
+		// The reader wrote it since: they have seen it.
+		if (found.after.some((v) => byReader(commits.get(`${m.spaceId}:${v.fromSeq}`)))) continue;
+		if (finishedByAgent(commit, claims.get(m.id), readerId)) out.add(m.id);
+	}
+	return out;
+}
+
+/**
+ * The reader saw these tasks on a board (「新完成」 shown to them): one row each, at the version
+ * the board showed. Only tasks that are done and theirs (they manage them), in a space they may
+ * read, are recorded; the rest are ignored (nothing is said about them). Returns how many were
+ * recorded.
+ */
+export async function markOutlineTasksSeen(
+	principal: OutlinePrincipal,
+	request: OutlineBoardSeenRequest,
+	options: { store?: OutlineStore; now?: Date } = {},
+): Promise<number> {
+	const store = options.store ?? outlineStore;
+	const wanted = new Map<string, number>();
+	for (const task of request.tasks.slice(0, OUTLINE_TASK_BOARD_LIMITS.seenPerRequest))
+		wanted.set(task.id, Math.max(wanted.get(task.id) ?? 0, task.versionSeq));
+	if (wanted.size === 0) return 0;
+	const metas = await store.getBlockMetasByIds([...wanted.keys()]);
+	const readable = new Map<string, boolean>();
+	const rows: Array<{ taskBlockId: string; seenSeq: number }> = [];
+	for (const m of metas) {
+		const manager = m.taskJson?.manager;
+		if (m.deleted || m.taskJson?.status !== "done") continue;
+		if (manager?.kind !== "human" || manager.id !== principal.userId) continue;
+		if (!readable.has(m.spaceId)) {
+			const space = await store.getSpace(m.spaceId);
+			readable.set(m.spaceId, !!space && (await canReadSpace(principal, space)));
+		}
+		if (!readable.get(m.spaceId)) continue;
+		// Never past the task's version now: a version the board could not have shown.
+		const seenSeq = Math.min(wanted.get(m.id) ?? 0, m.versionSeq);
+		rows.push({ taskBlockId: m.id, seenSeq });
+	}
+	// Nothing to record: no write, no prune.
+	if (rows.length === 0) return 0;
+	const now = options.now ?? new Date();
+	await store.putTaskSeen(
+		principal.userId,
+		rows,
+		now.toISOString(),
+		new Date(now.getTime() - OUTLINE_BOARD_NEW_DONE.keepSeenDays * DAY_MS).toISOString(),
+	);
+	return rows.length;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Describing tasks
 // ─────────────────────────────────────────────────────────────────────────────
+
+/** Distinct `@agent:` names of one board read that are checked for being a readable session. */
+const ASSIGNED_SESSIONS_READ = 50;
 
 interface Context {
 	store: OutlineStore;
 	principal: OutlinePrincipal;
 	spaces: Map<string, OutlineSpaceRow>;
+	/**
+	 * Project spaces whose startable tasks the reader may open a new session for (outline P2
+	 * PR 10c-1): decided once per board, see `readProjectTaskBoard`.
+	 */
+	openSessionSpaces?: ReadonlyMap<string, string>;
 }
 
 /** The space of a session: its root narrator's, by id. */
@@ -167,7 +406,8 @@ async function describe(
 		? await inDocumentOrder(store, metas, options.first ?? null, { keys, ancestors: known })
 		: [...metas];
 	const ids = ordered.map((m) => m.id);
-	const now = new Date().toISOString();
+	const nowDate = new Date();
+	const now = nowDate.toISOString();
 	const openPending = options.open ? await openPendingOf(store, ordered, known) : [];
 	const [heads, claimRows, waits, completions] = await Promise.all([
 		store.getBlockHeads(ids),
@@ -181,9 +421,44 @@ async function describe(
 	]);
 	const titles = new Map(heads.map((h) => [h.id, blockTitle(h.contentHead)]));
 	const claims = new Map<string, OutlineTaskClaimRow>(claimRows.map((c) => [c.taskBlockId, c]));
+	// For "open a new session": the claims of tasks in progress above the tasks listed that are
+	// not listed themselves (a step under a task someone is doing is theirs). One keyed read.
+	if (options.open && ctx.openSessionSpaces) {
+		const above = [...known.values()].filter(
+			(m) =>
+				!claims.has(m.id) &&
+				ctx.openSessionSpaces?.has(m.spaceId) &&
+				m.taskJson?.status === "doing",
+		);
+		if (above.length > 0)
+			for (const claim of await store.getTaskClaims(above.map((m) => m.id)))
+				claims.set(claim.taskBlockId, claim);
+	}
+	// 「有交接」: the handoffs under the open tasks of project spaces, looked up by the ids a
+	// handoff of each claim generation would have (primary keys, bounded).
+	const handoffs = new Map<string, number>();
+	if (options.open) {
+		const wanted = new Map<string, string>();
+		for (const meta of ordered) {
+			if (wanted.size >= OUTLINE_BOARD_HANDOFF_LIMITS.ids) break;
+			const epoch = claims.get(meta.id)?.epoch ?? 0;
+			if (epoch < 1 || ctx.spaces.get(meta.spaceId)?.kind !== "project") continue;
+			for (const id of handoffBlockIdsOf(meta.id, epoch)) wanted.set(id, meta.id);
+		}
+		if (wanted.size > 0)
+			for (const block of await store.getBlockMetasByIds([...wanted.keys()])) {
+				const task = wanted.get(block.id) as string;
+				if (!block.deleted && block.parentId === task)
+					handoffs.set(task, (handoffs.get(task) ?? 0) + 1);
+			}
+	}
+	const newlyDone = options.open
+		? new Set<string>()
+		: await newlyDoneFor(ctx, ordered, claims, nowDate);
 
 	// Holders as sessions (a subagent's claim is its root's work), and the names to show.
 	const holderNarrators = new Set<string>();
+	const assignedNames = new Set<string>();
 	const userIds = new Set<string>();
 	for (const meta of ordered) {
 		const claim = claims.get(meta.id);
@@ -194,7 +469,21 @@ async function describe(
 		const lock = meta.taskJson?.lock;
 		if (lock?.by.kind === "human") userIds.add(lock.by.id);
 		else if (lock) holderNarrators.add(lock.by.id);
+		// Handed to a session by its id (the board's 「转交给会话」, outline P2 PR 10a): shown as
+		// that session where the viewer may read it. Read with the holders, by primary key; a
+		// name that is no narrator's id (a handle, a label) stays a name.
+		const assigned = agentAssigneeName(meta.taskJson?.assignee);
+		if (assigned) assignedNames.add(assigned);
 	}
+	// Anyone who writes the space can type `@agent:<any id>`: the session's title is shown only to
+	// a viewer who may read that session, never because the id was written there.
+	const visible = narratorVisibility(ctx.principal);
+	const assignedSessions = new Set<string>();
+	for (const name of [...assignedNames].slice(0, ASSIGNED_SESSIONS_READ))
+		if (await visible(name)) {
+			assignedSessions.add(name);
+			holderNarrators.add(name);
+		}
 	const roots = await store.getNarratorRoots([...holderNarrators]);
 	const narratorIds = new Set<string>([...holderNarrators]);
 	for (const session of roots.values()) narratorIds.add(session.root);
@@ -227,8 +516,13 @@ async function describe(
 		}
 		if (task.assignee?.startsWith("human:"))
 			return { kind: "human", userId: null, name: task.assignee.slice("human:".length) };
-		if (task.assignee?.startsWith("agent:"))
-			return { kind: "agent", name: task.assignee.slice("agent:".length) };
+		if (task.assignee?.startsWith("agent:")) {
+			const name = task.assignee.slice("agent:".length);
+			// A root session's id the viewer may read: that session will do it. Anything else is
+			// a name, as written.
+			if (assignedSessions.has(name) && roots.get(name)?.root === name) return session(name);
+			return { kind: "agent", name };
+		}
 		if (!open && claim) {
 			if (claim.lastHolderUserId)
 				return {
@@ -242,6 +536,28 @@ async function describe(
 		return owner ? session(owner) : { kind: "none" };
 	};
 
+	// "Open a new session for this" (`task-session.ts` decides again when asked): to do, held by
+	// nobody, startable as a delegation would find it, in a space the reader may open sessions in.
+	const canOpenSession = (
+		meta: OutlineBlockMeta,
+		task: OutlineTaskJson,
+		wait: Parameters<typeof outlineTaskStartBlocker>[0]["wait"],
+	): boolean => {
+		if (!options.open || !ctx.openSessionSpaces?.has(meta.spaceId)) return false;
+		if (task.status !== "todo" || isClaimLive(claims.get(meta.id), now)) return false;
+		let planning = false;
+		let above: OutlineBlockMeta | undefined = meta;
+		for (let depth = 0; above && depth <= OUTLINE_LIMITS.maxDepth && !planning; depth++) {
+			planning = isPlanningRoot(above.taskJson);
+			// Someone is doing a task above it: its steps are theirs.
+			if (above !== meta && above.taskJson && isClaimLive(claims.get(above.id), now)) return false;
+			above = above.parentId === null ? undefined : known.get(above.parentId);
+		}
+		return outlineTaskStartBlocker({ task, planning, wait }) === null;
+	};
+
+	// The directory the session before worked in, for the tasks a session can be opened for.
+	const previousDirs = new Map<string, string>();
 	const out: OutlineBoardTask[] = [];
 	for (const meta of ordered) {
 		const task = meta.taskJson;
@@ -257,6 +573,20 @@ async function describe(
 					}
 				: null;
 		const completion = completions.get(meta.id);
+		const openable = canOpenSession(meta, task, wait);
+		if (
+			openable &&
+			handoffs.has(meta.id) &&
+			previousDirs.size < OUTLINE_BOARD_HANDOFF_LIMITS.directories
+		) {
+			const previous = await previousSessionDirectory(
+				store,
+				claims.get(meta.id),
+				ctx.openSessionSpaces?.get(meta.spaceId) ?? null,
+			).catch(() => null);
+			if (previous && (await isDirectory(previous.path)))
+				previousDirs.set(meta.id, previous.relative);
+		}
 		const lock = task.lock ?? null;
 		out.push({
 			id: meta.id,
@@ -285,6 +615,10 @@ async function describe(
 					}
 				: null,
 			versionSeq: meta.versionSeq,
+			...(newlyDone.has(meta.id) ? { newlyDone: true as const } : {}),
+			...(openable ? { openSession: true as const } : {}),
+			...(handoffs.has(meta.id) ? { handoffs: handoffs.get(meta.id) } : {}),
+			...(previousDirs.has(meta.id) ? { previousDirectory: previousDirs.get(meta.id) } : {}),
 		});
 	}
 	return out;
@@ -555,6 +889,43 @@ export async function readSessionTaskBoard(
 }
 
 /**
+ * Whether the person may open new sessions for the project space's tasks (outline P2 PR 10c-1):
+ * the session runtime runs here (not on PostgreSQL), they may create sessions in the project (its
+ * write access) and write its space, and the project has a working directory. A few keyed reads,
+ * once per board.
+ */
+async function mayOpenTaskSessions(
+	principal: OutlinePrincipal,
+	space: OutlineSpaceRow,
+	projectId: string,
+): Promise<string | null> {
+	if (!outlineTaskSessionsAvailable()) return null;
+	const project = await readProject(projectId);
+	if (!project) return null;
+	const creates =
+		principal.isAdmin ||
+		(await projectUsersWith(project, [principal.userId], "write")).has(principal.userId);
+	if (!creates || !(await canWriteSpace(principal, space))) return null;
+	return await outlineTaskSessionProjectDir(projectId);
+}
+
+/** Limits of the board's handoff marks. */
+const OUTLINE_BOARD_HANDOFF_LIMITS = {
+	/** Handoff ids looked up for one list of tasks. */
+	ids: 2000,
+	/** Tasks of one list whose previous session's directory is looked up (and checked on disk). */
+	directories: 20,
+} as const;
+
+async function isDirectory(path: string): Promise<boolean> {
+	try {
+		return (await stat(path)).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+/**
  * The board of a project (the project page): the project space on the first page, then the
  * session spaces of its sessions that the person may read, a page at a time. The caller has
  * checked that the person may read the project.
@@ -570,7 +941,11 @@ export async function readProjectTaskBoard(
 	const spaces: OutlineSpaceRow[] = [];
 	if (after === undefined) {
 		const projectSpace = await store.findSpace({ kind: "project", projectId });
-		if (projectSpace && (await canReadSpace(principal, projectSpace))) spaces.push(projectSpace);
+		if (projectSpace && (await canReadSpace(principal, projectSpace))) {
+			spaces.push(projectSpace);
+			const dir = await mayOpenTaskSessions(principal, projectSpace, projectId);
+			if (dir !== null) ctx.openSessionSpaces = new Map([[projectSpace.id, dir]]);
+		}
 	}
 	const page = await readProjectSessionSpacePage(principal, projectId, {
 		afterNarratorId: after,

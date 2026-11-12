@@ -23,6 +23,7 @@ import {
 	PLUGIN_UI_RUNTIME_JS_PATH,
 	type PluginUiRuntimeBundle,
 } from "./build/plugin-ui-runtime";
+import { nativeModuleBoundary } from "./build/remote-boundaries";
 import { createShikiLanguageAliasMap } from "./build/shiki-language-aliases";
 
 const vitePort = Number(process.env.VITE_PORT) || 7778;
@@ -519,6 +520,7 @@ export default defineConfig(({ mode, command }) => {
 			plugins: () => [shikiLanguageAliases(false), editorCodecBuffer()],
 		},
 		define: {
+			__NF_REMOTE_BUILD__: "false",
 			__NARRAFORK_BUILD_REPOSITORY__: JSON.stringify(
 				resolveBuildGitHubRepository({ root: resolve(__dirname, "..") }),
 			),
@@ -530,6 +532,7 @@ export default defineConfig(({ mode, command }) => {
 			__APP_VERSION__: JSON.stringify(appVersion),
 		},
 		plugins: [
+			nativeModuleBoundary(),
 			editorCodecBuffer(),
 			watchSharedDirectory(),
 			devSpaBaseHref(),

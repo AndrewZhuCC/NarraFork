@@ -14,6 +14,7 @@ import {
 import { z } from "zod";
 import { legacyPermissionModeSchema } from "../permission-modes";
 import { commandSchema, localeSchema } from "./common";
+import { outlineDigestTimeSchema, outlineDigestTimeZoneSchema } from "./outline/digest";
 
 /** Repair only the configured directory, after explicit administrator confirmation. */
 export const dataDirectoryRepairSchema = z.object({ confirmed: z.literal(true) }).strict();
@@ -127,6 +128,7 @@ export const updateUserPreferencesSchema = z.object({
 	replyInUserLanguage: z.boolean().optional(),
 	showTokenUsage: z.boolean().optional(),
 	showOutputStats: z.boolean().optional(),
+	compactAuxiliaryContent: z.boolean().optional(),
 	terminalTheme: z.string().min(1).max(50).optional(),
 	terminalFontSize: z.number().int().min(8).max(32).optional(),
 	// Narrator transcript typography (percentages). Bounds are taken FROM the shared
@@ -171,6 +173,10 @@ export const updateUserPreferencesSchema = z.object({
 		.max(TYPOGRAPHY_RANGE.paragraphScalePercent.max)
 		.optional(),
 	treatAsLocalAccess: z.boolean().optional(),
+	// The outline's daily report (P2 PR 11): null goes back to the default (the server's zone,
+	// 07:00); absent leaves the setting as it is.
+	outlineDigestTimeZone: outlineDigestTimeZoneSchema.optional(),
+	outlineDigestTime: outlineDigestTimeSchema.optional(),
 	addSubagentToRecentTabs: z.boolean().optional(),
 	recentTabsGroupMode: z.enum(["flat", "directory"]).optional(),
 	// Notification preferences
@@ -218,6 +224,8 @@ export const updateUserPreferencesSchema = z.object({
 	// 提交身份入口的显示位置。跟账号走，不是浏览器本地偏好；默认关，叙述者详情里始终能选身份。
 	gitIdentityContextMenu: z.boolean().optional(),
 	gitIdentityCreateModal: z.boolean().optional(),
+	gitIdentityFolderContextMenu: z.boolean().optional(),
+	recentTabsShowDirectory: z.boolean().optional(),
 });
 
 /**
@@ -295,6 +303,11 @@ export const removeRecentTabSchema = z.object({
 	 * a snapshot that points at entities that are already gone.
 	 */
 	cascade: z.boolean().optional(),
+	/**
+	 * 保留因这次移除而变空的文件夹。归档走的是 cascade 清理，但会话还能撤销归档回来，
+	 * 所以文件夹不该跟着最后一条记录一起消失。
+	 */
+	keepEmptyFolder: z.boolean().optional(),
 });
 
 export const moveRecentTabSchema = z

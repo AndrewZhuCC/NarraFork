@@ -57,7 +57,12 @@ function findKey(tabs: LayoutTab[], key: string): number {
 
 /**
  * Pull every folder's members right after its header, pinned members first (stable
- * otherwise). Returns the input array when it is already in that shape.
+ * otherwise), and every pinned top-level unit ahead of the unpinned ones. Returns the
+ * input array when it is already in that shape.
+ *
+ * The pinned block must lead the list: the server pages it by position, so a pinned unit
+ * stored below unpinned ones would only appear once the user scrolled far enough to load
+ * its page.
  *
  * `prune` gives the server's canonical form: a member whose folder is not in the list
  * goes back to the top level, and a folder with no members is removed. The client leaves
@@ -79,8 +84,6 @@ export function regroupFolders<T extends LayoutTab>(
 				return released;
 			})
 		: tabs;
-	if (folderIds.size === 0) return sameItems(source, tabs) ? tabs : source;
-
 	const membersByFolder = new Map<string, T[]>();
 	for (const tab of source) {
 		if (!tab.folderId || !folderIds.has(tab.folderId)) continue;
@@ -88,21 +91,27 @@ export function regroupFolders<T extends LayoutTab>(
 		if (members) members.push(tab);
 		else membersByFolder.set(tab.folderId, [tab]);
 	}
-	const result: T[] = [];
+	const pinnedUnits: T[] = [];
+	const unpinnedUnits: T[] = [];
+	let zone = pinnedUnits;
 	for (const tab of source) {
 		if (tab.folderId && folderIds.has(tab.folderId)) continue;
+		// A member whose header is outside a partial client window stays with the unit
+		// before it; anything else picks its block from its own pin.
+		if (!tab.folderId) zone = tab.pinned === true ? pinnedUnits : unpinnedUnits;
 		if (!isFolderTab(tab)) {
-			result.push(tab);
+			zone.push(tab);
 			continue;
 		}
 		const members = membersByFolder.get(tab.id) ?? [];
 		if (options.prune && members.length === 0) continue;
-		result.push(
+		zone.push(
 			tab,
 			...members.filter((member) => member.pinned),
 			...members.filter((member) => !member.pinned),
 		);
 	}
+	const result = [...pinnedUnits, ...unpinnedUnits];
 	return sameItems(result, tabs) ? tabs : result;
 }
 
@@ -352,19 +361,28 @@ export function applyRecentTabPin<T extends LayoutTab>(
 	return regroupFolders(next);
 }
 
-/** Remove a folder but keep its members, in order and unpinned, at the folder's position. */
+/**
+ * Remove a folder but keep its members, in order, at the folder's position.
+ *
+ * Released members take the folder's pin, not their own: the pinned block is positional
+ * (`getPinnedSectionEndIndex`), so unpinning them would drop the whole folder's contents
+ * into the unpinned area instead of leaving them where the user was looking. A member's
+ * own `pinned` only orders it inside the folder (pinned members first).
+ */
 export function applyRecentTabFolderDissolve<T extends LayoutTab>(
 	tabs: T[],
 	folderId: string,
 ): T[] {
 	const index = folderHeaderIndex(tabs, folderId);
 	if (index < 0) return tabs;
+	const pinned = tabs[index]?.pinned === true;
 	const range = unitRange(tabs, index);
 	const next = [...tabs];
 	const members = next.slice(range.start + 1, range.end + 1).map((member) => {
 		const released = { ...member };
 		delete released.folderId;
-		delete released.pinned;
+		if (pinned) released.pinned = true;
+		else delete released.pinned;
 		return released;
 	});
 	next.splice(range.start, range.end - range.start + 1, ...members);
@@ -372,15 +390,18 @@ export function applyRecentTabFolderDissolve<T extends LayoutTab>(
 }
 
 /** Remove a tab; a folder takes its members with it, and a folder left empty goes too. */
-export function applyRecentTabRemove<T extends LayoutTab>(tabs: T[], key: string): T[] {
+export function applyRecentTabRemove<T extends LayoutTab>(
+	tabs: T[],
+	key: string,
+	options: { keepEmptyFolder?: boolean } = {},
+): T[] {
 	const index = findKey(tabs, key);
 	if (index < 0) return tabs;
 	const removed = tabs[index];
 	if (!isFolderTab(removed)) {
-		return dropEmptyFolder(
-			tabs.filter((_, candidate) => candidate !== index),
-			removed.folderId,
-		);
+		const remaining = tabs.filter((_, candidate) => candidate !== index);
+		// Archiving is reversible, so the folder outlives its last member there.
+		return options.keepEmptyFolder ? remaining : dropEmptyFolder(remaining, removed.folderId);
 	}
 	return tabs.filter((tab) => tab !== removed && tab.folderId !== removed.id);
 }

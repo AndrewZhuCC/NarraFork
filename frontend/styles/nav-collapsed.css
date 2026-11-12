@@ -10,6 +10,20 @@
  * clips and the backdrop's (NavHoverPanel) sliding between the rail's edge and the
  * expanded width together.
  */
+/*
+ * Let the recent-tabs scrollport use the navbar's trailing padding. Its rows keep
+ * their original width and alignment, while the scrollbar gets a separate lane
+ * 4px inside the navbar edge (clear of the resize handle). Logical properties
+ * keep the same spacing in RTL. This also applies to the expanded hover panel.
+ */
+.nf-nav-tabs {
+	--nf-nav-scrollbar-inset: 4px;
+
+	margin-inline-end: calc(var(--nf-nav-scrollbar-inset) - var(--mantine-spacing-md));
+	padding-inline-end: calc(var(--mantine-spacing-md) - var(--nf-nav-scrollbar-inset));
+	scrollbar-gutter: stable;
+}
+
 .nf-nav-hover-panel {
 	--nf-nav-open-ease: cubic-bezier(0.2, 0, 0, 1);
 	--nf-nav-open-duration: 220ms;
@@ -147,4 +161,15 @@
 		/* biome-ignore lint/complexity/noImportantStyles: the elements set an inline display, this must win on desktop */
 		display: none !important;
 	}
+}
+
+/*
+ * The sidebar's edge line, in the same 1px and colour as the dividers between dockview
+ * panels, so the rail reads as one more split in the workspace. Mantine's AppShell paints
+ * it with `--app-shell-border-color` (gray-3); dockview's separators use
+ * `--mantine-color-default-border` (see dockview/theme.css), and the two are visibly
+ * different lines side by side.
+ */
+.mantine-AppShell-navbar {
+	border-inline-end-color: var(--mantine-color-default-border);
 }
