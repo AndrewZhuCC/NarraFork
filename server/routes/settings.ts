@@ -670,7 +670,10 @@ export const updateSettingsSchema = z
 			.optional(),
 		storageRetention: storageRetentionPatchSchema.optional(),
 		workspace: z.object({ treeSnapshotsEnabled: z.boolean() }).partial().optional(),
-		outline: z.object({ enabled: z.boolean() }).partial().optional(),
+		outline: z
+			.object({ enabled: z.boolean(), dailyDigestEnabled: z.boolean() })
+			.partial()
+			.optional(),
 		narratorBlocks: z
 			.object({
 				write: z.boolean(),

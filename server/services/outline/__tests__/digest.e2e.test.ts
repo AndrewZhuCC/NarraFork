@@ -42,8 +42,9 @@ import { AppError } from "../../../lib/errors";
 import { eventBus } from "../../../lib/event-bus";
 import { generateId } from "../../../lib/id";
 import { logger } from "../../../lib/logger";
-import { settings } from "../../../lib/settings";
+import { getDefaults, settings } from "../../../lib/settings";
 import { outlineRoutes } from "../../../routes/outline";
+import { settingsRoutes } from "../../../routes/settings";
 import { OUTLINE_DIGEST_LIMITS } from "../digest";
 import {
 	OUTLINE_DIGEST_JOB,
@@ -277,6 +278,7 @@ function ask(to: string): OutlineAskJson {
 
 beforeEach(() => {
 	settings.outline.enabled = true;
+	settings.outline.dailyDigestEnabled = true;
 	resetOutlineDigestJobForTests();
 });
 
@@ -1948,5 +1950,107 @@ describe("reports: settings", () => {
 			.from(userPreferences)
 			.where(and(eq(userPreferences.userId, kim.id)));
 		expect(row?.outlineDigestTimeZone).toBeNull();
+	});
+});
+describe("daily report switch", () => {
+	test("disabled skips automatic scans but preserves reports, previews and later re-enabling", async () => {
+		const amy = await person("daily-switch", { timeZone: "UTC" });
+		const p = await project(amy.id);
+		const actor = { kind: "human" as const, id: amy.id };
+		await write(p.space, actor, amy.id, "2027-04-10T10:00:00.000Z", [
+			{ op: "insert", parent: null, content: "yesterday's fact" },
+		]);
+		await runJob("2027-04-11T08:00:00.000Z");
+		const saved = await dailies(amy.id);
+		expect(saved.length).toBeGreaterThan(0);
+		await write(p.space, actor, amy.id, "2027-04-12T09:00:00.000Z", [
+			{ op: "insert", parent: null, content: "today's fact" },
+		]);
+		settings.outline.dailyDigestEnabled = false;
+		resetOutlineDigestJobForTests();
+		const noScan = wrapStore({
+			listUnstampedSpaces: () => {
+				throw new Error("disabled daily reports must not scan");
+			},
+			listSpacesCommittedSince: () => {
+				throw new Error("disabled daily reports must not scan");
+			},
+		});
+		expect(await runJob("2027-04-12T12:00:00.000Z", { store: noScan })).toBe(0);
+		expect((await dailies(amy.id)).map((d) => d.id)).toEqual(saved.map((d) => d.id));
+		expect(settings.outline.enabled).toBe(true);
+		const first = saved[0] as OutlineDigestRow;
+		expect((await detail(amy.id, first.id)).digest.id).toBe(first.id);
+		expect(
+			requestOutlineDigestPreview(amy.id, {
+				now: Date.parse("2027-04-12T12:00:00.000Z"),
+				kick: false,
+			}),
+		).toEqual({ queued: true });
+		await runJob("2027-04-12T12:00:00.000Z");
+		expect(await store.listDigestHeads(amy.id, { kind: "today", limit: 10 })).toHaveLength(1);
+		expect(await dailies(amy.id)).toHaveLength(saved.length);
+		settings.outline.dailyDigestEnabled = true;
+		await runJob("2027-04-13T08:00:00.000Z");
+		expect((await dailies(amy.id)).some((d) => d.periodKey === "2027-04-12")).toBe(true);
+	}, 30_000);
+
+	test("cancels paused batches and checks the switch again before writes", async () => {
+		const bob = await person("daily-cancel", { timeZone: "UTC" });
+		const p = await project(bob.id);
+		await write(p.space, { kind: "human", id: bob.id }, bob.id, "2027-05-10T10:00:00.000Z", [
+			{ op: "insert", parent: null, content: "pending daily fact" },
+		]);
+		const now = "2027-05-11T08:00:00.000Z";
+		startOutlineDigestSweepForTests();
+		let ticks = 0;
+		await runOutlineDigestSlice({
+			store,
+			now: () => new Date(now),
+			serverTimeZone: "UTC",
+			clock: () => (++ticks <= 5 ? 0 : ticks * 10_000),
+			budgetMs: 1500,
+		});
+		expect(outlineDigestBatchSizesForTests()).not.toBeNull();
+		settings.outline.dailyDigestEnabled = false;
+		expect(await runJob(now)).toBe(0);
+		expect(outlineDigestBatchSizesForTests()).toBeNull();
+		expect(await dailies(bob.id)).toHaveLength(0);
+		settings.outline.dailyDigestEnabled = true;
+		const disableBeforeWrite = wrapStore({
+			listSpacesCommittedSince: async (
+				...args: Parameters<typeof store.listSpacesCommittedSince>
+			) => {
+				const page = await store.listSpacesCommittedSince(...args);
+				if (page.length === 0) settings.outline.dailyDigestEnabled = false;
+				return page;
+			},
+		});
+		expect(await runJob(now, { store: disableBeforeWrite })).toBe(0);
+		expect(settings.outline.dailyDigestEnabled).toBe(false);
+		expect(await dailies(bob.id)).toHaveLength(0);
+		settings.outline.dailyDigestEnabled = true;
+		await runJob(now);
+		expect((await dailies(bob.id)).length).toBeGreaterThan(0);
+	}, 30_000);
+
+	test("defaults off and only administrators can patch the switch without disabling the outline", async () => {
+		expect(getDefaults().outline.dailyDigestEnabled).toBe(false);
+		const admin = await person("daily-admin");
+		await db.update(users).set({ role: "admin" }).where(eq(users.id, admin.id));
+		const app = appAs(admin.id, "admin").route("/settings", settingsRoutes);
+		const patch = (value: unknown) => ({
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ outline: { dailyDigestEnabled: value } }),
+		});
+		expect((await app.request("http://localhost/settings", patch(false))).status).toBe(200);
+		expect(settings.outline.dailyDigestEnabled).toBe(false);
+		expect(settings.outline.enabled).toBe(true);
+		expect((await app.request("http://localhost/settings", patch("false"))).status).toBe(400);
+		const ordinaryUser = await person("daily-user");
+		const ordinary = appAs(ordinaryUser.id).route("/settings", settingsRoutes);
+		expect((await ordinary.request("http://localhost/settings", patch(true))).status).toBe(403);
+		expect(settings.outline.dailyDigestEnabled).toBe(false);
 	});
 });

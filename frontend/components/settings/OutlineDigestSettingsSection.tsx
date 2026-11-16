@@ -1,9 +1,13 @@
-import { Group, Select, Stack, Text, TextInput } from "@mantine/core";
+import { Group, Select, Stack, Switch, Text, TextInput } from "@mantine/core";
+import { notifications } from "@mantine/notifications";
 import { OUTLINE_DIGEST_DEFAULT_TIME, OUTLINE_DIGEST_TIME_PATTERN } from "@shared/outline-digest";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useCurrentUser } from "../../hooks/useAuth";
 import { useOutlineEnabled } from "../../hooks/useOutline";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
+import { api } from "../../lib/api";
 
 /** The Select's value for "the server's zone" (stored as null). */
 const SERVER_ZONE = "__server__";
@@ -18,8 +22,8 @@ function timeZones(): string[] {
 }
 
 /**
- * The outline's daily report (P2 PR 11): which time zone a person's day is cut in and when its
- * report is made on the next day. Two personal settings; null is the server's zone and 07:00.
+ * Instance-wide automatic report switch, alongside each person's day/time settings.
+ * Null personal settings use the server's time zone and 07:00.
  * Shown only while the outline is switched on.
  */
 export function OutlineDigestSettingsSection() {
@@ -27,6 +31,28 @@ export function OutlineDigestSettingsSection() {
 	const { enabled } = useOutlineEnabled();
 	const { data } = useUserPreferences();
 	const update = useUpdateUserPreferences();
+	const { data: user } = useCurrentUser();
+	const { data: instance } = useQuery({
+		queryKey: ["settings"],
+		queryFn: api.getSettings,
+		enabled,
+		staleTime: 30_000,
+	});
+	const queryClient = useQueryClient();
+	const updateReports = useMutation({
+		mutationFn: (dailyDigestEnabled: boolean) =>
+			api.updateSettings({ outline: { dailyDigestEnabled } }),
+		onSuccess: () => queryClient.invalidateQueries({ queryKey: ["settings"] }),
+		onError: (error) =>
+			notifications.show({
+				color: "red",
+				title: t("outlineDigestUpdateError"),
+				message: error.message,
+			}),
+	});
+	const dailyEnabled =
+		(instance as { outline?: { dailyDigestEnabled?: unknown } } | undefined)?.outline
+			?.dailyDigestEnabled === true;
 	const zones = useMemo(timeZones, []);
 	const stored = data?.outlineDigestTime ?? null;
 	const [time, setTime] = useState(stored ?? "");
@@ -54,6 +80,14 @@ export function OutlineDigestSettingsSection() {
 			<Text size="sm" c="dimmed">
 				{t("outlineDigestDescription")}
 			</Text>
+			<Switch
+				label={t("outlineDigestEnabled")}
+				description={t("outlineDigestEnabledDescription")}
+				checked={dailyEnabled}
+				disabled={!instance || user?.role !== "admin" || updateReports.isPending}
+				onChange={(event) => updateReports.mutate(event.currentTarget.checked)}
+				data-testid="outline-digest-enabled"
+			/>
 			<Group align="flex-end" wrap="wrap" gap="sm">
 				<Select
 					label={t("outlineDigestTimeZone")}

@@ -17,6 +17,7 @@ import { ensurePgFts } from "../../../../server/db/pg-fts";
 import { createPostgresClient } from "../../../../server/db/postgres-client";
 import * as pgSchema from "../../../../server/db/postgres-schema";
 import { generateId } from "../../../../server/lib/id";
+import { settings } from "../../../../server/lib/settings";
 import {
 	createPostgresOutlineAccessExecutor,
 	readDigestPeoplePage,
@@ -76,6 +77,8 @@ describe("PostgreSQL outline reports", () => {
 				setOutlineAccessExecutor(createPostgresOutlineAccessExecutor(pg));
 				invalidateSessionReadScopes();
 				resetOutlineDigestJobForTests();
+				const reportsEnabled = settings.outline.dailyDigestEnabled;
+				settings.outline.dailyDigestEnabled = true;
 				const problems: string[] = [];
 				const check = (label: string, ok: boolean, detail?: unknown) => {
 					if (!ok) problems.push(`${label}: ${JSON.stringify(detail)}`);
@@ -219,6 +222,7 @@ describe("PostgreSQL outline reports", () => {
 				} catch (error) {
 					return { error: error instanceof Error ? (error.stack ?? error.message) : String(error) };
 				} finally {
+					settings.outline.dailyDigestEnabled = reportsEnabled;
 					resetOutlineDigestJobForTests();
 					setOutlineStore(undefined);
 					setOutlineAccessExecutor(undefined);

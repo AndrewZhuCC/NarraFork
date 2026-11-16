@@ -719,6 +719,8 @@ export interface NarraForkSettings {
 		 * (`services/task-source`).
 		 */
 		enabled: boolean;
+		/** Automatic daily reports for this instance, off by default; history and previews remain. */
+		dailyDigestEnabled?: boolean;
 		/**
 		 * How sessions that still keep their tasks in Dynamic Spec are imported into the outline
 		 * (outline P2 PR 12b), while `enabled` is on: their current spec files, tasks and behavior

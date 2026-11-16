@@ -294,6 +294,7 @@ async function narrator(owner: string, title: string) {
 beforeAll(async () => {
 	if (!existsSync(executablePath)) throw new Error(`Chromium unavailable: ${executablePath}`);
 	settings.outline.enabled = true;
+	settings.outline.dailyDigestEnabled = true;
 	resetOutlineDigestJobForTests();
 	const bundle = await Bun.build({
 		entrypoints: [new URL("./outline-digest.browser-fixture.tsx", import.meta.url).pathname],

@@ -43,6 +43,7 @@ export const DEFAULTS: NarraForkSettings = {
 	},
 	outline: {
 		enabled: false,
+		dailyDigestEnabled: false,
 		// Owner decision pending: "manual" until imports are switched on for everyone ("auto").
 		specImport: "manual",
 	},
@@ -429,6 +430,11 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	// ── outline ─────────────────────────────────────────────────────────
 	"outline.enabled": {
 		desc: "大纲系统（块大纲、时间轴、导图）的总开关，开发中，默认关闭。关闭时大纲的 agent 工具不出现、接口返回 404、导航不显示，所有会话都按 Dynamic Spec（spec://）会话运行。打开后新建的根会话把任务记在大纲里；还在用 spec:// 的旧会话按 outline.specImport 导入大纲（导入后改用大纲记任务，spec:// 的数据保留不删）。知识库不受影响。",
+		type: "boolean",
+		valid: "true / false，默认 false",
+	},
+	"outline.dailyDigestEnabled": {
+		desc: "自动生成大纲每日汇报的服务级开关，默认关闭。开启时按各用户的时区和生成时间汇总前一天的大纲变更。关闭后停止自动日报扫描和生成，不关闭大纲、不删除历史汇报，也不影响手动生成今日预览。修改立即生效。",
 		type: "boolean",
 		valid: "true / false，默认 false",
 	},

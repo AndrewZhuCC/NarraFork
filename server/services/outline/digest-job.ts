@@ -61,6 +61,7 @@
 import { eventBus } from "@server/lib/event-bus";
 import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
+import { settings } from "@server/lib/settings";
 import type { OutlineDigestKind, OutlineDigestRanges } from "@shared/outline-digest";
 import { canReadSpace } from "./access";
 import {
@@ -325,7 +326,7 @@ async function nextBatch(
 			const person = await readDigestPerson(userId);
 			if (person) chains.push(await previewChain(store, person, now, fallbackZone));
 		}
-	} else {
+	} else if (settings.outline?.dailyDigestEnabled === true) {
 		let days = 0;
 		while (!state.sweep.done && days < OUTLINE_DIGEST_JOB.personDaysPerBatch && !over()) {
 			const people = await readDigestPeoplePage(
@@ -334,6 +335,7 @@ async function nextBatch(
 			);
 			if (people.length < OUTLINE_DIGEST_JOB.peoplePerPage) state.sweep.done = true;
 			for (const person of people) {
+				if (settings.outline?.dailyDigestEnabled !== true) return null;
 				state.sweep.after = person.id;
 				if (waitingFor(person.id, now)) continue;
 				// One person's trouble never holds up the people after them.
@@ -538,6 +540,7 @@ async function writeChain(
 	let written = 0;
 	const userId = chain.person.id;
 	for (const day of chain.days) {
+		if (day.kind === "daily" && settings.outline?.dailyDigestEnabled !== true) break;
 		const assembled = assembleDigest(day.parts, limits, { dropped: day.dropped });
 		if (day.failed > 0) assembled.truncated = true;
 		const row = {
@@ -625,6 +628,16 @@ const yieldToLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
 export async function runOutlineDigestSlice(
 	options: OutlineDigestJobOptions = {},
 ): Promise<{ more: boolean; written: number }> {
+	if (settings.outline?.dailyDigestEnabled !== true) {
+		if (state.batch?.chains[0]?.days[0]?.kind === "daily") {
+			const attention = state.batch.attention;
+			state.batch = null;
+			state.sweep = { after: null, done: false };
+			if (attention.size > 0)
+				eventBus.emit({ type: "human_attention:changed", userIds: [...attention] });
+		}
+		if (!state.batch && state.previewQueue.length === 0) return { more: false, written: 0 };
+	}
 	const store = options.store ?? outlineStore;
 	const now = options.now ?? (() => new Date());
 	const clock = options.clock ?? (() => performance.now());
@@ -658,6 +671,11 @@ export async function runOutlineDigestSlice(
 		// The last page once it is visited to its end (a slice may stop in the middle of it).
 		if (page.length === 0) batch.exhausted = true;
 		for (const space of page) {
+			if (
+				batch.chains[0]?.days[0]?.kind === "daily" &&
+				settings.outline?.dailyDigestEnabled !== true
+			)
+				return { more: true, written: 0 };
 			batch.after = { lastCommitAt: space.lastCommitAt, id: space.id };
 			// A space committed to again moves along the index: it is visited once.
 			if (batch.visited.has(space.id)) continue;
