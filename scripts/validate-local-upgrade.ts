@@ -24,6 +24,7 @@ const ALLOWED_TARGET_TAGS = new Set([
 	"0227_merge_selfuse_099",
 	"0228_merge_selfuse_011",
 	"0229_merge_selfuse_0912",
+	"0230_merge_selfuse_0914",
 ]);
 const JOURNAL_TAIL_TAGS = new Set([
 	"0013_omniscient_dormammu",
@@ -40,8 +41,30 @@ const JOURNAL_TAIL_TAGS = new Set([
 	"0227_merge_selfuse_099",
 	"0228_merge_selfuse_011",
 	"0229_merge_selfuse_0912",
+	"0230_merge_selfuse_0914",
 ]);
 const MAX_REPORT_BYTES = 64 * 1024;
+const MERGE_0914_NEW_TABLES = [
+	"folder_git_identity_bindings", "outline_digests", "outline_task_seen",
+	"recent_tab_archive_marks", "usage_daily",
+];
+const MERGE_0914_ADDED_COLUMNS: Record<string, string[]> = {
+	api_requests: ["billing_user_id", "project_id"],
+	knowledge_submissions: ["author_read_at"],
+	narrators: ["question_reflection_override", "workspace_directories"],
+	outline_spaces: ["last_commit_at"],
+	outline_view_state: ["expanded_json"],
+	user_preferences: [
+		"compact_auxiliary_content", "recent_tabs_show_directory", "git_identity_folder_context_menu",
+		"outline_digest_time_zone", "outline_digest_time",
+	],
+	workspaces: ["title_source", "title_revision"],
+};
+const MERGE_0914_NEW_INDEXES = [
+	"idx_ks_submitter_author_read", "idx_narrators_status", "idx_narrators_variant_list",
+	"idx_outline_spaces_last_commit", "idx_outline_spaces_unstamped",
+	"idx_workspace_panels_kind_workspace",
+];
 const MERGE_0912_NEW_TABLES = ["outline_questions"];
 const MERGE_0912_ADDED_COLUMNS: Record<string, string[]> = {
 	api_requests: ["decode_ms"],
@@ -312,15 +335,21 @@ function affectedSummary(
 	targetTag: string,
 	excludeNew: boolean,
 ): Record<string, unknown> {
-	if (targetTag === "0228_merge_selfuse_011" || targetTag === "0229_merge_selfuse_0912") {
-		const addedColumns = targetTag === "0229_merge_selfuse_0912"
-			? MERGE_0912_ADDED_COLUMNS : MERGE_0911_ADDED_COLUMNS;
+	if (
+		targetTag === "0230_merge_selfuse_0914" ||
+		targetTag === "0229_merge_selfuse_0912" ||
+		targetTag === "0228_merge_selfuse_011"
+	) {
+		const addedColumns = targetTag === "0230_merge_selfuse_0914"
+			? MERGE_0914_ADDED_COLUMNS : targetTag === "0229_merge_selfuse_0912"
+				? MERGE_0912_ADDED_COLUMNS : MERGE_0911_ADDED_COLUMNS;
 		return Object.fromEntries(
 			Object.entries(addedColumns).map(([table, added]) => [
 				table,
 				tableDigest(db, table, excludeNew ? new Set(added) : new Set(),
-					table === "outline_block_versions" ? ["block_id", "from_seq"] :
-						table === "user_recent_tabs_meta" ? "user_id" : "id"),
+					table === "outline_view_state" ? ["user_id", "page_block_id"] :
+						table === "outline_block_versions" ? ["block_id", "from_seq"] :
+							table === "user_recent_tabs_meta" ? "user_id" : "id"),
 			]),
 		);
 	}
@@ -494,11 +523,15 @@ function narratorRefsIndexShape(db: Database) {
 }
 
 function schemaShape(db: Database, targetTag?: string): Record<string, unknown> {
+	const merge0914 = targetTag === "0230_merge_selfuse_0914";
 	const merge0912 = targetTag === "0229_merge_selfuse_0912";
-	if (merge0912 || targetTag === "0228_merge_selfuse_011") {
-		const newTables = merge0912 ? MERGE_0912_NEW_TABLES : MERGE_0911_NEW_TABLES;
-		const addedColumns = merge0912 ? MERGE_0912_ADDED_COLUMNS : MERGE_0911_ADDED_COLUMNS;
-		const newIndexes = merge0912 ? MERGE_0912_NEW_INDEXES : MERGE_0911_NEW_INDEXES;
+	if (merge0914 || merge0912 || targetTag === "0228_merge_selfuse_011") {
+		const newTables = merge0914 ? MERGE_0914_NEW_TABLES :
+			merge0912 ? MERGE_0912_NEW_TABLES : MERGE_0911_NEW_TABLES;
+		const addedColumns = merge0914 ? MERGE_0914_ADDED_COLUMNS :
+			merge0912 ? MERGE_0912_ADDED_COLUMNS : MERGE_0911_ADDED_COLUMNS;
+		const newIndexes = merge0914 ? MERGE_0914_NEW_INDEXES :
+			merge0912 ? MERGE_0912_NEW_INDEXES : MERGE_0911_NEW_INDEXES;
 		return {
 			...Object.fromEntries(newTables.map((table) => [table, tableSchemaShape(db, table)])),
 			columns: Object.fromEntries(
@@ -805,7 +838,8 @@ async function main() {
 			throw new Error("Target migration hash was not applied");
 		}
 		const expectedCounts = { ...beforeCounts };
-		const newTables = target.tag === "0229_merge_selfuse_0912" ? MERGE_0912_NEW_TABLES :
+		const newTables = target.tag === "0230_merge_selfuse_0914" ? MERGE_0914_NEW_TABLES :
+			target.tag === "0229_merge_selfuse_0912" ? MERGE_0912_NEW_TABLES :
 			target.tag === "0228_merge_selfuse_011" ? MERGE_0911_NEW_TABLES :
 			target.tag === "0227_merge_selfuse_099" ? MERGE_099_NEW_TABLES :
 			merge098Chain ? MERGE_098_NEW_TABLES :
