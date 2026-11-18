@@ -65,6 +65,14 @@ describe("Agent task tool", () => {
 		expect(agentTool.parameters.safeParse({ reasoning_effort: "invalid" }).success).toBe(false);
 	});
 
+	test("accepts the optional Fast Mode boolean", () => {
+		const schema = agentTool.rawJsonSchema as { properties: Record<string, unknown> };
+		expect(schema.properties.fast_mode).toMatchObject({ type: "boolean" });
+		for (const fast_mode of [true, false, undefined]) {
+			expect(agentTool.parameters.safeParse({ fast_mode }).success).toBe(true);
+		}
+		expect(agentTool.parameters.safeParse({ fast_mode: "false" }).success).toBe(false);
+	});
 	test("custom effective pool description takes precedence over global metadata", () => {
 		settings.agent.customModels = [
 			{ value: "p:global", label: "p:global" },
@@ -138,9 +146,16 @@ describe("Agent task tool", () => {
 			requestPermission: async () => ({ behavior: "allow" }),
 		};
 
-		await agentTool.execute({ prompt: "check preference plumbing", subagent_type: "general" }, ctx);
-
-		expect(runCalls[0]).toMatchObject({ userId: "user-42" });
+		const input = { prompt: "check preference plumbing", subagent_type: "general" };
+		await agentTool.execute(input, ctx);
+		await agentTool.execute({ ...input, fast_mode: true }, ctx);
+		await agentTool.execute({ ...input, fast_mode: false }, ctx);
+		expect(runCalls.map(({ userId }) => userId)).toEqual(["user-42", "user-42", "user-42"]);
+		expect(runCalls.map(({ fastModeOverride }) => fastModeOverride)).toEqual([
+			undefined,
+			"on",
+			"off",
+		]);
 	});
 
 	// The tool used to re-write the runner's `<subagent_id>` tag to swap in an

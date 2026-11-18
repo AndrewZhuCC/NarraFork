@@ -442,6 +442,7 @@ interface CreateSubagentInput {
 	questionReflectionOverride?: BooleanOverride;
 	model?: string;
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null;
+	fastModeOverride?: BooleanOverride;
 	systemPrompt?: string;
 	/** Compiled template ceiling; compiled from `subagentType` when omitted. */
 	runtimePolicy?: RuntimePolicyTrait;
@@ -1805,6 +1806,9 @@ export const narratorService = {
 			const resolvedReasoningEffort =
 				input.reasoningEffort ??
 				(storedModel === FOLLOW_PARENT_MODEL ? null : (parent.reasoningEffort ?? null));
+			const fastModeOverride = normalizeBooleanOverride(
+				input.fastModeOverride ?? parent.fastModeOverride,
+			);
 
 			// The template is compiled into an ordinary ceiling trait; the parent's own
 			// restrictions are not copied but followed live through the registered
@@ -1845,8 +1849,8 @@ export const narratorService = {
 						systemPrompt: input.systemPrompt ?? null,
 						permissionMode: resolvedPermMode,
 						reasoningEffort: resolvedReasoningEffort,
-						fastModeOverride: normalizeBooleanOverride(parent.fastModeOverride),
-						fastMode: legacyFastModeMirror(parent.fastModeOverride),
+						fastModeOverride,
+						fastMode: legacyFastModeMirror(fastModeOverride),
 						relaxedPlan: resolvedRelaxedPlan,
 						planReflectionAutoApproveOverride:
 							input.planReflectionAutoApproveOverride ??

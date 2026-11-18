@@ -9,6 +9,7 @@ import {
 	resolveOptionalExecutionTimeout,
 } from "../lib/agent/execution-timeout";
 import type { ToolCallBinding, ToolUpdateExecutionLease } from "../lib/agent/types";
+import type { BooleanOverride } from "../lib/boolean-override";
 import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
@@ -137,6 +138,7 @@ export interface RunSubagentInput {
 	timeoutMs?: number;
 	model?: string;
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
+	fastModeOverride?: BooleanOverride;
 	background?: boolean;
 	/** Launch non-blocking, with the result held for further user interaction. */
 	takeoverByUser?: boolean;
@@ -300,6 +302,7 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 			systemPrompt,
 			model: storedModelInput,
 			reasoningEffort: configuredReasoningEffort,
+			fastModeOverride: input.fastModeOverride,
 			runtimePolicy: templatePolicy,
 		});
 		const subagentId = subagent.id;

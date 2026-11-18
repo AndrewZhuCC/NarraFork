@@ -18,6 +18,8 @@ const REASONING_EFFORT_DESCRIPTION =
 	"If the selected model/provider does not support configurable thinking intensity, this option is ignored. " +
 	"A fixed reasoning effort configured in the matching model pool overrides this parameter.";
 
+const FAST_MODE_DESCRIPTION =
+	"Speed for this new subagent on supported Codex connections: true = Fast, false = Standard. Omit to inherit Fast Mode.";
 const TASK_DESCRIPTION =
 	"An outline task to hand to this agent, in a session whose tasks live in the outline: its address (an id, key/id, an alias or its title). " +
 	"The agent's instructions are written from the task's tree, so prompt may be left out; when given, it is added as further instructions. " +
@@ -136,6 +138,7 @@ function buildParameters() {
 				.enum(REASONING_EFFORT_VALUES)
 				.optional()
 				.describe(REASONING_EFFORT_DESCRIPTION),
+			fast_mode: z.boolean().optional().describe(FAST_MODE_DESCRIPTION),
 			workdir: z
 				.string()
 				.optional()
@@ -212,6 +215,7 @@ function buildRawJsonSchema(): Record<string, unknown> {
 				type: "string",
 				enum: REASONING_EFFORT_VALUES,
 			},
+			fast_mode: { description: FAST_MODE_DESCRIPTION, type: "boolean" },
 			workdir: {
 				description:
 					"Working directory for the subagent. Defaults to the parent narrator's cwd. When set to a different directory, user approval is required before the subagent is created, and the subagent's permission checks will be scoped to this directory.",
@@ -293,6 +297,7 @@ export const agentTool: ToolDefinition = {
 			timeout?: number;
 			model?: string;
 			reasoning_effort?: ReasoningEffort;
+			fast_mode?: boolean;
 			workdir?: string;
 			alias?: string;
 			archive?: string;
@@ -510,6 +515,8 @@ export const agentTool: ToolDefinition = {
 				locale: ctx.locale,
 				model: model || undefined,
 				reasoningEffort: reasoning_effort,
+				fastModeOverride:
+					raw.fast_mode === undefined ? undefined : raw.fast_mode ? "on" : "off",
 				background: run_in_background || false,
 				takeoverByUser: raw.takeover_by_user === true,
 				timeoutMs: timeout,
