@@ -65,6 +65,30 @@ describe("data-only model directory adapter", () => {
 		expect(profile.inputModalities).toEqual([]);
 		expect(profile.reasoning.levels).toEqual([]);
 	});
+	test("preserves source notes and raw provenance paths and imports model-level upstream IDs", () => {
+		const source = {
+			label: "Catalog evidence",
+			fields: ["max_output_tokens", "metadata.max_input_tokens"],
+			notes: "Provider-specific source evidence",
+		};
+		const entry = {
+			...model(),
+			matches: { ids: ["existing-id"] },
+			upstreamModelIds: ["Upstream-M"],
+			sources: [source],
+		};
+		const catalog = read(entry);
+		expect(catalog.models[0]?.sources).toEqual([source]);
+		expect(catalog.models[0]?.matches?.ids).toEqual(["existing-id", "Upstream-M"]);
+		expect(resolveProfile(catalog, { upstreamModelId: "Upstream-M" }).contextWindow).toBe(2000);
+		expect(() => read({ ...entry, upstreamModelIds: "Upstream-M" })).toThrow();
+		expect(() => read({ ...entry, sources: [{ ...source, unexpected: true }] })).toThrow(
+			"Unknown field",
+		);
+		expect(() => read({ ...entry, matches: { fields: source.fields } })).toThrow(
+			"Invalid match field",
+		);
+	});
 	test("changing one default propagates to every inheriting channel, without altering channel overrides", () => {
 		const value = model();
 		value.metadata.input_cost_per_token = 7e-6;

@@ -17,8 +17,10 @@ export type RawMetadata = { [key: string]: JSONValue };
 export interface MetadataSource {
 	label: string;
 	url?: string;
+	/** Provenance labels: raw source keys or paths, not runtime matching field groups. */
 	fields?: string[];
 	verifiedAt?: string;
+	notes?: string;
 }
 export interface MatchRules {
 	ids?: string[];

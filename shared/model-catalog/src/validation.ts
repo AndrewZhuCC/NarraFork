@@ -104,9 +104,8 @@ export function validateShape(value: unknown, name: string): void {
 }
 
 /**
- * Field groups that `matches.fields` and `sources[].fields` may name. This is the
- * public catalog's grouping vocabulary, not a metadata shape: `fieldAllowed` in
- * resolve.ts maps each group onto the raw keys it covers.
+ * The field groups that `matches.fields` may borrow from. `fieldAllowed` in resolve.ts
+ * maps them onto raw keys. Source provenance can name raw keys and paths independently.
  */
 export const MATCH_FIELD_GROUPS: ReadonlySet<string> = new Set([
 	"limits",
@@ -180,9 +179,6 @@ function validateEntries(models: RawModel[], variants: RawCatalog["variants"]): 
 			validateRawMetadata(entry.metadata);
 			for (const path of entry.matches?.fields ?? [])
 				if (!MATCH_FIELD_GROUPS.has(path)) fail(`Invalid match field ${path}`);
-			for (const source of entry.sources ?? [])
-				for (const path of source.fields ?? [])
-					if (!MATCH_FIELD_GROUPS.has(path)) fail(`Invalid source field ${path}`);
 			if (entry.status === "verified" && !entry.sources?.some((s) => s.url && s.verifiedAt))
 				fail(`Verified entry lacks verified source: ${entry.id}`);
 			const scope = "providerKey" in entry ? entry.providerKey : "";

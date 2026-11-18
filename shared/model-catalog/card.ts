@@ -7,7 +7,7 @@ import type {
 	RawModel,
 	RawVariant,
 } from "./schema/catalog";
-import { validateRawCatalog } from "./src/validation";
+import { validateRawCatalog, validateShape } from "./src/validation";
 
 export type {
 	JSONValue,
@@ -494,7 +494,16 @@ export function rawCatalogFromModelFiles(
 			!Array.isArray(entry.variants)
 		)
 			throw new Error(`Expected one model and nested variants in ${filename}`);
-		const { variants: children, ...model } = entry;
+		const { variants: children, upstreamModelIds, ...model } = entry;
+		// Root entries use matches.ids internally; the data source also publishes upstreamModelIds.
+		if (upstreamModelIds !== undefined) {
+			validateShape({ ids: upstreamModelIds }, "MatchRules");
+			if (model.matches !== undefined) validateShape(model.matches, "MatchRules");
+			model.matches = {
+				...model.matches,
+				ids: [...new Set([...(model.matches?.ids ?? []), ...upstreamModelIds])],
+			};
+		}
 		model.metadata = validateRawMetadata(model.metadata);
 		models.push(model);
 		for (const child of children) {
