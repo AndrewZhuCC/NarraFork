@@ -237,16 +237,16 @@ const parentFunction = {
 	strict: false,
 };
 
-test("an empty active list cannot enable predeclared or parent tools", () => {
+test("keeps the shared tool choice even with an empty decision list", () => {
 	for (const reflection of [false, true]) {
-		const body: Record<string, unknown> = { tools: [], input: [] };
+		const body: Record<string, unknown> = { tools: [], input: [], tool_choice: "auto" };
 		applyCodexReflectionTools(body, {
 			tools: [],
 			...(reflection
 				? { reflectionParentTools: [parentFunction, { type: "web_search" }] }
 				: { reflectionTools: decisionTools }),
 		});
-		expect(body.tool_choice).toBe("none");
+		expect(body.tool_choice).toBe("auto");
 		expect(body.input).toEqual([]);
 	}
 });
@@ -266,6 +266,12 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 				reflectionTools: decisionTools,
 			};
 			const before = await capture(normal);
+			expect((before.body.input as unknown[])[0]).toEqual({
+				type: "message",
+				role: "developer",
+				content: [{ type: "input_text", text: "parent instructions" }],
+			});
+			expect(before.body.instructions).not.toContain("parent instructions");
 			const loaded = { ...parentFunction, name: "LoadedTool" };
 			const addition = { type: "additional_tools", role: "developer", tools: [loaded] };
 			const history = [...(normal.history ?? []), addition];
@@ -276,22 +282,9 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 			expect(after.body.input).toEqual([
 				...previousInput.slice(0, -1),
 				addition,
-			expect((before.body.input as unknown[])[0]).toEqual({
-				type: "message",
-				role: "developer",
-				content: [{ type: "input_text", text: "parent instructions" }],
-			});
-			expect(before.body.instructions).not.toContain("parent instructions");
 				...previousInput.slice(-1),
 			]);
-			expect(after.body.tool_choice).toEqual({
-				type: "allowed_tools",
-				mode: "auto",
-				tools: [
-					...(before.body.tool_choice as { tools: unknown[] }).tools,
-					{ type: "function", name: loaded.name },
-				],
-			});
+			expect(after.body.tool_choice).toBe("auto");
 			const reflection = await capture({
 				...normal,
 				history,
@@ -301,13 +294,9 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 			});
 			expect(reflection.body.tools).toEqual(after.body.tools);
 			expect(reflection.body.input).toEqual(after.body.input);
-			expect(reflection.body.tool_choice).toEqual({
-				type: "allowed_tools",
-				mode: "required",
-				tools: [{ type: "function", name: dangerConfirmTool.name }],
-			});
+			expect(reflection.body.tool_choice).toBe(after.body.tool_choice);
 		});
-		test("full inherited declarations only enable the explicit reflection ceiling", async () => {
+		test("local decision lists do not change the inherited wire fields", async () => {
 			const parent = await capture({
 				tools: [parentFunction, ...decisionTools],
 				reflectionTools: decisionTools,
@@ -320,18 +309,10 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 					reflectionAllowedTools: allowed,
 				});
 				expect(reflection.body.tools).toEqual(parent.body.tools);
-				expect(reflection.body.tool_choice).toEqual(
-					allowed.length
-						? {
-								type: "allowed_tools",
-								mode: "required",
-								tools: [{ type: "function", name: dangerCancelTool.name }],
-							}
-						: "none",
-				);
+				expect(reflection.body.tool_choice).toBe(parent.body.tool_choice);
 			}
 		});
-		test("keeps the parent wire prefix and parallel mode while restricting real decision tools", async () => {
+		test("keeps the parent wire prefix and parallel mode with decision tools", async () => {
 			let parentTools: unknown[] | undefined;
 			const normal: Partial<ChatParams> = {
 				history: [
@@ -346,15 +327,7 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 			};
 			const parent = await capture(normal);
 			expect((parent.body.tools as unknown[]).slice(-2)).toEqual(decisionTools);
-			expect(parent.body.tool_choice).toEqual({
-				type: "allowed_tools",
-				mode: "auto",
-				tools: [
-					{ type: "function", name: parentFunction.name },
-					{ type: "web_search" },
-					{ type: "image_generation" },
-				],
-			});
+			expect(parent.body.tool_choice).toBe("auto");
 			expect(JSON.stringify(parentTools)).toBe(JSON.stringify(parent.body.tools));
 			const before = JSON.stringify(parentTools);
 			const reflection = await capture({
@@ -377,11 +350,7 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 				(reflection.body.client_metadata as Record<string, unknown>)
 					.ws_request_header_x_openai_internal_codex_responses_lite,
 			).toBeUndefined();
-			expect(reflection.body.tool_choice).toEqual({
-				type: "allowed_tools",
-				mode: "required",
-				tools: decisionTools.map((tool) => ({ type: "function", name: tool.name })),
-			});
+			expect(reflection.body.tool_choice).toBe(parent.body.tool_choice);
 			for (const key of [
 				"parallel_tool_calls",
 				"prompt_cache_key",
@@ -409,14 +378,7 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 					(item) => item.type === "additional_tools",
 				),
 			).toBe(false);
-			expect(req.body.tool_choice).toEqual({
-				type: "allowed_tools",
-				mode: "required",
-				tools: [parentFunction, ...decisionTools].map((tool) => ({
-					type: "function",
-					name: tool.name,
-				})),
-			});
+			expect(req.body.tool_choice).toBe("auto");
 		});
 
 		test("does not append another definition when all decisions already exist", async () => {
@@ -428,11 +390,7 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 					(item) => item.type === "additional_tools",
 				),
 			).toBe(false);
-			expect(req.body.tool_choice).toEqual({
-				type: "allowed_tools",
-				mode: "required",
-				tools: decisionTools.map((tool) => ({ type: "function", name: tool.name })),
-			});
+			expect(req.body.tool_choice).toBe("auto");
 		});
 
 		test("a missing snapshot declares only decisions without native or Lite tools", async () => {
@@ -457,7 +415,7 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 		});
 
 		if (transport !== "http") {
-			test("HTTP fallback preserves the WebSocket parent tools and decision restriction", async () => {
+			test("HTTP fallback preserves the WebSocket parent tools and tool choice", async () => {
 				let parentTools: unknown[] | undefined;
 				await capture({
 					tools: [parentFunction],
@@ -483,11 +441,7 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 				expect(req.websocketBody).toEqual(req.body);
 				expect(req.body.tools).toEqual(parentTools);
 				expect(reported).toEqual([parentTools, parentTools]);
-				expect(req.body.tool_choice).toEqual({
-					type: "allowed_tools",
-					mode: "required",
-					tools: decisionTools.map((tool) => ({ type: "function", name: tool.name })),
-				});
+				expect(req.body.tool_choice).toBe("auto");
 			});
 		}
 	});
@@ -647,7 +601,7 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 				role: "user",
 				content: [{ type: "input_image", image_url: "data:image/png;base64,AA==" }],
 			});
-			expect(requests[0].tool_choice).toMatchObject({ type: "allowed_tools", mode: "auto" });
+			expect(requests[0].tool_choice).toBe("auto");
 			expect(requests[0].service_tier).toBe("priority");
 			await provider.compactRemote(history, "codex:gpt-5.3-codex", {
 				conversationId,

@@ -313,7 +313,7 @@ export function appendCodexNativeTools(
 	applyCodexImageGenerationDefaults(tools);
 }
 
-/** Keep definitions stable; switch only which tools may run, without entering Responses Lite. */
+/** Reserve stable declarations; the NF executor gates reflection-only tool calls. */
 export function applyCodexReflectionTools(
 	body: Record<string, unknown>,
 	params: Pick<
@@ -322,62 +322,26 @@ export function applyCodexReflectionTools(
 	>,
 ): void {
 	const reflection = params.reflectionParentTools !== undefined;
-	const declarations = (reflection ? params.tools : params.reflectionTools) as
+	const decisions = (reflection ? params.tools : params.reflectionTools) as
 		| Array<{ type: string; name?: string }>
 		| undefined;
-	// The inherited declarations contain ordinary and hosted tools too. They keep
-	// the cache prefix stable, but only this gate's function tools may execute.
-	const reserved =
-		reflection && params.reflectionAllowedTools
-			? declarations?.filter(
-					(tool) =>
-						tool.type === "function" &&
-						!!tool.name &&
-						params.reflectionAllowedTools?.includes(tool.name),
-				)
-			: declarations;
-	if (!reserved || (!reflection && reserved.length === 0)) return;
+	if (!decisions?.length) return;
 	const tools = (params.reflectionParentTools ?? body.tools ?? []) as Array<{
 		type: string;
 		name?: string;
 	}>;
 	const names = new Set(tools.filter((tool) => tool.type === "function").map((tool) => tool.name));
-	// An old/missing snapshot can need a one-time append. Never use additional_tools:
-	// relays can interpret that item as opting the entire request into Responses Lite.
-	body.tools = [...tools, ...reserved.filter((tool) => !names.has(tool.name))];
-	const reservedNames = new Set(reserved.map((tool) => tool.name));
-	const allowed = reflection
-		? reserved
-		: tools.filter((tool) => tool.type !== "function" || !reservedNames.has(tool.name));
-	// Loaded definitions stay in history; only extend the ordinary execution gate.
-	if (!reflection && Array.isArray(body.input)) {
-		for (const item of body.input) {
-			if (!isRecord(item) || !isResponsesInputItem(item) || !Array.isArray(item.tools)) continue;
-			for (const tool of item.tools) {
-				if (
-					!isRecord(tool) ||
-					tool.type !== "function" ||
-					typeof tool.name !== "string" ||
-					!tool.name ||
-					reservedNames.has(tool.name) ||
-					names.has(tool.name)
-				)
-					continue;
-				allowed.push({ type: "function", name: tool.name });
-				names.add(tool.name);
-			}
-		}
-	}
-	// Hosted tools must also be excluded during reflection: they execute upstream.
-	body.tool_choice = allowed.length
-		? {
-				type: "allowed_tools",
-				mode: reflection ? "required" : "auto",
-				tools: allowed.map((tool) =>
-					tool.type === "function" ? { type: tool.type, name: tool.name } : { type: tool.type },
-				),
-			}
-		: "none";
+	// Repair a missing/old parent snapshot without changing valid inherited definitions.
+	const missing = decisions.filter(
+		(tool) =>
+			tool.type === "function" &&
+			!!tool.name &&
+			!names.has(tool.name) &&
+			(!reflection ||
+				!params.reflectionAllowedTools ||
+				params.reflectionAllowedTools.includes(tool.name)),
+	);
+	if (missing.length) body.tools = [...tools, ...missing];
 }
 /** Ordinary requests apply native capability policy to a copy of their frozen tool declarations. */
 export function withCodexNativeTools(

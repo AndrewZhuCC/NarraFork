@@ -229,7 +229,7 @@ describe("OpenAI request paths", () => {
 	test.each([
 		"tools",
 		"tool_choice",
-	])("Codex reflection keeps its required gate when upstream rejects %s", async (parameter) => {
+	])("Codex reflection does not strip shared request parameters when upstream rejects %s", async (parameter) => {
 		globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
 			requests.push(JSON.parse(init?.body as string));
 			return new Response(JSON.stringify({ detail: `Unsupported parameter: ${parameter}` }), {
@@ -265,11 +265,7 @@ describe("OpenAI request paths", () => {
 		expect(failure).toBeTruthy();
 		expect(requests).toHaveLength(1);
 		expect(requests[0].tools).toEqual(parentTools);
-		expect(requests[0].tool_choice).toEqual({
-			type: "allowed_tools",
-			mode: "required",
-			tools: [{ type: "function", name: "DangerConfirm" }],
-		});
+		expect(requests[0].tool_choice).toBe("auto");
 		expect(modelRejectsParameter(model, parameter)).toBe(false);
 	});
 
