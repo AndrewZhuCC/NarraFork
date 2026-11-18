@@ -1,5 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import { getInstallationId } from "../installation-id";
+import {
+	isRuntimeSystemMessage,
+	markRuntimeInstructions,
+	markRuntimeSystemMessage,
+} from "./input-characters";
 import { boundedJsonCopy } from "./request-dump";
 
 /**
@@ -101,6 +106,30 @@ export function applyCodexStableRequestFields(
 	body.client_metadata = options.identity.clientMetadata;
 }
 
+export const CODEX_DEFAULT_INSTRUCTIONS =
+	"You are NarraFork Narrator. Follow the user's request and answer concisely.";
+
+export function applyCodexChatInstructions(
+	body: Record<string, unknown>,
+	instructions: string,
+	firstMessage: { role?: unknown; content?: unknown } | undefined,
+): void {
+	body.instructions = CODEX_DEFAULT_INSTRUCTIONS;
+	markRuntimeInstructions(body);
+	if (instructions && Array.isArray(body.input)) {
+		const fixedChars =
+			isRuntimeSystemMessage(firstMessage) &&
+			(firstMessage?.role === "system" || firstMessage?.role === "developer") &&
+			typeof firstMessage.content === "string"
+				? firstMessage.content.length
+				: 0;
+		const fixedPrompt = markRuntimeSystemMessage(
+			{ type: "message", role: "developer", content: [{ type: "input_text", text: instructions }] },
+			fixedChars,
+		);
+		body.input = [fixedPrompt, ...body.input];
+	}
+}
 const MAX_COMPACT_PREFIX_BYTES = 512 * 1024;
 const MAX_COMPACT_PREFIX_CACHE_BYTES = 16 * 1024 * 1024;
 const MAX_COMPACT_PREFIX_ENTRIES = 64;
@@ -114,7 +143,7 @@ function forgetCompactPrefix(key: string): void {
 }
 
 /**
- * Retain only the final ordinary request's non-history fields, never its input or headers.
+ * Retain ordinary request fields and its one host-injected prompt, never the conversation or headers.
  * ponytail: bounded process-local LRU survives idle sessions, not restarts; cache misses
  * keep the existing compact path. Persist templates only if restart reuse is required.
  */
@@ -125,8 +154,12 @@ export function rememberCodexCompactPrefix(
 	if (!key) return;
 	// An oversized replacement must not leave an obsolete template eligible for reuse.
 	forgetCompactPrefix(key);
-	const { input: _input, previous_response_id: _previous, type: _type, ...prefix } = request;
-	const copied = boundedJsonCopy(prefix, MAX_COMPACT_PREFIX_BYTES);
+	const { input, previous_response_id: _previous, type: _type, ...prefix } = request;
+	const fixedPrompt = Array.isArray(input) ? input[0] : undefined;
+	const copied = boundedJsonCopy(
+		isRuntimeSystemMessage(fixedPrompt) ? { ...prefix, input: [fixedPrompt] } : prefix,
+		MAX_COMPACT_PREFIX_BYTES,
+	);
 	if (copied.truncated) return;
 	const bytes = Buffer.byteLength(JSON.stringify(copied.value), "utf8");
 	if (bytes > MAX_COMPACT_PREFIX_BYTES) return;

@@ -164,7 +164,7 @@ for (const model of [null, "", "   ", "__default__", "test-relay:gpt-5.3-codex"]
 for (const kind of ["primary", "subagent", "stale-primary"] as const) {
 	test(`remote compact follows ${kind} runtime model, effort and conversation`, async () => {
 		const { activeNarrators } = await import("../narrator-session-state");
-		const { getSettingsRevision } = await import("../../lib/settings");
+		const { getSettingsRevision, saveSettings } = await import("../../lib/settings");
 		if (kind === "subagent") await seedNarrator("runtime-parent");
 		await seedNarrator("n1", kind === "subagent" ? "runtime-parent" : undefined);
 		await db
@@ -172,8 +172,16 @@ for (const kind of ["primary", "subagent", "stale-primary"] as const) {
 			.set({ apiConversationId: "persisted-api-conversation" })
 			.where(eq(narrators.id, "n1"));
 		await message("new", 1);
-		settings.agent.defaultModel = "test-relay:gpt-5.4";
-		settings.agent.defaultReasoningEffort = "high";
+		// First-time prompt setup can reload settings before the active epoch is sealed.
+		saveSettings({
+			...settings,
+			customApiProviders: undefined,
+			agent: {
+				...settings.agent,
+				defaultModel: "test-relay:gpt-5.4",
+				defaultReasoningEffort: "high",
+			},
+		});
 		activeNarrators.set("n1", {
 			narratorId: "n1",
 			conversationId: "live-api-conversation",
@@ -184,6 +192,7 @@ for (const kind of ["primary", "subagent", "stale-primary"] as const) {
 			_modelRef: "__default__",
 			_reasoningEffortRef: "medium",
 			_settingsRevision: getSettingsRevision() - (kind === "stale-primary" ? 1 : 0),
+			_enabledOptionalTools: new Set<string>(),
 			_substatus: new Set(),
 			events: new (await import("node:events")).EventEmitter(),
 		} as import("../narrator-session-state").ActiveNarrator);

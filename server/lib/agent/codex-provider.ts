@@ -1,5 +1,5 @@
 import type { NativeMediaInput } from "@shared/media-attachments";
-import { markRuntimeInstructions, reportInputCharacters } from "./input-characters";
+import { reportInputCharacters } from "./input-characters";
 import { rejectNativeMedia, storedMessageMedia } from "./native-media";
 import type { ToolLoadingTarget } from "./tool-loading";
 
@@ -21,7 +21,11 @@ import { isNativeSearchChannelFirstEnabled } from "../search/native";
 import { parseModelId, settings } from "../settings";
 import { getHttpCodexUserAgent, resolveClientFingerprint } from "../user-agent";
 import { CodexRebuildHistoryRetryError } from "./codex-errors";
-import { applyCodexStableRequestFields, createCodexRequestIdentity } from "./codex-request";
+import {
+	applyCodexChatInstructions,
+	applyCodexStableRequestFields,
+	createCodexRequestIdentity,
+} from "./codex-request";
 import {
 	type CodexResponsesRequestBody,
 	CodexWebSocketFallbackError,
@@ -32,7 +36,6 @@ import {
 import {
 	applyCodexReflectionTools,
 	applyOpenAIModelMetadata,
-	CODEX_DEFAULT_INSTRUCTIONS,
 	convertHistoryToResponsesApi,
 	isResponsesInputItem,
 	type OAIContentPart,
@@ -897,8 +900,7 @@ export class CodexProvider implements ProviderAdapter {
 			stream: true,
 			store: false,
 		};
-		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
-		if (!instructions) markRuntimeInstructions(request);
+		applyCodexChatInstructions(request, instructions, messages[0]);
 		const tools =
 			params.reflectionParentTools ??
 			withCodexNativeTools(params.tools, params.model, {

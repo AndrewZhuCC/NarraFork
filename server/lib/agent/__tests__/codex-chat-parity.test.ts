@@ -276,6 +276,12 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 			expect(after.body.input).toEqual([
 				...previousInput.slice(0, -1),
 				addition,
+			expect((before.body.input as unknown[])[0]).toEqual({
+				type: "message",
+				role: "developer",
+				content: [{ type: "input_text", text: "parent instructions" }],
+			});
+			expect(before.body.instructions).not.toContain("parent instructions");
 				...previousInput.slice(-1),
 			]);
 			expect(after.body.tool_choice).toEqual({

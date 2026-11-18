@@ -39,16 +39,19 @@ export interface InputCharacterOptions extends InputCharacterBudget {
 
 // Runtime provenance is object identity, not a text/role heuristic. This survives delegate
 // replacement while remaining absent from serialized wire/history data and user JSON.
-const runtimeSystemMessages = new WeakSet<object>();
+const runtimeSystemMessages = new WeakMap<object, number | undefined>();
 const runtimeInstructionRoots = new WeakSet<object>();
 /** The builder generated root instructions itself rather than lifting history text. */
 export function markRuntimeInstructions<T extends object>(body: T): T {
 	runtimeInstructionRoots.add(body);
 	return body;
 }
-export function markRuntimeSystemMessage<T extends object>(message: T): T {
-	runtimeSystemMessages.add(message);
+export function markRuntimeSystemMessage<T extends object>(message: T, fixedChars?: number): T {
+	runtimeSystemMessages.set(message, fixedChars);
 	return message;
+}
+export function isRuntimeSystemMessage(message: unknown): boolean {
+	return !!message && typeof message === "object" && runtimeSystemMessages.has(message);
 }
 
 type ObjectValue = Record<string, unknown>;
@@ -191,6 +194,14 @@ async function measureInputCharacters(
 		if (value === undefined || value === null) return;
 		if (typeof value !== "object") fail("unsupported_input");
 		const part = object(value);
+		const fixedPromptChars = runtimeSystemMessages.get(part);
+		if (fixedPromptChars !== undefined) {
+			const prompt = object(Array.isArray(part.content) ? part.content[0] : undefined).text;
+			if (typeof prompt !== "string" || fixedPromptChars > prompt.length) fail("unsupported_input");
+			add(fixedPromptChars, "system");
+			add(prompt.length - fixedPromptChars, "other");
+			return;
+		}
 		if (category !== "system") {
 			if (part.role === "user") category = "user";
 			else if (part.role === "assistant" || part.role === "model") category = "assistant";

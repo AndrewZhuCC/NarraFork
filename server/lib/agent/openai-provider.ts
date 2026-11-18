@@ -29,7 +29,9 @@ import {
 	getCodexComposerSettings,
 } from "./codex-composer";
 import {
+	applyCodexChatInstructions,
 	applyCodexStableRequestFields,
+	CODEX_DEFAULT_INSTRUCTIONS,
 	createCodexRequestIdentity,
 	getCodexCompactPrefix,
 	rememberCodexCompactPrefix,
@@ -53,11 +55,7 @@ import {
 	type ImageGenerationRequest,
 	type ImageGenerationResponse,
 } from "./image-generation-api";
-import {
-	markRuntimeInstructions,
-	markRuntimeSystemMessage,
-	reportInputCharacters,
-} from "./input-characters";
+import { markRuntimeSystemMessage, reportInputCharacters } from "./input-characters";
 import {
 	assertNativeMediaPayload,
 	chatAudioMedia,
@@ -509,8 +507,7 @@ const OPENAI_IDENTITY: Record<string, string> = {
 // Codex models (gpt-5.x-codex) use a specialized prompt inspired by OpenCode's codex_header.txt.
 // This prompt emphasizes concise, action-oriented behavior with minimal formatting.
 
-export const CODEX_DEFAULT_INSTRUCTIONS =
-	"You are NarraFork Narrator. Follow the user's request and answer concisely.";
+export { CODEX_DEFAULT_INSTRUCTIONS };
 
 const CODEX_IDENTITY: Record<string, string> = {
 	en: `You are NarraFork Narrator, an AI coding assistant with access to tools for reading, writing, and editing files, running shell commands, searching codebases, and more.
@@ -978,7 +975,10 @@ export class OpenAIProvider implements ProviderAdapter {
 			{ preserveIds: !!prefix },
 		);
 		const body: Record<string, unknown> = prefix
-			? { ...prefix, input: prepared }
+			? {
+					...prefix,
+					input: Array.isArray(prefix.input) ? [...prefix.input, ...prepared] : prepared,
+				}
 			: { model: parseModelId(model).model, input: prepared, stream: true, store: false };
 		if (prefix) {
 			// Explicit live effort changes still take effect; otherwise retain the actual
@@ -1387,12 +1387,10 @@ export class OpenAIProvider implements ProviderAdapter {
 			// previous_response_id is unsupported — always send full history.
 			body = { model, input: responsesInput, stream: true, store: false };
 
-			if (instructions) {
+			if (this.apiMode === "codex") {
+				applyCodexChatInstructions(body, instructions, messages[0]);
+			} else if (instructions) {
 				body.instructions = instructions;
-			} else if (this.apiMode === "codex") {
-				// Codex gateway requires non-empty instructions even for pure tool/result turns.
-				body.instructions = CODEX_DEFAULT_INSTRUCTIONS;
-				markRuntimeInstructions(body);
 			}
 			if (tools.length > 0) body.tools = tools;
 
@@ -2331,8 +2329,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			stream: true,
 			store: false,
 		};
-		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
-		if (!instructions) markRuntimeInstructions(request);
+		applyCodexChatInstructions(request, instructions, messages[0]);
 		const tools =
 			params.reflectionParentTools ??
 			withCodexNativeTools(params.tools, params.model, {

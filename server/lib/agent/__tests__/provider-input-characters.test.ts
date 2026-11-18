@@ -377,9 +377,9 @@ describe("providers report their final logical inputs", () => {
 			} catch {
 				/* Mocked failure. */
 			}
-			expect(snapshots[0]?.systemChars).toBe(historical ? 0 : CODEX_DEFAULT_INSTRUCTIONS.length);
+			expect(snapshots[0]?.systemChars).toBe(CODEX_DEFAULT_INSTRUCTIONS.length);
 			expect((snapshots[0]?.totalChars ?? 0) - (snapshots[0]?.toolsChars ?? 0)).toBe(
-				CODEX_DEFAULT_INSTRUCTIONS.length + "current😀".length,
+				CODEX_DEFAULT_INSTRUCTIONS.length * (historical ? 2 : 1) + "current😀".length,
 			);
 		}
 	});

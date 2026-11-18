@@ -7,7 +7,9 @@
  */
 import { describe, expect, test } from "bun:test";
 import {
+	applyCodexChatInstructions,
 	applyCodexStableRequestFields,
+	CODEX_DEFAULT_INSTRUCTIONS,
 	createCodexRequestIdentity,
 	deriveCodexWindowId,
 	getCodexCompactPrefix,
@@ -155,6 +157,30 @@ describe("Codex compact request prefixes", () => {
 		]);
 		expect(getCodexCompactPrefix("another-scope")).toBeUndefined();
 		expect(getCodexCompactPrefix(undefined)).toBeUndefined();
+	});
+
+	test("keeps one injected developer message without retaining conversation history", () => {
+		const prompt = "Fixed instructions\n\nKeep existing spacing.";
+		const history = [
+			{ role: "user", content: "ordinary message" },
+			{ type: "additional_tools", role: "developer", tools: [] },
+		];
+		const request: Record<string, unknown> = { input: history };
+		applyCodexChatInstructions(request, prompt, undefined);
+		const fixed = {
+			type: "message",
+			role: "developer",
+			content: [{ type: "input_text", text: prompt }],
+		};
+		expect(request).toEqual({
+			instructions: CODEX_DEFAULT_INSTRUCTIONS,
+			input: [fixed, ...history],
+		});
+		rememberCodexCompactPrefix("fixed-developer", request);
+		expect(getCodexCompactPrefix("fixed-developer")).toEqual({
+			instructions: CODEX_DEFAULT_INSTRUCTIONS,
+			input: [fixed],
+		});
 	});
 
 	test("oversized replacement drops the old template instead of reusing stale fields", () => {
