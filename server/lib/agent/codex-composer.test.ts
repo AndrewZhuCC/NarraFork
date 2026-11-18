@@ -11,6 +11,7 @@ function ordinaryRequest() {
 		model: "gpt-6.1-sol",
 		instructions: "Keep this exact ordinary prefix.",
 		tools: [{ type: "function", name: "Read", parameters: { type: "object" } }],
+		tool_choice: "auto",
 		reasoning: { effort: "xhigh", summary: "auto" },
 		text: { verbosity: "low" },
 		prompt_cache_key: "ordinary-key",
@@ -39,7 +40,7 @@ describe("Codex Composer request", () => {
 		}
 		expect(body.previous_response_id).toBeUndefined();
 		expect(body.type).toBeUndefined();
-		expect(body.tool_choice).toBe("none");
+		expect(body.tool_choice).toBe(source.tool_choice);
 		const metadata = body.client_metadata as Record<string, string>;
 		expect(metadata.extra).toBe("preserved");
 		expect(JSON.parse(metadata["x-codex-turn-metadata"] ?? "")).toEqual({

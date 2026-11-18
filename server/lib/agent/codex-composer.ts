@@ -79,8 +79,7 @@ export function buildCodexComposerRequest(
 		...body,
 		stream: true,
 		store: false,
-		// Keep definitions (and the complete ordinary prefix), but execute no tools.
-		tool_choice: "none",
+		// Inherit tool_choice with the ordinary prefix; callers discard tool calls.
 		client_metadata: {
 			...identity,
 			turn_id: turnId,

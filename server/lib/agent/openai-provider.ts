@@ -840,7 +840,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				{ requestDump: options.requestDump },
 				conversationId,
 				undefined,
-				{ headers, maxResponseBytes: CODEX_COMPOSER_MAX_RESPONSE_BYTES },
+				{ headers, maxResponseBytes: CODEX_COMPOSER_MAX_RESPONSE_BYTES, rejectToolCalls: true },
 			);
 			return { ...result, credentialId };
 		}
@@ -1884,7 +1884,11 @@ export class OpenAIProvider implements ProviderAdapter {
 		options?: GenerateOptions,
 		conversationId?: string,
 		turnState?: { value: string | null },
-		requestOptions?: { headers?: Record<string, string>; maxResponseBytes?: number },
+		requestOptions?: {
+			headers?: Record<string, string>;
+			maxResponseBytes?: number;
+			rejectToolCalls?: boolean;
+		},
 	): Promise<GenerateMetaResult> {
 		if (body.stream !== true) {
 			throw new Error("OpenAI lightweight Responses generation requires stream=true");
@@ -1943,6 +1947,12 @@ export class OpenAIProvider implements ProviderAdapter {
 		if (looksJson) {
 			const raw = await response.text();
 			const json = parseResponsesJson(raw);
+			if (
+				requestOptions?.rejectToolCalls &&
+				json.output?.some((item) => typeof item?.type === "string" && item.type.endsWith("_call"))
+			) {
+				throw new Error("Composer returned a tool call instead of a suggestion");
+			}
 			const text = extractResponsesText(json.output);
 			// Reuse stream error precedence: a policy/API failure is not a truncation.
 			const invalid = parseResponsesAPIEvent({ response: json }, new Map(), new Map()).find(
@@ -1971,6 +1981,12 @@ export class OpenAIProvider implements ProviderAdapter {
 		let usage: GenerateMetaResult["usage"] = null;
 		let outputTruncated = false;
 		for await (const evt of _parseResponsesAPIStream(response.body)) {
+			if (
+				requestOptions?.rejectToolCalls &&
+				(evt.toolUses?.length || evt.webSearch || evt.imageGeneration)
+			) {
+				throw new Error("Composer returned a tool call instead of a suggestion");
+			}
 			if (evt.text) {
 				text += evt.text;
 				await options?.onTextDelta?.(evt.text);
