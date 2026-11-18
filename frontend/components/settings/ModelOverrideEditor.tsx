@@ -20,7 +20,9 @@ import {
 	isEmptyOverride,
 	MODALITIES,
 	type ModelOverride,
+	normalizeOverride,
 	type OverrideField,
+	OverrideValidationError,
 	PRICE_FIELDS,
 	REASONING_LEVELS,
 	TOOL_LOADING_MODES,
@@ -35,6 +37,10 @@ import { formatLocaleNumber } from "../../lib/intl-format";
 import { Z } from "../../lib/z-index";
 
 type Scope = "connection" | "model";
+
+type TokenField = "contextWindow" | "maxOutputTokens";
+/** A blank token limit is an enabled override waiting for a value, not inheritance. */
+type OverrideDraft = Omit<ModelOverride, TokenField> & Partial<Record<TokenField, number | "">>;
 
 const ORIGIN_COLOR: Record<FieldOrigin, string> = {
 	catalog: "gray",
@@ -87,7 +93,7 @@ function FieldRow({
 }: {
 	field: OverrideField;
 	description: ModelDescription;
-	draft: ModelOverride;
+	draft: OverrideDraft;
 	onToggle: (on: boolean) => void;
 	error?: string;
 	disabled: boolean;
@@ -127,8 +133,10 @@ function FieldRow({
 }
 
 /** Sensible starting value when a field is switched to customized. */
-function seed(field: OverrideField, description: ModelDescription): ModelOverride[OverrideField] {
+function seed(field: OverrideField, description: ModelDescription): OverrideDraft[OverrideField] {
 	const current = description.effective[field]?.value;
+	if (field === "contextWindow" || field === "maxOutputTokens")
+		return typeof current === "number" ? current : "";
 	if (current !== undefined) return structuredClone(current) as ModelOverride[OverrideField];
 	switch (field) {
 		case "inputModalities":
@@ -169,7 +177,7 @@ export function ModelOverrideEditor({
 	const description = useModelDescription(model, opened);
 	const save = useSetModelOverride();
 	const [scope, setScope] = useState<Scope>("connection");
-	const [draft, setDraft] = useState<ModelOverride>({});
+	const [draft, setDraft] = useState<OverrideDraft>({});
 	const [errors, setErrors] = useState<Record<string, string>>({});
 	const info = description.data;
 
@@ -186,9 +194,9 @@ export function ModelOverrideEditor({
 		setErrors({});
 	}, [info?.model, info !== undefined, scope]);
 
-	const set = <K extends OverrideField>(field: K, value: ModelOverride[K] | undefined) => {
+	const set = <K extends OverrideField>(field: K, value: OverrideDraft[K]) => {
 		setDraft((previous) => {
-			const next = { ...previous };
+			const next: OverrideDraft = { ...previous };
 			if (value === undefined) delete next[field];
 			else next[field] = value;
 			return next;
@@ -196,24 +204,27 @@ export function ModelOverrideEditor({
 		setErrors(({ [field]: _removed, ...rest }) => rest);
 	};
 	const toggle = (field: OverrideField) => (on: boolean) =>
-		set(field, on && info ? (seed(field, info) as never) : undefined);
+		set(field, on && info ? seed(field, info) : undefined);
 
-	const submit = async (fields: ModelOverride | null) => {
+	const submit = async (fields: OverrideDraft | null) => {
 		if (!info || !model) return;
 		try {
+			const valid = fields ? normalizeOverride(fields) : null;
 			await save.mutateAsync({
 				scope,
 				key: scope === "model" ? (info.catalogModelId ?? "") : model,
-				fields: fields && !isEmptyOverride(fields) ? fields : null,
+				fields: valid && !isEmptyOverride(valid) ? valid : null,
 				model,
 			});
 			notifications.show({ message: t("catalog.saved"), color: "green" });
 			onClose();
 		} catch (error) {
 			const field =
-				error instanceof ApiError && typeof error.data?.field === "string"
-					? (error.data.field.split(".")[0] ?? "")
-					: "";
+				error instanceof OverrideValidationError
+					? (error.field.split(".")[0] ?? "")
+					: error instanceof ApiError && typeof error.data?.field === "string"
+						? (error.data.field.split(".")[0] ?? "")
+						: "";
 			const message = error instanceof Error ? error.message : String(error);
 			const key = `catalog.invalid.${field}`;
 			setErrors({ [field]: field && i18n.exists(key, { ns: "settings" }) ? t(key) : message });
@@ -285,9 +296,7 @@ export function ModelOverrideEditor({
 								thousandSeparator=","
 								disabled={readOnly}
 								value={draft.contextWindow ?? ""}
-								onChange={(value) =>
-									set("contextWindow", typeof value === "number" ? value : undefined)
-								}
+								onChange={(value) => set("contextWindow", typeof value === "number" ? value : "")}
 							/>,
 						)}
 						{row(
@@ -298,9 +307,7 @@ export function ModelOverrideEditor({
 								thousandSeparator=","
 								disabled={readOnly}
 								value={draft.maxOutputTokens ?? ""}
-								onChange={(value) =>
-									set("maxOutputTokens", typeof value === "number" ? value : undefined)
-								}
+								onChange={(value) => set("maxOutputTokens", typeof value === "number" ? value : "")}
 							/>,
 						)}
 						{row(
