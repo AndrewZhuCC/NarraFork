@@ -18,6 +18,7 @@
  */
 
 import { includesSearch } from "@frontend/lib/search-utils";
+import { normalizeFastModeOverride } from "@shared/fast-mode";
 
 // ── Boolean overrides ──────────────────────────────────────────────────────
 
@@ -162,9 +163,8 @@ export function shouldPromoteAdvancedRow(
 ): boolean {
 	switch (row) {
 		case "fastMode":
-			// "off" is an explicit choice just as much as "on": only "inherit" (or an
-			// unrecognized value) counts as untouched.
-			return normalizeBooleanOverride(input.fastModeOverride) !== "inherit";
+			// Only "inherit" (or an unrecognized value) counts as untouched.
+			return normalizeFastModeOverride(input.fastModeOverride) !== "inherit";
 		case "relaxedPlan":
 			return !!input.relaxedPlan;
 		case "planMode":

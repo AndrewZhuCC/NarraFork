@@ -1,4 +1,15 @@
 import { describe, expect, test } from "bun:test";
+import { supportsCodexUltrafast } from "@shared/fast-mode";
+
+test("Ultrafast requires the exact configured connection and model", () => {
+	const qualified = "primary:gpt-6.2-sol";
+	expect(supportsCodexUltrafast(qualified, undefined)).toBe(false);
+	expect(supportsCodexUltrafast(qualified, [qualified])).toBe(true);
+	expect(supportsCodexUltrafast("backup:gpt-6.2-sol", [qualified])).toBe(false);
+	expect(supportsCodexUltrafast("primary:gpt-6.2-astra", [qualified])).toBe(false);
+	expect(supportsCodexUltrafast("auto:gpt-6.2-sol", ["auto:gpt-6.2-sol"])).toBe(false);
+});
+
 import {
 	fastModeOverrideFromLegacyInput,
 	legacyFastModeMirror,
@@ -26,10 +37,11 @@ describe("resolveFastMode", () => {
 });
 
 describe("legacyFastModeMirror", () => {
-	test("mirrors only an explicit opt-in, so inherit never looks pinned to old readers", () => {
+	test("mirrors only ordinary Fast, never promoting another tier on legacy readers", () => {
 		expect(legacyFastModeMirror("on")).toBe(true);
 		expect(legacyFastModeMirror("off")).toBe(false);
 		expect(legacyFastModeMirror("inherit")).toBe(false);
+		expect(legacyFastModeMirror("ultrafast")).toBe(false);
 	});
 });
 

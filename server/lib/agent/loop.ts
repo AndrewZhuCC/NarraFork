@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import type { ContextCharCache } from "@shared/context-composition";
 import type { ContextInputCharacters, ContextUsageSnapshot } from "@shared/context-usage";
+import { supportsCodexUltrafast } from "@shared/fast-mode";
 import { GEN_UI_STREAM_FIELDS } from "@shared/gen-ui-tool-policy";
 import {
 	MEDIA_MIME_TO_EXT,
@@ -51,7 +52,7 @@ import {
 	SearchExecutionBudgetExceededError,
 } from "../search/execution-scope";
 import { shouldUseNativeSearch } from "../search/native";
-import { getModelContextWindow, settings, usesStatefulModel } from "../settings";
+import { getModelContextWindow, settings, usesCodexModel, usesStatefulModel } from "../settings";
 import { sideCarBodyWithText } from "../sidecar-templates";
 import { StreamStaleError } from "../stream-timeout";
 import { buildUsageDataFromSnapshot } from "../usage-tracking";
@@ -5488,7 +5489,15 @@ async function* agentLoopInMetadataSnapshot(
 						stickySessionKey: config.narratorId,
 						workTurnId: config.getWorkTurnId?.(),
 						reasoningEffort: config.reasoningEffort,
-						serviceTier: config.serviceTier,
+						serviceTier:
+							config.serviceTier === "ultrafast" &&
+							!(
+								supportsCodexUltrafast(effectiveModel, settings.agent.codexUltrafastModels) &&
+								config.getUltrafastModel?.() === effectiveModel &&
+								usesCodexModel(effectiveProvider, effectiveModel)
+							)
+								? undefined
+								: config.serviceTier,
 						metadata: config.metadata,
 						requestDump,
 						streamProgress,

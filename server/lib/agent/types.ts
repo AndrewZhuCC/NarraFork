@@ -1253,8 +1253,10 @@ export interface AgentConfig {
 	knowledgeInjectionCompactSeq?: number;
 	/** Reasoning effort — maps to thinking config (Anthropic) or reasoning config (Codex) */
 	reasoningEffort?: ReasoningEffort;
-	/** Service tier for Codex-mode providers — "priority" enables fast mode */
+	/** Service tier for Codex-mode providers. */
 	serviceTier?: string;
+	/** Current fixed model reference; automatic routes are never billed as Ultrafast. */
+	getUltrafastModel?: () => string | undefined;
 	/** Metadata sent with API requests (e.g. Anthropic metadata.user_id) */
 	metadata?: { user_id: string };
 	/**

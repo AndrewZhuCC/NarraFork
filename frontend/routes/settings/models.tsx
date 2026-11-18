@@ -1,16 +1,24 @@
-import { Alert, Divider, Stack, Title } from "@mantine/core";
+import { Alert, Divider, MultiSelect, Stack, Title } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import {
+	resolveCodexCapableProviders,
+	resolveCodexControls,
+} from "../../components/narrator/interaction/use-model-selection";
 import { ModelAggregationsSection } from "../../components/settings/ModelAggregationsSection";
 import { ModelCatalogSection } from "../../components/settings/ModelCatalogSection";
 import { ModelsSection } from "../../components/settings/ModelsSection";
 import { useInstanceSettingsContext } from "../../hooks/useInstanceSettings";
 import { useAllModels } from "../../hooks/useModels";
 import { api } from "../../lib/api";
-import type { ModelAggregation } from "../../lib/constants";
+import {
+	AGG_MODEL_PREFIX,
+	AUTO_MODEL_VALUE_PREFIX,
+	type ModelAggregation,
+} from "../../lib/constants";
 
 export const Route = createFileRoute("/settings/models")({
 	component: SettingsModelsPage,
@@ -20,6 +28,7 @@ function SettingsModelsPage() {
 	const { t } = useTranslation("settings");
 	const navigate = useNavigate();
 	const {
+		allModels,
 		groupedModels,
 		visibleModels,
 		providerLabels,
@@ -28,6 +37,23 @@ function SettingsModelsPage() {
 		catalogMissingModels,
 	} = useAllModels();
 	const is = useInstanceSettingsContext();
+	const codexProviders = resolveCodexCapableProviders(is.settings);
+	const ultrafastModelOptions = allModels.flatMap((model) => {
+		const { value } = model;
+		const separator = value.indexOf(":");
+		if (
+			separator <= 0 ||
+			separator === value.length - 1 ||
+			value.startsWith(AUTO_MODEL_VALUE_PREFIX) ||
+			value.startsWith(AGG_MODEL_PREFIX)
+		) {
+			return [];
+		}
+		return resolveCodexControls(value, value.slice(separator + 1), model, codexProviders)
+			.supportsCodexControls
+			? [value]
+			: [];
+	});
 	const qc = useQueryClient();
 	const [localAggregations, setLocalAggregations] = useState<ModelAggregation[]>(aggregations);
 	const serverAggregationsRef = useRef(aggregations);
@@ -125,6 +151,16 @@ function SettingsModelsPage() {
 				groupedModels={groupedModels}
 				catalogMissingModels={catalogMissingModels}
 				navigate={navigate}
+			/>
+			<MultiSelect
+				label={t("codexUltrafastModels")}
+				description={t("codexUltrafastModelsDescription")}
+				data={ultrafastModelOptions}
+				// Values absent from data still render as removable pills.
+				value={is.codexUltrafastModels}
+				onChange={is.setCodexUltrafastModels}
+				disabled={!is.initialized || is.isSaving}
+				searchable
 			/>
 			{localAggregations.length > 0 && (
 				<>

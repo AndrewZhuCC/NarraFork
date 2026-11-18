@@ -1,4 +1,5 @@
 import { MAX_COMPOSER_QUOTE_CHARS, parseComposerDocument } from "@shared/composer-document";
+import { FAST_MODE_OVERRIDE_VALUES } from "@shared/fast-mode";
 import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 import {
 	HUMAN_ATTENTION_DEFAULT_PAGE_SIZE,
@@ -88,7 +89,7 @@ export const createNarratorSchema = z.object({
 	reasoningEffort: reasoningEffortSchema.nullable().optional(),
 	/** @deprecated Use fastModeOverride. Kept so older clients keep working. */
 	fastMode: z.boolean().optional(),
-	fastModeOverride: booleanOverrideSchema.optional(),
+	fastModeOverride: z.enum(FAST_MODE_OVERRIDE_VALUES).optional(),
 	relaxedPlan: z.boolean().optional(),
 	planReflectionAutoApproveOverride: booleanOverrideSchema.optional(),
 	dangerReflectionOverride: dangerReflectionOverrideSchema.optional(),

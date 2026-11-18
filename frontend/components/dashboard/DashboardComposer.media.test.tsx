@@ -5,6 +5,7 @@ import { parseHTML } from "linkedom";
 import { act, type ComponentProps, type ReactNode, useImperativeHandle } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { api } from "../../lib/api";
+import type { ModelOption } from "../../lib/constants";
 import { composerAssetsFromFiles } from "../narrator/composer/composer-document-adapter";
 import { loadDraftImageAttachments } from "../narrator/composer/draft-image-attachments";
 import type {
@@ -20,6 +21,8 @@ const modules = [
 	"@tanstack/react-router",
 	"react-i18next",
 	"../../hooks/useAuth",
+	"../../hooks/useModelCatalog",
+	"../../hooks/useModels",
 	"../../hooks/useNarrator",
 	"../../hooks/usePlatform",
 	"../../hooks/useProjectDirStatus",
@@ -31,27 +34,54 @@ const modules = [
 	"../narrator/interaction/UploadProgressBar",
 	"../narrator/model/ModelPickerMenu",
 	"../narrator/model/ReasoningEffortPickerMenu",
-	"../narrator/model/use-draft-reasoning-effort",
 ] as const;
 const originals = new Map<string, object>();
 for (const id of modules) originals.set(id, await import(id));
 const replace = (id: (typeof modules)[number], exports: object) =>
 	mock.module(id, () => ({ ...originals.get(id), ...exports }));
 const shell = ({ children }: { children?: ReactNode }) => <div>{children}</div>;
+const codexModel = "codex:gpt-test";
+const otherCodexModel = "relay:gpt-test";
+const autoModel = "auto:gpt-test";
+const aggregation = { id: "mix", name: "Mixed", models: [codexModel], routingMode: "priority" };
+const aggregationModel = `__agg__:${aggregation.id}`;
+const pinnedModel = `${aggregationModel}:${codexModel}`;
+const modelOptions: ModelOption[] = [
+	{ value: codexModel, label: "GPT Test" },
+	{ value: otherCodexModel, label: "GPT Test (Relay)" },
+	{
+		value: autoModel,
+		label: "GPT Test (Auto)",
+		autoSources: [{ value: codexModel, provider: "codex", available: true, subscription: true }],
+	},
+];
+let codexAvailable = false;
+let codexUltrafastModels: string[] = [];
+let fastModeDefault = false;
 const button = ({
 	children,
 	onClick,
 	disabled,
+	"aria-pressed": pressed,
+	"aria-current": current,
 }: {
 	children?: ReactNode;
 	onClick?: () => void;
 	disabled?: boolean;
+	"aria-pressed"?: boolean;
+	"aria-current"?: boolean;
 }) => (
-	<button type="button" disabled={disabled} onClick={onClick}>
+	<button
+		type="button"
+		disabled={disabled}
+		aria-pressed={pressed}
+		aria-current={current}
+		onClick={onClick}
+	>
 		{children}
 	</button>
 );
-const create = mock(async () => ({
+const create = mock(async (_data: Parameters<typeof api.createNarrator>[0]) => ({
 	id: "new-session",
 	title: "New",
 	cwd: "/workspace",
@@ -71,12 +101,16 @@ replace("@mantine/core", {
 	Box: shell,
 	Button: button,
 	Group: shell,
+	Menu: Object.assign(shell, { Target: shell, Dropdown: shell, Item: button }),
 	Text: shell,
 	Tooltip: shell,
 });
 replace("@tanstack/react-query", {
-	useQuery: () => ({
-		data: { agent: { defaultPermissionMode: "default", defaultStartInPlanMode: false } },
+	useQuery: ({ queryKey }: { queryKey: readonly string[] }) => ({
+		data:
+			queryKey[0] === "user-preferences"
+				? { fastModeDefault }
+				: { agent: { defaultPermissionMode: "default", defaultStartInPlanMode: false } },
 	}),
 });
 replace("@tanstack/react-router", { useNavigate: () => navigate });
@@ -97,10 +131,30 @@ replace("../narrator/CreateNarratorLazyModal", { CreateNarratorLazyModal: () => 
 replace("../narrator/interaction/PermissionModePickerMenu", {
 	PermissionModePickerMenu: () => null,
 });
-replace("../narrator/model/ModelPickerMenu", { ModelPickerMenu: () => null });
+replace("../narrator/model/ModelPickerMenu", {
+	ModelPickerMenu: ({ onChange }: { onChange: (value: string) => void }) => (
+		<>
+			{[otherCodexModel, autoModel, aggregationModel, pinnedModel].map((value) => (
+				<button type="button" key={value} data-model={value} onClick={() => onChange(value)}>
+					{value}
+				</button>
+			))}
+		</>
+	),
+});
 replace("../narrator/model/ReasoningEffortPickerMenu", { ReasoningEffortPickerMenu: () => null });
-replace("../narrator/model/use-draft-reasoning-effort", {
-	useDraftReasoningEffort: () => ({ supported: false, options: [] }),
+replace("../../hooks/useModelCatalog", { useActualResolvedModelCard: () => ({}) });
+replace("../../hooks/useModels", {
+	useAllModels: () => ({
+		visibleWithDefault: modelOptions,
+		defaultModelValue: codexModel,
+		aggregations: [aggregation],
+		settingsData: {
+			codexAvailable,
+			openaiProviders: [{ prefix: "relay", apiMode: "codex" }],
+			agent: { codexUltrafastModels },
+		},
+	}),
 });
 replace("../narrator/interaction/UploadProgressBar", {
 	UploadProgressBar: ({ sendingState }: { sendingState: typeof progressState }) => {
@@ -207,6 +261,9 @@ beforeEach(async () => {
 		globals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
 		Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
 	}
+	codexAvailable = false;
+	codexUltrafastModels = [];
+	fastModeDefault = false;
 	create.mockClear();
 	navigate.mockClear();
 	noteSent.mockClear();
@@ -255,6 +312,63 @@ async function submit() {
 		await props.onSendWithMode?.("turn");
 	});
 }
+
+test("Dashboard offers Fast Mode for Codex and can explicitly turn off the enabled default", async () => {
+	const fastModeButton = () => host.querySelector<HTMLButtonElement>("button[aria-pressed]");
+	expect(fastModeButton()).toBeNull();
+	codexAvailable = true;
+	fastModeDefault = true;
+	await act(async () => root.render(<DashboardComposer />));
+	const button = fastModeButton();
+	expect(button?.textContent).toBe("fast_mode");
+	expect(button?.getAttribute("aria-pressed")).toBe("true");
+	await act(async () => button?.click());
+	expect(fastModeButton()?.getAttribute("aria-pressed")).toBe("false");
+	await attach([audio()]);
+	await submit();
+	expect(create).toHaveBeenCalledWith(expect.objectContaining({ fastModeOverride: "off" }));
+	expect(fastModeButton()?.getAttribute("aria-pressed")).toBe("true");
+});
+
+test("Dashboard applies Ultrafast from the first send only for an allowlisted fixed route", async () => {
+	const ultrafastOption = () =>
+		Array.from(host.querySelectorAll<HTMLButtonElement>("button[aria-current]")).find(
+			(item) => item.textContent === "fast_mode_ultrafast",
+		);
+	const pickModel = async (value: string) => {
+		const button = host.querySelector<HTMLButtonElement>(`button[data-model="${value}"]`);
+		expect(button).not.toBeNull();
+		await act(async () => button?.click());
+	};
+	codexAvailable = true;
+	codexUltrafastModels = [codexModel];
+	await act(async () => root.render(<DashboardComposer />));
+	expect(ultrafastOption()?.getAttribute("aria-current")).toBe("false");
+	await pickModel(autoModel);
+	expect(ultrafastOption()).toBeUndefined();
+	await pickModel(aggregationModel);
+	expect(ultrafastOption()).toBeUndefined();
+	await pickModel(pinnedModel);
+	await act(async () => ultrafastOption()?.click());
+	expect(ultrafastOption()?.getAttribute("aria-current")).toBe("true");
+	expect(host.querySelector("button[aria-pressed]")?.textContent).toBe("fast_mode_ultrafast");
+	await attach([audio()]);
+	await submit();
+	expect(create).toHaveBeenCalledWith(
+		expect.objectContaining({ model: pinnedModel, fastModeOverride: "ultrafast" }),
+	);
+	expect(send.mock.calls[0]?.[0]).toBe("new-session");
+
+	await act(async () => ultrafastOption()?.click());
+	await pickModel(otherCodexModel);
+	expect(ultrafastOption()).toBeUndefined();
+	expect(host.querySelector("button[aria-pressed]")?.textContent).toBe("fast_mode");
+	await attach([audio()]);
+	await submit();
+	expect(create).toHaveBeenCalledTimes(2);
+	expect(create.mock.calls[1]?.[0]).toMatchObject({ model: otherCodexModel });
+	expect(create.mock.calls[1]?.[0]).not.toHaveProperty("fastModeOverride");
+});
 
 test("Dashboard stages and persists media-only drafts through the real ingestion hook", async () => {
 	const speech = audio();

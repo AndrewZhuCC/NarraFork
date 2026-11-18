@@ -10,6 +10,7 @@ import {
 	startCompactAttempt,
 	truncateCompactError,
 } from "@shared/compact-message";
+import type { FastModeOverride } from "@shared/fast-mode";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { isHistoryProtectedContent } from "@shared/narrator-blocks/retention";
 import { isNativeModelContextBlock, modelTextFromContentBlocks } from "@shared/native-injection";
@@ -2994,7 +2995,7 @@ const sqliteNarratorPersistence = {
 	 * Set the tri-state fast-mode override. The deprecated `fastMode` boolean is
 	 * mirrored so older readers of the same database still see explicit opt-ins.
 	 */
-	async updateFastModeOverride(narratorId: string, fastModeOverride: BooleanOverride) {
+	async updateFastModeOverride(narratorId: string, fastModeOverride: FastModeOverride) {
 		const now = new Date().toISOString();
 		await db
 			.update(narrators)

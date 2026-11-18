@@ -226,7 +226,6 @@ export interface NarratorInteractionStatusBarProps {
 	};
 
 	codexControls: {
-		supportsCodexControls: boolean;
 		isBuiltInCodexModel: boolean;
 		renderFastModeControl: (position: "top-end" | "bottom-end") => React.ReactNode;
 	};
@@ -841,10 +840,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 														</Menu.Dropdown>
 													</Menu>
 												)}
-												{/* Fast Mode toggle (only for Codex-mode providers) */}
-												{codexControls.supportsCodexControls &&
-													!isMobileViewport &&
-													codexControls.renderFastModeControl("top-end")}
+												{!isMobileViewport && codexControls.renderFastModeControl("top-end")}
 												<Tooltip
 													label={
 														narrator.isAskInPassing
@@ -1141,9 +1137,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 													</Menu.Dropdown>
 												</Menu>
 											)}
-											{/* Fast Mode toggle (only for Codex-mode providers) - Mobile */}
-											{codexControls.supportsCodexControls &&
-												(compact || isMobileViewport) &&
+											{(compact || isMobileViewport) &&
 												codexControls.renderFastModeControl("bottom-end")}
 											<Tooltip
 												label={

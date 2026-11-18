@@ -128,6 +128,7 @@ export const DEFAULTS: NarraForkSettings = {
 		behaviorFenceAttachTasks: true,
 		defaultReasoningEffort: "max",
 		reasoningEffortBlocklist: [],
+		codexUltrafastModels: [],
 		routerModels: [],
 		retryBackoffCeilMs: 20_000,
 		firstTokenTimeoutMs: 300_000,
@@ -822,6 +823,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 	"agent.reasoningEffortBlocklist": {
 		desc: "思考强度黑名单。默认向所有模型发送思考强度（另有内置规则排除 4.6 之前的 Claude）；上游拒绝该参数时把模型加到这里。每项含 pattern、enabled；pattern 为不区分大小写的子串，或 /正则/flags。",
+		type: "array",
+	},
+	"agent.codexUltrafastModels": {
+		desc: "允许选择 Codex Ultrafast 的连接和模型，使用完整 provider:model（如 anzhi.newapi:gpt-6.2-sol）。默认空；加入列表只开放档位，不改变 Fast 默认值。",
 		type: "array",
 	},
 	"agent.routerModels": {

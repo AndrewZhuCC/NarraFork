@@ -5,6 +5,7 @@ import {
 	composerDocumentText,
 	parseComposerDocument,
 } from "@shared/composer-document";
+import { normalizeFastModeOverride } from "@shared/fast-mode";
 import type { FileReference } from "@shared/file-reference";
 import type { SavedRecording } from "@shared/request-recording";
 import type { TFunction } from "i18next";
@@ -895,7 +896,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 					permissionMode: fetchedNarrator?.permissionMode ?? narrator?.permissionMode ?? undefined,
 					reasoningEffort:
 						fetchedNarrator?.reasoningEffort ?? narrator?.reasoningEffort ?? undefined,
-					fastModeOverride: normalizeBooleanOverride(
+					fastModeOverride: normalizeFastModeOverride(
 						fetchedNarrator?.fastModeOverride ?? narrator?.fastModeOverride,
 					),
 					relaxedPlan: fetchedNarrator?.relaxedPlan ?? narrator?.relaxedPlan ?? undefined,

@@ -5,6 +5,7 @@ import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import type { ComposerDocument } from "@shared/composer-document";
 import { serializeCatalogErrorMessage } from "@shared/error-catalog";
+import { normalizeFastModeOverride } from "@shared/fast-mode";
 import { resolveMcpLoadingMode } from "@shared/mcp-loading-mode";
 import {
 	isMediaContentBlock,
@@ -753,7 +754,7 @@ export async function executeQueuedNewCommand(
 		systemPrompt: sourceNarrator.systemPrompt ?? undefined,
 		permissionMode: sourceNarrator.permissionMode ?? undefined,
 		reasoningEffort: sourceNarrator.reasoningEffort ?? undefined,
-		fastModeOverride: normalizeBooleanOverride(sourceNarrator.fastModeOverride),
+		fastModeOverride: normalizeFastModeOverride(sourceNarrator.fastModeOverride),
 		relaxedPlan: sourceNarrator.relaxedPlan ?? undefined,
 		planReflectionAutoApproveOverride: normalizeOptionalBooleanOverride(
 			sourceNarrator.planReflectionAutoApproveOverride,

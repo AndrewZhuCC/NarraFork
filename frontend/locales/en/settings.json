@@ -766,6 +766,8 @@
 	"defaultProjectDir": "Default Project Directory",
 	"agentSection": "AI Agent",
 	"modelsSection": "Models",
+	"codexUltrafastModels": "Codex models allowed to use Ultrafast",
+	"codexUltrafastModelsDescription": "Allow Ultrafast on these model connections without making it a default. Users must select it explicitly; it uses more quota than Fast Mode.",
 	"providerAgentModeUnsupportedTitle": "Some providers cannot run agent sessions",
 	"providerAgentModeUnsupportedDesc": "The current backend reports agent mode as unavailable for: {{providers}}. Their models are hidden from agent model selectors but remain visible in provider settings.",
 	"runtimeBenchmarkContainerExecutionUnsupported": "Benchmark container execution is not available in this backend runtime.",

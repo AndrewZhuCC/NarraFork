@@ -525,6 +525,16 @@ export const updateSettingsSchema = z
 					)
 					.max(100)
 					.optional(),
+				codexUltrafastModels: z
+					.array(
+						z
+							.string()
+							.trim()
+							.max(256)
+							.regex(/^(?!auto:)[^:\s]+:[^:\s]\S*$/),
+					)
+					.max(100)
+					.optional(),
 				// Models that enable task-aware routing. Whitelist: empty
 				// by default, routing activates only for matching model ids.
 				routerModels: z

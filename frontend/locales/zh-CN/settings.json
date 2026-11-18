@@ -766,6 +766,8 @@
 	"defaultProjectDir": "默认项目目录",
 	"agentSection": "AI 代理",
 	"modelsSection": "模型",
+	"codexUltrafastModels": "允许使用 Ultrafast 的 Codex 模型",
+	"codexUltrafastModelsDescription": "仅向所选模型连接开放 Ultrafast，不会设为默认。用户需手动选择此档位，且消耗的额度比普通快速模式更高。",
 	"providerAgentModeUnsupportedTitle": "部分供应商无法运行代理会话",
 	"providerAgentModeUnsupportedDesc": "当前后端声明以下供应商不可用于 agent mode：{{providers}}。这些模型会从代理模型选择器中隐藏，但仍会保留在供应商设置中。",
 	"runtimeBenchmarkContainerExecutionUnsupported": "当前后端运行时不支持基准测试容器执行。",

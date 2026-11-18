@@ -65,10 +65,12 @@ describe("Agent task tool", () => {
 		expect(agentTool.parameters.safeParse({ reasoning_effort: "invalid" }).success).toBe(false);
 	});
 
-	test("accepts the optional Fast Mode boolean", () => {
+	test("accepts the legacy Fast Mode boolean and explicit Ultrafast", () => {
 		const schema = agentTool.rawJsonSchema as { properties: Record<string, unknown> };
-		expect(schema.properties.fast_mode).toMatchObject({ type: "boolean" });
-		for (const fast_mode of [true, false, undefined]) {
+		expect(schema.properties.fast_mode).toMatchObject({
+			anyOf: [{ type: "boolean" }, { type: "string", enum: ["ultrafast"] }],
+		});
+		for (const fast_mode of [true, false, "ultrafast", undefined]) {
 			expect(agentTool.parameters.safeParse({ fast_mode }).success).toBe(true);
 		}
 		expect(agentTool.parameters.safeParse({ fast_mode: "false" }).success).toBe(false);
@@ -150,11 +152,19 @@ describe("Agent task tool", () => {
 		await agentTool.execute(input, ctx);
 		await agentTool.execute({ ...input, fast_mode: true }, ctx);
 		await agentTool.execute({ ...input, fast_mode: false }, ctx);
-		expect(runCalls.map(({ userId }) => userId)).toEqual(["user-42", "user-42", "user-42"]);
+		await agentTool.execute({ ...input, fast_mode: "ultrafast" }, ctx);
+
+		expect(runCalls.map(({ userId }) => userId)).toEqual([
+			"user-42",
+			"user-42",
+			"user-42",
+			"user-42",
+		]);
 		expect(runCalls.map(({ fastModeOverride }) => fastModeOverride)).toEqual([
 			undefined,
 			"on",
 			"off",
+			"ultrafast",
 		]);
 	});
 

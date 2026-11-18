@@ -1,4 +1,5 @@
 import { afterAll, afterEach, expect, mock, test } from "bun:test";
+import { settings } from "../../settings";
 import { forgetModelTraceRequest, getModelTraceRequest } from "../modeltrace-request";
 import type { ChatParams, ProviderAdapter } from "../provider";
 import type { AgentConfig } from "../types";
@@ -7,7 +8,7 @@ const id = "modeltrace-loop-test";
 let outbound: ChatParams | undefined;
 let startsRequest = true;
 const adapter: ProviderAdapter = {
-	formatTools: (tools) => tools,
+	formatTools: (tools) => tools.map(({ name }) => ({ name })),
 	buildHistory: async (rows) => ({
 		history: rows.map((row) => ({ role: row.role, content: row.contentText })),
 	}),
@@ -24,7 +25,10 @@ const adapter: ProviderAdapter = {
 const realProvider = { ...(await import("../provider")) };
 mock.module("../provider", () => ({
 	...realProvider,
-	resolveProviderAndModel: () => ({ adapter, provider: "test", model: "test-model" }),
+	resolveProviderAndModel: (model?: string) =>
+		model?.startsWith("codex:")
+			? { adapter, provider: "codex", model }
+			: { adapter, provider: "test", model: "test-model" },
 }));
 const { agentLoop } = await import("../loop");
 afterEach(() => {
@@ -79,6 +83,27 @@ test("captures the actual post-injection provider prefix, before later answer tu
 	]);
 	expect(snapshot?.params.tools).toEqual(outbound?.tools);
 	expect(snapshot?.params).not.toHaveProperty("onRequestStart");
+});
+
+test("dispatches Ultrafast only when the allowlisted model is also the fixed selection", async () => {
+	const model = "codex:gpt-6.2-sol";
+	settings.agent.codexUltrafastModels = [model];
+	for (const [reference, tier] of [
+		[model, "ultrafast"],
+		["auto:gpt-6.2-sol", undefined],
+	] as const) {
+		const run = {
+			...config(),
+			model,
+			provider: "codex",
+			serviceTier: "ultrafast",
+			getUltrafastModel: () => reference,
+		};
+		for await (const event of agentLoop(run, "check tier", { rows: [] })) {
+			if (event.type === "error") throw new Error(event.message);
+		}
+		expect(outbound?.serviceTier).toBe(tier);
+	}
 });
 
 test("does not capture local preparation that never starts an upstream request", async () => {

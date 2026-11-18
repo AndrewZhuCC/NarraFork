@@ -28,6 +28,7 @@ import {
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import { type FastModeOverride, normalizeFastModeOverride } from "@shared/fast-mode";
 import { isSubagentModelInheritance } from "@shared/model-inheritance";
 import { formatTokensPerSecond } from "@shared/pretext-layout/turn-usage";
 import type { SubagentModelPools } from "@shared/subagent-model-policy";
@@ -617,11 +618,13 @@ function NarratorDetailsContent({
 
 	const formatBoolean = (value?: boolean | null) => (value ? t("details.on") : t("details.off"));
 
-	// Fast mode is a tri-state: "inherit" resolves against the user's default at
-	// request time, so report the effective value and note where it came from.
-	const formatFastMode = (override?: "inherit" | "on" | "off" | null) => {
+	// Show the saved override here; the toolbar indicates if Ultrafast can apply
+	// to the active model. Inherit follows the user's ordinary Fast Mode default.
+	const formatFastMode = (value?: FastModeOverride | null) => {
+		const override = normalizeFastModeOverride(value);
 		if (override === "on") return t("details.on");
 		if (override === "off") return t("details.off");
+		if (override === "ultrafast") return t("details.fastModeUltrafast");
 		const effective = userPrefs?.fastModeDefault ?? false;
 		return t("details.fastModeInherited", {
 			state: effective ? t("details.on") : t("details.off"),

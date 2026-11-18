@@ -82,6 +82,7 @@ import {
 	getContextThresholds,
 	getSettingsRevision,
 	isAnthropicProvider,
+	parseAggModelValue,
 	resolveDefaultReasoningEffort,
 	resolveEffectiveModel,
 	resolveProvider,
@@ -1917,20 +1918,20 @@ export async function runAgentLoopUnlocked(
 
 			const resolvedReasoningEffort = runReasoningEffort ?? active.reasoningEffort ?? undefined;
 
-			// Resolved per turn, not frozen at creation: an "inherit" override follows
-			// the acting user's fastModeDefault preference, so flipping that default
-			// takes effect on existing narrators from their next turn onward.
+			// Restrictions come from the same strict per-pass resolution as the ceiling.
+			runState.stopHooks = runtimePolicy.capabilities.stopHooks;
+			// Resolve ordinary Fast against the acting user's current preference. Ultrafast
+			// is explicit and rechecked against the actual connection before each send.
 			const resolvedFastMode = await resolveFastModeForUser(
 				freshNarrator.fastModeOverride,
 				actingUserId,
 			);
-
-			// Restrictions come from the same strict per-pass resolution as the ceiling.
-			runState.stopHooks = runtimePolicy.capabilities.stopHooks;
-			const resolvedServiceTier =
-				resolvedFastMode && usesCodexModel(resolved.provider, resolved.model)
-					? "priority"
-					: undefined;
+			let resolvedServiceTier: "ultrafast" | "priority" | undefined;
+			if (freshNarrator.fastModeOverride === "ultrafast") {
+				resolvedServiceTier = "ultrafast";
+			} else if (resolvedFastMode && usesCodexModel(resolved.provider, resolved.model)) {
+				resolvedServiceTier = "priority";
+			}
 
 			const resetUpstreamSessionForThisLoop = active._resetUpstreamSessionOnNextRequest === true;
 			active._resetUpstreamSessionOnNextRequest = false;
@@ -2080,6 +2081,14 @@ export async function runAgentLoopUnlocked(
 				knowledgeInjectionCompactSeq: cycleSeq,
 				reasoningEffort: resolvedReasoningEffort,
 				serviceTier: resolvedServiceTier,
+				getUltrafastModel: () => {
+					const selected = active._modelRef?.trim();
+					const reference =
+						!selected || selected === FOLLOW_DEFAULT_MODEL
+							? settings.agent.defaultModel?.trim()
+							: selected;
+					return parseAggModelValue(reference)?.pinnedModel ?? reference;
+				},
 				maxTransientRetries: getMaxTransientRetries(),
 				silentToolCallThreshold: getSilentToolCallThreshold(),
 				maxToolCallsPerResponse: settings.agent.maxToolCallsPerResponse,

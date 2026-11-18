@@ -14,11 +14,12 @@
  * - `narrator_tool_calls` are intentionally not copied (tool_use blocks remain in contentJson).
  * - `aclRootNarratorId = null` — primary narrators are judged on their own columns.
  */
+
+import { normalizeFastModeOverride } from "@shared/fast-mode";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { asc, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessageRefs, narratorMessages, narrators } from "../db/schema";
-import { normalizeBooleanOverride } from "../lib/boolean-override";
 import { measureSummaryCharacters, queueContextCharacterRefresh } from "../lib/context-characters";
 import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
@@ -203,7 +204,7 @@ export async function extractSubagentToPrimary(
 							// Do not inherit explore/plan readOnly lockdown.
 							permissionMode: "default",
 							reasoningEffort: source.reasoningEffort ?? null,
-							fastModeOverride: normalizeBooleanOverride(source.fastModeOverride),
+							fastModeOverride: normalizeFastModeOverride(source.fastModeOverride),
 							fastMode: legacyFastModeMirror(source.fastModeOverride),
 							relaxedPlan: resolveInitialRelaxedPlan({
 								permissionMode: "default",

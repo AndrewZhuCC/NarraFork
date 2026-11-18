@@ -111,6 +111,21 @@ describe("stripUnsupportedParameter", () => {
 });
 
 describe("withUnsupportedParameterFallback", () => {
+	test("does not silently retry an explicit Ultrafast request as Standard", async () => {
+		const error = new ApiError(400, "Unsupported parameter: service_tier");
+		// An earlier ordinary Fast request may already have caused this field to be omitted.
+		const fast = { service_tier: "priority" };
+		expect(stripUnsupportedParameter(fast, model, error)).toBe(true);
+		const attempts: unknown[] = [];
+		await expect(
+			withUnsupportedParameterFallback(model, { service_tier: "ultrafast" }, async (body) => {
+				attempts.push(body.service_tier);
+				throw error;
+			}),
+		).rejects.toThrow("Unsupported parameter: service_tier");
+		expect(attempts).toEqual(["ultrafast"]);
+	});
+
 	test("retries without the rejected field and succeeds", async () => {
 		const seen: Array<Record<string, unknown>> = [];
 		const result = await withUnsupportedParameterFallback(

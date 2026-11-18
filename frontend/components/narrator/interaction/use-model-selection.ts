@@ -1,3 +1,4 @@
+import { supportsCodexUltrafast } from "@shared/fast-mode";
 import type { ModelCard } from "@shared/model-catalog/card";
 import { modelProfile } from "@shared/model-catalog/profile";
 import {
@@ -14,7 +15,12 @@ import {
 	type ReasoningEffortBlocklistEntry,
 } from "@shared/reasoning-effort-support";
 import { useCallback, useMemo } from "react";
-import type { ModelOption } from "../../../lib/constants";
+import {
+	AGG_MODEL_PREFIX,
+	FOLLOW_DEFAULT_MODEL,
+	type ModelOption,
+	parseAggModelValue,
+} from "../../../lib/constants";
 
 /**
  * Reasoning tiers a resolved catalog card declares, ascending, never `none`. A card that
@@ -230,6 +236,7 @@ export interface ModelSelectionSettings {
 	agent?: {
 		reasoningEffortBlocklist?: readonly ReasoningEffortBlocklistEntry[] | null;
 		defaultReasoningEffort?: string;
+		codexUltrafastModels?: readonly string[];
 	};
 }
 
@@ -272,6 +279,32 @@ export function resolveCodexControls(
 		supportsCodexControls:
 			isCodexChannelModel || (!!providerPrefix && codexCapableProviders.has(providerPrefix)),
 	};
+}
+
+/** Only a fixed route can promise the allowlisted connection, not a display candidate. */
+export function resolveUltrafastSupport({
+	modelReference,
+	defaultModelValue,
+	resolvedModel,
+	supportsCodexControls,
+	allowedModels,
+}: {
+	modelReference: string | null | undefined;
+	defaultModelValue: string | undefined;
+	resolvedModel: string;
+	supportsCodexControls: boolean;
+	allowedModels: readonly string[] | undefined;
+}): boolean {
+	const selected = modelReference?.trim();
+	const reference =
+		!selected || selected === FOLLOW_DEFAULT_MODEL ? defaultModelValue?.trim() : selected;
+	const fixed = parseAggModelValue(reference)?.pinnedModel ?? reference;
+	return (
+		supportsCodexControls &&
+		fixed === resolvedModel &&
+		!resolvedModel.startsWith(AGG_MODEL_PREFIX) &&
+		supportsCodexUltrafast(resolvedModel, allowedModels)
+	);
 }
 
 /**

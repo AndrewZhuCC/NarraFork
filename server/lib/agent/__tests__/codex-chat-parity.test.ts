@@ -128,6 +128,16 @@ async function captureChat(
 	return { ...captured, websocketBody };
 }
 
+test.each([
+	"http",
+	"ws",
+] as const)("Ultrafast changes only service_tier on Codex %s", async (transport) => {
+	const { body: fast } = await captureChat({ serviceTier: "priority" }, "codex", transport);
+	const { body: ultrafast } = await captureChat({ serviceTier: "ultrafast" }, "codex", transport);
+	expect(fast.service_tier).toBe("priority");
+	expect(ultrafast).toEqual({ ...fast, service_tier: "ultrafast" });
+});
+
 describe("codex HTTP chat request parity", () => {
 	test("sends the stable managed Codex client headers", async () => {
 		const req = await captureChat();

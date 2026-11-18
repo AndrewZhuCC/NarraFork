@@ -1,8 +1,16 @@
-import { ActionIcon, Box, Button, Group, Text, Tooltip } from "@mantine/core";
+import { ActionIcon, Box, Button, Group, Menu, Text, Tooltip } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { composerDocumentText, parseComposerDocument } from "@shared/composer-document";
+import type { FastModeOverride } from "@shared/fast-mode";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
-import { IconAdjustmentsHorizontal, IconBolt, IconFolder, IconPaperclip } from "@tabler/icons-react";
+import {
+	IconAdjustmentsHorizontal,
+	IconBolt,
+	IconCheck,
+	IconChevronDown,
+	IconFolder,
+	IconPaperclip,
+} from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
@@ -104,7 +112,7 @@ export function DashboardComposer() {
 	// `null` = never chosen on this device: follow the instance default directory.
 	const [chosenCwd, setChosenCwd] = useState<string | null>(prefs.cwd || null);
 	const [model, setModel] = useState(prefs.model || FOLLOW_DEFAULT_MODEL);
-	const [fastModeOverride, setFastModeOverride] = useState<"inherit" | "on" | "off">("inherit");
+	const [fastModeOverride, setFastModeOverride] = useState<FastModeOverride>("inherit");
 	const { data: userPreferences } = useUserPreferences();
 	const fastModeDefault = userPreferences?.fastModeDefault ?? false;
 	// Same "null = follow the instance default" rule for the create-time session
@@ -127,8 +135,19 @@ export function DashboardComposer() {
 		staleTime: 30_000,
 	});
 	const draftReasoning = useDraftReasoningEffort(model);
+	// Guard both the display and the create payload while the draft resets on a model change.
+	const availableFastModeOverride =
+		fastModeOverride === "ultrafast" && !draftReasoning.supportsUltrafast
+			? "inherit"
+			: fastModeOverride;
+	const ultrafastSelected = availableFastModeOverride === "ultrafast";
 	const fastModeEnabled =
-		fastModeOverride === "inherit" ? fastModeDefault : fastModeOverride === "on";
+		availableFastModeOverride === "inherit" ? fastModeDefault : availableFastModeOverride !== "off";
+	useEffect(() => {
+		if (!draftReasoning.supportsUltrafast) {
+			setFastModeOverride((value) => (value === "ultrafast" ? "inherit" : value));
+		}
+	}, [draftReasoning.supportsUltrafast]);
 	// Show what the created session will actually get: the user's choice clamped
 	// onto the selected model's tiers, or the instance default when untouched.
 	const reasoningEffort = reasoningEffortOverride
@@ -343,8 +362,8 @@ export function DashboardComposer() {
 					// instance defaults when the field is absent (a null reasoningEffort is
 					// exactly "follow the global default", re-clamped per model per turn).
 					...(reasoningEffortOverride ? { reasoningEffort: reasoningEffortOverride } : {}),
-					...(draftReasoning.supportsCodexControls && fastModeOverride !== "inherit"
-						? { fastModeOverride }
+					...(draftReasoning.supportsCodexControls && availableFastModeOverride !== "inherit"
+						? { fastModeOverride: availableFastModeOverride }
 						: {}),
 					// Sent when the menu's value is known, so what it shows is what the
 					// session gets; that value is the instance default until the user
@@ -406,6 +425,17 @@ export function DashboardComposer() {
 
 	const sending = sendingState != null;
 	const fastModeSettingsDisabled = sending || pendingSessionRef.current !== null;
+	const fastModeMenuOptions = [
+		{
+			value: "inherit",
+			label: tn("fast_mode_session_inherit", {
+				state: fastModeDefault ? tn("fast_mode_on") : tn("fast_mode_off"),
+			}),
+		},
+		{ value: "on", label: tn("fast_mode") },
+		{ value: "off", label: tn("fast_mode_off") },
+		{ value: "ultrafast", label: tn("fast_mode_ultrafast") },
+	] as const;
 
 	return (
 		<Box {...dropZoneProps}>
@@ -507,28 +537,64 @@ export function DashboardComposer() {
 					</Box>
 				)}
 				{draftReasoning.supportsCodexControls && (
-					<Tooltip
-						label={
-							fastModeOverride === "inherit"
-								? tn("fast_mode_inherit_tooltip", {
-										state: fastModeDefault ? tn("fast_mode_on") : tn("fast_mode_off"),
-									})
-								: tn("fast_mode_tooltip")
-						}
-					>
-						<Button
-							type="button"
-							size="xs"
-							variant={fastModeEnabled ? "light" : "default"}
-							color={fastModeEnabled ? "yellow" : undefined}
-							leftSection={<IconBolt size={14} />}
-							aria-pressed={fastModeEnabled}
-							disabled={fastModeSettingsDisabled}
-							onClick={() => setFastModeOverride(fastModeEnabled ? "off" : "on")}
+					<Group gap={2} wrap="nowrap">
+						<Tooltip
+							label={
+								availableFastModeOverride === "inherit"
+									? tn("fast_mode_inherit_tooltip", {
+											state: fastModeDefault ? tn("fast_mode_on") : tn("fast_mode_off"),
+										})
+									: ultrafastSelected
+										? tn("fast_mode_ultrafast_hint")
+										: tn("fast_mode_tooltip")
+							}
 						>
-							{tn("fast_mode")}
-						</Button>
-					</Tooltip>
+							<Button
+								type="button"
+								size="xs"
+								variant={fastModeEnabled ? "light" : "default"}
+								color={ultrafastSelected ? "orange" : fastModeEnabled ? "yellow" : undefined}
+								leftSection={<IconBolt size={14} />}
+								aria-pressed={fastModeEnabled}
+								disabled={fastModeSettingsDisabled}
+								onClick={() => setFastModeOverride(fastModeEnabled ? "off" : "on")}
+							>
+								{tn(ultrafastSelected ? "fast_mode_ultrafast" : "fast_mode")}
+							</Button>
+						</Tooltip>
+						{draftReasoning.supportsUltrafast && (
+							<Menu position="bottom-end" withinPortal>
+								<Menu.Target>
+									<ActionIcon
+										variant="subtle"
+										color="gray"
+										aria-label={tn("fast_mode_choose_tier")}
+										disabled={fastModeSettingsDisabled}
+									>
+										<IconChevronDown size={14} />
+									</ActionIcon>
+								</Menu.Target>
+								<Menu.Dropdown>
+									{fastModeMenuOptions.map(({ value, label }) => (
+										<Menu.Item
+											key={value}
+											aria-current={availableFastModeOverride === value}
+											aria-description={
+												value === "ultrafast" ? tn("fast_mode_ultrafast_hint") : undefined
+											}
+											leftSection={
+												availableFastModeOverride === value ? <IconCheck size={14} /> : null
+											}
+											disabled={fastModeSettingsDisabled}
+											onClick={() => setFastModeOverride(value)}
+										>
+											{label}
+										</Menu.Item>
+									))}
+								</Menu.Dropdown>
+							</Menu>
+						)}
+					</Group>
 				)}
 				<Box style={{ minWidth: 0 }}>
 					<PermissionModePickerMenu

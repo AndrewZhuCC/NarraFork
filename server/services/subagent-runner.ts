@@ -3,13 +3,14 @@
  * caller, and start it through the single run service. Nothing here executes,
  * controls or finalizes a run — `agent-runtime/run.ts` does that for every session.
  */
+
+import type { FastModeOverride } from "@shared/fast-mode";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import {
 	normalizeOptionalExecutionTimeout,
 	resolveOptionalExecutionTimeout,
 } from "../lib/agent/execution-timeout";
 import type { ToolCallBinding, ToolUpdateExecutionLease } from "../lib/agent/types";
-import type { BooleanOverride } from "../lib/boolean-override";
 import { ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
@@ -138,7 +139,7 @@ export interface RunSubagentInput {
 	timeoutMs?: number;
 	model?: string;
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
-	fastModeOverride?: BooleanOverride;
+	fastModeOverride?: FastModeOverride;
 	background?: boolean;
 	/** Launch non-blocking, with the result held for further user interaction. */
 	takeoverByUser?: boolean;

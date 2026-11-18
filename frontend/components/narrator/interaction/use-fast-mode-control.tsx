@@ -1,14 +1,15 @@
+import { type FastModeOverride, normalizeFastModeOverride } from "@shared/fast-mode";
 import type React from "react";
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { FastModeControl } from "./FastModeControl";
 
-type FastModeOverride = "inherit" | "on" | "off";
-
 export interface UseFastModeControlOptions {
 	narratorId: string;
 	/** Session-level override from the narrator ("inherit" follows the user default). */
 	narratorFastModeOverride: FastModeOverride | null | undefined;
+	supportsCodexControls: boolean;
+	supportsUltrafast: boolean;
 	/** User-level default fast-mode state (what "inherit" resolves to). */
 	fastModeDefault: boolean;
 	/** Coarse-pointer / mobile viewports open settings by long-press, not hover. */
@@ -41,6 +42,8 @@ export function useFastModeControl(options: UseFastModeControlOptions): UseFastM
 	const {
 		narratorId,
 		narratorFastModeOverride,
+		supportsCodexControls,
+		supportsUltrafast,
 		fastModeDefault,
 		fastModeUsesTapSettings,
 		fastModeMutation,
@@ -48,11 +51,14 @@ export function useFastModeControl(options: UseFastModeControlOptions): UseFastM
 		t,
 	} = options;
 
-	// "inherit" follows the default, so the default switch also changes what this
-	// session actually does — matching the server-side per-turn resolution.
-	const fastModeOverride: FastModeOverride = narratorFastModeOverride ?? "inherit";
+	const fastModeOverride = normalizeFastModeOverride(narratorFastModeOverride);
+	// An unsupported Ultrafast override falls back to Standard, not the user default.
 	const fastModeEnabled =
-		fastModeOverride === "inherit" ? fastModeDefault : fastModeOverride === "on";
+		fastModeOverride === "ultrafast"
+			? supportsUltrafast
+			: fastModeOverride === "inherit"
+				? fastModeDefault
+				: fastModeOverride === "on";
 
 	const [fastModeSettingsOpened, setFastModeSettingsOpened] = useState(false);
 	const fastModeSettingsCloseTimerRef = useRef<number | null>(null);
@@ -114,28 +120,36 @@ export function useFastModeControl(options: UseFastModeControlOptions): UseFastM
 	}, [clearFastModeLongPressTimer, clearFastModeSettingsCloseTimer]);
 
 	const renderFastModeControl = useCallback(
-		(position: "top-end" | "bottom-end") => (
-			<FastModeControl
-				position={position}
-				fastModeOverride={fastModeOverride}
-				fastModeDefault={fastModeDefault}
-				fastModeEnabled={fastModeEnabled}
-				fastModeUsesTapSettings={fastModeUsesTapSettings}
-				settingsOpened={fastModeSettingsOpened}
-				setSettingsOpened={setFastModeSettingsOpened}
-				openSettings={openFastModeSettings}
-				closeSettings={closeFastModeSettings}
-				scheduleSettingsClose={scheduleFastModeSettingsClose}
-				startLongPress={startFastModeLongPress}
-				clearLongPressTimer={clearFastModeLongPressTimer}
-				longPressFiredRef={fastModeLongPressFiredRef}
-				narratorId={narratorId}
-				fastModeMutation={fastModeMutation}
-				updateUserPrefs={updateUserPrefs}
-				t={t}
-			/>
-		),
+		(position: "top-end" | "bottom-end") => {
+			// Keep a way to clear an existing Ultrafast override after switching away from Codex.
+			if (!supportsCodexControls && fastModeOverride !== "ultrafast") return null;
+			return (
+				<FastModeControl
+					position={position}
+					fastModeOverride={fastModeOverride}
+					fastModeDefault={fastModeDefault}
+					fastModeEnabled={fastModeEnabled}
+					supportsCodexControls={supportsCodexControls}
+					supportsUltrafast={supportsUltrafast}
+					fastModeUsesTapSettings={fastModeUsesTapSettings}
+					settingsOpened={fastModeSettingsOpened}
+					setSettingsOpened={setFastModeSettingsOpened}
+					openSettings={openFastModeSettings}
+					closeSettings={closeFastModeSettings}
+					scheduleSettingsClose={scheduleFastModeSettingsClose}
+					startLongPress={startFastModeLongPress}
+					clearLongPressTimer={clearFastModeLongPressTimer}
+					longPressFiredRef={fastModeLongPressFiredRef}
+					narratorId={narratorId}
+					fastModeMutation={fastModeMutation}
+					updateUserPrefs={updateUserPrefs}
+					t={t}
+				/>
+			);
+		},
 		[
+			supportsCodexControls,
+			supportsUltrafast,
 			fastModeOverride,
 			fastModeDefault,
 			fastModeEnabled,

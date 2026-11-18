@@ -1,33 +1,30 @@
-import { type BooleanOverride, normalizeBooleanOverride } from "./boolean-override";
+import { type FastModeOverride, normalizeFastModeOverride } from "@shared/fast-mode";
 
 /**
- * Fast mode (priority service tier) resolution.
- *
- * `narrators.fastModeOverride` is the source of truth: "inherit" follows the
- * per-user `fastModeDefault` preference at request time, so changing that
- * preference immediately affects every narrator that never opted in or out
- * explicitly. "on"/"off" pin the session regardless of the default.
+ * Compatibility view of the narrator's speed setting for boolean clients.
+ * "inherit" follows the user's ordinary Fast default. "on", "off" and
+ * "ultrafast" are explicit overrides; Ultrafast eligibility is checked at send time.
  *
  * The legacy `narrators.fastMode` boolean is only kept as a mirror of the
  * explicit override (see `legacyFastModeMirror`) for older readers of the same
  * database and for project-DB exports.
  */
 export function resolveFastMode(override: unknown, userDefault: boolean): boolean {
-	const normalized = normalizeBooleanOverride(override);
+	const normalized = normalizeFastModeOverride(override);
 	if (normalized === "inherit") return userDefault;
-	return normalized === "on";
+	return normalized === "on" || normalized === "ultrafast";
 }
 
 /** Deprecated-column mirror: only an explicit "on" is recorded as enabled. */
 export function legacyFastModeMirror(override: unknown): boolean {
-	return normalizeBooleanOverride(override) === "on";
+	return normalizeFastModeOverride(override) === "on";
 }
 
-/** Coerce a legacy boolean `fastMode` input into the tri-state override. */
+/** Coerce a legacy boolean `fastMode` input into the session override. */
 export function fastModeOverrideFromLegacyInput(
-	override: BooleanOverride | undefined,
+	override: FastModeOverride | undefined,
 	legacy: boolean | undefined,
-): BooleanOverride {
+): FastModeOverride {
 	if (override) return override;
 	if (legacy === undefined) return "inherit";
 	return legacy ? "on" : "off";
@@ -91,8 +88,8 @@ export async function resolveFastModeForUser(
 	override: unknown,
 	userId: string | null | undefined,
 ): Promise<boolean> {
-	const normalized = normalizeBooleanOverride(override);
+	const normalized = normalizeFastModeOverride(override);
 	// Skip the preference lookup entirely when the session is pinned.
-	if (normalized !== "inherit") return normalized === "on";
+	if (normalized !== "inherit") return resolveFastMode(normalized, false);
 	return getUserFastModeDefault(userId);
 }

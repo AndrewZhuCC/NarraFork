@@ -4,6 +4,11 @@ import { resolve } from "node:path";
 import type { PendingAgentMessagesPage } from "@shared/agent-inbox";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import { type ComposerDocument, composerQuoteBlock } from "@shared/composer-document";
+import {
+	FAST_MODE_OVERRIDE_VALUES,
+	isFastModeOverride,
+	normalizeFastModeOverride,
+} from "@shared/fast-mode";
 import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 import {
 	type FileReference,
@@ -2918,7 +2923,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 				systemPrompt: narrator.systemPrompt ?? undefined,
 				permissionMode: narrator.permissionMode ?? undefined,
 				reasoningEffort: narrator.reasoningEffort ?? undefined,
-				fastModeOverride: normalizeBooleanOverride(narrator.fastModeOverride),
+				fastModeOverride: normalizeFastModeOverride(narrator.fastModeOverride),
 				relaxedPlan: narrator.relaxedPlan ?? undefined,
 				planReflectionAutoApproveOverride: normalizeBooleanOverride(
 					narrator.planReflectionAutoApproveOverride,
@@ -5669,7 +5674,7 @@ narratorRoutes.patch("/:id/reasoning-effort", async (c) => {
 	return c.json({ ok: true });
 });
 
-// Update fast mode (tri-state override; a legacy boolean is still accepted)
+// Update fast mode (session override; a legacy boolean is still accepted)
 narratorRoutes.patch("/:id/fast-mode", async (c) => {
 	const id = c.req.param("id");
 	const body = (await c.req.json()) as unknown;
@@ -5677,13 +5682,16 @@ narratorRoutes.patch("/:id/fast-mode", async (c) => {
 		throw new ValidationError("Request body must be an object");
 	}
 	const input = body as { fastModeOverride?: unknown; fastMode?: unknown };
-	let override: BooleanOverride;
-	if (Object.hasOwn(input, "fastModeOverride")) {
-		override = parseBooleanOverride(input.fastModeOverride, "fastModeOverride");
-	} else if (typeof input.fastMode === "boolean") {
-		override = input.fastMode ? "on" : "off";
-	} else {
-		throw new ValidationError("fastModeOverride must be one of: inherit, on, off");
+	const override =
+		!Object.hasOwn(input, "fastModeOverride") && typeof input.fastMode === "boolean"
+			? input.fastMode
+				? "on"
+				: "off"
+			: input.fastModeOverride;
+	if (!isFastModeOverride(override)) {
+		throw new ValidationError(
+			`fastModeOverride must be one of: ${FAST_MODE_OVERRIDE_VALUES.join(", ")}`,
+		);
 	}
 	await narratorService.getById(id); // ensure exists
 	await narratorService.updateFastModeOverride(id, override);

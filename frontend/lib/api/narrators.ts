@@ -8,6 +8,7 @@ import type { PendingAgentMessagesPage } from "@shared/agent-inbox";
 import type { BackgroundTaskListPage } from "@shared/background-task-list";
 import type { CodexComposerSuggestion } from "@shared/codex-composer";
 import type { ComposerDocument } from "@shared/composer-document";
+import type { FastModeOverride } from "@shared/fast-mode";
 import type {
 	FileChangeEvidenceUncertaintyWarning,
 	FileChangeRevertAction,
@@ -1041,7 +1042,7 @@ export const narratorsApi = {
 		permissionMode?: string;
 		startInPlanMode?: boolean;
 		reasoningEffort?: string | null;
-		fastModeOverride?: "inherit" | "on" | "off";
+		fastModeOverride?: FastModeOverride;
 		relaxedPlan?: boolean;
 		planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 		dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
@@ -1844,8 +1845,8 @@ export const narratorsApi = {
 			method: "PATCH",
 			body: JSON.stringify({ reasoningEffort }),
 		}),
-	updateNarratorFastMode: (id: string, fastModeOverride: "inherit" | "on" | "off") =>
-		request<{ ok: boolean; fastModeOverride: "inherit" | "on" | "off"; fastMode: boolean }>(
+	updateNarratorFastMode: (id: string, fastModeOverride: FastModeOverride) =>
+		request<{ ok: boolean; fastModeOverride: FastModeOverride; fastMode: boolean }>(
 			`/narrators/${id}/fast-mode`,
 			{
 				method: "PATCH",

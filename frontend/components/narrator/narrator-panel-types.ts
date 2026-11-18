@@ -1,3 +1,4 @@
+import type { FastModeOverride } from "@shared/fast-mode";
 import {
 	IconEye,
 	IconHandStop,
@@ -128,7 +129,7 @@ export interface NarratorPanelSnapshot {
 	substatus?: string[] | string | null;
 	reasoningEffort?: string | null;
 	fastMode?: boolean;
-	fastModeOverride?: "inherit" | "on" | "off";
+	fastModeOverride?: FastModeOverride;
 	turnStartedAt?: string | null;
 }
 

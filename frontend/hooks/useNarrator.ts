@@ -1,5 +1,6 @@
 import { publishAskInPassingEvent } from "@frontend/lib/ask-in-passing-events";
 import { notifications } from "@mantine/notifications";
+import type { FastModeOverride } from "@shared/fast-mode";
 import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 import type { SubagentModelPools } from "@shared/subagent-model-policy";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -779,7 +780,7 @@ export function useCreateNarrator() {
 			permissionMode?: string;
 			startInPlanMode?: boolean;
 			reasoningEffort?: string | null;
-			fastModeOverride?: "inherit" | "on" | "off";
+			fastModeOverride?: FastModeOverride;
 			relaxedPlan?: boolean;
 			planReflectionAutoApproveOverride?: "inherit" | "on" | "off";
 			dangerReflectionOverride?: "inherit" | "on" | "off" | "light" | "standard" | "strict";
@@ -1124,13 +1125,8 @@ export function useUpdateReasoningEffort() {
 export function useUpdateFastMode() {
 	const qc = useQueryClient();
 	return useMutation({
-		mutationFn: ({
-			id,
-			fastModeOverride,
-		}: {
-			id: string;
-			fastModeOverride: "inherit" | "on" | "off";
-		}) => api.updateNarratorFastMode(id, fastModeOverride),
+		mutationFn: ({ id, fastModeOverride }: { id: string; fastModeOverride: FastModeOverride }) =>
+			api.updateNarratorFastMode(id, fastModeOverride),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
 		},

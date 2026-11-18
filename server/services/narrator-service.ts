@@ -1,6 +1,7 @@
 import { existsSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
+import { type FastModeOverride, normalizeFastModeOverride } from "@shared/fast-mode";
 import {
 	type MediaContentBlock,
 	type MediaRef,
@@ -53,11 +54,10 @@ import {
 import { SETUP_KIND_PRELOAD_TOOLS, SETUP_KIND_TRAIT } from "../lib/agent/tools/setup-kind";
 import { narratorHandleLock, narratorTraitsLock } from "../lib/async-mutex";
 import { buildAttachedFilesHint } from "../lib/attached-files";
-import {
-	type AutoContinuationOverride,
-	type BooleanOverride,
-	type DangerReflectionOverride,
-	normalizeBooleanOverride,
+import type {
+	AutoContinuationOverride,
+	BooleanOverride,
+	DangerReflectionOverride,
 } from "../lib/boolean-override";
 import {
 	measureMessageCharacters,
@@ -370,8 +370,8 @@ export interface CreateNarratorInput {
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null;
 	/** @deprecated Legacy boolean; coerced into `fastModeOverride` ("on"/"off"). */
 	fastMode?: boolean;
-	/** Tri-state priority-tier override. "inherit" follows the user's fastModeDefault. */
-	fastModeOverride?: BooleanOverride;
+	/** Session speed override. "inherit" follows the user's ordinary Fast default. */
+	fastModeOverride?: FastModeOverride;
 	relaxedPlan?: boolean;
 	planReflectionAutoApproveOverride?: BooleanOverride;
 	dangerReflectionOverride?: DangerReflectionOverride;
@@ -442,7 +442,7 @@ interface CreateSubagentInput {
 	questionReflectionOverride?: BooleanOverride;
 	model?: string;
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null;
-	fastModeOverride?: BooleanOverride;
+	fastModeOverride?: FastModeOverride;
 	systemPrompt?: string;
 	/** Compiled template ceiling; compiled from `subagentType` when omitted. */
 	runtimePolicy?: RuntimePolicyTrait;
@@ -1806,8 +1806,9 @@ export const narratorService = {
 			const resolvedReasoningEffort =
 				input.reasoningEffort ??
 				(storedModel === FOLLOW_PARENT_MODEL ? null : (parent.reasoningEffort ?? null));
-			const fastModeOverride = normalizeBooleanOverride(
-				input.fastModeOverride ?? parent.fastModeOverride,
+			const fastModeOverride = normalizeFastModeOverride(
+				input.fastModeOverride ??
+					(parent.fastModeOverride === "ultrafast" ? "off" : parent.fastModeOverride),
 			);
 
 			// The template is compiled into an ordinary ceiling trait; the parent's own
@@ -2591,7 +2592,7 @@ export const narratorService = {
 								contextToolsChars: parent.contextToolsChars,
 								permissionMode: resolvedPermMode,
 								reasoningEffort: parent.reasoningEffort ?? null,
-								fastModeOverride: normalizeBooleanOverride(parent.fastModeOverride),
+								fastModeOverride: normalizeFastModeOverride(parent.fastModeOverride),
 								fastMode: legacyFastModeMirror(parent.fastModeOverride),
 								relaxedPlan: resolveInitialRelaxedPlan({
 									permissionMode: resolvedPermMode,
@@ -2799,7 +2800,7 @@ export const narratorService = {
 								systemPrompt,
 								permissionMode: resolvedPermMode,
 								reasoningEffort: resolvedReasoningEffort,
-								fastModeOverride: normalizeBooleanOverride(parent.fastModeOverride),
+								fastModeOverride: normalizeFastModeOverride(parent.fastModeOverride),
 								fastMode: legacyFastModeMirror(parent.fastModeOverride),
 								relaxedPlan: resolveInitialRelaxedPlan({
 									permissionMode: resolvedPermMode,

@@ -844,6 +844,8 @@ export interface NarraForkSettings {
 		 * substring match on the bare model id; `/regex/flags` is a regex.
 		 */
 		reasoningEffortBlocklist?: Array<{ pattern: string; enabled?: boolean }>;
+		/** Concrete provider:model routes the administrator has opted in to Codex Ultrafast. */
+		codexUltrafastModels?: string[];
 		/**
 		 * Models that enable the task-aware reasoning-mode routing.
 		 *

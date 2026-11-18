@@ -117,6 +117,7 @@ export interface InstanceSettingsState {
 	autoCompactKeepPairs: number;
 	queueDuringCompaction: boolean;
 	agentDefaultReasoningEffort: string;
+	codexUltrafastModels: string[];
 	/** Models excluded from receiving a reasoning-effort hint. */
 	reasoningEffortBlocklist: Array<{ pattern: string; enabled?: boolean }>;
 	/** Models that enable task-aware reasoning-mode routing (whitelist; empty = disabled). */
@@ -292,6 +293,7 @@ function makeDefaults(): InstanceSettingsState {
 		autoCompactKeepPairs: 2,
 		queueDuringCompaction: true,
 		agentDefaultReasoningEffort: "",
+		codexUltrafastModels: [],
 		reasoningEffortBlocklist: [],
 		routerModels: [],
 		globalWhitelistDirs: [],
@@ -398,6 +400,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				autoCompactKeepPairs: settings.agent?.autoCompactKeepPairs ?? 2,
 				queueDuringCompaction: settings.agent?.queueDuringCompaction ?? true,
 				agentDefaultReasoningEffort: settings.agent?.defaultReasoningEffort ?? "",
+				codexUltrafastModels: settings.agent?.codexUltrafastModels ?? [],
 				reasoningEffortBlocklist: settings.agent?.reasoningEffortBlocklist ?? [],
 				routerModels: settings.agent?.routerModels ?? [],
 				globalWhitelistDirs: normalizeSharedRules<DirectoryWhitelistRuleInput>(
@@ -520,6 +523,11 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 						| "xhigh"
 						| "max"
 						| "",
+					// Omit an unchanged allowlist, but send [] when the admin clears it.
+					...(JSON.stringify(state.codexUltrafastModels) !==
+					JSON.stringify(serverSnapshot.current.codexUltrafastModels)
+						? { codexUltrafastModels: state.codexUltrafastModels }
+						: {}),
 					// Blank patterns are dropped so an empty row left in the editor
 					// cannot become a rule that matches every model.
 					reasoningEffortBlocklist: state.reasoningEffortBlocklist.filter((r) => r.pattern.trim()),

@@ -7,6 +7,7 @@ import {
 	resolveCodexCapableProviders,
 	resolveCodexControls,
 	resolveReasoningEffortSupport,
+	resolveUltrafastSupport,
 } from "../interaction/use-model-selection";
 import { useResolvedModel } from "../interaction/use-resolved-model";
 
@@ -16,6 +17,7 @@ export interface DraftReasoningEffort {
 	/** Tiers the model accepts, ascending. */
 	options: readonly ReasoningEffort[];
 	supportsCodexControls: boolean;
+	supportsUltrafast: boolean;
 	/**
 	 * The tier a new session actually gets when the composer sends no explicit
 	 * override: the instance default, clamped onto this model's tiers. Showing the
@@ -73,6 +75,21 @@ export function useDraftReasoningEffort(model: string): DraftReasoningEffort {
 			options: support.reasoningEffortOptions,
 			defaultEffort: clampReasoningEffort(desired, support.reasoningEffortOptions),
 			supportsCodexControls,
+			supportsUltrafast: resolveUltrafastSupport({
+				modelReference: model,
+				defaultModelValue,
+				resolvedModel,
+				supportsCodexControls,
+				allowedModels: settings?.agent?.codexUltrafastModels,
+			}),
 		};
-	}, [modelCard, resolvedBareModel, resolvedModel, resolvedModelOption, settings]);
+	}, [
+		defaultModelValue,
+		model,
+		modelCard,
+		resolvedBareModel,
+		resolvedModel,
+		resolvedModelOption,
+		settings,
+	]);
 }

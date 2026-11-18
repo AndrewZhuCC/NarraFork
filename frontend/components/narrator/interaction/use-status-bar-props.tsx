@@ -1,11 +1,13 @@
+import type { FastModeOverride } from "@shared/fast-mode";
 import type { ModelCard } from "@shared/model-catalog/card";
 import type { TFunction } from "i18next";
 import type React from "react";
 import { FOLLOW_PARENT_MODEL, type ModelOption } from "../../../lib/constants";
 import type { NarratorInteractionStatusBarProps } from "./NarratorInteractionStatusBar";
 import { useFastModeControl } from "./use-fast-mode-control";
-import { useModelSelection } from "./use-model-selection";
+import { resolveUltrafastSupport, useModelSelection } from "./use-model-selection";
 import { usePermissionModeControl } from "./use-permission-mode-control";
+import { capabilityModelReference } from "./use-resolved-model";
 
 /**
  * Assembles the {@link NarratorInteractionStatusBar} props from raw inputs,
@@ -61,7 +63,7 @@ export interface UseStatusBarPropsOptions {
 	updateSettingsMutation: any;
 
 	// fast mode
-	narratorFastModeOverride: "inherit" | "on" | "off" | null | undefined;
+	narratorFastModeOverride: FastModeOverride | null | undefined;
 	fastModeDefault: boolean;
 	fastModeUsesTapSettings: boolean;
 	// biome-ignore lint/suspicious/noExplicitAny: mutation passthrough.
@@ -123,6 +125,17 @@ export function useStatusBarProps(
 	const { renderFastModeControl } = useFastModeControl({
 		narratorId: options.narratorId,
 		narratorFastModeOverride: options.narratorFastModeOverride,
+		supportsCodexControls: modelSelection.supportsCodexControls,
+		supportsUltrafast: resolveUltrafastSupport({
+			modelReference: capabilityModelReference(
+				options.narrator.model,
+				options.narrator.modelInheritance?.model,
+			),
+			defaultModelValue: options.model.defaultModelValue,
+			resolvedModel: options.resolvedModel,
+			supportsCodexControls: modelSelection.supportsCodexControls,
+			allowedModels: options.settingsData?.agent?.codexUltrafastModels,
+		}),
 		fastModeDefault: options.fastModeDefault,
 		fastModeUsesTapSettings: options.fastModeUsesTapSettings,
 		fastModeMutation: options.fastModeMutation,
@@ -218,7 +231,6 @@ export function useStatusBarProps(
 			reflectionSettingsDisabled: options.reflectionSettingsDisabled,
 		},
 		codexControls: {
-			supportsCodexControls: modelSelection.supportsCodexControls,
 			isBuiltInCodexModel: modelSelection.isBuiltInCodexModel,
 			renderFastModeControl,
 		},

@@ -81,6 +81,8 @@ export function stripUnsupportedParameter(
 ): boolean {
 	const parameter = unsupportedParameterFromError(err);
 	if (!parameter || !OPTIONAL_RETRY_PARAMETERS.has(parameter) || !(parameter in body)) return false;
+	// An explicit Ultrafast request must not appear to succeed as Standard after a relay rejects it.
+	if (parameter === "service_tier" && body.service_tier === "ultrafast") return false;
 	delete body[parameter];
 	rememberUnsupportedParameter(model, parameter);
 	logger.warn("Endpoint rejected a request parameter; stripping it for retry", {
@@ -99,6 +101,7 @@ export function omitUnsupportedParameters(body: Record<string, unknown>, model: 
 	const set = unsupportedParametersByModel.get(model);
 	if (!set) return;
 	for (const parameter of set) {
+		if (parameter === "service_tier" && body.service_tier === "ultrafast") continue;
 		if (parameter in body) delete body[parameter];
 	}
 }
