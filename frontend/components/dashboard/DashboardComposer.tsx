@@ -2,7 +2,7 @@ import { ActionIcon, Box, Button, Group, Text, Tooltip } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { composerDocumentText, parseComposerDocument } from "@shared/composer-document";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
-import { IconAdjustmentsHorizontal, IconFolder, IconPaperclip } from "@tabler/icons-react";
+import { IconAdjustmentsHorizontal, IconBolt, IconFolder, IconPaperclip } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
@@ -15,6 +15,7 @@ import {
 } from "../../hooks/usePlatform";
 import { useProjectDirStatus } from "../../hooks/useProjectDirStatus";
 import { addRecentTab } from "../../hooks/useRecentTabs";
+import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api, isAbortError } from "../../lib/api";
 import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
 import {
@@ -103,6 +104,9 @@ export function DashboardComposer() {
 	// `null` = never chosen on this device: follow the instance default directory.
 	const [chosenCwd, setChosenCwd] = useState<string | null>(prefs.cwd || null);
 	const [model, setModel] = useState(prefs.model || FOLLOW_DEFAULT_MODEL);
+	const [fastModeOverride, setFastModeOverride] = useState<"inherit" | "on" | "off">("inherit");
+	const { data: userPreferences } = useUserPreferences();
+	const fastModeDefault = userPreferences?.fastModeDefault ?? false;
 	// Same "null = follow the instance default" rule for the create-time session
 	// options, so an untouched composer behaves exactly like a session created
 	// without them (the server then applies its own defaults).
@@ -123,6 +127,8 @@ export function DashboardComposer() {
 		staleTime: 30_000,
 	});
 	const draftReasoning = useDraftReasoningEffort(model);
+	const fastModeEnabled =
+		fastModeOverride === "inherit" ? fastModeDefault : fastModeOverride === "on";
 	// Show what the created session will actually get: the user's choice clamped
 	// onto the selected model's tiers, or the instance default when untouched.
 	const reasoningEffort = reasoningEffortOverride
@@ -337,6 +343,9 @@ export function DashboardComposer() {
 					// instance defaults when the field is absent (a null reasoningEffort is
 					// exactly "follow the global default", re-clamped per model per turn).
 					...(reasoningEffortOverride ? { reasoningEffort: reasoningEffortOverride } : {}),
+					...(draftReasoning.supportsCodexControls && fastModeOverride !== "inherit"
+						? { fastModeOverride }
+						: {}),
 					// Sent when the menu's value is known, so what it shows is what the
 					// session gets; that value is the instance default until the user
 					// touches it. Before settings land, omitting lets the server decide
@@ -375,6 +384,7 @@ export function DashboardComposer() {
 			composer.clearTextAndDraft();
 			clearAttachedFilesAndDraft();
 			pendingSessionRef.current = null;
+			setFastModeOverride("inherit");
 			openSession(session);
 		} catch (error) {
 			if (isAbortError(error)) {
@@ -395,6 +405,7 @@ export function DashboardComposer() {
 	};
 
 	const sending = sendingState != null;
+	const fastModeSettingsDisabled = sending || pendingSessionRef.current !== null;
 
 	return (
 		<Box {...dropZoneProps}>
@@ -494,6 +505,30 @@ export function DashboardComposer() {
 							onFollowDefault={reasoningEffortOverride ? followDefaultReasoningEffort : undefined}
 						/>
 					</Box>
+				)}
+				{draftReasoning.supportsCodexControls && (
+					<Tooltip
+						label={
+							fastModeOverride === "inherit"
+								? tn("fast_mode_inherit_tooltip", {
+										state: fastModeDefault ? tn("fast_mode_on") : tn("fast_mode_off"),
+									})
+								: tn("fast_mode_tooltip")
+						}
+					>
+						<Button
+							type="button"
+							size="xs"
+							variant={fastModeEnabled ? "light" : "default"}
+							color={fastModeEnabled ? "yellow" : undefined}
+							leftSection={<IconBolt size={14} />}
+							aria-pressed={fastModeEnabled}
+							disabled={fastModeSettingsDisabled}
+							onClick={() => setFastModeOverride(fastModeEnabled ? "off" : "on")}
+						>
+							{tn("fast_mode")}
+						</Button>
+					</Tooltip>
 				)}
 				<Box style={{ minWidth: 0 }}>
 					<PermissionModePickerMenu

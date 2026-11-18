@@ -5,6 +5,7 @@ import { useAllModels } from "../../../hooks/useModels";
 import {
 	type ModelSelectionSettings,
 	resolveCodexCapableProviders,
+	resolveCodexControls,
 	resolveReasoningEffortSupport,
 } from "../interaction/use-model-selection";
 import { useResolvedModel } from "../interaction/use-resolved-model";
@@ -14,6 +15,7 @@ export interface DraftReasoningEffort {
 	supported: boolean;
 	/** Tiers the model accepts, ascending. */
 	options: readonly ReasoningEffort[];
+	supportsCodexControls: boolean;
 	/**
 	 * The tier a new session actually gets when the composer sends no explicit
 	 * override: the instance default, clamped onto this model's tiers. Showing the
@@ -48,13 +50,20 @@ export function useDraftReasoningEffort(model: string): DraftReasoningEffort {
 	const settings = settingsData as ModelSelectionSettings | undefined;
 
 	return useMemo(() => {
+		const codexCapableProviders = resolveCodexCapableProviders(settings);
+		const { supportsCodexControls } = resolveCodexControls(
+			resolvedModel,
+			resolvedBareModel,
+			resolvedModelOption,
+			codexCapableProviders,
+		);
 		const support = resolveReasoningEffortSupport({
 			resolvedModel,
 			resolvedBareModel,
 			resolvedModelOption,
 			settingsData: settings,
 			modelCard,
-			codexCapableProviders: resolveCodexCapableProviders(settings),
+			codexCapableProviders,
 		});
 		const desired =
 			(settings?.agent?.defaultReasoningEffort as ReasoningEffort | undefined) ||
@@ -63,6 +72,7 @@ export function useDraftReasoningEffort(model: string): DraftReasoningEffort {
 			supported: support.supportsReasoningEffort,
 			options: support.reasoningEffortOptions,
 			defaultEffort: clampReasoningEffort(desired, support.reasoningEffortOptions),
+			supportsCodexControls,
 		};
 	}, [modelCard, resolvedBareModel, resolvedModel, resolvedModelOption, settings]);
 }

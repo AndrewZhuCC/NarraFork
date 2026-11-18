@@ -257,6 +257,23 @@ export function resolveCodexCapableProviders(
 	return providers;
 }
 
+export function resolveCodexControls(
+	resolvedModel: string,
+	resolvedBareModel: string,
+	resolvedModelOption: ModelOption | undefined,
+	codexCapableProviders: ReadonlySet<string>,
+) {
+	const isCodexChannelModel =
+		resolvedModelOption?.channelType?.toLowerCase() === "codex" ||
+		resolvedBareModel.startsWith("codex:");
+	const providerPrefix = resolvedModel.split(":")[0];
+	return {
+		isCodexChannelModel,
+		supportsCodexControls:
+			isCodexChannelModel || (!!providerPrefix && codexCapableProviders.has(providerPrefix)),
+	};
+}
+
 /**
  * Resolve the reasoning-effort menu for one model reference.
  *
@@ -451,13 +468,12 @@ export function useModelSelection(options: UseModelSelectionOptions): UseModelSe
 		() => resolveCodexCapableProviders(settingsData),
 		[settingsData],
 	);
-	const isCodexChannelModel =
-		resolvedModelOption?.channelType?.toLowerCase() === "codex" ||
-		resolvedBareModel.startsWith("codex:");
-	const supportsCodexControls = useMemo(() => {
-		const providerPrefix = resolvedModel?.split(":")[0];
-		return (!!providerPrefix && codexCapableProviders.has(providerPrefix)) || isCodexChannelModel;
-	}, [codexCapableProviders, isCodexChannelModel, resolvedModel]);
+	const { isCodexChannelModel, supportsCodexControls } = resolveCodexControls(
+		resolvedModel,
+		resolvedBareModel,
+		resolvedModelOption,
+		codexCapableProviders,
+	);
 	const isBuiltInCodexModel = resolvedModel?.split(":")[0] === "codex";
 
 	const { supportsReasoningEffort, reasoningEffortOptions } = useMemo(
