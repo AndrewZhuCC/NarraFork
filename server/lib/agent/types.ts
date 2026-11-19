@@ -1255,7 +1255,7 @@ export interface AgentConfig {
 	reasoningEffort?: ReasoningEffort;
 	/** Service tier for Codex-mode providers. */
 	serviceTier?: string;
-	/** Current fixed model reference; automatic routes are never billed as Ultrafast. */
+	/** Current named model reference; an automatic route may change provider but not model. */
 	getUltrafastModel?: () => string | undefined;
 	/** Metadata sent with API requests (e.g. Anthropic metadata.user_id) */
 	metadata?: { user_id: string };

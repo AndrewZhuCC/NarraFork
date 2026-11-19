@@ -85,17 +85,21 @@ test("captures the actual post-injection provider prefix, before later answer tu
 	expect(snapshot?.params).not.toHaveProperty("onRequestStart");
 });
 
-test("dispatches Ultrafast only when the allowlisted model is also the fixed selection", async () => {
+test("dispatches Ultrafast only for the named, allowlisted Codex model", async () => {
 	const model = "codex:gpt-6.2-sol";
-	settings.agent.codexUltrafastModels = [model];
-	for (const [reference, tier] of [
-		[model, "ultrafast"],
-		["auto:gpt-6.2-sol", undefined],
+	settings.agent.codexUltrafastModels = ["gpt-6.2-sol", "test-model"];
+	for (const [reference, effective, tier] of [
+		[model, model, "ultrafast"],
+		["auto:gpt-6.2-sol", model, "ultrafast"],
+		["backup:gpt-6.2-sol", model, "ultrafast"],
+		["__agg__:gpt-6.2-sol", model, undefined],
+		["auto:gpt-other", model, undefined],
+		["test:test-model", "test-model", undefined],
 	] as const) {
 		const run = {
 			...config(),
-			model,
-			provider: "codex",
+			model: effective,
+			provider: effective === model ? "codex" : "test",
 			serviceTier: "ultrafast",
 			getUltrafastModel: () => reference,
 		};

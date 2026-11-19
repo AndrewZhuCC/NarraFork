@@ -826,7 +826,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "array",
 	},
 	"agent.codexUltrafastModels": {
-		desc: "允许选择 Codex Ultrafast 的连接和模型，使用完整 provider:model（如 anzhi.newapi:gpt-6.2-sol）。默认空；加入列表只开放档位，不改变 Fast 默认值。",
+		desc: "允许选择 Codex Ultrafast 的模型，使用模型名（如 gpt-6.2-sol），不分 provider。默认空；仅开放档位，不改变 Fast 默认值。",
 		type: "array",
 	},
 	"agent.routerModels": {

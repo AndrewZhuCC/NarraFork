@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
 import type { ContextCharCache } from "@shared/context-composition";
 import type { ContextInputCharacters, ContextUsageSnapshot } from "@shared/context-usage";
-import { supportsCodexUltrafast } from "@shared/fast-mode";
+import { codexUltrafastModelId, supportsCodexUltrafast } from "@shared/fast-mode";
 import { GEN_UI_STREAM_FIELDS } from "@shared/gen-ui-tool-policy";
 import {
 	MEDIA_MIME_TO_EXT,
@@ -5493,7 +5493,8 @@ async function* agentLoopInMetadataSnapshot(
 							config.serviceTier === "ultrafast" &&
 							!(
 								supportsCodexUltrafast(effectiveModel, settings.agent.codexUltrafastModels) &&
-								config.getUltrafastModel?.() === effectiveModel &&
+								codexUltrafastModelId(config.getUltrafastModel?.()) ===
+									codexUltrafastModelId(effectiveModel) &&
 								usesCodexModel(effectiveProvider, effectiveModel)
 							)
 								? undefined

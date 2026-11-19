@@ -1,5 +1,6 @@
 import { Alert, Divider, MultiSelect, Stack, Title } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import { codexUltrafastModelId } from "@shared/fast-mode";
 import { useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -14,11 +15,7 @@ import { ModelsSection } from "../../components/settings/ModelsSection";
 import { useInstanceSettingsContext } from "../../hooks/useInstanceSettings";
 import { useAllModels } from "../../hooks/useModels";
 import { api } from "../../lib/api";
-import {
-	AGG_MODEL_PREFIX,
-	AUTO_MODEL_VALUE_PREFIX,
-	type ModelAggregation,
-} from "../../lib/constants";
+import { AUTO_MODEL_VALUE_PREFIX, type ModelAggregation } from "../../lib/constants";
 
 export const Route = createFileRoute("/settings/models")({
 	component: SettingsModelsPage,
@@ -38,22 +35,18 @@ function SettingsModelsPage() {
 	} = useAllModels();
 	const is = useInstanceSettingsContext();
 	const codexProviders = resolveCodexCapableProviders(is.settings);
-	const ultrafastModelOptions = allModels.flatMap((model) => {
-		const { value } = model;
-		const separator = value.indexOf(":");
-		if (
-			separator <= 0 ||
-			separator === value.length - 1 ||
-			value.startsWith(AUTO_MODEL_VALUE_PREFIX) ||
-			value.startsWith(AGG_MODEL_PREFIX)
-		) {
-			return [];
-		}
-		return resolveCodexControls(value, value.slice(separator + 1), model, codexProviders)
-			.supportsCodexControls
-			? [value]
-			: [];
-	});
+	const ultrafastModelOptions = [
+		...new Set(
+			allModels.flatMap((model) => {
+				const { value } = model;
+				const id = codexUltrafastModelId(value);
+				if (!id || id === value || value.startsWith(AUTO_MODEL_VALUE_PREFIX)) return [];
+				return resolveCodexControls(value, id, model, codexProviders).supportsCodexControls
+					? [id]
+					: [];
+			}),
+		),
+	];
 	const qc = useQueryClient();
 	const [localAggregations, setLocalAggregations] = useState<ModelAggregation[]>(aggregations);
 	const serverAggregationsRef = useRef(aggregations);

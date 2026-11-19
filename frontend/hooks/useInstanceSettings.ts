@@ -1,6 +1,7 @@
 import { notifications } from "@mantine/notifications";
 import { DEFAULT_BRAND_ICON_COLOR } from "@shared/branding";
 import { cloneDefaultContextThresholds } from "@shared/context-thresholds";
+import { codexUltrafastModelId } from "@shared/fast-mode";
 import {
 	DEFAULT_RECORDING_REQUEST_BYTES,
 	DEFAULT_RECORDING_RESPONSE_BYTES,
@@ -400,7 +401,11 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				autoCompactKeepPairs: settings.agent?.autoCompactKeepPairs ?? 2,
 				queueDuringCompaction: settings.agent?.queueDuringCompaction ?? true,
 				agentDefaultReasoningEffort: settings.agent?.defaultReasoningEffort ?? "",
-				codexUltrafastModels: settings.agent?.codexUltrafastModels ?? [],
+				codexUltrafastModels: [
+					...new Set(
+						(settings.agent?.codexUltrafastModels ?? []).map(codexUltrafastModelId).filter(Boolean),
+					),
+				],
 				reasoningEffortBlocklist: settings.agent?.reasoningEffortBlocklist ?? [],
 				routerModels: settings.agent?.routerModels ?? [],
 				globalWhitelistDirs: normalizeSharedRules<DirectoryWhitelistRuleInput>(

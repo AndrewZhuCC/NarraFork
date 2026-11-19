@@ -531,7 +531,7 @@ export const updateSettingsSchema = z
 							.string()
 							.trim()
 							.max(256)
-							.regex(/^(?!auto:)[^:\s]+:[^:\s]\S*$/),
+							.regex(/^(?!auto:|__agg__:)(?:[^:\s]+:)?[^:\s]\S*$/),
 					)
 					.max(100)
 					.optional(),

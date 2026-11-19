@@ -1,13 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { supportsCodexUltrafast } from "@shared/fast-mode";
 
-test("Ultrafast requires the exact configured connection and model", () => {
+test("Ultrafast selects a named model across providers, including saved legacy entries", () => {
 	const qualified = "primary:gpt-6.2-sol";
 	expect(supportsCodexUltrafast(qualified, undefined)).toBe(false);
-	expect(supportsCodexUltrafast(qualified, [qualified])).toBe(true);
-	expect(supportsCodexUltrafast("backup:gpt-6.2-sol", [qualified])).toBe(false);
+	expect(supportsCodexUltrafast(qualified, ["gpt-6.2-sol"])).toBe(true);
+	expect(supportsCodexUltrafast("backup:gpt-6.2-sol", [qualified])).toBe(true);
 	expect(supportsCodexUltrafast("primary:gpt-6.2-astra", [qualified])).toBe(false);
-	expect(supportsCodexUltrafast("auto:gpt-6.2-sol", ["auto:gpt-6.2-sol"])).toBe(false);
+	expect(supportsCodexUltrafast("auto:gpt-6.2-sol", [qualified])).toBe(true);
+	expect(supportsCodexUltrafast("__agg__:gpt-6.2-sol", [qualified])).toBe(false);
 });
 
 import {

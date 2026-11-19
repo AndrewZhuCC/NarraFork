@@ -1,4 +1,4 @@
-import { supportsCodexUltrafast } from "@shared/fast-mode";
+import { codexUltrafastModelId, supportsCodexUltrafast } from "@shared/fast-mode";
 import type { ModelCard } from "@shared/model-catalog/card";
 import { modelProfile } from "@shared/model-catalog/profile";
 import {
@@ -15,12 +15,7 @@ import {
 	type ReasoningEffortBlocklistEntry,
 } from "@shared/reasoning-effort-support";
 import { useCallback, useMemo } from "react";
-import {
-	AGG_MODEL_PREFIX,
-	FOLLOW_DEFAULT_MODEL,
-	type ModelOption,
-	parseAggModelValue,
-} from "../../../lib/constants";
+import { FOLLOW_DEFAULT_MODEL, type ModelOption, parseAggModelValue } from "../../../lib/constants";
 
 /**
  * Reasoning tiers a resolved catalog card declares, ascending, never `none`. A card that
@@ -281,7 +276,7 @@ export function resolveCodexControls(
 	};
 }
 
-/** Only a fixed route can promise the allowlisted connection, not a display candidate. */
+/** The chosen model must be known; providers for the same model are interchangeable here. */
 export function resolveUltrafastSupport({
 	modelReference,
 	defaultModelValue,
@@ -301,8 +296,7 @@ export function resolveUltrafastSupport({
 	const fixed = parseAggModelValue(reference)?.pinnedModel ?? reference;
 	return (
 		supportsCodexControls &&
-		fixed === resolvedModel &&
-		!resolvedModel.startsWith(AGG_MODEL_PREFIX) &&
+		codexUltrafastModelId(fixed) === codexUltrafastModelId(resolvedModel) &&
 		supportsCodexUltrafast(resolvedModel, allowedModels)
 	);
 }

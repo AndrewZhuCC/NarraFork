@@ -1,3 +1,5 @@
+import { parseModelId } from "./model-id";
+
 export const FAST_MODE_OVERRIDE_VALUES = ["inherit", "on", "off", "ultrafast"] as const;
 export type FastModeOverride = (typeof FAST_MODE_OVERRIDE_VALUES)[number];
 
@@ -9,15 +11,20 @@ export function normalizeFastModeOverride(value: unknown): FastModeOverride {
 	return isFastModeOverride(value) ? value : "inherit";
 }
 
-/** Match the concrete connection and model, never an auto: route or a bare model name. */
+/** Match the named model across providers; an unpinned aggregation names no model. */
+export function codexUltrafastModelId(reference: unknown): string {
+	const { provider, model } = parseModelId(typeof reference === "string" ? reference.trim() : "");
+	return provider === "__agg__" ? "" : model;
+}
+
 export function supportsCodexUltrafast(
 	model: string,
 	allowedModels: readonly string[] | undefined,
 ): boolean {
+	const id = codexUltrafastModelId(model);
 	return (
-		model.indexOf(":") > 0 &&
-		!model.startsWith("auto:") &&
+		!!id &&
 		Array.isArray(allowedModels) &&
-		allowedModels.includes(model)
+		allowedModels.some((allowed) => allowed === id || codexUltrafastModelId(allowed) === id)
 	);
 }

@@ -43,6 +43,7 @@ const replace = (id: (typeof modules)[number], exports: object) =>
 const shell = ({ children }: { children?: ReactNode }) => <div>{children}</div>;
 const codexModel = "codex:gpt-test";
 const otherCodexModel = "relay:gpt-test";
+const unlistedModel = "relay:gpt-other";
 const autoModel = "auto:gpt-test";
 const aggregation = { id: "mix", name: "Mixed", models: [codexModel], routingMode: "priority" };
 const aggregationModel = `__agg__:${aggregation.id}`;
@@ -50,6 +51,7 @@ const pinnedModel = `${aggregationModel}:${codexModel}`;
 const modelOptions: ModelOption[] = [
 	{ value: codexModel, label: "GPT Test" },
 	{ value: otherCodexModel, label: "GPT Test (Relay)" },
+	{ value: unlistedModel, label: "Unlisted Model" },
 	{
 		value: autoModel,
 		label: "GPT Test (Auto)",
@@ -165,7 +167,7 @@ replace("../narrator/interaction/PermissionModePickerMenu", {
 replace("../narrator/model/ModelPickerMenu", {
 	ModelPickerMenu: ({ onChange }: { onChange: (value: string) => void }) => (
 		<>
-			{[otherCodexModel, autoModel, aggregationModel, pinnedModel].map((value) => (
+			{[otherCodexModel, unlistedModel, autoModel, aggregationModel, pinnedModel].map((value) => (
 				<button type="button" key={value} data-model={value} onClick={() => onChange(value)}>
 					{value}
 				</button>
@@ -363,7 +365,7 @@ test("Dashboard offers Fast Mode for Codex and can explicitly turn off the enabl
 	expect(fastModeButton()?.getAttribute("aria-pressed")).toBe("true");
 });
 
-test("Dashboard applies Ultrafast from the first send only for an allowlisted fixed route", async () => {
+test("Dashboard applies Ultrafast from the first send for a named model across Codex providers", async () => {
 	const ultrafastOption = () =>
 		Array.from(host.querySelectorAll<HTMLButtonElement>("button[aria-current]")).find(
 			(item) => item.textContent === "fast_mode_ultrafast",
@@ -374,11 +376,13 @@ test("Dashboard applies Ultrafast from the first send only for an allowlisted fi
 		await act(async () => button?.click());
 	};
 	codexAvailable = true;
-	codexUltrafastModels = [codexModel];
+	codexUltrafastModels = ["gpt-test"];
 	await act(async () => root.render(<DashboardComposer />));
 	expect(ultrafastOption()?.getAttribute("aria-current")).toBe("false");
 	await pickModel(autoModel);
-	expect(ultrafastOption()).toBeUndefined();
+	expect(ultrafastOption()).not.toBeUndefined();
+	await pickModel(otherCodexModel);
+	expect(ultrafastOption()).not.toBeUndefined();
 	await pickModel(aggregationModel);
 	expect(ultrafastOption()).toBeUndefined();
 	await pickModel(pinnedModel);
@@ -395,13 +399,13 @@ test("Dashboard applies Ultrafast from the first send only for an allowlisted fi
 	expect(send.mock.calls[0]?.[0]).toBe("new-session");
 
 	await act(async () => ultrafastOption()?.click());
-	await pickModel(otherCodexModel);
+	await pickModel(unlistedModel);
 	expect(ultrafastOption()).toBeUndefined();
 	expect(host.querySelector("button[aria-pressed]")?.getAttribute("aria-label")).toBe("fast_mode");
 	await attach([audio()]);
 	await submit();
 	expect(create).toHaveBeenCalledTimes(2);
-	expect(create.mock.calls[1]?.[0]).toMatchObject({ model: otherCodexModel });
+	expect(create.mock.calls[1]?.[0]).toMatchObject({ model: unlistedModel });
 	expect(create.mock.calls[1]?.[0]).not.toHaveProperty("fastModeOverride");
 });
 
