@@ -38,20 +38,17 @@ export interface FastModeControlProps {
 	clearLongPressTimer: () => void;
 	/** True immediately after a long-press fired, so the ensuing click is ignored. */
 	longPressFiredRef: React.MutableRefObject<boolean>;
-	narratorId: string;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation object passthrough from useUpdateFastMode.
-	fastModeMutation: any;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation object passthrough from useUpdateUserPreferences.
-	updateUserPrefs: any;
+	onOverrideChange: (value: FastModeOverride) => void;
+	onDefaultChange: (value: boolean) => void;
+	disabled?: boolean;
 	/** narrator translation fn (namespace "narrator"). */
 	t: (key: string, opts?: Record<string, unknown>) => string;
 }
 
 /**
  * Fast-mode toggle button + its settings popover (session override segmented
- * control + user-default switch). Extracted verbatim from NarratorPanel; all
- * state/handlers are injected so behaviour is identical across the desktop and
- * mobile status-bar mounts.
+ * control + user-default switch). The caller supplies the save handlers so existing
+ * narrators and the dashboard draft use the same UI.
  */
 export function FastModeControl(props: FastModeControlProps) {
 	const {
@@ -70,9 +67,9 @@ export function FastModeControl(props: FastModeControlProps) {
 		startLongPress,
 		clearLongPressTimer,
 		longPressFiredRef,
-		narratorId,
-		fastModeMutation,
-		updateUserPrefs,
+		onOverrideChange,
+		onDefaultChange,
+		disabled = false,
 		t,
 	} = props;
 	const [keyboardOpened, setKeyboardOpened] = useState(false);
@@ -113,7 +110,7 @@ export function FastModeControl(props: FastModeControlProps) {
 				<Group
 					gap={4}
 					wrap="nowrap"
-					onMouseEnter={fastModeUsesTapSettings ? undefined : openSettings}
+					onMouseEnter={fastModeUsesTapSettings || disabled ? undefined : openSettings}
 					onMouseLeave={closeOnMouseLeave}
 					style={{ flexShrink: 0 }}
 				>
@@ -128,6 +125,7 @@ export function FastModeControl(props: FastModeControlProps) {
 							size="sm"
 							aria-label={buttonLabel}
 							aria-pressed={fastModeEnabled}
+							disabled={disabled}
 							aria-haspopup="dialog"
 							aria-expanded={settingsOpened}
 							aria-keyshortcuts="ArrowDown"
@@ -151,10 +149,7 @@ export function FastModeControl(props: FastModeControlProps) {
 								}
 								// Clicking pins this session against its current effective
 								// state; the popover restores "follow default".
-								fastModeMutation.mutate({
-									id: narratorId,
-									fastModeOverride: fastModeEnabled || !supportsCodexControls ? "off" : "on",
-								});
+								onOverrideChange(fastModeEnabled || !supportsCodexControls ? "off" : "on");
 							}}
 						>
 							{ultrafastActive ? <IconBoltFilled size={16} /> : <IconBolt size={16} />}
@@ -175,12 +170,8 @@ export function FastModeControl(props: FastModeControlProps) {
 						fullWidth
 						aria-label={t("fast_mode_choose_tier")}
 						value={ultrafastUnavailable ? "" : fastModeOverride}
-						onChange={(value) =>
-							fastModeMutation.mutate({
-								id: narratorId,
-								fastModeOverride: normalizeFastModeOverride(value),
-							})
-						}
+						disabled={disabled}
+						onChange={(value) => onOverrideChange(normalizeFastModeOverride(value))}
 						data={[
 							{ value: "inherit", label: t("fast_mode_session_inherit", { state: defaultState }) },
 							...(supportsCodexControls ? [{ value: "on", label: t("fast_mode_on") }] : []),
@@ -203,9 +194,8 @@ export function FastModeControl(props: FastModeControlProps) {
 					<Switch
 						size="sm"
 						checked={fastModeDefault}
-						onChange={(event) =>
-							updateUserPrefs.mutate({ fastModeDefault: event.currentTarget.checked })
-						}
+						disabled={disabled}
+						onChange={(event) => onDefaultChange(event.currentTarget.checked)}
 						label={t("fast_mode_default_switch")}
 					/>
 					<Text size="xs" c="dimmed">

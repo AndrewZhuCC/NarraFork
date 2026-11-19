@@ -123,8 +123,7 @@ export function useStatusBarProps(
 	});
 
 	const { renderFastModeControl } = useFastModeControl({
-		narratorId: options.narratorId,
-		narratorFastModeOverride: options.narratorFastModeOverride,
+		fastModeOverride: options.narratorFastModeOverride,
 		supportsCodexControls: modelSelection.supportsCodexControls,
 		supportsUltrafast: resolveUltrafastSupport({
 			modelReference: capabilityModelReference(
@@ -138,8 +137,9 @@ export function useStatusBarProps(
 		}),
 		fastModeDefault: options.fastModeDefault,
 		fastModeUsesTapSettings: options.fastModeUsesTapSettings,
-		fastModeMutation: options.fastModeMutation,
-		updateUserPrefs: options.updateUserPrefs,
+		onOverrideChange: (fastModeOverride) =>
+			options.fastModeMutation.mutate({ id: options.narratorId, fastModeOverride }),
+		onDefaultChange: (fastModeDefault) => options.updateUserPrefs.mutate({ fastModeDefault }),
 		t: options.t,
 	});
 

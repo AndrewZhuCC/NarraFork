@@ -1,21 +1,16 @@
-import { ActionIcon, Box, Button, Group, Menu, Text, Tooltip } from "@mantine/core";
+import { ActionIcon, Box, Button, Group, Text, Tooltip } from "@mantine/core";
+import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { composerDocumentText, parseComposerDocument } from "@shared/composer-document";
 import type { FastModeOverride } from "@shared/fast-mode";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
-import {
-	IconAdjustmentsHorizontal,
-	IconBolt,
-	IconCheck,
-	IconChevronDown,
-	IconFolder,
-	IconPaperclip,
-} from "@tabler/icons-react";
+import { IconAdjustmentsHorizontal, IconFolder, IconPaperclip } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
+import { useMobileViewport } from "../../hooks/useMobileViewport";
 import { useCreateNarrator } from "../../hooks/useNarrator";
 import {
 	useNarratorPermissionsCapability,
@@ -23,7 +18,7 @@ import {
 } from "../../hooks/usePlatform";
 import { useProjectDirStatus } from "../../hooks/useProjectDirStatus";
 import { addRecentTab } from "../../hooks/useRecentTabs";
-import { useUserPreferences } from "../../hooks/useUserPreferences";
+import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import { api, isAbortError } from "../../lib/api";
 import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
 import {
@@ -46,6 +41,7 @@ import { PermissionModePickerMenu } from "../narrator/interaction/PermissionMode
 import { UploadProgressBar } from "../narrator/interaction/UploadProgressBar";
 import { useComposerAttachments } from "../narrator/interaction/use-composer-attachments";
 import { useComposerFileIngest } from "../narrator/interaction/use-composer-file-ingest";
+import { useFastModeControl } from "../narrator/interaction/use-fast-mode-control";
 import {
 	type NarratorSendingState,
 	snapshotComposerFiles,
@@ -115,6 +111,9 @@ export function DashboardComposer() {
 	const [fastModeOverride, setFastModeOverride] = useState<FastModeOverride>("inherit");
 	const { data: userPreferences } = useUserPreferences();
 	const fastModeDefault = userPreferences?.fastModeDefault ?? false;
+	const updateUserPrefs = useUpdateUserPreferences();
+	const isMobileViewport = useMobileViewport();
+	const isCoarsePointer = useMediaQuery("(hover: none), (pointer: coarse)") ?? false;
 	// Same "null = follow the instance default" rule for the create-time session
 	// options, so an untouched composer behaves exactly like a session created
 	// without them (the server then applies its own defaults).
@@ -140,9 +139,6 @@ export function DashboardComposer() {
 		fastModeOverride === "ultrafast" && !draftReasoning.supportsUltrafast
 			? "inherit"
 			: fastModeOverride;
-	const ultrafastSelected = availableFastModeOverride === "ultrafast";
-	const fastModeEnabled =
-		availableFastModeOverride === "inherit" ? fastModeDefault : availableFastModeOverride !== "off";
 	useEffect(() => {
 		if (!draftReasoning.supportsUltrafast) {
 			setFastModeOverride((value) => (value === "ultrafast" ? "inherit" : value));
@@ -424,18 +420,17 @@ export function DashboardComposer() {
 	};
 
 	const sending = sendingState != null;
-	const fastModeSettingsDisabled = sending || pendingSessionRef.current !== null;
-	const fastModeMenuOptions = [
-		{
-			value: "inherit",
-			label: tn("fast_mode_session_inherit", {
-				state: fastModeDefault ? tn("fast_mode_on") : tn("fast_mode_off"),
-			}),
-		},
-		{ value: "on", label: tn("fast_mode") },
-		{ value: "off", label: tn("fast_mode_off") },
-		{ value: "ultrafast", label: tn("fast_mode_ultrafast") },
-	] as const;
+	const { renderFastModeControl } = useFastModeControl({
+		fastModeOverride: availableFastModeOverride,
+		supportsCodexControls: draftReasoning.supportsCodexControls,
+		supportsUltrafast: draftReasoning.supportsUltrafast,
+		fastModeDefault,
+		fastModeUsesTapSettings: isMobileViewport || isCoarsePointer,
+		onOverrideChange: setFastModeOverride,
+		onDefaultChange: (fastModeDefault) => updateUserPrefs.mutate({ fastModeDefault }),
+		disabled: sending || pendingSessionRef.current !== null,
+		t: tn,
+	});
 
 	return (
 		<Box {...dropZoneProps}>
@@ -536,66 +531,7 @@ export function DashboardComposer() {
 						/>
 					</Box>
 				)}
-				{draftReasoning.supportsCodexControls && (
-					<Group gap={2} wrap="nowrap">
-						<Tooltip
-							label={
-								availableFastModeOverride === "inherit"
-									? tn("fast_mode_inherit_tooltip", {
-											state: fastModeDefault ? tn("fast_mode_on") : tn("fast_mode_off"),
-										})
-									: ultrafastSelected
-										? tn("fast_mode_ultrafast_hint")
-										: tn("fast_mode_tooltip")
-							}
-						>
-							<Button
-								type="button"
-								size="xs"
-								variant={fastModeEnabled ? "light" : "default"}
-								color={ultrafastSelected ? "orange" : fastModeEnabled ? "yellow" : undefined}
-								leftSection={<IconBolt size={14} />}
-								aria-pressed={fastModeEnabled}
-								disabled={fastModeSettingsDisabled}
-								onClick={() => setFastModeOverride(fastModeEnabled ? "off" : "on")}
-							>
-								{tn(ultrafastSelected ? "fast_mode_ultrafast" : "fast_mode")}
-							</Button>
-						</Tooltip>
-						{draftReasoning.supportsUltrafast && (
-							<Menu position="bottom-end" withinPortal>
-								<Menu.Target>
-									<ActionIcon
-										variant="subtle"
-										color="gray"
-										aria-label={tn("fast_mode_choose_tier")}
-										disabled={fastModeSettingsDisabled}
-									>
-										<IconChevronDown size={14} />
-									</ActionIcon>
-								</Menu.Target>
-								<Menu.Dropdown>
-									{fastModeMenuOptions.map(({ value, label }) => (
-										<Menu.Item
-											key={value}
-											aria-current={availableFastModeOverride === value}
-											aria-description={
-												value === "ultrafast" ? tn("fast_mode_ultrafast_hint") : undefined
-											}
-											leftSection={
-												availableFastModeOverride === value ? <IconCheck size={14} /> : null
-											}
-											disabled={fastModeSettingsDisabled}
-											onClick={() => setFastModeOverride(value)}
-										>
-											{label}
-										</Menu.Item>
-									))}
-								</Menu.Dropdown>
-							</Menu>
-						)}
-					</Group>
-				)}
+				{renderFastModeControl(isMobileViewport ? "bottom-end" : "top-end")}
 				<Box style={{ minWidth: 0 }}>
 					<PermissionModePickerMenu
 						value={permissionMode}

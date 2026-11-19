@@ -5,19 +5,17 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { FastModeControl } from "./FastModeControl";
 
 export interface UseFastModeControlOptions {
-	narratorId: string;
-	/** Session-level override from the narrator ("inherit" follows the user default). */
-	narratorFastModeOverride: FastModeOverride | null | undefined;
+	/** Session or draft override; "inherit" follows the user default. */
+	fastModeOverride: FastModeOverride | null | undefined;
 	supportsCodexControls: boolean;
 	supportsUltrafast: boolean;
 	/** User-level default fast-mode state (what "inherit" resolves to). */
 	fastModeDefault: boolean;
 	/** Coarse-pointer / mobile viewports open settings by long-press, not hover. */
 	fastModeUsesTapSettings: boolean;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation object passthrough from useUpdateFastMode.
-	fastModeMutation: any;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation object passthrough from useUpdateUserPreferences.
-	updateUserPrefs: any;
+	onOverrideChange: (value: FastModeOverride) => void;
+	onDefaultChange: (value: boolean) => void;
+	disabled?: boolean;
 	/** narrator translation fn (namespace "narrator"). */
 	t: (key: string, opts?: Record<string, unknown>) => string;
 }
@@ -40,18 +38,17 @@ export interface UseFastModeControlResult {
  */
 export function useFastModeControl(options: UseFastModeControlOptions): UseFastModeControlResult {
 	const {
-		narratorId,
-		narratorFastModeOverride,
 		supportsCodexControls,
 		supportsUltrafast,
 		fastModeDefault,
 		fastModeUsesTapSettings,
-		fastModeMutation,
-		updateUserPrefs,
+		onOverrideChange,
+		onDefaultChange,
+		disabled,
 		t,
 	} = options;
 
-	const fastModeOverride = normalizeFastModeOverride(narratorFastModeOverride);
+	const fastModeOverride = normalizeFastModeOverride(options.fastModeOverride);
 	// An unsupported Ultrafast override falls back to Standard, not the user default.
 	const fastModeEnabled =
 		fastModeOverride === "ultrafast"
@@ -140,9 +137,9 @@ export function useFastModeControl(options: UseFastModeControlOptions): UseFastM
 					startLongPress={startFastModeLongPress}
 					clearLongPressTimer={clearFastModeLongPressTimer}
 					longPressFiredRef={fastModeLongPressFiredRef}
-					narratorId={narratorId}
-					fastModeMutation={fastModeMutation}
-					updateUserPrefs={updateUserPrefs}
+					onOverrideChange={onOverrideChange}
+					onDefaultChange={onDefaultChange}
+					disabled={disabled}
 					t={t}
 				/>
 			);
@@ -160,9 +157,9 @@ export function useFastModeControl(options: UseFastModeControlOptions): UseFastM
 			scheduleFastModeSettingsClose,
 			startFastModeLongPress,
 			clearFastModeLongPressTimer,
-			narratorId,
-			fastModeMutation,
-			updateUserPrefs,
+			onOverrideChange,
+			onDefaultChange,
+			disabled,
 			t,
 		],
 	);

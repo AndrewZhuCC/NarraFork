@@ -27,6 +27,7 @@ const modules = [
 	"../../hooks/usePlatform",
 	"../../hooks/useProjectDirStatus",
 	"../../hooks/useRecentTabs",
+	"../../hooks/useUserPreferences",
 	"../common/DirectoryPicker",
 	"../narrator/CreateNarratorLazyModal",
 	"../narrator/composer/NarratorComposer",
@@ -62,20 +63,20 @@ const button = ({
 	children,
 	onClick,
 	disabled,
+	"aria-label": label,
 	"aria-pressed": pressed,
-	"aria-current": current,
 }: {
 	children?: ReactNode;
 	onClick?: () => void;
 	disabled?: boolean;
+	"aria-label"?: string;
 	"aria-pressed"?: boolean;
-	"aria-current"?: boolean;
 }) => (
 	<button
 		type="button"
 		disabled={disabled}
+		aria-label={label}
 		aria-pressed={pressed}
-		aria-current={current}
 		onClick={onClick}
 	>
 		{children}
@@ -101,7 +102,34 @@ replace("@mantine/core", {
 	Box: shell,
 	Button: button,
 	Group: shell,
-	Menu: Object.assign(shell, { Target: shell, Dropdown: shell, Item: button }),
+	Popover: Object.assign(shell, { Target: shell, Dropdown: shell }),
+	SegmentedControl: ({
+		data,
+		value,
+		onChange,
+		disabled,
+	}: {
+		data: Array<{ value: string; label: string }>;
+		value: string;
+		onChange: (value: string) => void;
+		disabled?: boolean;
+	}) => (
+		<>
+			{data.map((option) => (
+				<button
+					type="button"
+					key={option.value}
+					aria-current={value === option.value}
+					disabled={disabled}
+					onClick={() => onChange(option.value)}
+				>
+					{option.label}
+				</button>
+			))}
+		</>
+	),
+	Stack: shell,
+	Switch: () => null,
 	Text: shell,
 	Tooltip: shell,
 });
@@ -126,6 +154,9 @@ replace("../../hooks/useProjectDirStatus", {
 	useProjectDirStatus: () => ({ usablePath: "/workspace", needsChoice: false }),
 });
 replace("../../hooks/useRecentTabs", { addRecentTab: async () => {} });
+replace("../../hooks/useUserPreferences", {
+	useUpdateUserPreferences: () => ({ mutate: () => {} }),
+});
 replace("../common/DirectoryPicker", { DirectoryBrowserModal: () => null });
 replace("../narrator/CreateNarratorLazyModal", { CreateNarratorLazyModal: () => null });
 replace("../narrator/interaction/PermissionModePickerMenu", {
@@ -320,7 +351,9 @@ test("Dashboard offers Fast Mode for Codex and can explicitly turn off the enabl
 	fastModeDefault = true;
 	await act(async () => root.render(<DashboardComposer />));
 	const button = fastModeButton();
-	expect(button?.textContent).toBe("fast_mode");
+	expect(button?.getAttribute("aria-label")).toBe("fast_mode");
+	expect(button?.querySelector("svg")).not.toBeNull();
+	expect(button?.textContent).toBe("");
 	expect(button?.getAttribute("aria-pressed")).toBe("true");
 	await act(async () => button?.click());
 	expect(fastModeButton()?.getAttribute("aria-pressed")).toBe("false");
@@ -351,7 +384,9 @@ test("Dashboard applies Ultrafast from the first send only for an allowlisted fi
 	await pickModel(pinnedModel);
 	await act(async () => ultrafastOption()?.click());
 	expect(ultrafastOption()?.getAttribute("aria-current")).toBe("true");
-	expect(host.querySelector("button[aria-pressed]")?.textContent).toBe("fast_mode_ultrafast");
+	expect(host.querySelector("button[aria-pressed]")?.getAttribute("aria-label")).toBe(
+		"fast_mode_ultrafast",
+	);
 	await attach([audio()]);
 	await submit();
 	expect(create).toHaveBeenCalledWith(
@@ -362,7 +397,7 @@ test("Dashboard applies Ultrafast from the first send only for an allowlisted fi
 	await act(async () => ultrafastOption()?.click());
 	await pickModel(otherCodexModel);
 	expect(ultrafastOption()).toBeUndefined();
-	expect(host.querySelector("button[aria-pressed]")?.textContent).toBe("fast_mode");
+	expect(host.querySelector("button[aria-pressed]")?.getAttribute("aria-label")).toBe("fast_mode");
 	await attach([audio()]);
 	await submit();
 	expect(create).toHaveBeenCalledTimes(2);
