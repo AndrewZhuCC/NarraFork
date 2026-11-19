@@ -156,6 +156,7 @@ async function runStream(
 	server: TestServer,
 	overrides: {
 		sessionKey?: string;
+		exclusive?: boolean;
 		input?: string[];
 		requestDump?: ApiRequestDumpCollector;
 		request?: CodexResponsesRequestBody;
@@ -168,6 +169,8 @@ async function runStream(
 		apiKey: "sk-test",
 		requestDump: overrides.requestDump,
 		sessionKey: overrides.sessionKey ?? "narrator-1",
+		ephemeral: overrides.exclusive,
+		exclusive: overrides.exclusive,
 		conversationId: "conv-1",
 		credentialId: "cred-1",
 		model: "gpt-5.3-codex",
@@ -184,6 +187,46 @@ async function runStream(
 	return events;
 }
 
+test("remote compaction waits for nested reflection and blocks new sends until it closes", async () => {
+	const arrived = Array.from({ length: 4 }, () => Promise.withResolvers<void>());
+	const finish = Array.from({ length: 4 }, () => Promise.withResolvers<void>());
+	const server = startServer(({ requestIndex, send }) => {
+		arrived[requestIndex]?.resolve();
+		void finish[requestIndex]?.promise.then(() => {
+			for (const frame of completedFrames(`resp-${requestIndex}`)) send(frame);
+		});
+	});
+	activeServer = server;
+	const ordinary = runStream(server, { input: ["ordinary"] });
+	await arrived[0]?.promise;
+	const compact = runStream(server, {
+		sessionKey: "compact-local-key",
+		exclusive: true,
+		input: ["compact"],
+	});
+	const reflection = runStream(server, { input: ["nested reflection"] });
+	await arrived[1]?.promise;
+	expect(server.requests[1]?.body.input).toEqual([userMessage("nested reflection")]);
+	finish[1]?.resolve();
+	await reflection;
+	expect(server.connectionCount()).toBe(2);
+	finish[0]?.resolve();
+	await ordinary;
+	await arrived[2]?.promise;
+	expect(server.requests[2]?.body.input).toEqual([userMessage("compact")]);
+
+	const controller = new AbortController();
+	const cancelled = runStream(server, { input: ["cancelled"], signal: controller.signal });
+	controller.abort();
+	await expect(cancelled).rejects.toThrow("aborted");
+	const next = runStream(server, { input: ["next turn"] });
+	finish[2]?.resolve();
+	await compact;
+	await arrived[3]?.promise;
+	expect(server.requests[3]?.body.input).toEqual([userMessage("next turn")]);
+	finish[3]?.resolve();
+	await next;
+});
 type RecordingEntry =
 	| { kind: "request"; request: RecordingRequest }
 	| { kind: "meta"; meta: Record<string, unknown> }

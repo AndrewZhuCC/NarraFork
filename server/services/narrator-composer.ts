@@ -56,6 +56,7 @@ interface PredictionTask {
 	bytes: number;
 	seed?: CodexComposerSeed;
 	controller: AbortController;
+	response?: Promise<GenerateMetaResult>;
 	promise?: Promise<void>;
 }
 
@@ -212,6 +213,7 @@ async function predict(task: PredictionTask): Promise<void> {
 		task.controller.signal.throwIfAborted();
 		if (!task.seed) throw new Error("Composer prediction has no seed");
 		const response = task.seed.run({ signal: task.controller.signal, requestDump: dump });
+		task.response = response;
 		// The request producer owns the snapshot until it settles; caches never retain it.
 		task.seed = undefined;
 		result = await response;
@@ -239,6 +241,7 @@ async function predict(task: PredictionTask): Promise<void> {
 		errorCode ??= task.controller.signal.aborted ? "cancelled" : "request_failed";
 	} finally {
 		clearTimeout(timeout);
+		task.response = undefined;
 		task.seed = undefined;
 		seedBytes -= task.bytes;
 		task.bytes = 0;
@@ -312,6 +315,13 @@ export function invalidateComposerSuggestion(narratorId: string, generation?: st
 	discardRun(narratorId);
 }
 
+export async function cancelComposerForCompaction(narratorId: string): Promise<void> {
+	// Drop both running and scheduled predictions. The transport must finish aborting
+	// before opening the compact socket, but recording its usage can finish separately.
+	discardRun(narratorId);
+	const responses = [...tasks].filter((task) => task.narratorId === narratorId);
+	if (responses.length) await Promise.allSettled(responses.map((task) => task.response));
+}
 export function invalidateAllComposerSuggestions(): void {
 	const narratorIds = new Set([...runs.keys(), ...Array.from(tasks, (task) => task.narratorId)]);
 	for (const narratorId of narratorIds) discardRun(narratorId);

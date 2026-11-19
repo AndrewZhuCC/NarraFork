@@ -41,6 +41,7 @@ import {
 	startLiveCompactProgress,
 } from "./compact-live-state";
 import { drainQueuedMessagesAfterCompact } from "./compact-queue-drain";
+import { cancelComposerForCompaction } from "./narrator-composer";
 import { narratorContext } from "./narrator-context";
 import { compactEpochRecord, toolLoadingEpochOf } from "./narrator-epochs";
 import { estimateNarratorBuildHistoryTokens } from "./narrator-history-token-estimate";
@@ -1242,6 +1243,10 @@ async function doRunCustomCompact({
 					narratorId,
 					remoteHistoryOptions,
 				);
+				// Composer may still be using the same upstream session after the turn is idle.
+				// Let its socket close before compact connects, so its reconnect can't preempt us.
+				await cancelComposerForCompaction(narratorId);
+				if (signal?.aborted) throw compactAbortError();
 				logger.info("Requesting Codex remote compact", {
 					narratorId,
 					model: resolvedCompact.model,

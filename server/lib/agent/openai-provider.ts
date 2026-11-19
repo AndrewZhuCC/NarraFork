@@ -988,6 +988,7 @@ export class OpenAIProvider implements ProviderAdapter {
 					request: body as CodexResponsesRequestBody,
 					signal: options?.signal ?? new AbortController().signal,
 					ephemeral: true,
+					exclusive: true,
 					extraHeaders: headers,
 					requestDump: options?.requestDump,
 					onResponseFrame: (frame) => {

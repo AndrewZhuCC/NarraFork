@@ -195,6 +195,8 @@ export interface StreamCodexResponsesWebSocketOptions {
 	signal: AbortSignal;
 	/** Use a private uncached connection, closed on completion (e.g. remote compaction). */
 	ephemeral?: boolean;
+	/** Reserve the upstream conversation for remote compaction without changing its wire identity. */
+	exclusive?: boolean;
 	/** Request-scoped raw frames, before ordinary chat parsing. */
 	onResponseFrame?: (frame: string) => void;
 	/** Close and clear cached WebSocket response-chain state before dispatching this request. */
@@ -1246,7 +1248,65 @@ async function ensureConnection(
 	return connection;
 }
 
+interface UpstreamSocketLane {
+	active: number;
+	exclusive: boolean;
+	idleWaiters: Set<() => void>;
+}
+
+const upstreamSocketLanes = new Map<string, UpstreamSocketLane>();
+
+async function claimUpstreamSocket(options: StreamCodexResponsesWebSocketOptions) {
+	// Compact has a different local sessionKey, but uses the same upstream conversation.
+	const key = JSON.stringify([options.baseUrl, options.conversationId]);
+	const exclusive = options.exclusive === true;
+	const { signal } = options;
+	while (true) {
+		if (signal.aborted) throw createCodexWebSocketAbortError();
+		let lane = upstreamSocketLanes.get(key);
+		if (!lane) {
+			lane = { active: 0, exclusive: false, idleWaiters: new Set() };
+			upstreamSocketLanes.set(key, lane);
+		}
+		const current = lane;
+		if (!current.exclusive && (!exclusive || current.active === 0)) {
+			current.active++;
+			current.exclusive = exclusive;
+			return () => {
+				if (--current.active !== 0) return;
+				upstreamSocketLanes.delete(key);
+				for (const wake of current.idleWaiters) wake();
+			};
+		}
+		// A waiting compact cannot block nested reflection: an active turn may be waiting
+		// for that reflection before it can release its own socket.
+		await new Promise<void>((resolve, reject) => {
+			const wake = () => {
+				signal.removeEventListener("abort", abort);
+				resolve();
+			};
+			const abort = () => {
+				current.idleWaiters.delete(wake);
+				reject(createCodexWebSocketAbortError());
+			};
+			current.idleWaiters.add(wake);
+			signal.addEventListener("abort", abort, { once: true });
+		});
+	}
+}
+
 export async function* streamCodexResponsesWebSocket(
+	options: StreamCodexResponsesWebSocketOptions,
+): AsyncGenerator<ParsedStreamEvent> {
+	const release = await claimUpstreamSocket(options);
+	try {
+		yield* streamCodexResponsesWithSocket(options);
+	} finally {
+		release();
+	}
+}
+
+async function* streamCodexResponsesWithSocket(
 	options: StreamCodexResponsesWebSocketOptions,
 ): AsyncGenerator<ParsedStreamEvent> {
 	// A cancelled background request must not acquire or reset the foreground session.

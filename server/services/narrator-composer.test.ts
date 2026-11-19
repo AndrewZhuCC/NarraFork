@@ -56,6 +56,7 @@ mock.module("@server/lib/logger", () => ({ logger: { debug: () => {}, warn } }))
 
 const {
 	beginComposerRun,
+	cancelComposerForCompaction,
 	rememberComposerSeed,
 	startComposerPrediction,
 	getComposerSuggestion,
@@ -205,6 +206,26 @@ describe("server Composer state", () => {
 		expect(run).toHaveBeenCalledTimes(1);
 	});
 
+	test("compaction cancels its Composer and waits for the transport to release", async () => {
+		const wait = deferred();
+		const run = mock((_options: CodexComposerRunOptions) => wait.promise);
+		const generation = prepare("compact", seed(run));
+		startComposerPrediction("compact", generation);
+		startComposerPrediction("other", prepare("other", seed(run)));
+		let released = false;
+		const cancellation = cancelComposerForCompaction("compact").then(() => {
+			released = true;
+		});
+		await settle();
+		expect(run.mock.calls[0]?.[0].signal.aborted).toBe(true);
+		expect(run.mock.calls[1]?.[0].signal.aborted).toBe(false);
+		expect(released).toBe(false);
+		wait.resolve(answer());
+		await cancellation;
+		startComposerPrediction("compact", generation);
+		expect(run).toHaveBeenCalledTimes(2);
+		expect(getComposerSuggestion("compact").suggestion).toBeNull();
+	});
 	test("two concurrent slots never queue, retry, or free a still-unsettled cancelled request", async () => {
 		const wait = deferred();
 		const first = mock((_options: CodexComposerRunOptions) => wait.promise);
