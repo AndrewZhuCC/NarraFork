@@ -3,7 +3,11 @@ import type { Dirent } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { getNarraforkHome } from "../narrafork-home";
-import { createRequestRecording, type RequestRecorderClient } from "../request-recorder";
+import {
+	createRequestRecording,
+	type RequestRecorderClient,
+	saveSpecificRequestRecording,
+} from "../request-recorder";
 import { RECORDING_CHUNK_BYTES, REQUEST_RECORDING_DIR } from "../request-recorder-protocol";
 import { settings } from "../settings";
 
@@ -153,5 +157,36 @@ describe("二进制响应块录制", () => {
 		);
 		// The caller's buffer is copied, never detached.
 		expect(large.byteLength).toBe(RECORDING_CHUNK_BYTES * 2 + 10);
+	}, 30_000);
+
+	test("结束与立即保存不会越过尚未写完的 5.5 MiB 请求", async () => {
+		settings.requestEvidence.ringRequestBytes = 16 * 1024 * 1024;
+		const recording = createRequestRecording({
+			requestId: "large-request",
+			narratorId: "n1",
+			provider: "fixture",
+			model: "fixture",
+		});
+		if (!recording) throw new Error("Recording not started");
+		// Put a surrogate pair across the first encoding boundary.
+		const text = `${"a".repeat(RECORDING_CHUNK_BYTES - 1)}𠮷${"b".repeat(5.5 * 1024 * 1024 - RECORDING_CHUNK_BYTES)}`;
+		recording.frame({ direction: "request", type: "websocket.message", text });
+		recording.responseChunk("done");
+		recording.finish({ status: "completed" });
+
+		const saved = await saveSpecificRequestRecording("n1", recording.requestId);
+		expect(saved.partial).toBe(false);
+		expect(saved.truncated).toBe(false);
+		const frames = (await framesFor(recording.requestId))
+			.filter((frame) => frame.direction === "request")
+			.sort((a, b) => a.offset - b.offset);
+		let offset = 0;
+		const parts = frames.map((frame) => {
+			expect(frame.offset).toBe(offset);
+			const bytes = Buffer.from(frame.data, "base64");
+			offset += bytes.length;
+			return bytes;
+		});
+		expect(Buffer.concat(parts).equals(Buffer.from(text))).toBe(true);
 	}, 30_000);
 });

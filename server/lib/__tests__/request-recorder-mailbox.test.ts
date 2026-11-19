@@ -8,6 +8,7 @@ import type { RecordingSettings, SavedRecording } from "../../../shared/request-
 import { DEFAULT_DISK_SAFETY } from "../disk-safety-config";
 import { RequestRecorderClient } from "../request-recorder";
 import {
+	RECORDING_CHUNK_BYTES,
 	RECORDING_QUEUE_BYTES,
 	REQUEST_RECORDING_SAVED_DIR,
 	type RecorderOperation,
@@ -26,12 +27,14 @@ interface MailboxState {
 	ready: boolean;
 	retryAt: number;
 	worker?: Worker;
-	queued: Array<{ id: number; bytes: number; op: RecorderOperation }>;
+	queued: Array<{ id: number; bytes: number; op: RecorderOperation; payload?: object }>;
 	queuedBytes: number;
 	inflightBytes: number;
+	pendingSourceBytes: number;
 	recordings: Map<string, { beginId: number; endId?: number }>;
 	waiters: Map<number, unknown>;
 	pump(): void;
+	expirePayload(payload: object): void;
 }
 let home: string;
 let client: RequestRecorderClient;
@@ -43,6 +46,21 @@ const begin = (requestId: string): Extract<RecorderOperation, { type: "begin" }>
 	continuous: false,
 	errorsOnly: false,
 });
+function stagePayload(requestId: string) {
+	const source = "a".repeat(5.5 * 1024 * 1024);
+	client.capturePayload(
+		{
+			type: "chunk",
+			requestId,
+			side: "request",
+			kind: "body",
+			packet: 1,
+			total: source.length,
+			time: "fixture",
+		},
+		source,
+	);
+}
 function bounded() {
 	expect(state.queuedBytes + state.inflightBytes).toBeLessThanOrEqual(RECORDING_QUEUE_BYTES);
 	expect(state.queued.length).toBeLessThanOrEqual(2048);
@@ -54,8 +72,9 @@ function bounded() {
 					? item.op.data.byteLength +
 						Buffer.byteLength(JSON.stringify({ ...item.op, data: undefined }))
 					: Buffer.byteLength(JSON.stringify(item.op));
-			expect(item.bytes).toBe(bytes);
-			return sum + bytes;
+			const reserved = item.payload ? (item.bytes ? bytes + RECORDING_CHUNK_BYTES : 0) : bytes;
+			expect(item.bytes).toBe(reserved);
+			return sum + reserved;
 		}, 0),
 	);
 }
@@ -303,6 +322,9 @@ describe("真实 recorder worker 的有界可靠控制邮箱", () => {
 	test("真实 worker 故障清理 pending RPC/quota，并能在 backoff 后重新录制", async () => {
 		await client.call(begin("before-crash"));
 		state.ready = false;
+		stagePayload("before-crash");
+		expect(state.pendingSourceBytes).toBeGreaterThan(RECORDING_QUEUE_BYTES);
+		bounded();
 		for (let index = 0; index < 127; index++) {
 			expect(client.capture(begin(`queued-${index}`))).toBe(true);
 			expect(client.capture({ type: "end", requestId: `queued-${index}` })).toBe(true);
@@ -318,6 +340,7 @@ describe("真实 recorder worker 的有界可靠控制邮箱", () => {
 		expect(state.recordings.size).toBe(0);
 		expect(state.waiters.size).toBe(0);
 		expect(state.queuedBytes + state.inflightBytes).toBe(0);
+		expect(state.pendingSourceBytes).toBe(0);
 		await expect(client.call(begin("backoff"))).rejects.toMatchObject({ code: "RECORDING_BUSY" });
 		expect(state.waiters.size).toBe(0);
 		state.retryAt = 0;
@@ -330,6 +353,26 @@ describe("真实 recorder worker 的有界可靠控制邮箱", () => {
 				?.status,
 		).toBe("complete");
 	}, 30_000);
+
+	test("大载荷超时释放原文，终结照常写入并标出缺口", async () => {
+		await client.call(begin("payload-timeout"));
+		state.ready = false;
+		stagePayload("payload-timeout");
+		client.capture({ type: "end", requestId: "payload-timeout" });
+		bounded();
+		const payload = state.queued.find((item) => item.payload)?.payload;
+		if (!payload) throw new Error("Missing staged payload");
+		// Exercise the timer callback without waiting for the production deadline.
+		state.expirePayload(payload);
+		expect(state.pendingSourceBytes).toBe(0);
+		bounded();
+		await resume();
+		const { saved, records } = await snapshot();
+		expect(saved.bytes).toBe(0);
+		expect(saved.truncated).toBe(true);
+		expect(records[0].status).toBe("complete");
+		expect(records[0].gapReasons).toEqual(["recording payload timed out"]);
+	});
 
 	test("begin RPC 取消不遗留记录，end RPC 取消仍可靠送达终结", async () => {
 		state.ready = false;

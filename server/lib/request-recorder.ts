@@ -60,10 +60,24 @@ export function requestRecordingSettings(): RecordingSettings {
 }
 export { sanitizeRecordingMetadata, sanitizeRecordingUrl } from "./request-recorder-sanitize";
 
+type ChunkOperation = Extract<RecorderOperation, { type: "chunk" }>;
+type ChunkHeader = Omit<ChunkOperation, "data" | "offset">;
+interface PendingPayload {
+	chunks: Generator<ChunkOperation, void>;
+	sourceBytes: number;
+	remaining: number;
+	timer?: ReturnType<typeof setTimeout>;
+}
+
+// Already-built bodies may outlive their transport briefly. Bound their shared retention
+// independently of the unchanged mailbox limit for encoded chunks and control messages.
+const PENDING_SOURCE_BYTES = 32 * 1024 * 1024;
+const PENDING_SOURCE_TIMEOUT_MS = 30_000;
 interface QueuedOperation {
 	id: number;
 	op: RecorderOperation;
 	bytes: number;
+	payload?: PendingPayload;
 }
 interface Waiter {
 	resolve: (value: unknown) => void;
@@ -81,6 +95,13 @@ export class RequestRecorderClient {
 	private sequence = 0;
 	private queued: QueuedOperation[] = [];
 	private queuedBytes = 0;
+	private pendingSourceBytes = 0;
+	private payloadFlight?: {
+		id: number;
+		item: QueuedOperation;
+		chunkBytes: number;
+		reservedBytes: number;
+	};
 	private inflight = new Map<number, number>();
 	private inflightBytes = 0;
 	private waiters = new Map<number, Waiter>();
@@ -180,8 +201,10 @@ export class RequestRecorderClient {
 		this.retryAt = Date.now() + 10_000;
 		if (!this.closed) this.warn(error);
 		for (const id of [...this.waiters.keys()]) this.settle(id, undefined, error);
+		for (const item of this.queued) this.releasePayload(item);
 		this.queued = [];
 		this.queuedBytes = 0;
+		this.payloadFlight = undefined;
 		this.inflight.clear();
 		this.inflightBytes = 0;
 		this.recordings.clear();
@@ -211,15 +234,48 @@ export class RequestRecorderClient {
 			else if (lifecycle.type === "end" && recording?.endId === message.id)
 				this.recordings.delete(lifecycle.requestId);
 		}
+		const flight = this.payloadFlight;
+		if (flight?.id === message.id) {
+			this.payloadFlight = undefined;
+			const { item } = flight;
+			const payload = item.payload;
+			if (payload) {
+				if (error) {
+					payload.remaining += flight.chunkBytes;
+					this.drop(0, "recording payload write failed");
+				} else if (!payload.remaining) {
+					this.queued.shift();
+					this.releasePayload(item);
+				} else {
+					// The payload stays at the head until its last chunk is acknowledged.
+					item.bytes = flight.reservedBytes;
+					this.queuedBytes += item.bytes;
+				}
+			}
+		}
 		if (error && !this.waiters.has(message.id)) this.warn(error);
 		this.settle(message.id, message.value, error);
 		this.pump();
+	}
+	private expirePayload(payload: PendingPayload): void {
+		const index = this.queued.findIndex((item) => item.payload === payload);
+		if (index < 0) return;
+		this.drop(index, "recording payload timed out");
+		this.pump();
+	}
+	private releasePayload(item: QueuedOperation): void {
+		const payload = item.payload;
+		if (!payload) return;
+		clearTimeout(payload.timer);
+		this.pendingSourceBytes -= payload.sourceBytes;
+		item.payload = undefined;
 	}
 	private release(requestId: string, error: unknown): void {
 		this.recordings.delete(requestId);
 		this.queued = this.queued.filter((item) => {
 			if (!("requestId" in item.op) || item.op.requestId !== requestId) return true;
 			this.queuedBytes -= item.bytes;
+			this.releasePayload(item);
 			this.lifecycle.delete(item.id);
 			this.settle(item.id, undefined, error);
 			return false;
@@ -228,16 +284,29 @@ export class RequestRecorderClient {
 	private pump(): void {
 		if (!this.ready || !this.worker) return;
 		while (this.queued.length && this.inflight.size < 64 && this.inflightBytes < 512 * 1024) {
-			const item = this.queued.shift() as QueuedOperation;
-			this.queuedBytes -= item.bytes;
-			this.inflight.set(item.id, item.bytes);
-			this.inflightBytes += item.bytes;
-			this.worker.ref();
-			const message: RecorderMessage = { id: item.id, op: item.op };
+			const item = this.queued[0];
+			let { id, op } = item;
+			const { bytes, payload } = item;
 			try {
+				if (payload) {
+					if (this.inflight.size) break;
+					const next = payload.chunks.next();
+					if (next.done) throw new Error("Incomplete request recording payload");
+					op = next.value;
+					id = ++this.sequence;
+					const chunkBytes = op.data.byteLength;
+					payload.remaining -= chunkBytes;
+					this.payloadFlight = { id, item, chunkBytes, reservedBytes: bytes };
+					item.bytes = 0;
+				} else this.queued.shift();
+				this.queuedBytes -= bytes;
+				this.inflight.set(id, bytes);
+				this.inflightBytes += bytes;
+				this.worker.ref();
+				const message: RecorderMessage = { id, op };
 				this.worker.postMessage(
 					message,
-					item.op.type === "chunk" ? [item.op.data.buffer as ArrayBuffer] : [],
+					op.type === "chunk" ? [op.data.buffer as ArrayBuffer] : [],
 				);
 			} catch (error) {
 				this.fail(error);
@@ -289,26 +358,26 @@ export class RequestRecorderClient {
 			this.queued.length < limit.slots
 		);
 	}
-	private gap(op: Extract<RecorderOperation, { type: "chunk" | "meta" }>): void {
-		this.enqueue({
-			type: "gap",
-			requestId: op.requestId,
-			side: op.side,
-			bytes: op.type === "chunk" ? op.data.byteLength : 0,
-			reason: op.type === "chunk" ? "mailbox overload" : "mailbox overload: metadata missing",
-		});
+	private gap(
+		op: Extract<RecorderOperation, { type: "chunk" | "meta" }>,
+		bytes = op.type === "chunk" ? op.data.byteLength : 0,
+		reason = op.type === "chunk" ? "mailbox overload" : "mailbox overload: metadata missing",
+	): void {
+		this.enqueue({ type: "gap", requestId: op.requestId, side: op.side, bytes, reason });
 	}
-	private drop(index: number): void {
+	private drop(index: number, reason?: string): void {
 		const [item] = this.queued.splice(index, 1);
 		this.queuedBytes -= item.bytes;
-		if (item.op.type === "chunk" || item.op.type === "meta") this.gap(item.op);
+		const remaining = item.payload?.remaining;
+		this.releasePayload(item);
+		if (item.op.type === "chunk" || item.op.type === "meta") this.gap(item.op, remaining, reason);
 		this.settle(
 			item.id,
 			undefined,
 			new AppError("Recording evidence dropped by overload", 429, "RECORDING_BUSY"),
 		);
 	}
-	private enqueue(op: RecorderOperation, id = ++this.sequence): boolean {
+	private enqueue(op: RecorderOperation, id = ++this.sequence, payload?: PendingPayload): boolean {
 		if (this.closed || Date.now() < this.retryAt) return false;
 		let admitted = false;
 		if (op.type === "begin") {
@@ -377,7 +446,7 @@ export class RequestRecorderClient {
 		}
 		if (op.type === "chunk" && op.data.buffer.byteLength !== op.data.byteLength)
 			op = { ...op, data: Uint8Array.from(op.data) };
-		const bytes = this.operationBytes(op);
+		const bytes = this.operationBytes(op) + (payload ? RECORDING_CHUNK_BYTES : 0);
 		const maximum =
 			op.type === "gap" || op.type === "bind"
 				? RequestRecorderClient.GAP_BYTES
@@ -405,11 +474,11 @@ export class RequestRecorderClient {
 				}
 			}
 			if (admitted && op.type === "begin") this.recordings.delete(op.identity.requestId);
-			if (op.type === "chunk" || op.type === "meta") this.gap(op);
+			if (op.type === "chunk" || op.type === "meta") this.gap(op, payload?.remaining);
 			this.warn("control mailbox overload");
 			return false;
 		}
-		const item = { id, op, bytes };
+		const item = { id, op, bytes, payload };
 		if (op.type === "gap") {
 			// Eviction may concern a closing recording; its missing evidence must precede end.
 			const end = this.queued.findIndex(
@@ -440,6 +509,37 @@ export class RequestRecorderClient {
 		if (serialized === this.lastConfig) return;
 		if (this.enqueue({ type: "configure", settings: value, diskSafety: configuration.diskSafety }))
 			this.lastConfig = serialized;
+	}
+	capturePayload(header: ChunkHeader, value: string | Uint8Array): void {
+		const op: ChunkOperation = { ...header, offset: header.total, data: new Uint8Array(0) };
+		const recording = this.recordings.get(header.requestId);
+		if (!recording || recording.endId) return;
+		const sourceBytes =
+			typeof value === "string" ? Math.max(header.total, value.length * 2) : header.total;
+		if (this.pendingSourceBytes + sourceBytes > PENDING_SOURCE_BYTES) {
+			this.gap(op, header.total, "recording payload backlog full");
+			return;
+		}
+		// Strings are immutable; byte buffers must not change while the worker catches up.
+		const source = typeof value === "string" ? value : Uint8Array.from(value);
+		const payload: PendingPayload = {
+			chunks: payloadChunks(header, source),
+			sourceBytes,
+			remaining: header.total,
+		};
+		this.pendingSourceBytes += sourceBytes;
+		payload.timer = setTimeout(
+			() => this.expirePayload(payload),
+			PENDING_SOURCE_TIMEOUT_MS,
+		).unref();
+		try {
+			if (this.enqueue(op, undefined, payload)) return;
+		} catch (error) {
+			this.warn(error);
+			this.gap(op, header.total);
+		}
+		clearTimeout(payload.timer);
+		this.pendingSourceBytes -= sourceBytes;
 	}
 	capture(op: RecorderOperation): boolean {
 		try {
@@ -540,56 +640,18 @@ function client(): RequestRecorderClient {
 	value.configure(requestRecordingSettings());
 	return value;
 }
-function sendBytes(
-	port: RequestRecorderClient,
-	requestId: string,
-	side: RecordingSide,
-	kind: string,
+function* payloadChunks(
+	header: ChunkHeader,
 	value: string | Uint8Array,
-	packet: number,
-): void {
-	const total = typeof value === "string" ? Buffer.byteLength(value, "utf8") : value.byteLength;
-	const time = new Date().toISOString();
-	if (total === 0) {
-		port.capture({
-			type: "chunk",
-			requestId,
-			side,
-			kind,
-			data: new Uint8Array(0),
-			packet,
-			offset: 0,
-			total,
-			time,
-		});
+): Generator<ChunkOperation, void> {
+	if (header.total === 0) {
+		yield { ...header, data: new Uint8Array(0), offset: 0 };
 		return;
 	}
-	let offset = 0;
-	const inputLimit = RECORDING_QUEUE_BYTES - 512 * 1024;
 	if (typeof value === "string") {
-		let position = 0;
-		if (total > inputLimit) {
-			position = Math.max(0, value.length - Math.floor((inputLimit * value.length) / total));
-			if (Buffer.byteLength(value.slice(position)) > inputLimit)
-				position = Math.max(0, value.length - Math.floor(inputLimit / 3));
-			if (
-				position > 0 &&
-				value.charCodeAt(position) >= 0xdc00 &&
-				value.charCodeAt(position) <= 0xdfff &&
-				value.charCodeAt(position - 1) >= 0xd800 &&
-				value.charCodeAt(position - 1) <= 0xdbff
-			)
-				position++;
-			offset = total - Buffer.byteLength(value.slice(position));
-			port.capture({
-				type: "gap",
-				requestId,
-				side,
-				bytes: offset,
-				reason: "single payload safety limit",
-			});
-		}
 		const encoder = new TextEncoder();
+		let position = 0;
+		let offset = 0;
 		while (position < value.length) {
 			const buffer = new Uint8Array(RECORDING_CHUNK_BYTES);
 			let end = Math.min(value.length, position + RECORDING_CHUNK_BYTES);
@@ -601,43 +663,39 @@ function sendBytes(
 				value.charCodeAt(end) <= 0xdfff
 			)
 				end--;
-			const { read = 0, written = 0 } = encoder.encodeInto(value.slice(position, end), buffer);
-			if (!read) break;
-			port.capture({
-				type: "chunk",
-				requestId,
-				side,
-				kind,
-				data: buffer.slice(0, written),
-				packet,
-				offset,
-				total,
-				time,
-			});
+			const { read, written } = encoder.encodeInto(value.slice(position, end), buffer);
+			yield { ...header, offset, data: buffer.slice(0, written) };
 			position += read;
 			offset += written;
 		}
 	} else {
-		if (total > inputLimit) {
-			offset = total - inputLimit;
-			port.capture({
-				type: "gap",
-				requestId,
-				side,
-				bytes: offset,
-				reason: "single payload safety limit",
-			});
-		}
-		while (offset < value.byteLength) {
+		for (let offset = 0; offset < value.byteLength; offset += RECORDING_CHUNK_BYTES) {
+			// Transfer the copy, not the caller's buffer or the source for later chunks.
 			const data = Uint8Array.from(value.subarray(offset, offset + RECORDING_CHUNK_BYTES));
-			// capture() may synchronously transfer data.buffer to the worker, which detaches it
-			// (byteLength becomes 0). Read the length first, or offset never advances and the
-			// same chunk is re-posted until the in-flight window fills.
-			const length = data.byteLength;
-			port.capture({ type: "chunk", requestId, side, kind, data, packet, offset, total, time });
-			offset += length;
+			yield { ...header, offset, data };
 		}
 	}
+}
+function sendBytes(
+	port: RequestRecorderClient,
+	requestId: string,
+	side: RecordingSide,
+	kind: string,
+	value: string | Uint8Array,
+	packet: number,
+): void {
+	const total = typeof value === "string" ? Buffer.byteLength(value, "utf8") : value.byteLength;
+	const header: ChunkHeader = {
+		type: "chunk",
+		requestId,
+		side,
+		kind,
+		total,
+		packet,
+		time: new Date().toISOString(),
+	};
+	if (total > 512 * 1024) port.capturePayload(header, value);
+	else for (const op of payloadChunks(header, value)) port.capture(op);
 }
 export function createRequestRecording(identity: RecordingIdentity): RequestRecording | undefined {
 	const config = requestRecordingSettings();
