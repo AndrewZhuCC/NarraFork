@@ -299,6 +299,7 @@ def main():
             ['0017_merge_opensource_083'], ['0018_merge_upstream_090'],
             ['0205_merge_upstream_093'], ['0227_merge_selfuse_099'], ['0228_merge_selfuse_011'],
             ['0229_merge_selfuse_0912'], ['0230_merge_selfuse_0914'],
+            ['0231_merge_selfuse_0915'],
             ['0209_unified-runtime-registration', '0210_fresh_mephisto',
              '0211_editor_operation_recovery', '0212_file_write_redesign'],
             ['0196_narrator_model_history_revision', '0197_fluffy_the_professor',
