@@ -919,6 +919,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		model: string,
 		options?: {
 			conversationId?: string;
+			stickySessionKey?: string;
 			reasoningEffort?: ReasoningEffort;
 			signal?: AbortSignal;
 			trailingToolResults?: unknown[];
@@ -981,9 +982,9 @@ export class OpenAIProvider implements ProviderAdapter {
 			const tools = Array.isArray(body.tools) ? body.tools : [];
 			if (!hasNativeTool(tools, "web_search")) body.tools = [...tools, { type: "web_search" }];
 		}
-		const headers = this.buildHeaders(apiKey, conversationId);
 		let result: RemoteCompactResult | undefined;
 		if (prefix && conversationId && (options?.useWebSocket ?? this.useWebSocket)) {
+			const fingerprint = this.resolveFingerprint(conversationId);
 			const collector = createCompactOutputCollector();
 			const budget = new StreamByteBudget(16 * 1024 * 1024, "Codex remote compact response");
 			try {
@@ -995,7 +996,7 @@ export class OpenAIProvider implements ProviderAdapter {
 					proxy: this.proxy
 						? applyProxyExemptions(this.proxy, baseUrl)
 						: resolveProxyForUrl(baseUrl, this.config.proxy),
-					sessionKey: conversationId,
+					sessionKey: options?.stickySessionKey ?? conversationId,
 					conversationId,
 					credentialId: this.compactCredentialId ?? this.config.id,
 					model,
@@ -1003,7 +1004,9 @@ export class OpenAIProvider implements ProviderAdapter {
 					signal: options?.signal ?? new AbortController().signal,
 					ephemeral: true,
 					exclusive: true,
-					extraHeaders: headers,
+					reuseIdleConnection: true,
+					userAgent: fingerprint.userAgent,
+					extraHeaders: { ...fingerprint.headers, ...this.config.dynamicHeaders?.() },
 					requestDump: options?.requestDump,
 					onResponseFrame: (frame) => {
 						budget.add(Buffer.byteLength(frame, "utf8"));
@@ -1021,6 +1024,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			}
 		}
 		if (!result) {
+			const headers = this.buildHeaders(apiKey, conversationId);
 			headers.Accept = "text/event-stream";
 			const url = `${baseUrl}/responses`;
 			const bodyText = await stringifyRequestBody(body, options?.signal);

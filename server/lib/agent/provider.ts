@@ -263,6 +263,8 @@ export interface RemoteCompactCapableProvider {
 		model: string,
 		options?: {
 			conversationId?: string;
+			/** The ordinary request's local socket key, distinct from wire conversationId. */
+			stickySessionKey?: string;
 			reasoningEffort?: ChatParams["reasoningEffort"];
 			signal?: AbortSignal;
 			trailingToolResults?: unknown[];

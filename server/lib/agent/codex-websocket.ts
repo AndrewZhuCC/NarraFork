@@ -198,6 +198,8 @@ export interface StreamCodexResponsesWebSocketOptions {
 	ephemeral?: boolean;
 	/** Reserve the upstream conversation for remote compaction without changing its wire identity. */
 	exclusive?: boolean;
+	/** An exclusive ephemeral request may take over its idle socket and close it when done. */
+	reuseIdleConnection?: boolean;
 	/** Request-scoped raw frames, before ordinary chat parsing. */
 	onResponseFrame?: (frame: string) => void;
 	/** Close and clear cached WebSocket response-chain state before dispatching this request. */
@@ -956,6 +958,7 @@ class ReusableWebSocketConnection {
 	private queue: PendingFrame[] = [];
 	private waiters: Array<(frame: PendingFrame) => void> = [];
 	private open = false;
+	private connectedProxy?: string;
 	/** Wall-clock time the upgrade completed, for the 60-minute lifetime cap. */
 	private connectedAt = 0;
 
@@ -981,6 +984,7 @@ class ReusableWebSocketConnection {
 			// HTTP path: a target covered by `settings.proxy.noProxyRules` connects
 			// directly. `wss:` URLs parse, so the rules match on host/URL as usual.
 			const proxyUrl = this.proxy ? applyProxyExemptions(this.proxy, this.url) : undefined;
+			this.connectedProxy = proxyUrl;
 			if (proxyUrl) {
 				wsOptions.agent = new HttpsProxyAgent(proxyUrl);
 			}
@@ -1086,6 +1090,14 @@ class ReusableWebSocketConnection {
 
 	isOpen(): boolean {
 		return !!this.ws && this.open;
+	}
+
+	matchesHandshake(headers: Record<string, string>, proxy: string | undefined): boolean {
+		const proxyUrl = proxy ? applyProxyExemptions(proxy, this.url) : undefined;
+		return (
+			this.connectedProxy === proxyUrl &&
+			JSON.stringify([...new Headers(this.headers)]) === JSON.stringify([...new Headers(headers)])
+		);
 	}
 
 	hasPendingFrames(): boolean {
@@ -1341,6 +1353,29 @@ async function* streamCodexResponsesWithSocket(
 		});
 	}
 
+	const handshakeHeaders = buildHandshakeHeaders(options);
+	if (options.exclusive && options.ephemeral && options.reuseIdleConnection) {
+		const foreground = sessionCache.get(cacheKey);
+		const socket = foreground?.connection;
+		if (
+			foreground &&
+			!foreground.busy &&
+			!foreground.disabled &&
+			socket?.isOpen() &&
+			!socket.isExpiring() &&
+			!socket.hasPendingFrames() &&
+			socket.matchesHandshake(handshakeHeaders, options.proxy)
+		) {
+			// The exclusive lane owns this conversation. Move only the socket, not the
+			// foreground turn token or previous_response_id chain. Compact sends a full
+			// request and closes the socket as before when the ephemeral session ends.
+			foreground.connection = null;
+			foreground.lastRequest = null;
+			foreground.lastCompleted = null;
+			session.connection = socket;
+		}
+	}
+
 	touchSession(session);
 	session.busy = true;
 	// The provider's built request stays read-only during dispatch. Own the root and
@@ -1361,9 +1396,18 @@ async function* streamCodexResponsesWithSocket(
 	};
 
 	try {
-		// Only the runtime knows when new user work starts. An aborted request is not that boundary.
+		// A new work turn needs a fresh routing token and a full request, not a new
+		// transport. Retain only a socket with the same handshake and proxy.
 		if (options.workTurnId && options.workTurnId !== session.workTurnId) {
-			await resetSession(session);
+			if (
+				session.connection &&
+				!session.connection.matchesHandshake(handshakeHeaders, options.proxy)
+			) {
+				await closeSessionConnection(session);
+			}
+			session.lastRequest = null;
+			session.lastCompleted = null;
+			session.turnState = null;
 			session.workTurnId = options.workTurnId;
 		}
 		if (options.resetSessionBeforeRequest) {
@@ -1375,7 +1419,6 @@ async function* streamCodexResponsesWithSocket(
 		let connectionLimitReconnects = 0;
 		let previousResponseRetries = 0;
 		let hasYieldedEvents = false;
-		const handshakeHeaders = buildHandshakeHeaders(options);
 		let requestReported = false;
 		const beginAttempt = () =>
 			options.requestDump?.beginResponseAttempt({

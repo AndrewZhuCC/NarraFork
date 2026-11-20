@@ -475,6 +475,7 @@ export class CodexProvider implements ProviderAdapter {
 		model: string,
 		options?: {
 			conversationId?: string;
+			stickySessionKey?: string;
 			reasoningEffort?: ChatParams["reasoningEffort"];
 			signal?: AbortSignal;
 			trailingToolResults?: unknown[];

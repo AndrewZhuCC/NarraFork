@@ -519,6 +519,7 @@ function createChatProvider(server: TestServer, apiKey = "sk-local-test-only"): 
 		defaultModel: "gpt-5.3-codex",
 		apiMode: "codex",
 		codexWebSocket: true,
+		codexRemoteCompact: true,
 		codexWebSearch: false,
 		codexImageGeneration: false,
 	});
@@ -557,6 +558,43 @@ async function runChat(
 	}
 	return { events, error };
 }
+
+test("remote compaction takes over the idle ordinary socket without inheriting its response chain", async () => {
+	const item = { id: "cmp-1", type: "compaction", encrypted_content: "sealed-history" };
+	const server = startServer(
+		({ requestIndex, send }) => {
+			if (requestIndex === 1) {
+				send(JSON.stringify({ type: "response.output_item.done", item }));
+			}
+			for (const frame of completedFrames(`resp-${requestIndex}`)) send(frame);
+		},
+		() => ({ "x-codex-turn-state": "foreground-token" }),
+	);
+	activeServer = server;
+	const provider = createChatProvider(server);
+	const conversationId = "wire-conversation";
+	const stickySessionKey = "local-narrator";
+	const model = "codex-ws-recovery:gpt-5.3-codex";
+	const context = { model, conversationId, stickySessionKey };
+	expect((await runChat(provider, { ...context, workTurnId: "first" })).error).toBeUndefined();
+	const result = await provider.compactRemote([userMessage("hello")], model, {
+		conversationId,
+		stickySessionKey,
+	});
+	expect(result.items).toEqual([item]);
+	expect(server.connectionCount()).toBe(1);
+	expect(server.requests[1]?.connectionIndex).toBe(0);
+	expect(server.requests[1]?.body.input).toEqual([
+		...(server.requests[0]?.body.input as unknown[]),
+		{ type: "compaction_trigger" },
+	]);
+	expect(server.requests[1]?.body.previous_response_id).toBeUndefined();
+	expect(requestTurnState(server, 1)).toBeUndefined();
+
+	expect((await runChat(provider, { ...context, workTurnId: "next" })).error).toBeUndefined();
+	expect(server.requests[2]?.connectionIndex).toBe(1);
+	expect(server.requests[2]?.body.previous_response_id).toBeUndefined();
+});
 
 test("Composer reuses the primary socket without leaking its prediction into a continuation", async () => {
 	activeServer = startServer(({ requestIndex, send }) => {
@@ -614,8 +652,12 @@ test("Composer reuses the primary socket without leaking its prediction into a c
 	expect(suggestion.text).toBe('{"suggestion":"next"}');
 	expect(activeServer.connectionCount()).toBe(1);
 	expect(activeServer.requests[1]?.connectionIndex).toBe(0);
-	expect(activeServer.requests[1]?.body.previous_response_id).toBeUndefined();
-	expect(activeServer.requests[1]?.body.tool_choice).toBe("none");
+	// Composer now inherits the ordinary tool_choice, so its matching prefix
+	// can use the primary response. The following ordinary request must not use the prediction.
+	expect(activeServer.requests[1]?.body.previous_response_id).toBe("composer-0");
+	expect(activeServer.requests[1]?.body.tool_choice).toBe(
+		activeServer.requests[0]?.body.tool_choice,
+	);
 	expect(JSON.stringify(activeServer.requests[1]?.body.client_metadata)).toContain(
 		"composer_predictions",
 	);
@@ -974,13 +1016,24 @@ test("work turns freeze the first token across metadata, reconnects and backgrou
 		undefined,
 		"metadata-0",
 		"metadata-0",
-		"handshake-2",
-		"handshake-2",
-		"handshake-2",
+		undefined,
+		"metadata-3",
+		"metadata-3",
 	]);
-	expect(server.connectionCount()).toBe(3);
+	expect(server.connectionCount()).toBe(2);
 	expect(server.requests[2]?.body.previous_response_id).toBeUndefined();
 	expect(server.requests[3]?.body.previous_response_id).toBeUndefined();
+
+	// The same narrator can get a different conversation identity after compacting.
+	const changedIdentity = await runChat(provider, {
+		stickySessionKey: "conv-chat-recovery",
+		conversationId: "conv-chat-after-compact",
+		workTurnId: "work-3",
+	});
+	expect(changedIdentity.error).toBeUndefined();
+	expect(server.connectionCount()).toBe(3);
+	expect(requestTurnState(server, 6)).toBe("handshake-2");
+	expect(server.requests[6]?.body.previous_response_id).toBeUndefined();
 });
 
 test("editing a relay API key cannot reuse the previous authorization's socket or token", async () => {

@@ -1400,6 +1400,7 @@ async function doRunCustomCompact({
 							signal,
 							conversationId:
 								(active?.alive ? active.conversationId : narrator?.apiConversationId) || narratorId,
+							stickySessionKey: narratorId,
 							onActivity: hooks?.beat,
 							reasoningEffort: remoteEffort ?? undefined,
 							requestDump,
