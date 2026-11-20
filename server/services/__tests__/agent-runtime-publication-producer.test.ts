@@ -320,7 +320,7 @@ describe("real task producers use publication outbox", () => {
 		expect(Buffer.byteLength(task?.output ?? "")).toBeLessThan(5120);
 		expect(task?.output).toContain("toolcall_");
 		expect(task?.outputTruncated).toBe(true);
-		expect(task?.output).toContain("No Await is needed");
+		expect(task?.output).toContain("No observation is needed");
 		expect(db.select().from(narratorMessages).all()).toHaveLength(0);
 	});
 

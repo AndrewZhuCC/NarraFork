@@ -16,6 +16,7 @@ import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-docum
 import type { ProgressPhase } from "@shared/progress-phase";
 import type { NarratorWsSubscriptionLimitError, RecentTabsDelta } from "@shared/recent-tabs";
 import type { StreamingEditOrigin } from "@shared/streaming-edit-origin";
+import type { SubagentNestedSummary } from "@shared/subagent-nested";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { ApiRequestDiagnostics } from "../lib/agent/types";
@@ -90,6 +91,8 @@ export type NarratorServerMessage =
 	| import("@shared/outline-page-events").OutlinePageServerMessage
 	/** No narrator identifiers or payloads; clients re-fetch their ACL-filtered inbox. */
 	| { type: "human_attention_changed" }
+	/** Delivered only to this account's sockets; clients refetch authorized preferences. */
+	| { type: "user_preferences_changed" }
 	/** Per-user activity invalidation; no titles, previews or source identifiers. */
 	| {
 			type: typeof NOTIFICATION_CENTER_CHANGED_WS_TYPE;
@@ -328,6 +331,8 @@ export type NarratorServerMessage =
 			balance?: number;
 			required?: number;
 			resumeAction: "retry" | "continue";
+			/** Parent copy of a subagent's frame: the parent must not react to it. */
+			isSubagent?: boolean;
 	  }
 	| {
 			/**
@@ -958,6 +963,8 @@ export type NarratorServerMessage =
 			narratorId: string;
 			quotaBalance: string | null;
 			detailedQuotaBalance?: string | null;
+			/** Parent copy of a subagent's frame: its balance is not the parent's. */
+			isSubagent?: boolean;
 	  }
 	| {
 			type: "queue_status";
@@ -1097,6 +1104,19 @@ export type NarratorServerMessage =
 			subagentNarratorId: string;
 			toolUseId?: string;
 			takenOver: boolean;
+	  }
+	/**
+	 * The helpers a first-level subagent launched changed (one started, changed status or
+	 * asks for or got a permission decision). Sent to the ACL root's page, where that
+	 * subagent is a card; `nested` replaces the card's helper rows. Like the takeover
+	 * frame, `toolUseId` is best-effort and the client may match by `subagentNarratorId`.
+	 */
+	| {
+			type: "subagent_nested_changed";
+			narratorId: string;
+			subagentNarratorId: string;
+			toolUseId?: string;
+			nested: SubagentNestedSummary;
 	  }
 	| {
 			type: "subagent_warning";
@@ -1266,7 +1286,7 @@ export type NarratorServerMessage =
 			path: string;
 			revisionId: string | null;
 			updatedBy: "user" | "assistant" | "system";
-			source: "ui" | "tool" | "task_create" | "reset" | "import";
+			source: "ui" | "tool" | "task_create" | "reset" | "import" | "revert";
 	  }
 	| {
 			/**

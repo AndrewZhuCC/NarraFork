@@ -7,6 +7,7 @@ import {
 	getDbWorkerPoolStats,
 	resetDbWorkerPoolForTest,
 	runReadTask,
+	runShortReadTask,
 	shutdownDbWorkerPool,
 } from "../pool";
 import {
@@ -35,7 +36,7 @@ async function query(sql: string, params: SelectRowsParams["params"] = [], maxRo
 	);
 }
 
-beforeEach(() => {
+beforeEach(async () => {
 	home = mkdtempSync(join(tmpdir(), "narrafork-search-worker-"));
 	dbPath = join(home, "fixture.db");
 	writer = new Database(dbPath);
@@ -46,11 +47,11 @@ beforeEach(() => {
 	writer.run("INSERT INTO messages_fts(rowid, content) SELECT id, content FROM messages");
 	previousConcurrency = process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
 	process.env.NARRAFORK_DB_WORKER_CONCURRENCY = "1";
-	resetDbWorkerPoolForTest();
+	await resetDbWorkerPoolForTest();
 });
 
-afterEach(() => {
-	shutdownDbWorkerPool();
+afterEach(async () => {
+	await shutdownDbWorkerPool();
 	if (previousConcurrency === undefined) delete process.env.NARRAFORK_DB_WORKER_CONCURRENCY;
 	else process.env.NARRAFORK_DB_WORKER_CONCURRENCY = previousConcurrency;
 	writer.close();
@@ -58,6 +59,20 @@ afterEach(() => {
 });
 
 describe("real selectRows read-worker pool", () => {
+	test("short reads see new committed WAL data without starting the ordinary pool", async () => {
+		const select = (id: number) =>
+			runShortReadTask(dbPath, {
+				kind: "selectRows",
+				sql: "SELECT id, content FROM messages WHERE id = ?",
+				params: [id],
+				maxRows: 1,
+			});
+		expect(await select(2)).toEqual({ columns: ["id", "content"], rows: [] });
+		writer.run("INSERT INTO messages(id, content) VALUES (2, 'committed')");
+		expect(await select(2)).toEqual({ columns: ["id", "content"], rows: [[2, "committed"]] });
+		expect(getDbWorkerPoolStats().workers).toBe(0);
+	});
+
 	test("cached readonly worker sees new committed WAL data and preserves FTS snippet", async () => {
 		expect(await query("SELECT id, content FROM messages ORDER BY id")).toHaveLength(1);
 		writer.transaction(() => {

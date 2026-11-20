@@ -269,9 +269,11 @@ import {
 	consumePlanModePromptRebuild,
 	hasNarratorAdmissionWork,
 	hasPendingHistoryCompact,
+	hasRevertBlockingAdmissionWork,
 	isNarratorRevertAdmissionBlocked,
 	isNarratorRuntimeBusy,
 	listNarratorAdmissionOwners,
+	loadBackgroundSubagentIds,
 	narratorCreationLocks,
 	narratorLoopAdmissions,
 	pendingFeedback,
@@ -283,6 +285,7 @@ import {
 	planModeAskedOnce,
 	reserveNarratorRevertAdmission,
 	resolveNarratorAdmissionRoot,
+	retainBackgroundSubagentWork,
 	waitForNarratorAdmissionWork,
 	withNarratorMutationAdmission,
 	withNarratorStartAdmission,
@@ -1672,8 +1675,8 @@ async function createNarrator(
 		}
 	} else {
 		// Preload optional tools whose routine mode is `resident` (project override
-		// first, then global). `manual` and `auto` are not preloaded — `auto` is the
-		// toolsearch placeholder and behaves like `manual` until that lands.
+		// first, then global). `manual` stays out until `/load`. `auto` is not
+		// preloaded either; ToolSearch loads that group on demand.
 		for (const routine of getBuiltinToolRoutines()) {
 			if (!routine.tool) continue;
 			const { mode } = resolveEffectiveToolRoutineMode(
@@ -1966,12 +1969,19 @@ export const OUTLINE_TURN_END_MIN_TOOL_CALLS = 30;
 
 /**
  * At the start of a run: import a session that still keeps its tasks in Dynamic Spec (outline P2
- * PR 12b, `spec-import/triggers.ts`). Then, for an outline session: move the old behavior fence's text to the
+ * PR 12b, `spec-import/triggers.ts`). Then, for an outline session: tell it once where its Dynamic
+ * Spec went when the import moved it (PR 12b2, `spec-import/notice.ts`), move the old behavior fence's text to the
  * session's behavior page (once; `importOutlineBehaviorFence`) and a plugin's SOP left in it to the
  * plugin's block there (once; `moveOutlineFenceSop`, outline P2 PR 12a), then note where the run
  * starts for the turn-end note (the completed tool count and the revision of the open tasks).
  * Spec sessions only resolve their (cached) backend. Never rejects.
  */
+/** Whether the Dynamic Spec import moved this session into the outline (outline P2 PR 12b2). */
+async function isSpecImportedSession(narratorId: string): Promise<boolean> {
+	const { isSpecImportedSession: read } = await import("./outline/spec-import/state");
+	return await read(narratorId);
+}
+
 export async function prepareOutlineRun(active: ActiveNarrator): Promise<void> {
 	active._outlineTurnStart = undefined;
 	try {
@@ -1985,6 +1995,9 @@ export async function prepareOutlineRun(active: ActiveNarrator): Promise<void> {
 		if ((await resolveTaskBackend(active.narratorId)) !== "outline") return;
 		const { readTaskSession } = await import("./task-source/backend");
 		if ((await readTaskSession(active.narratorId))?.subagent === true) return;
+		// Moved by the import: one history row tells the model where its spec went (PR 12b2).
+		const { deliverSpecImportNotice } = await import("./outline/spec-import/notice");
+		await deliverSpecImportNotice(active.narratorId);
 		const { importOutlineBehaviorFence } = await import("./task-source/outline-behavior");
 		await importOutlineBehaviorFence(active.narratorId, active.locale);
 		// A plugin's SOP the old fence still holds moves to its block on the page (PR 12a).
@@ -3024,6 +3037,16 @@ export async function drainInjectionsIntoHistory(
 		const activity = await writeOutlineTeamActivity(narratorId, locale, "boundary");
 		if (activity?.turnText)
 			parts.push({ text: activity.turnText, messageId: activity.messageId ?? undefined });
+		// A team coordinator's status again, at most every ten minutes and only when it changed
+		// (Project Teams P2; a map lookup for every other session).
+		const { writeTeamStatusAtBoundary } = await import("./teams/team-status");
+		const teamStatus = await writeTeamStatusAtBoundary({
+			narratorId,
+			locale,
+			contextPercent: active._contextUsagePct,
+		});
+		if (teamStatus?.turnText)
+			parts.push({ text: teamStatus.turnText, messageId: teamStatus.messageId ?? undefined });
 	}
 
 	return {
@@ -4124,14 +4147,18 @@ async function updateToolCallConclusionUnlocked(opts: {
 		resultMessageId,
 		refreshTiming = false,
 	} = opts;
-	const resultPrefix = agentResultTag(await resolveAgentLabel(parentNarratorId, subagentId));
 	// Scope metadata only: do not load the child's transcript or file-tool payloads.
 	const attributionTurn = await db.query.narrators
 		.findFirst({
 			where: eq(narrators.id, subagentId),
-			columns: { turnStartedAt: true },
+			columns: { turnStartedAt: true, title: true },
 		})
 		.catch(() => undefined);
+	const resultPrefix = agentResultTag(
+		await resolveAgentLabel(parentNarratorId, subagentId),
+		subagentId,
+		attributionTurn?.title,
+	);
 	const output = await appendSubagentFileChanges(
 		{
 			parentNarratorId,
@@ -6782,10 +6809,12 @@ async function reExecuteDeniedToolCallUnlocked(
 					narratorId,
 					active._currentUserId ?? null,
 				);
+				const taskBackend = await resolveTaskBackend(narratorId).catch(() => "spec" as const);
 				const config: import("../lib/agent").AgentConfig = {
 					narratorId,
 					runtimePolicy,
-					taskBackend: await resolveTaskBackend(narratorId).catch(() => "spec" as const),
+					taskBackend,
+					specImported: taskBackend === "outline" && (await isSpecImportedSession(narratorId)),
 					systemPrompt: active.systemPrompt ?? undefined,
 					permissionMode: oauthRuntime?.permissionMode ?? narrator.permissionMode ?? "default",
 					planMode: !oauthRuntime && isPlanModeTrait(narrator.traits),
@@ -8918,6 +8947,11 @@ export function interruptNarrator(narratorId: string): boolean {
 		.set({ lastStopReason: "user_interrupt" })
 		.where(eq(narrators.id, narratorId))
 		.run();
+	// A stopped subagent's helpers stop with it, even when it is between turns while they
+	// still run in the background. A no-op for primaries and helper-less subagents.
+	void import("./agent-runtime/run")
+		.then(({ stopSubagentHelpers }) => stopSubagentHelpers(narratorId, "Parent subagent stopped"))
+		.catch(() => {});
 	if (cancelModelTrace(narratorId)) return true;
 	const active = activeNarrators.get(narratorId);
 	const recovery = interruptPlannedUpdateRecovery(narratorId);
@@ -9048,10 +9082,21 @@ export async function acquireNarratorRevertAdmission(
 			const interrupted = new Set<AbortController>();
 			interruptPlannedUpdateRecovery(narratorId);
 			// No start mutex is held here. Starting work may not have mounted its abort
-			// controller yet, so rescan until ALL admitted work (including delivery) exits.
-			while (busy() || hasNarratorAdmissionWork(narratorId)) {
+			// controller yet, so rescan until the reverted session's own work exits.
+			// Background subagents share this admission root but are not part of the
+			// turn: cancelling them here is what stopped agents launched with
+			// run_in_background. Foreground runs on this root are still cancelled,
+			// including a held run, and so is the session being reverted.
+			for (;;) {
 				signal.throwIfAborted();
-				for (const owner of new Set([narratorId, ...listNarratorAdmissionOwners(narratorId)])) {
+				const owners = listNarratorAdmissionOwners(narratorId);
+				const background = await loadBackgroundSubagentIds(
+					owners.filter((id) => id !== narratorId),
+				);
+				retainBackgroundSubagentWork(narratorId, background);
+				if (!busy() && !hasRevertBlockingAdmissionWork(narratorId)) break;
+				for (const owner of new Set([narratorId, ...owners])) {
+					if (background.has(owner)) continue;
 					// A revert needs the real terminal boundary, including a held run: cancel
 					// the run itself, not only its current turn.
 					const run = getRunControl(owner);
@@ -9081,7 +9126,11 @@ export async function acquireNarratorRevertAdmission(
 				});
 			}
 		}
-		await reservation.acquire(signal, busy);
+		await reservation.acquire(
+			signal,
+			busy,
+			interrupt ? { retainBackgroundSubagents: true } : undefined,
+		);
 		return releaseAndResume;
 	} catch (error) {
 		releaseAndResume();
@@ -10258,6 +10307,7 @@ export {
 	compactLocks,
 	isCompactInProgress,
 	markCompactAsBlocking,
+	refreshCompactContextPercentAfter,
 	retryFailedCompact,
 	runCustomCompact,
 	runSegmentCompact,

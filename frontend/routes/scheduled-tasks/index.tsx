@@ -548,8 +548,14 @@ function TaskFormModal({
 	const { t: tc } = useTranslation("common");
 	const { t: tn } = useTranslation("narrator");
 	const { data: projects = [] } = useProjects();
-	const { groupedModels, allModels, defaultModelValue, aggregations, settingsData } =
-		useAllModels();
+	const {
+		groupedModels,
+		allModels,
+		defaultModelValue,
+		aggregations,
+		settingsData,
+		modelOptionsFilter,
+	} = useAllModels();
 	const reuseId = draft.narratorMode === "reuse" ? draft.reuseNarratorId : null;
 	// Detail contains metadata, not message history. Do not fetch while the modal is closed.
 	const {
@@ -806,6 +812,7 @@ function TaskFormModal({
 						description={t("modelDesc")}
 						data={groupedModels}
 						searchable
+						filter={modelOptionsFilter}
 						limit={MODEL_SELECT_OPTION_LIMIT}
 						value={draft.model || FOLLOW_DEFAULT_MODEL}
 						onChange={(v) => patch({ model: v && v !== FOLLOW_DEFAULT_MODEL ? v : "" })}

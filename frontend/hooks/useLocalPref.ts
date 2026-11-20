@@ -1,4 +1,9 @@
+import { appearanceDefinition } from "@shared/appearance-preferences";
 import { useCallback, useSyncExternalStore } from "react";
+import {
+	appearanceStore,
+	subscribeAppearancePreferences,
+} from "../lib/appearance-preference-store";
 import {
 	DEFAULT_STREAM_ANIM_DURATION_MS,
 	MAX_STREAM_ANIM_DURATION_MS,
@@ -37,7 +42,6 @@ type Key =
 	// keeps their stored value either way.
 	| "narrafork_unified_morph"
 	// TEMPORARY debug surface — see components/narrator/mock/README-REMOVAL.md.
-	| "narrafork_mock_stream"
 	| "narrafork_mock_stream";
 
 /**
@@ -93,9 +97,9 @@ let storageListener: ((e: StorageEvent) => void) | null = null;
 function ensureStorageListener() {
 	if (storageListener) return;
 	storageListener = (e: StorageEvent) => {
-		if (e.key === SHORTCUT_PREF_KEY || e.key === null) shortcutFallback = undefined;
-		if (e.key === null || e.key?.startsWith("narrafork_")) {
-			for (const cb of listeners) cb();
+		if (e.key === SHORTCUT_PREF_KEY || e.key === null) {
+			shortcutFallback = undefined;
+			notify();
 		}
 	};
 	window.addEventListener("storage", storageListener);
@@ -120,48 +124,25 @@ function notify() {
 	for (const cb of listeners) cb();
 }
 
-/** Keys whose default value is `true` (opt-out instead of opt-in). */
-const DEFAULT_TRUE: ReadonlySet<Key> = new Set([
-	"narrafork_advanced_anim",
-	// The LOD gesture is existing behavior, so nothing-stored must keep it working;
-	// the switch exists to opt OUT.
-	"narrafork_lod_alt_gesture",
-	// The unified morph driver is now the intended path; the switch exists to opt OUT
-	// while the keyframe planners are still present. See the key's note above.
-	"narrafork_unified_morph",
-]);
-
 /**
  * The default value of a preference key when nothing is stored in localStorage.
  * Exported (pure, no DOM) so tests can lock critical defaults.
  */
 export function localPrefDefault(key: Key): boolean {
-	return DEFAULT_TRUE.has(key);
+	return appearanceDefinition(key).fallback as boolean;
 }
 
 export function readLocalPref(key: Key): boolean {
-	try {
-		const raw = localStorage.getItem(key);
-		if (raw === null) return localPrefDefault(key);
-		return raw === "true";
-	} catch {
-		return localPrefDefault(key);
-	}
+	return appearanceStore.get(key) as boolean;
 }
 
 export function useLocalPref(key: Key): [boolean, (v: boolean) => void] {
 	const value = useSyncExternalStore(
-		subscribe,
+		subscribeAppearancePreferences,
 		() => readLocalPref(key),
 		() => localPrefDefault(key),
 	);
-	const setValue = useCallback(
-		(v: boolean) => {
-			localStorage.setItem(key, String(v));
-			notify();
-		},
-		[key],
-	);
+	const setValue = useCallback((v: boolean) => appearanceStore.set(key, v), [key]);
 	return [value, setValue];
 }
 
@@ -198,33 +179,17 @@ export function clampLocalNumberPref(key: NumberKey, value: number): number {
 }
 
 export function readLocalNumberPref(key: NumberKey): number {
-	try {
-		const raw = localStorage.getItem(key);
-		if (raw === null) return localNumberPrefDefault(key);
-		const parsed = Number.parseInt(raw, 10);
-		if (Number.isNaN(parsed)) return localNumberPrefDefault(key);
-		return clampLocalNumberPref(key, parsed);
-	} catch {
-		// A storage-less environment (SSR, locked-down WebView) reads the default.
-		return localNumberPrefDefault(key);
-	}
+	return clampLocalNumberPref(key, appearanceStore.get(key) as number);
 }
 
 export function useLocalNumberPref(key: NumberKey): [number, (v: number) => void] {
 	const value = useSyncExternalStore(
-		subscribe,
+		subscribeAppearancePreferences,
 		() => readLocalNumberPref(key),
 		() => localNumberPrefDefault(key),
 	);
 	const setValue = useCallback(
-		(v: number) => {
-			try {
-				localStorage.setItem(key, String(clampLocalNumberPref(key, v)));
-			} catch {
-				// Ignore: the in-tab notify below still updates this session.
-			}
-			notify();
-		},
+		(v: number) => appearanceStore.set(key, clampLocalNumberPref(key, v)),
 		[key],
 	);
 	return [value, setValue];

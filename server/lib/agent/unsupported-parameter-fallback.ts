@@ -34,6 +34,11 @@ const OPTIONAL_RETRY_PARAMETERS = new Set([
 	"stream_options",
 ]);
 
+interface RetryOptions {
+	/** Only the ordinary OpenAI adapters add this key as an optional hint. */
+	allowPromptCacheKey?: boolean;
+}
+
 /** Observed shapes: `Unsupported parameter: foo`, `Unsupported parameter: "foo"`. */
 const UNSUPPORTED_PARAMETER_PATTERN =
 	/unsupported parameter:?\s*["'`]?([A-Za-z0-9_.-]{1,64})["'`]?/i;
@@ -78,9 +83,15 @@ export function stripUnsupportedParameter(
 	body: Record<string, unknown>,
 	model: string,
 	err: unknown,
+	options: RetryOptions = {},
 ): boolean {
 	const parameter = unsupportedParameterFromError(err);
-	if (!parameter || !OPTIONAL_RETRY_PARAMETERS.has(parameter) || !(parameter in body)) return false;
+	if (!parameter || !(parameter in body)) return false;
+	if (
+		!OPTIONAL_RETRY_PARAMETERS.has(parameter) &&
+		!(parameter === "prompt_cache_key" && options.allowPromptCacheKey)
+	)
+		return false;
 	// An explicit Ultrafast request must not appear to succeed as Standard after a relay rejects it.
 	if (parameter === "service_tier" && body.service_tier === "ultrafast") return false;
 	delete body[parameter];
@@ -97,10 +108,15 @@ export function stripUnsupportedParameter(
  * Drop every field this model is known to reject. Applied before every send so
  * a later request never re-pays the doomed first attempt.
  */
-export function omitUnsupportedParameters(body: Record<string, unknown>, model: string): void {
+export function omitUnsupportedParameters(
+	body: Record<string, unknown>,
+	model: string,
+	options: RetryOptions = {},
+): void {
 	const set = unsupportedParametersByModel.get(model);
 	if (!set) return;
 	for (const parameter of set) {
+		if (parameter === "prompt_cache_key" && !options.allowPromptCacheKey) continue;
 		if (parameter === "service_tier" && body.service_tier === "ultrafast") continue;
 		if (parameter in body) delete body[parameter];
 	}

@@ -27,10 +27,13 @@ interface MailboxState {
 	ready: boolean;
 	retryAt: number;
 	worker?: Worker;
+	retiring?: Promise<void>;
 	queued: Array<{ id: number; bytes: number; op: RecorderOperation; payload?: object }>;
 	queuedBytes: number;
 	inflightBytes: number;
 	pendingSourceBytes: number;
+	payloadFlight?: { id: number };
+	operationTimers: Map<number, unknown>;
 	recordings: Map<string, { beginId: number; endId?: number }>;
 	waiters: Map<number, unknown>;
 	pump(): void;
@@ -337,6 +340,8 @@ describe("真实 recorder worker 的有界可靠控制邮箱", () => {
 		expect(worker).toBeDefined();
 		await worker?.terminate();
 		expect(await pending).toBeInstanceOf(Error);
+		// Caller failure does not return admission: await the common handle's exit cleanup.
+		await state.retiring;
 		expect(state.recordings.size).toBe(0);
 		expect(state.waiters.size).toBe(0);
 		expect(state.queuedBytes + state.inflightBytes).toBe(0);
@@ -372,6 +377,35 @@ describe("真实 recorder worker 的有界可靠控制邮箱", () => {
 		expect(saved.truncated).toBe(true);
 		expect(records[0].status).toBe("complete");
 		expect(records[0].gapReasons).toEqual(["recording payload timed out"]);
+	});
+
+	test("close 期间丢弃剩余大载荷仍等待已发分块 ACK，且缺口先于终结", async () => {
+		await client.call(begin("payload-close"));
+		state.ready = false;
+		stagePayload("payload-close");
+		const placeholder = state.queued.find((item) => item.payload);
+		const closing = client.close();
+		state.ready = true;
+		state.pump();
+
+		const flight = state.payloadFlight;
+		if (!placeholder?.payload || !flight) throw new Error("Missing staged payload or chunk");
+		expect(flight.id).not.toBe(placeholder.id);
+		expect(state.operationTimers.has(placeholder.id)).toBe(false);
+		state.expirePayload(placeholder.payload);
+
+		expect(state.pendingSourceBytes).toBe(0);
+		expect(state.operationTimers.has(flight.id)).toBe(true);
+		expect(state.queued.map((item) => item.op.type)).toEqual(["gap", "end"]);
+		expect(state.queued[0].op).toMatchObject({
+			bytes: 5.5 * 1024 * 1024 - RECORDING_CHUNK_BYTES,
+			reason: "recording payload timed out",
+		});
+		bounded();
+		await closing;
+		expect(state.operationTimers.size).toBe(0);
+		expect(state.queuedBytes + state.inflightBytes).toBe(0);
+		expect(state.worker).toBeUndefined();
 	});
 
 	test("begin RPC 取消不遗留记录，end RPC 取消仍可靠送达终结", async () => {

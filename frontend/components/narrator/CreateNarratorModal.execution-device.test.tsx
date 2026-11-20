@@ -175,6 +175,7 @@ mock.module("../../hooks/useGitIdentities", () => ({
 		isLoading: false,
 		isError: false,
 	}),
+	useFolderGitIdentity: () => ({ data: undefined }),
 	narratorGitIdentityQueryKey: (id: string) => ["narrator", id, "gitIdentity"],
 }));
 mock.module("../../hooks/useWorkspaceContext", () => ({
@@ -292,6 +293,26 @@ test("picking a remote device swaps in its own path editor and submits device + 
 	const payload = create.mock.calls[0]?.[0] as Record<string, unknown>;
 	expect(payload.deviceId).toBe("win-box");
 	expect(payload.cwd).toBe("C:\\srv");
+});
+
+test("opening on a remote device does not adopt this server's default directory", () => {
+	act(() => {
+		root.render(<CreateNarratorModalBody opened onClose={() => {}} initialDeviceId="win-box" />);
+	});
+	expect(container.querySelector("[data-select]")?.getAttribute("data-value")).toBe("win-box");
+	// The instance default is /instance. It belongs to this server, so a remote
+	// target that arrived without a directory must stay empty.
+	expect(directoryField()?.getAttribute("data-value")).toBe("");
+	expect(directoryField()?.getAttribute("data-error")).toBe("workingDirectoryRemoteRequired");
+});
+
+test("a mounted dialog drops the local directory when handed a remote device", () => {
+	render();
+	expect(container.querySelector("[data-local-directory-picker]")).not.toBeNull();
+	act(() => {
+		root.render(<CreateNarratorModalBody opened onClose={() => {}} initialDeviceId="win-box" />);
+	});
+	expect(directoryField()?.getAttribute("data-value")).toBe("");
 });
 
 test("a remote creation with no directory cannot be submitted", () => {

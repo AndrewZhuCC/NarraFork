@@ -10,6 +10,10 @@ import type {
 	WorktreePrepareRequest,
 	WorktreePrepareResult,
 	WorktreeReconcileRequest,
+	WorktreeRemovalPlan,
+	WorktreeRemovalPlanRequest,
+	WorktreeRemovalRequest,
+	WorktreeRemovalResult,
 } from "@shared/narrator-worktrees";
 import { request } from "./client";
 import type { ApiEntity } from "./types";
@@ -116,6 +120,18 @@ export const gitApi = {
 		const query = params.toString();
 		return gitRequest<GitWorkspace>(query ? `${path}?${query}` : path, { signal });
 	},
+	/** Read-only removal preflight; safe to re-run whenever the dialog needs fresh facts. */
+	planNarratorWorktreeRemoval: (id: string, input: WorktreeRemovalPlanRequest) =>
+		gitRequest<WorktreeRemovalPlan>(
+			`/narrators/${encodeURIComponent(id)}/git/worktrees/removal/plan`,
+			{ method: "POST", body: JSON.stringify(input) },
+		),
+	/** Explicit destructive command. Retrying a completed removal reports `already_absent`. */
+	removeNarratorWorktree: (id: string, input: WorktreeRemovalRequest) =>
+		gitRequest<WorktreeRemovalResult>(
+			`/narrators/${encodeURIComponent(id)}/git/worktrees/removal`,
+			{ method: "POST", body: JSON.stringify(input) },
+		),
 	getGitStatus: (target: GitTarget, signal?: AbortSignal, fresh = false) =>
 		gitRequest<ApiEntity>(gitReadPath(target, fresh ? "/status?fresh=1" : "/status"), { signal }),
 	/** Full branch listing: local, remote-tracking, upstream tracking and worktrees. */

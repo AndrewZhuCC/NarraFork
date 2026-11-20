@@ -523,8 +523,8 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 141 tables and 1868 columns including outline view state and local extensions", () => {
-		expect(target.tables.length).toBe(141);
+	test("covers 147 tables and 1960 columns including the project team tables and selfuse fields", () => {
+		expect(target.tables.length).toBe(147);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
 		// The numeric context stats replace the 5-column page cache with pins (3) and stats (4).
@@ -566,7 +566,24 @@ describe("real schema parity", () => {
 		// Workspace auto titles add title_source and title_revision (2).
 		// Recent-tab directory visibility adds one account-scoped user preference.
 		// The outline's default folding adds outline_view_state.expanded_json (nullable).
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1868);
+		// The Dynamic Spec import's state (outline P2 PR 12b2) adds outline_spec_imports (24).
+		// Cache hit rate eligibility adds api_requests.cache_usage_reported (nullable).
+		// The swallowed-content scan (outline P2 PR 12c) adds outline_spec_loss_findings (21) and
+		// outline_spec_loss_scans (6).
+		// Account appearance preferences add one bounded JSON text column.
+		// Per-user plugin overlay visibility adds user_preferences.hidden_plugin_overlays.
+		// Project teams (P1) add project_teams (9), team_work_items (21) and team_work_events (8).
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1960);
+		expect(
+			target.tables
+				.find((table) => table.name === "user_preferences")
+				?.columns.find((column) => column.property === "appearancePreferences"),
+		).toMatchObject({
+			name: "appearance_preferences",
+			pgType: "text",
+			notNull: true,
+			defaultExpression: '"{}"',
+		});
 		expect(target.tables.find((table) => table.name === "narrators")?.columns).toEqual(
 			expect.arrayContaining([
 				expect.objectContaining({

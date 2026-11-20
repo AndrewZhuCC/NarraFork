@@ -461,10 +461,10 @@ const NARRATOR_SUBAGENTS_CAPABILITY: {
 	reason?: string;
 	foreground: boolean;
 	background: boolean;
-	awaitAgent: boolean;
-	awaitBash: boolean;
-	awaitBashWaitForText: boolean;
-	awaitBashReason?: string;
+	watchAgent: boolean;
+	watchBash: boolean;
+	watchPattern: boolean;
+	watchBashReason?: string;
 	send: boolean;
 	teamStatus: boolean;
 	detachAttach: boolean;
@@ -478,9 +478,9 @@ const NARRATOR_SUBAGENTS_CAPABILITY: {
 	supported: true,
 	foreground: true,
 	background: true,
-	awaitAgent: true,
-	awaitBash: true,
-	awaitBashWaitForText: true,
+	watchAgent: true,
+	watchBash: true,
+	watchPattern: true,
 	send: true,
 	teamStatus: true,
 	detachAttach: true,

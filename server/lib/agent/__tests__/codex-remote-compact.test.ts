@@ -571,6 +571,7 @@ describe("remote compact completion and activity", () => {
 				inputTokens: 58,
 				cachedInputTokens: 12672,
 				cacheCreationInputTokens: 0,
+				cacheReported: true,
 				outputTokens: 51,
 				reasoningTokens: 7,
 			},

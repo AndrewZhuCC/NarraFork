@@ -27,6 +27,7 @@ function SettingsModelsPage() {
 	const {
 		allModels,
 		groupedModels,
+		modelOptionsFilter,
 		visibleModels,
 		providerLabels,
 		aggregations,
@@ -142,6 +143,7 @@ function SettingsModelsPage() {
 				routerModels={is.routerModels}
 				setRouterModels={is.setRouterModels}
 				groupedModels={groupedModels}
+				modelOptionsFilter={modelOptionsFilter}
 				catalogMissingModels={catalogMissingModels}
 				navigate={navigate}
 			/>

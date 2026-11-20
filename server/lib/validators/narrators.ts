@@ -605,7 +605,10 @@ export const askInPassingSchema = z.object({
 export const subagentRecoverySchema = z.object({
 	messageId: z.string().min(1),
 	subagentIds: z.array(z.string().min(1)).min(1).max(50),
-	mode: z.enum(["notify", "await"]),
+	// Old clients may still submit "await"; it now only registers Watch.
+	mode: z
+		.enum(["notify", "watch", "await"])
+		.transform((mode) => (mode === "await" ? ("watch" as const) : mode)),
 });
 
 export const askInPassingStartSchema = z.object({
@@ -650,6 +653,17 @@ export const narratorExportQuerySchema = z.object({
 	scope: z.enum(["full", "visible"]).default("visible"),
 	includeToolIO: exportBooleanSchema.default(true),
 	lang: z.enum(["en", "zh-CN"]).default("en"),
+	/** `1,2,3-10,15,21`；省略表示导出当前 scope 的全部消息。 */
+	range: z
+		.string()
+		.max(512)
+		.optional()
+		.transform((value) => value ?? ""),
+});
+
+/** 导出范围选择弹窗读取的轮次摘要；scope 与导出保持一致。 */
+export const narratorExportTurnsQuerySchema = z.object({
+	scope: z.enum(["full", "visible"]).default("visible"),
 });
 
 /**

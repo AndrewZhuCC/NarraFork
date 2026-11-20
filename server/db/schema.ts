@@ -2303,6 +2303,8 @@ export const userPreferences = sqliteTable("user_preferences", {
 	compactAuxiliaryContent: integer("compact_auxiliary_content", { mode: "boolean" })
 		.notNull()
 		.default(true),
+	/** Validated, previously-local presentation values only; never client scope rules. */
+	appearancePreferences: text("appearance_preferences").notNull().default("{}"),
 	terminalTheme: text("terminal_theme").notNull().default("auto"),
 	terminalFontSize: integer("terminal_font_size").notNull().default(14),
 	/**
@@ -2435,6 +2437,15 @@ export const userPreferences = sqliteTable("user_preferences", {
 	 * tasks.json / behavior_fence / index.md 不参与记录，始终固定在最前。
 	 */
 	specTabLayout: text("spec_tab_layout").notNull().default("{}"),
+	/**
+	 * Plugin ids whose `overlay` views this user has hidden (JSON string array).
+	 *
+	 * Overlays are shown by default once an admin installs the plugin; this is the
+	 * per-person opt-out, so one colleague hiding a desktop pet does not hide it for the
+	 * whole instance. Stored per account rather than in the browser so the choice
+	 * follows the person across devices and survives a reload.
+	 */
+	hiddenPluginOverlays: text("hidden_plugin_overlays").notNull().default("[]"),
 	/**
 	 * User layer of the layered trait system — the lowest-priority layer, applied
 	 * to every narrator the user acts on. Same encoding as `narrators.traits`.
@@ -3713,6 +3724,10 @@ export const apiRequests = sqliteTable(
 		cacheCreation5mTokens: integer("cache_creation_5m_tokens").notNull().default(0),
 		cacheCreation1hTokens: integer("cache_creation_1h_tokens").notNull().default(0),
 		reasoningTokens: integer("reasoning_tokens").notNull().default(0),
+		// provider 的 usage 是否带了缓存计数字段（哪怕是 0）。cached/creation 列是 NOT NULL DEFAULT 0，
+		// 分不清"上报了 0"（真实未命中）和"根本没上报"，命中率靠这一列区分。
+		// null = 旧记录或该适配器无法判断，命中率退回"有缓存读写才算"的启发式。
+		cacheUsageReported: integer("cache_usage_reported", { mode: "boolean" }),
 		// 性能指标
 		ttftMs: integer("ttft_ms"), // Time to first token
 		durationMs: integer("duration_ms"), // 总耗时
@@ -6334,6 +6349,149 @@ export const outlineDigests = sqliteTable(
 	],
 );
 
+// === outline_spec_imports ===
+/**
+ * The import of a session's Dynamic Spec into the outline (outline P2 PR 12b2): one row per root
+ * session that an import was tried for, or that was moved back to Dynamic Spec. No row: never
+ * tried. The source of truth for the Spec panel's banner, the automatic triggers' attempt limits
+ * (which survive restarts), the model's one notice per switch and the admin page; the service
+ * keeps an in-memory cache only (`services/outline/spec-import/state.ts`). Small rows: ids,
+ * codes, counts and times; `last_error_detail` is at most 300 characters.
+ *
+ *   - `status`: `idle`, `running` (read back after a restart as `busy`), `imported`, `failed`,
+ *     `attention`, `busy`, `reverted` (an administrator moved the session back to Dynamic Spec).
+ *   - `attempts`: failed attempts since the last success or an administrator's re-import.
+ *   - `switch_count`: how often an import moved the session to the outline; `notice_switch` the
+ *     switch whose notice the session's history holds (the notice's id is derived from it).
+ *   - `space_id`, `task_page_id`, `fence_revision_id`: where the import landed, and the old fence
+ *     revision it read (restored when the session is moved back).
+ *   - `revert_*`: the last move back, who made it, a digest of the Dynamic Spec file pointers
+ *     then (an unchanged spec is moved forward again without writing) and the marker blocks it
+ *     wrote (JSON array of block ids).
+ */
+export const outlineSpecImports = sqliteTable(
+	"outline_spec_imports",
+	{
+		narratorId: text("narrator_id")
+			.primaryKey()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		status: text("status", {
+			enum: ["idle", "running", "imported", "failed", "attention", "busy", "reverted"],
+		}).notNull(),
+		trigger: text("trigger"),
+		attempts: integer("attempts").notNull().default(0),
+		lastErrorCode: text("last_error_code"),
+		lastErrorCount: integer("last_error_count"),
+		lastErrorDetail: text("last_error_detail"),
+		attentionReason: text("attention_reason"),
+		switchCount: integer("switch_count").notNull().default(0),
+		switchedAt: text("switched_at"),
+		noticeSwitch: integer("notice_switch").notNull().default(0),
+		spaceId: text("space_id"),
+		taskPageId: text("task_page_id"),
+		fenceRevisionId: text("fence_revision_id"),
+		tasks: integer("tasks"),
+		pages: integer("pages"),
+		revertCount: integer("revert_count").notNull().default(0),
+		revertedAt: text("reverted_at"),
+		revertedBy: text("reverted_by"),
+		revertSourceKey: text("revert_source_key"),
+		revertNoteIds: text("revert_note_ids"),
+		lastActor: text("last_actor"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		// The admin page: by state, most recently changed first, and the bounded counts per state.
+		index("idx_outline_spec_imports_status").on(table.status, table.updatedAt, table.narratorId),
+	],
+);
+
+/**
+ * Content a save from the old Spec panel may have swallowed (outline P2 PR 12c;
+ * `server/services/outline/spec-import/loss-scan.ts`): one row per place, found by a read-only
+ * scan of a session's Dynamic Spec revisions and shown to an administrator and the session's
+ * owner. The lost content is attached to the file's imported page as a block of its own (owner
+ * decision D52: on the page only); nothing of the page's own content is ever repaired from it.
+ *
+ *   - `id` follows from (session, path, the revision before the save), so a scan run again adds
+ *     nothing twice and never changes what a person decided.
+ *   - `before_revision_id` still held the content, `after_revision_id` is the person's save that
+ *     no longer does; plain text, no foreign keys: the row outlives the spec revisions.
+ *   - `kinds`: JSON, how many structures of each kind were lost (`{"table":2}`).
+ *   - `excerpt`: JSON, the lost source text (bounded; `truncated` when it was cut). Never read by
+ *     a list, only by one finding's detail.
+ *   - `status`: `open` (not on the page: `attach_note` says why once that was tried), `attached`
+ *     (on the file's imported page: `block_id`), `dismissed` (a person's decision).
+ *   - `attach_seq`: how often it was attached anew after its block was deleted; the block's short
+ *     id follows from (`id`, `attach_seq`), so no attach is ever written twice.
+ *   - `attach_attempts`: automatic attaches that failed; after a few the finding is left to a
+ *     person (`attach_note` `gave_up`) and no pass tries it again.
+ *   - `inherited`: 1 when the save was made in the session this one was forked from (the revision
+ *     belongs to another namespace): listed here, attached only in the session of the save.
+ *
+ * Only findings of tables are attached automatically (owner decision 2026-11-13); the other
+ * kinds, and everything of the behavior fence, are listed and attached when a person asks.
+ */
+export const outlineSpecLossFindings = sqliteTable(
+	"outline_spec_loss_findings",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		path: text("path").notNull(),
+		beforeRevisionId: text("before_revision_id").notNull(),
+		afterRevisionId: text("after_revision_id").notNull(),
+		beforeAt: text("before_at"),
+		savedAt: text("saved_at"),
+		kinds: text("kinds").notNull(),
+		items: integer("items").notNull().default(0),
+		excerpt: text("excerpt").notNull(),
+		truncated: integer("truncated").notNull().default(0),
+		status: text("status", { enum: ["open", "attached", "dismissed"] })
+			.notNull()
+			.default("open"),
+		blockId: text("block_id"),
+		attachNote: text("attach_note"),
+		attachSeq: integer("attach_seq").notNull().default(0),
+		attachAttempts: integer("attach_attempts").notNull().default(0),
+		inherited: integer("inherited").notNull().default(0),
+		resolvedBy: text("resolved_by"),
+		resolvedAt: text("resolved_at"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		// The admin page: one status, newest first, and its bounded count.
+		index("idx_outline_spec_loss_findings_status").on(table.status, table.createdAt, table.id),
+		// The Spec panel: one session's findings of one status.
+		index("idx_outline_spec_loss_findings_narrator").on(
+			table.narratorId,
+			table.status,
+			table.createdAt,
+			table.id,
+		),
+	],
+);
+
+/**
+ * Which sessions the swallowed-content scan looked at (outline P2 PR 12c): one row per session,
+ * with the digest of the Dynamic Spec file pointers it read (`source_key`: an unchanged session is
+ * not scanned again), how many of a person's saves it compared, how many places it found, and
+ * `note` when it could not look at everything (`budget`, `files`, `findings`).
+ */
+export const outlineSpecLossScans = sqliteTable("outline_spec_loss_scans", {
+	narratorId: text("narrator_id")
+		.primaryKey()
+		.references(() => narrators.id, { onDelete: "cascade" }),
+	sourceKey: text("source_key").notNull(),
+	saves: integer("saves").notNull().default(0),
+	findings: integer("findings").notNull().default(0),
+	note: text("note"),
+	scannedAt: text("scanned_at").notNull(),
+});
+
 // === scheduled tasks ===
 // A scheduled task periodically starts a narrator with a preset prompt. The schedule is
 // always stored as a cron expression (the UI may generate it from friendly presets). At
@@ -6917,6 +7075,169 @@ export const notifications = sqliteTable(
 			table.status,
 			table.createdAt,
 			table.id,
+		),
+	],
+);
+
+// === project teams (docs/PROJECT_TEAMS-PLAN.md, P1) ===
+// A team IS one coordinator narrator (`team` trait) in a project. These tables are machine-local
+// (they record git branches and worktrees of this host) and are NOT exported; clearing sessions
+// clears them first (`data-portability.ts`).
+
+/**
+ * One row per team, keyed by the coordinator's narrator id. No name column: the team's name is
+ * the coordinator's title, so renaming the session renames the team.
+ *
+ * Both foreign keys are RESTRICT on purpose. The team (and its work items) is the only record
+ * of the worktrees and branches it made, and the cleanup rule is "delete only what a record
+ * names" — a cascade from a raw narrator or project delete would erase that record and leave
+ * worktrees nothing will ever clean. The service paths delete the team row explicitly:
+ * `narratorService.remove` refuses while work is live and otherwise deletes the team in its own
+ * transaction; project deletion refuses while the project has teams.
+ */
+export const projectTeams = sqliteTable(
+	"project_teams",
+	{
+		narratorId: text("narrator_id")
+			.primaryKey()
+			.references(() => narrators.id, { onDelete: "restrict" }),
+		projectId: text("project_id")
+			.notNull()
+			.references(() => projects.id, { onDelete: "restrict" }),
+		/** The branch work merges back into (decision T2's "baseline"). */
+		baseBranch: text("base_branch").notNull(),
+		/** Shared rules for the coordinator and every subagent (≤ 4 KB UTF-8). */
+		brief: text("brief").notNull().default(""),
+		/** `TeamSettings` (≤ 16 KB UTF-8 serialized). */
+		settingsJson: text("settings_json", { mode: "json" })
+			.$type<import("@shared/project-teams").TeamSettings>()
+			.notNull()
+			.default({}),
+		/** Follows the coordinator: archiving the narrator archives the team. */
+		status: text("status", { enum: ["active", "archived"] })
+			.notNull()
+			.default("active"),
+		createdBy: text("created_by").references((): AnySQLiteColumn => users.id, {
+			onDelete: "set null",
+		}),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_project_teams_project_status").on(table.projectId, table.status, table.narratorId),
+		index("idx_project_teams_created_by").on(table.createdBy),
+		check("ck_project_teams_status", sql`${table.status} in ('active', 'archived')`),
+		check("ck_project_teams_brief_bytes", sql`length(cast(${table.brief} as blob)) <= 4096`),
+		check(
+			"ck_project_teams_settings_bytes",
+			sql`length(cast(${table.settingsJson} as blob)) <= 16384`,
+		),
+	],
+);
+
+/**
+ * One unit of team work: one branch and one worktree (P3 creates them). PR / CI / integration
+ * columns are deferred with the hosting and integration PRs.
+ */
+export const teamWorkItems = sqliteTable(
+	"team_work_items",
+	{
+		id: text("id").primaryKey(),
+		teamId: text("team_id")
+			.notNull()
+			.references(() => projectTeams.narratorId, { onDelete: "cascade" }),
+		/** Denormalized for cross-team indexes and the project-level exclusive lock. */
+		projectId: text("project_id")
+			.notNull()
+			.references(() => projects.id, { onDelete: "restrict" }),
+		title: text("title").notNull(),
+		kind: text("kind").notNull().default("change"),
+		state: text("state", {
+			enum: ["queued", "in_progress", "in_review", "ready", "merged", "cancelled"],
+		})
+			.notNull()
+			.default("queued"),
+		branchName: text("branch_name"),
+		baseRef: text("base_ref"),
+		/** The worktree made for this item; SET NULL only when the resource row itself goes. */
+		worktreeResourceId: text("worktree_resource_id").references(
+			() => narratorWorktreeResources.id,
+			{ onDelete: "set null" },
+		),
+		headSha: text("head_sha"),
+		/** The first-level subagent responsible for the item. */
+		workerNarratorId: text("worker_narrator_id").references(() => narrators.id, {
+			onDelete: "set null",
+		}),
+		reviewRounds: integer("review_rounds").notNull().default(0),
+		lastReview: text("last_review", { enum: ["blocker", "clear"] }),
+		/** Paths changed relative to the merge base (≤ 2,000 entries, ≤ 128 KiB). */
+		changedPathsJson: text("changed_paths_json", { mode: "json" }).$type<string[]>(),
+		changedPathsAtSha: text("changed_paths_at_sha"),
+		/** Project-level exclusive lock key (e.g. migrations); unique per project while set. */
+		exclusiveKey: text("exclusive_key"),
+		/** Optional outline task block (after the outline lands on main). */
+		outlineSpaceId: text("outline_space_id"),
+		outlineBlockId: text("outline_block_id"),
+		createdBy: text("created_by").references((): AnySQLiteColumn => users.id, {
+			onDelete: "set null",
+		}),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_team_work_items_team_state").on(table.teamId, table.state, table.id),
+		index("idx_team_work_items_project_state").on(table.projectId, table.state, table.id),
+		uniqueIndex("uq_team_work_items_exclusive")
+			.on(table.projectId, table.exclusiveKey)
+			.where(sql`"exclusive_key" IS NOT NULL`),
+		// FK covering indexes (SET NULL on resource / narrator / user deletion).
+		index("idx_team_work_items_worktree").on(table.worktreeResourceId),
+		index("idx_team_work_items_worker").on(table.workerNarratorId),
+		index("idx_team_work_items_created_by").on(table.createdBy),
+		check(
+			"ck_team_work_items_state",
+			sql`${table.state} in ('queued', 'in_progress', 'in_review', 'ready', 'merged', 'cancelled')`,
+		),
+		check(
+			"ck_team_work_items_last_review",
+			sql`${table.lastReview} is null or ${table.lastReview} in ('blocker', 'clear')`,
+		),
+		check("ck_team_work_items_review_rounds", sql`${table.reviewRounds} >= 0`),
+		check(
+			"ck_team_work_items_changed_paths_bytes",
+			sql`${table.changedPathsJson} is null or length(cast(${table.changedPathsJson} as blob)) <= 131072`,
+		),
+	],
+);
+
+/** Append-only log of team changes, each with its person or agent. */
+export const teamWorkEvents = sqliteTable(
+	"team_work_events",
+	{
+		id: text("id").primaryKey(),
+		/** Null for team-level events. */
+		workItemId: text("work_item_id").references(() => teamWorkItems.id, { onDelete: "cascade" }),
+		teamId: text("team_id")
+			.notNull()
+			.references(() => projectTeams.narratorId, { onDelete: "cascade" }),
+		kind: text("kind").notNull(),
+		actorKind: text("actor_kind", { enum: ["person", "agent", "system"] }).notNull(),
+		/** A user id (person) or narrator id (agent); not a foreign key so the log outlives both. */
+		actorId: text("actor_id"),
+		detailJson: text("detail_json", { mode: "json" }).$type<Record<string, unknown>>(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_team_work_events_team_created").on(table.teamId, table.createdAt, table.id),
+		index("idx_team_work_events_item_created").on(table.workItemId, table.createdAt, table.id),
+		check(
+			"ck_team_work_events_actor_kind",
+			sql`${table.actorKind} in ('person', 'agent', 'system')`,
+		),
+		check(
+			"ck_team_work_events_detail_bytes",
+			sql`${table.detailJson} is null or length(cast(${table.detailJson} as blob)) <= 8192`,
 		),
 	],
 );

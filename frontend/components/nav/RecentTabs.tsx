@@ -1,6 +1,10 @@
 import { DndContext, DragOverlay, useDraggable } from "@dnd-kit/core";
 import type { RecentTabRow } from "@frontend/hooks/recent-tab-folders";
-import { hasDirectorySubtitle } from "@frontend/hooks/recent-tabs-utils";
+import {
+	hasDirectorySubtitle,
+	isTeamOnlookerTab,
+	statusAttention,
+} from "@frontend/hooks/recent-tabs-utils";
 import { canRevealFromBrowser } from "@frontend/lib/local-origin";
 import { TOUCH_POINTER_MEDIA_QUERY, useMatchMedia } from "@frontend/lib/use-match-media";
 import {
@@ -25,6 +29,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { installTeamOnlookerRefresh } from "../../hooks/team-onlooker-refresh";
 import { useFolderDisplay } from "../../hooks/useFolderDisplay";
 import { useArchiveNarrator } from "../../hooks/useNarrator";
 import type { NarratorListWSEvent } from "../../hooks/useNarratorWS";
@@ -51,7 +56,6 @@ import {
 	reconcileRecentTabsRuntimePatches,
 	refreshRecentTabsLoadedWindow,
 	selectRecentTabsLiveWindow,
-	shouldApplyRecentTabsRuntimeResponse,
 	snapshotRecentTabRuntimeVersions,
 	updateRecentTabLocal,
 	useRecentTabs,
@@ -62,6 +66,7 @@ import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { copyTextToClipboard } from "../../lib/clipboard";
 import { clearFaviconAlert, setFaviconAlert } from "../../lib/favicon";
+import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import {
 	clearNotifiedAttention,
 	triggerNotification,
@@ -106,6 +111,7 @@ import { createRecentTabHoverStore, type RecentTabHoverStore } from "./recent-ta
  * reload. Importers must reach the logic module directly.
  */
 import { stripKey } from "./recent-tab-keyboard-nav";
+import { newSessionTargetFor } from "./recent-tab-new-session";
 import {
 	getRecentTabNarratorId,
 	isBackgroundWorkSilencedStatus,
@@ -161,11 +167,12 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 		() => liveTabs.map(getRecentTabNarratorId).filter((id): id is string => !!id),
 		[liveTabs],
 	);
-	// The serialized form is the dependency for everything runtime-related below, so it
-	// must only be recomputed when the live window itself changed — not on every render
-	// of a component that re-renders on each narrator status tick.
+	// Snapshot membership is independent of display and subscription order.
 	const runtimeTargetsKey = useMemo(
-		() => JSON.stringify(liveTabs.map((tab) => [tabSortId(tab), getRecentTabNarratorId(tab)])),
+		() =>
+			JSON.stringify(
+				liveTabs.map((tab) => [tabSortId(tab), getRecentTabNarratorId(tab)] as const).sort(),
+			),
 		[liveTabs],
 	);
 	const runtimeTargets = useMemo(
@@ -182,65 +189,85 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 			),
 		[runtimeTargets],
 	);
-	const runtimeRefreshGenerationRef = useRef(0);
-	// Per-narrator, per-field counters of runtime values already delivered over WS.
-	// The runtime endpoint returns a full snapshot of every field, so any field whose
-	// counter moved while the request was in flight must not be overwritten by it.
+	// A snapshot cannot overwrite fields updated by WS while the request was in flight.
 	const runtimeVersionsRef = useRef<RecentTabRuntimeVersions>(new Map());
 	const runtimeNarratorIds = useMemo(
 		() => new Set(runtimeNarratorIdsByKey.values()),
 		[runtimeNarratorIdsByKey],
 	);
-	const runtimeNarratorIdsRef = useRef(runtimeNarratorIds);
-	runtimeNarratorIdsRef.current = runtimeNarratorIds;
-	const inFlightRuntimeNarratorIdsRef = useRef(new Map<number, ReadonlySet<string>>());
+	const runtimeRequestRef = useRef<{
+		controller: AbortController;
+		refreshAgain: boolean;
+		promise: Promise<void>;
+	} | null>(null);
 
-	const refreshRuntime = useCallback(async () => {
-		const requestGeneration = ++runtimeRefreshGenerationRef.current;
-		if (runtimeKeys.length === 0) return;
-		const requestNarratorIds = new Set(runtimeNarratorIdsByKey.values());
-		const versionsAtRequest = snapshotRecentTabRuntimeVersions(
-			runtimeVersionsRef.current,
-			requestNarratorIds,
-		);
-		inFlightRuntimeNarratorIdsRef.current.set(requestGeneration, requestNarratorIds);
-		try {
-			const result = await api.getRecentTabsRuntime(runtimeKeys);
-			if (
-				!shouldApplyRecentTabsRuntimeResponse(
-					requestGeneration,
-					runtimeRefreshGenerationRef.current,
-				)
-			) {
-				return;
-			}
-			applyRecentTabsRuntimePatches(
-				qc,
-				reconcileRecentTabsRuntimePatches(
-					result.patches,
-					runtimeNarratorIdsByKey,
-					versionsAtRequest,
-					runtimeVersionsRef.current,
-				),
-			);
-		} finally {
-			inFlightRuntimeNarratorIdsRef.current.delete(requestGeneration);
-			pruneRecentTabsRuntimeVersions(
-				runtimeVersionsRef.current,
-				runtimeNarratorIdsRef.current,
-				inFlightRuntimeNarratorIdsRef.current.values(),
-			);
+	const refreshRuntime = useCallback((): Promise<void> => {
+		if (runtimeKeys.length === 0) return Promise.resolve();
+		const active = runtimeRequestRef.current;
+		if (active) {
+			active.refreshAgain = true;
+			return active.promise;
 		}
-	}, [qc, runtimeKeys, runtimeNarratorIdsByKey]);
+		const controller = new AbortController();
+		const { signal } = controller;
+		const request = {
+			controller,
+			refreshAgain: false,
+			promise: Promise.resolve().then(async () => {
+				try {
+					while (!signal.aborted) {
+						request.refreshAgain = false;
+						const versions = snapshotRecentTabRuntimeVersions(
+							runtimeVersionsRef.current,
+							runtimeNarratorIds,
+						);
+						try {
+							const { patches } = await api.getRecentTabsRuntime(runtimeKeys, signal);
+							if (!signal.aborted && !request.refreshAgain) {
+								applyRecentTabsRuntimePatches(
+									qc,
+									reconcileRecentTabsRuntimePatches(
+										patches,
+										runtimeNarratorIdsByKey,
+										versions,
+										runtimeVersionsRef.current,
+									),
+								);
+							}
+						} catch (error) {
+							if (!signal.aborted && !request.refreshAgain) throw error;
+						}
+						if (!request.refreshAgain) break;
+					}
+				} finally {
+					if (runtimeRequestRef.current === request) runtimeRequestRef.current = null;
+				}
+			}),
+		};
+		runtimeRequestRef.current = request;
+		return request.promise;
+	}, [qc, runtimeKeys, runtimeNarratorIds, runtimeNarratorIdsByKey]);
 
 	useEffect(() => {
-		pruneRecentTabsRuntimeVersions(
-			runtimeVersionsRef.current,
-			runtimeNarratorIds,
-			inFlightRuntimeNarratorIdsRef.current.values(),
-		);
+		pruneRecentTabsRuntimeVersions(runtimeVersionsRef.current, runtimeNarratorIds);
 		void refreshRuntime().catch(() => {});
+		return () => {
+			runtimeRequestRef.current?.controller.abort();
+			runtimeRequestRef.current = null;
+		};
 	}, [refreshRuntime, runtimeNarratorIds]);
+
+	// A sharing change can turn a team onlooker into a member (or back): read the runtime patches
+	// again so `teamOnlooker` (which silences "waiting" alerts) follows it without a reload. M1.
+	useEffect(
+		() =>
+			installTeamOnlookerRefresh(
+				narratorWSManager,
+				() => tabsRef.current,
+				() => void refreshRuntime().catch(() => {}),
+			),
+		[refreshRuntime],
+	);
 
 	const pendingTabPatchesRef = useRef(new Map<string, Partial<RecentTab>>());
 	const tabPatchRafRef = useRef(0);
@@ -309,7 +336,8 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				updateAsyncQuestionAttention(
 					narratorId,
 					event.questionId,
-					event.awaited === true,
+					// A team onlooker cannot answer: never alerted (M1).
+					event.awaited === true && tab?.teamOnlooker !== true,
 					tab?.title,
 					userPrefsRef.current,
 				);
@@ -333,18 +361,20 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				const isWaitingForModel =
 					event.substatus?.includes("model_unavailable") ||
 					event.substatus?.includes("quota_exhausted");
-				const shouldNotify =
-					!isReflecting &&
-					!isWaitingForModel &&
-					(event.status === "waiting" || event.substatus?.includes("unread"));
+				// A team session waits for a member: an onlooker, who cannot approve or answer,
+				// gets no "waiting" alert (favicon, sound, PWA); "unread" still alerts. M1.
+				const attention =
+					isReflecting || isWaitingForModel
+						? null
+						: statusAttention(
+								event.status,
+								event.substatus,
+								isTeamOnlookerTab(tabsRef.current, narratorId),
+							);
 				if (isReflecting) {
 					setFaviconAlert(narratorId, "reflecting");
-				} else if (shouldNotify) {
-					const alertKind = event.substatus?.includes("error")
-						? "error"
-						: event.status === "waiting"
-							? "waiting"
-							: "unread";
+				} else if (attention) {
+					const alertKind = event.substatus?.includes("error") ? "error" : attention;
 					setFaviconAlert(narratorId, alertKind);
 					// Done while non-service background work is still running: keep the
 					// in-app unread + favicon state, but stay silent (no sound, no PWA
@@ -356,7 +386,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 							triggerNotification(
 								narratorId,
 								tab.title,
-								event.status === "waiting" ? "waiting" : "unread",
+								attention,
 								userPrefsRef.current,
 								event.turnStartedAt,
 							);
@@ -531,9 +561,11 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	const [editFolder, setEditFolder] = useState<RecentTab | null>(null);
 
 	// Open the shell before resolving cwd; only a resolved target mounts the form body.
+	// 文件夹目标没有目录要解析，`folderId` 表示"建完把新会话放进去"。
 	const [newNarratorTarget, setNewNarratorTarget] = useState<{
-		narratorId: string;
+		narratorId?: string;
 		cwd?: string;
+		folderId?: string;
 	} | null>(null);
 	const newNarratorTargetRef = useRef(newNarratorTarget);
 	newNarratorTargetRef.current = newNarratorTarget;
@@ -755,11 +787,17 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	const newNarratorHereFor = useCallback(
 		async (tab: RecentTab) => {
 			if (!requireSetup()) return;
-			const narratorId = getRecentTabNarratorId(tab);
-			if (!narratorId) {
-				notifications.show({ color: "red", message: t("newNarratorHereNoDir") });
+			const sessionTarget = newSessionTargetFor(tab);
+			if (!sessionTarget) return;
+			// 文件夹没有目录要解析：直接用弹窗的默认预填，建完再归入这个文件夹。
+			if ("folderId" in sessionTarget) {
+				newNarratorRequestRef.current += 1;
+				const folderTarget = { folderId: sessionTarget.folderId };
+				newNarratorTargetRef.current = folderTarget;
+				setNewNarratorTarget(folderTarget);
 				return;
 			}
+			const { narratorId } = sessionTarget;
 			const request = ++newNarratorRequestRef.current;
 			const target = { narratorId };
 			newNarratorTargetRef.current = target;
@@ -786,19 +824,35 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 	}, [ctxMenu, newNarratorHereFor]);
 
 	const handleNewNarratorHereCreated = useCallback(
-		(data: CreateNarratorResult) => {
+		// The modal closes (clearing `newNarratorTarget`) before it reports creation, so the
+		// folder comes from the call site's closure rather than from state.
+		(data: CreateNarratorResult, folderId?: string) => {
 			closeNewNarratorHere();
-			addRecentTab({
+			void addRecentTab({
 				type: "narrator",
 				id: data.id,
 				title: data.title,
 				subtitle: data.cwd,
 				status: data.status,
+			}).then(() => {
+				if (!folderId) return;
+				// The upsert strips `folderId`, so membership is a separate move. Going through the
+				// tab mutation keeps the row from flashing at top level until the WS delta lands.
+				moveTab(
+					`narrator:${data.id}`,
+					{ folderId },
+					{
+						// The session exists either way; say so, or the modal's "follow the folder"
+						// identity would silently not apply.
+						onError: () =>
+							notifications.show({ color: "orange", message: t("newNarratorJoinFolderFailed") }),
+					},
+				);
 			});
 			navigate({ to: `/narrators/${data.id}` });
 			onNavigate?.();
 		},
-		[navigate, onNavigate, closeNewNarratorHere],
+		[navigate, onNavigate, closeNewNarratorHere, moveTab, t],
 	);
 
 	const fsRevealCapability = useFsRevealCapability();
@@ -1296,7 +1350,8 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 								onReveal={handleReveal}
 								canReveal={revealAvailable && ctxTab.type !== "project" && !ctxIsFolder}
 								onNewNarratorHere={handleNewNarratorHere}
-								canNewNarratorHere={ctxTab.type === "narrator" || ctxTab.type === "subagent"}
+								canNewNarratorHere={newSessionTargetFor(ctxTab) !== null}
+								newNarratorHereLabel={ctxIsFolder ? t("newNarratorInFolder") : t("newNarratorHere")}
 								onCopyCwd={handleCopyCwd}
 								canCopyCwd={["narrator", "subagent"].includes(ctxTab.type)}
 								onOpenInWindow={handleOpenInWindow}
@@ -1378,10 +1433,14 @@ export function RecentTabList({ filter, onNavigate, excludeActiveNarratorId }: R
 						/>
 						<CreateNarratorLazyModal
 							opened={newNarratorTarget !== null}
-							busy={newNarratorTarget?.cwd == null}
+							// Busy only while a session target's directory is resolving; folders open directly.
+							busy={newNarratorTarget?.narratorId != null && newNarratorTarget.cwd == null}
 							initialCwd={newNarratorTarget?.cwd}
+							// 从文件夹里新建时，弹窗要说清 git 身份跟的是这个文件夹。
+							gitIdentityFolderId={newNarratorTarget?.folderId}
 							onClose={closeNewNarratorHere}
-							onCreated={handleNewNarratorHereCreated}
+							// 闭包捕获本次打开时的目标：onCreated 触发时状态已被清空。
+							onCreated={(data) => handleNewNarratorHereCreated(data, newNarratorTarget?.folderId)}
 						/>
 					</Box>
 					{/* Keep preview rows outside the measured source container. */}

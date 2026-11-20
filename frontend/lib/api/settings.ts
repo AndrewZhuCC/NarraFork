@@ -1,3 +1,4 @@
+import type { AppearanceValues } from "@shared/appearance-preferences";
 import type { DataDirectorySecurityStatus } from "@shared/data-directory-security";
 import type { Locale } from "@shared/i18n-locales";
 import type { ProviderReadiness } from "@shared/provider-readiness";
@@ -325,7 +326,7 @@ export const settingsApi = {
 		>("/settings/search/protocols"),
 
 	// User Preferences
-	getUserPreferences: () =>
+	getUserPreferences: (options?: { signal?: AbortSignal }) =>
 		request<{
 			autoLoadOlderMessages: boolean;
 			fastModeDefault: boolean;
@@ -338,6 +339,7 @@ export const settingsApi = {
 			showTokenUsage: boolean;
 			showOutputStats: boolean;
 			compactAuxiliaryContent: boolean;
+			appearancePreferences: AppearanceValues;
 			terminalTheme: string;
 			terminalFontSize: number;
 			/** Narrator transcript typography, as percentages of the built-in defaults. */
@@ -396,6 +398,8 @@ export const settingsApi = {
 			};
 			/** 大纲标签排布（JSON: { [narratorId]: { order, pinned } }）。 */
 			specTabLayout: Record<string, unknown>;
+			/** Plugin ids whose overlay views this user has hidden (shown by default). */
+			hiddenPluginOverlays: string[];
 			/** 提交身份入口的显示位置：会话右键菜单 / 新建会话弹窗（跟账号走）。 */
 			gitIdentityContextMenu: boolean;
 			gitIdentityCreateModal: boolean;
@@ -406,85 +410,91 @@ export const settingsApi = {
 			outlineDigestTime: string | null;
 			/** What the report uses while the zone is null. */
 			outlineDigestServerTimeZone: string;
-		}>("/user-preferences"),
-	updateUserPreferences: (data: {
-		autoLoadOlderMessages?: boolean;
-		fastModeDefault?: boolean;
-		treatAsLocalAccess?: boolean;
-		language?: Locale;
-		wordWrapMarkdown?: boolean;
-		wordWrapCode?: boolean;
-		wordWrapDiff?: boolean;
-		replyInUserLanguage?: boolean;
-		showTokenUsage?: boolean;
-		showOutputStats?: boolean;
-		compactAuxiliaryContent?: boolean;
-		terminalTheme?: string;
-		terminalFontSize?: number;
-		narratorFontScalePercent?: number;
-		narratorLetterSpacingPercent?: number;
-		narratorLineHeightV2Percent?: number;
-		narratorParagraphScalePercent?: number;
-		recentTabsShowDirectory?: boolean;
-		addSubagentToRecentTabs?: boolean;
-		// Notification preferences
-		notifyOnDone?: boolean;
-		notifyOnWaiting?: boolean;
-		notifyPwaEnabled?: boolean;
-		notifySoundEnabled?: boolean;
-		notifySoundType?: "builtin" | "custom";
-		notifySoundBuiltin?: string;
-		notifySoundFileId?: string | null;
-		notifySoundVolume?: number;
-		notifySoundMaxConcurrent?: number;
-		notifyDingtalkEnabled?: boolean;
-		notifyDingtalkWebhook?: string;
-		notifyDingtalkSecret?: string;
-		notifyFeishuEnabled?: boolean;
-		notifyFeishuWebhook?: string;
-		notifyFeishuSecret?: string;
-		// Slash commands
-		commands?: Array<{
-			name: string;
-			prompt: string;
-			description?: string;
-			params?: Array<{
+		}>("/user-preferences", options),
+	updateUserPreferences: (
+		data: {
+			autoLoadOlderMessages?: boolean;
+			fastModeDefault?: boolean;
+			treatAsLocalAccess?: boolean;
+			language?: Locale;
+			wordWrapMarkdown?: boolean;
+			wordWrapCode?: boolean;
+			wordWrapDiff?: boolean;
+			replyInUserLanguage?: boolean;
+			showTokenUsage?: boolean;
+			showOutputStats?: boolean;
+			compactAuxiliaryContent?: boolean;
+			/** Partial values merge by key; omitted keys remain unchanged on the account. */
+			appearancePreferences?: AppearanceValues;
+			terminalTheme?: string;
+			terminalFontSize?: number;
+			narratorFontScalePercent?: number;
+			narratorLetterSpacingPercent?: number;
+			narratorLineHeightV2Percent?: number;
+			narratorParagraphScalePercent?: number;
+			recentTabsShowDirectory?: boolean;
+			addSubagentToRecentTabs?: boolean;
+			// Notification preferences
+			notifyOnDone?: boolean;
+			notifyOnWaiting?: boolean;
+			notifyPwaEnabled?: boolean;
+			notifySoundEnabled?: boolean;
+			notifySoundType?: "builtin" | "custom";
+			notifySoundBuiltin?: string;
+			notifySoundFileId?: string | null;
+			notifySoundVolume?: number;
+			notifySoundMaxConcurrent?: number;
+			notifyDingtalkEnabled?: boolean;
+			notifyDingtalkWebhook?: string;
+			notifyDingtalkSecret?: string;
+			notifyFeishuEnabled?: boolean;
+			notifyFeishuWebhook?: string;
+			notifyFeishuSecret?: string;
+			// Slash commands
+			commands?: Array<{
 				name: string;
+				prompt: string;
 				description?: string;
-				required?: boolean;
-				defaultValue?: string;
+				params?: Array<{
+					name: string;
+					description?: string;
+					required?: boolean;
+					defaultValue?: string;
+				}>;
+				modelOverride?: {
+					model: string;
+					mode: "temporary" | "permanent";
+				};
 			}>;
-			modelOverride?: {
-				model: string;
-				mode: "temporary" | "permanent";
+			// Queue behavior bound to the Enter key / send button
+			enterQueueMode?: "turn" | "tool" | "interrupt";
+			// Queue behavior bound to the Ctrl/Cmd+Enter key
+			ctrlEnterQueueMode?: "turn" | "tool" | "interrupt";
+			// Setup wizard
+			setupWizardCompleted?: boolean;
+			// Sidebar navigation layout (flat ordered ids; a "__divider__" entry marks
+			// the boundary — ids after it are tucked into the "More" menu)
+			navLayout?: {
+				items: Array<{ id: string; hidden?: boolean }>;
 			};
-		}>;
-		// Queue behavior bound to the Enter key / send button
-		enterQueueMode?: "turn" | "tool" | "interrupt";
-		// Queue behavior bound to the Ctrl/Cmd+Enter key
-		ctrlEnterQueueMode?: "turn" | "tool" | "interrupt";
-		// Setup wizard
-		setupWizardCompleted?: boolean;
-		// Sidebar navigation layout (flat ordered ids; a "__divider__" entry marks
-		// the boundary — ids after it are tucked into the "More" menu)
-		navLayout?: {
-			items: Array<{ id: string; hidden?: boolean }>;
-		};
-		// Narrator header toolbar layout (same flat-ids + "__divider__" shape as
-		// navLayout; order is the user's priority, shared by desktop and mobile)
-		narratorToolbarLayout?: {
-			items: Array<{ id: string }>;
-		};
-		gitIdentityContextMenu?: boolean;
-		gitIdentityCreateModal?: boolean;
-		gitIdentityFolderContextMenu?: boolean;
-		/** Null goes back to the default (the server's zone, 07:00). */
-		outlineDigestTimeZone?: string | null;
-		outlineDigestTime?: string | null;
-	}) =>
+			// Narrator header toolbar layout (same flat-ids + "__divider__" shape as
+			// navLayout; order is the user's priority, shared by desktop and mobile)
+			narratorToolbarLayout?: {
+				items: Array<{ id: string }>;
+			};
+			gitIdentityContextMenu?: boolean;
+			gitIdentityCreateModal?: boolean;
+			gitIdentityFolderContextMenu?: boolean;
+			/** Null goes back to the default (the server's zone, 07:00). */
+			outlineDigestTimeZone?: string | null;
+			outlineDigestTime?: string | null;
+		},
+		options?: { signal?: AbortSignal },
+	) =>
 		request<ApiEntity>("/user-preferences", {
 			method: "PATCH",
 			body: JSON.stringify(data),
+			...options,
 		}),
 
 	// === Sidebar folder git identity pick ===
@@ -518,10 +528,11 @@ export const settingsApi = {
 			...(result.nextCursor ? { nextCursor: result.nextCursor } : {}),
 		};
 	},
-	getRecentTabsRuntime: (keys: string[]) =>
+	getRecentTabsRuntime: (keys: string[], signal?: AbortSignal) =>
 		request<RecentTabsRuntimeResult>("/user-preferences/recent-tabs/runtime", {
 			method: "POST",
 			body: JSON.stringify({ keys }),
+			signal,
 		}),
 	upsertRecentTab: (tab: RecentTabUpsertInput) =>
 		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs", {
@@ -601,5 +612,11 @@ export const settingsApi = {
 		request<{ ok: boolean }>("/user-preferences/spec-tab-layout", {
 			method: "PATCH",
 			body: JSON.stringify({ narratorId, ...layout }),
+		}),
+	/** Show or hide one plugin's overlay views for the current user only. */
+	setPluginOverlayHidden: (pluginId: string, hidden: boolean) =>
+		request<{ hiddenPluginOverlays: string[] }>("/user-preferences/plugin-overlays", {
+			method: "PATCH",
+			body: JSON.stringify({ pluginId, hidden }),
 		}),
 };

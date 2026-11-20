@@ -17,6 +17,12 @@
  * - 新增 NOT NULL 且无默认值的列会让旧快照导入缺列（列交集只能拷贝双方都有的列），
  *   需要补默认值或拒绝旧版本；
  * - 新增需要「清空」的数据需在 `clearData` 对应分支处理；
+ * - 不导出的会话附属表（如 `outline_spec_imports`）：覆盖会话改了 task_backend 时删掉它的行，清空会话时一起清；
+ * - 被吞内容排查的两张表（`outline_spec_loss_findings` / `outline_spec_loss_scans`，12c）也不导出：
+ *   说的是本机 spec 修订的事（spec 表不导出），覆盖会话不动它们，清空会话时一起清；
+ * - team 的三张表（`project_teams` / `team_work_items` / `team_work_events`）不导出：它们记的是
+ *   本机的 git 分支和 worktree。导入后会话的 `team` trait 以本机有没有 team 行为准
+ *   （`reconcileImportedTeamTraits`）；清空会话时先删 team 表（team 行 RESTRICT 会话删除）；
  * - 改完跑 `bun test --isolate server/services/__tests__/data-portability*.test.ts`。
  * 详见 docs/DATA_PORTABILITY.md。
  */
@@ -41,6 +47,7 @@ import { saveSettings, settings } from "@server/lib/settings";
 import {
 	COMMAND_CODE_KEY_OWNER,
 	nugKeyOwner,
+	nugOAuthKeyOwner,
 	TOKENDANCE_KEY_OWNER,
 } from "@server/lib/settings/provider-keys-projection";
 import type { NarraForkSettings } from "@server/lib/settings/types";
@@ -55,6 +62,9 @@ import {
 	withFirstKeys,
 	withoutKeys,
 } from "@server/services/data-portability-keys";
+import { resetSpecImportStateCache } from "@server/services/outline/spec-import/state";
+import { invalidateTaskBackend } from "@server/services/task-source/backend";
+import { forgetTeamSessions } from "@server/services/teams/team-session-memo";
 import { addImportedRequestsToUsageDaily } from "@server/services/usage-daily";
 import {
 	MAX_IMPORT_BYTES,
@@ -879,6 +889,35 @@ function repairDanglingReferences(baselines: Map<string, number>): void {
 }
 
 /**
+ * Team rows are not exported (they record this machine's git branches and worktrees), so an
+ * imported coordinator arrives without its team. A session is a team coordinator exactly when a
+ * local `project_teams` row says so: strip the `team` trait from incoming sessions without one,
+ * and keep it on a local coordinator that an overwrite would otherwise strip. Set-based and
+ * limited to the incoming ids, in the import transaction.
+ */
+function reconcileImportedTeamTraits(attachName: string): void {
+	const incoming = `SELECT id FROM ${attachName}.narrators`;
+	const hasTeamTrait = `EXISTS (SELECT 1 FROM json_each(main.narrators.traits) WHERE value = 'team')`;
+	const hasTeamRow = `EXISTS (SELECT 1 FROM main.project_teams WHERE narrator_id = main.narrators.id)`;
+	const stripped = changesOf(
+		sqlite.run(
+			`UPDATE main.narrators
+			 SET traits = (SELECT json_group_array(value) FROM json_each(main.narrators.traits)
+			               WHERE value <> 'team')
+			 WHERE id IN (${incoming}) AND json_valid(traits) AND ${hasTeamTrait} AND NOT ${hasTeamRow}`,
+		),
+	);
+	const kept = changesOf(
+		sqlite.run(
+			`UPDATE main.narrators SET traits = json_insert(traits, '$[#]', 'team')
+			 WHERE id IN (${incoming}) AND json_valid(traits) AND NOT ${hasTeamTrait} AND ${hasTeamRow}`,
+		),
+	);
+	if (stripped + kept > 0)
+		logger.info("Import reconciled team coordinator traits", { stripped, kept });
+}
+
+/**
  * Folder picks are personal: the two foreign keys alone do not prove that the picked
  * identity belongs to the binding's user. Drop only newly imported mismatches; existing
  * local rows are not this import's responsibility. Missing identities are rejected by the
@@ -1153,7 +1192,21 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 					}
 					// 覆盖只更新会话行本身：删掉本地 refs/tool_calls 会级联抹掉其它表对它们的引用，
 					// 也会丢掉导出之后本地新增的历史。合并语义不删除本地数据。
+					const backendBefore = (
+						sqlite.prepare(`SELECT task_backend FROM main.narrators WHERE id = ?`).get(id) as
+							| { task_backend: string | null }
+							| undefined
+					)?.task_backend;
 					sqlite.run(`UPDATE main.narrators SET ${columnAssignments} WHERE id = ?`, [id]);
+					// The Dynamic Spec import's state (outline P2 PR 12b2) is not exported: it relates
+					// this machine's spec rows to its outline content. Kept while the incoming row keeps
+					// the session's task backend (an administrator's move back stays decided); dropped
+					// when it brings another one, derived again by the next attempt.
+					sqlite.run(
+						`DELETE FROM main.outline_spec_imports WHERE narrator_id = ?
+						AND (SELECT task_backend FROM main.narrators WHERE id = ?) IS NOT ?`,
+						[id, id, backendBefore ?? null],
+					);
 					// Workspaces are local UI state, not snapshot tables. Imported session titles
 					// still invalidate any candidate generated from their previous metadata.
 					sqlite.run(
@@ -1191,6 +1244,7 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 				copyTable(attachName, "recent_tab_archive_marks", {
 					excludeNarrators: excludedNarrators,
 				});
+				reconcileImportedTeamTraits(attachName);
 				copyTable(attachName, "folder_git_identity_bindings");
 				removeInvalidFolderIdentityBindings(baselines.get("folder_git_identity_bindings") ?? 0);
 				if (
@@ -1289,7 +1343,14 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 		}
 	}
 
-	if (options.include?.sessions ?? true) invalidateGitIdentityCache();
+	if (options.include?.sessions ?? true) {
+		invalidateGitIdentityCache();
+		// Overwritten sessions may bring another task backend; their import state was dropped.
+		invalidateTaskBackend();
+		resetSpecImportStateCache();
+		// An overwritten id may now be another kind of session (team or not).
+		forgetTeamSessions();
+	}
 
 	// The key store is a file outside the SQLite transaction, so the remaining keys are
 	// written only once the transaction committed. The first key of each provider (and the
@@ -1542,8 +1603,11 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 			if (key === "customApiProviders" && incomingId) {
 				addedCustomApiProviders.set(incomingId, String(copy.id));
 			}
-			// A NUG provider's key is stored by the settings save under its (possibly new) id.
-			if (key === "nugProviders" && incomingId) addedSingleKeyOwners.add(nugKeyOwner(incomingId));
+			// NUG credentials were filled before the merge, so settings saves both under the new id.
+			if (key === "nugProviders" && incomingId) {
+				addedSingleKeyOwners.add(nugKeyOwner(incomingId));
+				addedSingleKeyOwners.add(nugOAuthKeyOwner(incomingId));
+			}
 			// 重名 → 自动追加「-副本」（多次重复时继续加编号）
 			const name = String(copy.name ?? "导入的供应商");
 			if (existingNames.has(name)) {
@@ -1743,6 +1807,16 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 				sqlite.run(`DELETE FROM recent_tab_archive_marks`);
 				// Unlike narrator picks, folder picks have no narrator FK to cascade through.
 				sqlite.run(`DELETE FROM folder_git_identity_bindings`);
+				// The Dynamic Spec import's state (outline P2 PR 12b2); the narrator FK cascades too.
+				sqlite.run(`DELETE FROM outline_spec_imports`);
+				// What the swallowed-content scan recorded about these sessions (outline P2 PR 12c).
+				sqlite.run(`DELETE FROM outline_spec_loss_findings`);
+				sqlite.run(`DELETE FROM outline_spec_loss_scans`);
+				// Teams are their coordinator sessions: the team row restricts the session delete, and
+				// its work items and events cascade with it. Children first, explicitly.
+				sqlite.run(`DELETE FROM team_work_events`);
+				sqlite.run(`DELETE FROM team_work_items`);
+				sqlite.run(`DELETE FROM project_teams`);
 				sqlite.run(`DELETE FROM narrators`);
 				deleted.sessions = Number(before.n);
 			}
@@ -1784,7 +1858,12 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 			}
 		});
 		transaction();
-		if (clearSessions) invalidateGitIdentityCache();
+		if (clearSessions) {
+			invalidateGitIdentityCache();
+			invalidateTaskBackend();
+			resetSpecImportStateCache();
+			forgetTeamSessions();
+		}
 	}
 
 	return { target, deleted };
