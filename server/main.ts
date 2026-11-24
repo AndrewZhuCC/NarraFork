@@ -1917,7 +1917,7 @@ async function performGracefulShutdown(
 	return shutdownState.promise;
 }
 
-registerGracefulShutdownHandler(async () => {
+registerGracefulShutdownHandler(async (request) => {
 	try {
 		logger.info("Replacement server requested graceful shutdown", {
 			phase: "replacement",
