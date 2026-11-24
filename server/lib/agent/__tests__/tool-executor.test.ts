@@ -1332,7 +1332,10 @@ describe("executeTool permission guard", () => {
 		expect(executed).toBe(false);
 		expect(permissionCalls).toBe(0);
 		expect(result.isError).toBe(true);
-		expect(result.fatal).toBe(true);
+		expect(result.fatal).toBe(reflectionOnly ? undefined : true);
+		expect(result.output).toContain(
+			reflectionOnly ? "current reflection context" : "runtime policy",
+		);
 	});
 
 	test("fails closed when the live runtime authorization guard expires", async () => {

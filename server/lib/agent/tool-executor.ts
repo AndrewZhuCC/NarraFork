@@ -1032,10 +1032,7 @@ async function executeToolUntraced(
 				: config.allowedTools
 					? new Set(config.allowedTools)
 					: null;
-		if (
-			(tool.reflectionOnly && !config.reflectionLoop) ||
-			(allowedTools && !allowedTools.has(tu.name))
-		) {
+		if (allowedTools && !allowedTools.has(tu.name)) {
 			return {
 				output: `Tool is not allowed by this narrator's runtime policy: ${tu.name}`,
 				isError: true,
