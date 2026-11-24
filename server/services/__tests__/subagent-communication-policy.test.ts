@@ -36,7 +36,7 @@ describe("communication capability policy", () => {
 		expect(watchProperties.type.enum).toEqual(["terminal", "bash", "agent"]);
 	});
 
-	test("the static agent variant still rejects delegated execution and Await is inert", async () => {
+	test("the static agent variant still rejects delegated execution and Await cannot wait for agents", async () => {
 		const context = {
 			narratorId: "child",
 			cwd: "/worktree",
@@ -48,8 +48,8 @@ describe("communication capability policy", () => {
 		const result = await watchTool.execute({ type: "agent", id: "some-agent" }, context);
 		expect(result.isError).toBe(true);
 		expect(result.output).toContain("does not permit agent");
-		const retired = await awaitTool.execute({ type: "agent", id: "some-agent" }, context);
-		expect(retired.isError).toBe(true);
-		expect(retired.output).toContain("Await is retired");
+		const awaitAgent = await awaitTool.execute({ type: "agent", id: "some-agent" }, context);
+		expect(awaitAgent.isError).toBe(true);
+		expect(awaitAgent.output).toContain(SUBAGENT_AGENT_AWAIT_FORBIDDEN_ERROR);
 	});
 });

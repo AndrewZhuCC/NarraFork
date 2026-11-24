@@ -35,7 +35,9 @@ export interface RuntimePolicy {
 	};
 	readonly capabilities: {
 		readonly spawnAgent: boolean;
+		readonly awaitAgent: boolean;
 		readonly watchAgent: boolean;
+		readonly awaitOwnQuestion: boolean;
 		readonly askUserQuestion: "sync-or-async" | "disabled";
 		readonly planApproval: boolean;
 		readonly stopHooks: boolean;
@@ -52,6 +54,7 @@ const READ_TOOLS = Object.freeze([
 	"WebFetch",
 	BASH_TOOL_NAME,
 	"TeamStatus",
+	"Await",
 	"Watch",
 	"Stop",
 	"Question",
@@ -176,6 +179,7 @@ const SEARCH_TOOLS = Object.freeze([
 	"WebSearch",
 	"WebFetch",
 	"TeamStatus",
+	"Await",
 	"Watch",
 	"Question",
 	"ContextAsk",
@@ -361,6 +365,8 @@ export function resolveRuntimePolicy(declarations: readonly RuntimePolicyTrait[]
 		capabilities: Object.freeze({
 			spawnAgent: allowed("spawnAgent"),
 			// Stored v1 ceilings keep their meaning; never rewrite old allowlists.
+			awaitAgent: allowed("awaitAgent") && allowed("watchAgent"),
+			awaitOwnQuestion: true,
 			watchAgent: allowed("watchAgent") && allowed("awaitAgent"),
 			askUserQuestion: allowed("askUserQuestion") ? "sync-or-async" : "disabled",
 			planApproval: allowed("planApproval"),
@@ -398,8 +404,6 @@ export function isRuntimeToolAllowed(
 	mcpBehavior?: string | null,
 ): boolean {
 	const caps = policy.capabilities;
-	// Frozen provider declarations and stored allowlists never revive the retired tool.
-	if (toolName === "Await") return false;
 	if (toolName === "Question") return true;
 	if (toolName === "AskUserQuestion" && caps.askUserQuestion === "disabled") return false;
 	if (
@@ -417,6 +421,15 @@ export function isRuntimeToolAllowed(
 	return policy.tools.builtin === "all" || policy.tools.builtin.includes(toolName);
 }
 
+export type RuntimeAwaitTarget = "agent" | "bash" | "transfer" | "question";
+export function runtimeAwaitTargets(policy: RuntimePolicy): RuntimeAwaitTarget[] {
+	return [
+		...(policy.capabilities.awaitAgent ? ["agent" as const] : []),
+		"bash",
+		"transfer",
+		...(policy.capabilities.awaitOwnQuestion ? ["question" as const] : []),
+	];
+}
 export type RuntimeWatchTarget = "terminal" | "bash" | "agent";
 export function runtimeWatchTargets(policy: RuntimePolicy): RuntimeWatchTarget[] {
 	return ["terminal", "bash", ...(policy.capabilities.watchAgent ? ["agent" as const] : [])];
@@ -428,14 +441,14 @@ export function runtimeInteractionHint(policy: RuntimePolicy, locale: string): s
 	if (!policy.capabilities.watchAgent)
 		lines.push(
 			locale === "zh-CN"
-				? "不得使用 Watch(agent) 观察其他代理；需要传递信息时使用异步 Send。"
-				: "Do not use Watch(agent) to observe other agents; use asynchronous Send to deliver information.",
+				? "不得使用 Await(agent) 或 Watch(agent) 等待或观察其他代理；需要传递信息时使用异步 Send。"
+				: "Do not use Await(agent) or Watch(agent) to wait for or observe other agents; use asynchronous Send to deliver information.",
 		);
 	if (policy.capabilities.askUserQuestion === "disabled")
 		lines.push(
 			locale === "zh-CN"
-				? "当前不可调用 AskUserQuestion 发起问题；可用 Question 查询本会话已有问题，回答会自动通知。"
-				: "AskUserQuestion is unavailable; use Question to inspect this session's existing questions. Answers notify automatically.",
+				? "当前不可调用 AskUserQuestion 发起问题；Await(question) 与 Question 只针对本会话已有问题。"
+				: "AskUserQuestion is unavailable; Await(question) and Question are only for this session's existing questions.",
 		);
 	return lines.join("\n");
 }

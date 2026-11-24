@@ -231,7 +231,7 @@ describe("run registration", () => {
 	});
 });
 
-describe("retired capabilities", () => {
+describe("legacy capability names", () => {
 	test("stored awaitAgent deny also denies Watch(agent) without widening old allowlists", () => {
 		const stored = `${RUNTIME_POLICY_TRAIT_PREFIX}${Buffer.from(
 			JSON.stringify({
@@ -245,7 +245,7 @@ describe("retired capabilities", () => {
 		const policy = resolveRuntimePolicy(traits);
 		expect(policy.capabilities.watchAgent).toBe(false);
 		expect(isRuntimeToolAllowed(policy, "Watch")).toBe(false);
-		expect(isRuntimeToolAllowed(policy, "Await")).toBe(false);
+		expect(isRuntimeToolAllowed(policy, "Await")).toBe(true);
 		expect(
 			isRuntimeToolAllowed(resolveRuntimePolicy([{ version: 1, tools: ["Await"] }]), "Watch"),
 		).toBe(false);

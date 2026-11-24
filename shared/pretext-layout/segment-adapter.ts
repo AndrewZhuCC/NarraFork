@@ -3723,7 +3723,8 @@ function adaptSystemBlock(
 					resumedCount,
 				),
 				notifyLabel: sysLabel(ctx, "subagentRecoveryResumeAndNotify"),
-				waitLabel: sysLabel(ctx, "subagentRecoveryResumeAndWatch"),
+				waitLabel: sysLabel(ctx, "subagentRecoveryResumeAndWait"),
+				watchLabel: sysLabel(ctx, "subagentRecoveryResumeAndWatch"),
 				backgroundBadge: sysLabel(ctx, "subagentRecoveryToBackground"),
 				// Close button (aria-label + tooltip). Height-neutral: it sits inside
 				// the header lane the measure layer already reserves.

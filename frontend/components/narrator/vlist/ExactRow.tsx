@@ -278,7 +278,11 @@ export interface ExactRowProps {
 	 */
 	resolveRowToolActions?: (rowKey: string) => VListRowToolActions | undefined;
 	/** Submit the subagent-recovery card's selection (mutation lives outside vlist/). */
-	onResumeSubagentRecovery?: (messageId: string, specKey: string, mode: "notify" | "watch") => void;
+	onResumeSubagentRecovery?: (
+		messageId: string,
+		specKey: string,
+		mode: "notify" | "watch" | "await",
+	) => void;
 	/**
 	 * Close the subagent-recovery card without resuming anything (mutation lives
 	 * outside vlist/). Absent → the card paints no close button at all.
@@ -697,7 +701,7 @@ export const ExactRow = memo(
 			const messageId = sourceIds[0];
 			if (messageId && onResumeSubagentRecovery) {
 				const specKey = item.spec.key;
-				extra.onResume = (mode: "notify" | "watch") =>
+				extra.onResume = (mode: "notify" | "watch" | "await") =>
 					onResumeSubagentRecovery(messageId, specKey, mode);
 			}
 			if (messageId && onDismissSubagentRecovery) {

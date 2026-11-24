@@ -278,7 +278,7 @@ describe("depth backstops", () => {
 		expect(worker.capabilities.watchAgent).toBe(true);
 		expect(isRuntimeToolAllowed(worker, "Agent")).toBe(true);
 		expect(isRuntimeToolAllowed(worker, "Watch")).toBe(true);
-		expect(isRuntimeToolAllowed(worker, "Await")).toBe(false);
+		expect(isRuntimeToolAllowed(worker, "Await")).toBe(true);
 		// A worker template at the deepest level, and an unrestricted declaration that only
 		// says "level 2", both lose spawning and agent waits.
 		for (const declarations of [

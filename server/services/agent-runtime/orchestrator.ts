@@ -261,7 +261,12 @@ import {
 	dropDeferredPlanApproval,
 	runDeferredPlanApproval,
 } from "./plan-approval-restart";
-import { type RuntimePolicy, runtimeInteractionHint, runtimeWatchTargets } from "./policy";
+import {
+	type RuntimePolicy,
+	runtimeAwaitTargets,
+	runtimeInteractionHint,
+	runtimeWatchTargets,
+} from "./policy";
 import { preparePrefixRequest, type RequestModelIdentity } from "./prepare-prefix-request";
 import type { RuntimeRecoveryState, RuntimeRecoveryTransition } from "./transition";
 import { selectRuntimeInterruption, selectRuntimeRecovery } from "./transition";
@@ -1408,7 +1413,8 @@ export async function runAgentLoopUnlocked(
 						runtimeHints: [
 							"Tool declarations are retained for history compatibility; only currently available tools may execute.",
 							`Runtime capabilities: ${JSON.stringify(runtimePolicy.capabilities)}`,
-							`Watch targets: ${runtimeWatchTargets(runtimePolicy).join(", ")}. Watch registers immediately; end the turn to receive its notification. Await is retired and cannot execute. Reflection-only tools may only execute in their matching active reflection gate.`,
+							`Await targets: ${runtimeAwaitTargets(runtimePolicy).join(", ")}. Await blocks the current turn until it returns.`,
+							`Watch targets: ${runtimeWatchTargets(runtimePolicy).join(", ")}. Watch registers immediately; end the turn to receive its notification. Reflection-only tools may only execute in their matching active reflection gate.`,
 							`Send user targets: ${isBotNarrator(current.traits) ? "available (bot)" : "unavailable"}; Send resume model and Stop agent: ${runtimePolicy.capabilities.spawnAgent ? "available" : "unavailable"}.`,
 							shouldUseNativeSearch(model.provider, model.model)
 								? "Use the provider-native web_search capability for web searches."

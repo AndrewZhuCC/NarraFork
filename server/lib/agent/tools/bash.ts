@@ -298,7 +298,7 @@ export const bashTool: ToolDefinition = {
 			},
 			run_in_background: {
 				description:
-					'Set to true to run this command in the background. Returns immediately with a task ID. Completion notifies automatically. Watch({ type: "bash", id }) registers a non-blocking observation or retrieves a saved result.',
+					'Set to true to run this command in the background. Returns immediately with a task ID. Completion notifies automatically. Use Await({ type: "bash", id }) if your next step needs the result now, or Watch({ type: "bash", id }) to observe without waiting.',
 				type: "boolean",
 			},
 			strict_serial: {
@@ -364,7 +364,7 @@ export const bashTool: ToolDefinition = {
 					.boolean()
 					.optional()
 					.describe(
-						'Set to true to run this command in the background. Returns immediately with a task ID. Completion notifies automatically. Watch({ type: "bash", id }) registers a non-blocking observation or retrieves a saved result.',
+						'Set to true to run this command in the background. Returns immediately with a task ID. Completion notifies automatically. Use Await({ type: "bash", id }) if your next step needs the result now, or Watch({ type: "bash", id }) to observe without waiting.',
 					),
 				strict_serial: z
 					.boolean()
@@ -698,7 +698,7 @@ export const bashTool: ToolDefinition = {
 						resolveDetached({
 							output:
 								`<background_task_id>${alias}</background_task_id>\n\n` +
-								`Bash moved to background: ${title}\nWatch({ type: "bash", id: "${alias}" })`,
+								`Bash moved to background: ${title}\nAwait({ type: "bash", id: "${alias}" }) to wait, or Watch({ type: "bash", id: "${alias}" }) to observe without waiting.`,
 							title,
 							metadata: {
 								background_task_id: taskId,
@@ -988,7 +988,7 @@ async function _runInBackground(
 	let output =
 		`<background_task_id>${alias}</background_task_id>\n\n` +
 		`Background bash ${backgroundKind} started: ${title}\n` +
-		`Watch({ type: "bash", id: "${alias}" })`;
+		`Await({ type: "bash", id: "${alias}" }) to wait, or Watch({ type: "bash", id: "${alias}" }) to observe without waiting.`;
 
 	if (conflicted) {
 		output +=

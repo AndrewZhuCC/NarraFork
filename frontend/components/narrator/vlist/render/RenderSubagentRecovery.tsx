@@ -43,7 +43,7 @@ interface RenderSubagentRecoveryProps {
 	/** Toggle the checkbox at `rowIndex`. Omit to render read-only. */
 	onToggleRow?: (rowIndex: number) => void;
 	/** Submit the selection in the given mode. Omit to render read-only. */
-	onResume?: (mode: "notify" | "watch") => void;
+	onResume?: (mode: "notify" | "watch" | "await") => void;
 	/**
 	 * Withdraw the offer without resuming anything. Omit to paint no close button at
 	 * all (read-only shares have nothing to dismiss).
@@ -156,21 +156,35 @@ export function RenderSubagentRecovery({
 					</Stack>
 				)}
 
-				<Group justify="flex-end" gap="xs">
+				<Group justify="flex-end" gap="xs" wrap="nowrap">
 					<Button
 						size="compact-sm"
 						variant="light"
+						style={{ minWidth: 0 }}
 						color="orange"
 						disabled={!interactive || selectedCount === 0}
 						onClick={interactive ? () => onResume?.("notify") : undefined}
 					>
 						{data.notifyLabel}
 					</Button>
+					{data.watchLabel && (
+						<Button
+							size="compact-sm"
+							variant="light"
+							color="orange"
+							style={{ minWidth: 0 }}
+							disabled={!interactive || selectedCount === 0}
+							onClick={interactive ? () => onResume?.("watch") : undefined}
+						>
+							{data.watchLabel}
+						</Button>
+					)}
 					<Button
 						size="compact-sm"
 						color="orange"
+						style={{ minWidth: 0 }}
 						disabled={!interactive || selectedCount === 0}
-						onClick={interactive ? () => onResume?.("watch") : undefined}
+						onClick={interactive ? () => onResume?.("await") : undefined}
 					>
 						{data.waitLabel}
 					</Button>

@@ -49,7 +49,7 @@ NarraFork 把 AI 会话、开发工具和团队协作放在一个自托管平台
 - 后台 subagent 或 bash 任务完成后会自动唤醒主代理并带回结果；启动后应继续无依赖工作，或**直接结束当前响应**等通知，不在回合内轮询。
 - `Watch({ type: "terminal" | "bash" | "agent", id, pattern?, timeout?, start_at? })` 登记非阻塞观察并立即返回；`timeout` 单位为毫秒，默认 600000、上限 86400000，只约束观察，不停止目标。终端写入的 `notify_on` 保持原子写入并登记，Terminal 的 `timeout` 仍使用秒。
 - Watch 卡片的“已登记观察”不是工具仍在运行。任务完成、输出命中或观察超时会通过通知送达；结果已保存时可用 Watch 获取有界结果。
-- Await 已退役，旧声明或历史卡片不授予执行权。问题与文件传输沿用自动通知及 Question／后台任务列表查询；有新信息需要传递时用 Send，不发催促或状态轮询消息。
+- 结果阻塞下一步时，用 `Await({ type: "bash" | "agent" | "question" | "transfer", id, timeout? })` 在当前回合显式等待；`agent` 仍受当前会话的运行权限限制。Bash 可用 `wait_for_text` 等待实际输出。超时或引导只结束等待，不停止目标；运行中的 `Await` 可在卡片上调整超时。无依赖工作优先并行处理，不发催促或状态轮询消息。
 
 **发布工作区规则（严格遵守）：**
 - **发布（`bun scripts/release.ts`）必须在当前主仓库工作区就地执行，禁止为了发布新建/使用隔离 git worktree。** 隔离发布会导致 release 提交和 tag 落在别的分支、主仓库 main 上缺少版本 bump 与 changelog，需要二次合并。若当前工作区有未提交的无关改动，应先与用户确认提交或暂不发布，而不是旁路到隔离工作区。

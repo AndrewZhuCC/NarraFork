@@ -1609,7 +1609,7 @@ export const PretextExactMessageList = memo(
 			const resumeRecoveryRef = useRef(resumeRecovery);
 			resumeRecoveryRef.current = resumeRecovery;
 			const handleResumeSubagentRecovery = useCallback(
-				(messageId: string, specKey: string, mode: "notify" | "watch") => {
+				(messageId: string, specKey: string, mode: "notify" | "watch" | "await") => {
 					const measured = measuredByKeyRef.current.get(specKey) as
 						| { blocks?: Array<{ data?: { subagents?: Array<{ id?: string }> } }> }
 						| undefined;

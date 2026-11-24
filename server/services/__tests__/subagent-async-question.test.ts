@@ -28,6 +28,7 @@ const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const questionService = await import("../narrator-question-service");
 const { askUserQuestionTool } = await import("../../lib/agent/tools/ask-user-question");
+const { awaitTool } = await import("../../lib/agent/tools/await");
 const { questionTool } = await import("../../lib/agent/tools/question");
 const { handlePermission } = await import("../narrator-permission");
 const { toolRegistry } = await import("../../lib/agent/tool-registry");
@@ -566,6 +567,9 @@ describe("asynchronous question integration", () => {
 		const own = await questionTool.execute({ action: "get", id: record.id }, ctx);
 		expect(own.isError).not.toBe(true);
 		expect(own.output).toContain("Disk");
+		const awaited = await awaitTool.execute({ type: "question", id: record.id }, ctx);
+		expect(awaited.metadata).toMatchObject({ awaitType: "question", status: "answered" });
+		expect(awaited.output).toContain("Disk");
 		for (const narratorId of [OTHER, CHILD]) {
 			const foreign = await questionTool.execute(
 				{ action: "get", id: record.id },
@@ -573,6 +577,11 @@ describe("asynchronous question integration", () => {
 			);
 			expect(JSON.parse(foreign.output)).toMatchObject({ record: null, events: [] });
 			expect(foreign.output).not.toContain("Disk");
+			const foreignAwait = await awaitTool.execute(
+				{ type: "question", id: record.id },
+				{ ...ctx, narratorId },
+			);
+			expect(foreignAwait.isError).toBe(true);
 		}
 	});
 

@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
-import { backgroundTasks, narrators } from "../../db/schema";
+import { backgroundTasks, deviceTransferTasks, narrators, remoteDevices } from "../../db/schema";
 import type { ToolContext } from "../../lib/agent/types";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
 
@@ -12,10 +12,12 @@ const { eventBus } = await import("../../lib/event-bus");
 const { backgroundTaskService } = await import("../background-task-service");
 const { narratorService } = await import("../narrator-service");
 const { awaitAgentResultDetailed, waitForSubagentResult } = await import("../agent-communication");
-const { getRuntimePublicationService, runtimePublication } = await import(
-	"../agent-runtime/publication"
+const { activateSqliteRuntimePublication, getRuntimePublicationService, runtimePublication } =
+	await import("../agent-runtime/publication");
+activateSqliteRuntimePublication(db);
+const { awaitTool, listRunningAwaits, updateAwaitTimeout } = await import(
+	"../../lib/agent/tools/await"
 );
-const { awaitTool, listRunningAwaits } = await import("../../lib/agent/tools/await");
 const { setRunHold } = await import("../agent-runtime/ownership");
 const markTakenOver = (id: string) => setRunHold(id, { released: false });
 const clearTakenOver = (id: string) => setRunHold(id, undefined);
@@ -90,24 +92,132 @@ function commitAgentResult(source = agentRun, output = "current final") {
 	});
 }
 
-for (const type of ["agent", "bash", "question", "transfer"] as const) {
-	test(`retired Await(${type}) never waits, creates a timer or consumes a completion`, async () => {
-		const wait = spyOn(backgroundTaskService, "waitForCompletion");
-		const text = spyOn(backgroundTaskService, "waitForText");
-		const publication = await getRuntimePublicationService();
-		const consume = spyOn(publication, "consumeAwaitedTerminal");
-		const timer = spyOn(globalThis, "setTimeout");
-		const result = await awaitTool.execute({ type, id: taskId, timeout: 600000 }, ctx());
-		expect(result.isError).toBe(true);
-		expect(result.output).toContain("Await is retired");
-		expect(wait).not.toHaveBeenCalled();
-		expect(text).not.toHaveBeenCalled();
-		expect(consume).not.toHaveBeenCalled();
-		expect(timer).not.toHaveBeenCalled();
-		expect(listRunningAwaits()).toEqual([]);
-	});
-}
+test("Await rejects terminal targets before creating a waiter", async () => {
+	const wait = spyOn(backgroundTaskService, "waitForCompletion");
+	const text = spyOn(backgroundTaskService, "waitForText");
+	const timer = spyOn(globalThis, "setTimeout");
+	const result = await awaitTool.execute({ type: "terminal", id: taskId }, ctx());
+	expect(result.isError).toBe(true);
+	expect(result.output).toContain('unsupported wait type "terminal"');
+	expect(wait).not.toHaveBeenCalled();
+	expect(text).not.toHaveBeenCalled();
+	expect(timer).not.toHaveBeenCalled();
+});
 
+test("Await reads a completed Bash by alias and consumes only its matching receipt", async () => {
+	await db
+		.update(backgroundTasks)
+		.set({ alias: "local-bash" })
+		.where(eq(backgroundTasks.id, taskId));
+	const consume = spyOn(getRuntimePublicationService(), "consumeAwaitedTerminal");
+	const result = await awaitTool.execute({ type: "bash", id: "local-bash" }, ctx());
+	expect(result.isError).not.toBe(true);
+	expect(result.output).toContain("final needle");
+	expect(consume).toHaveBeenCalledWith(run);
+});
+
+test("Await rejects a Bash owned by another session", async () => {
+	const wait = spyOn(backgroundTaskService, "waitForCompletion");
+	const args = { type: "bash", id: taskId };
+	expect(await awaitTool.execute(args, { ...ctx(), narratorId: child })).toMatchObject({
+		isError: true,
+	});
+	expect(wait).not.toHaveBeenCalled();
+});
+
+test("an early output match returns without consuming Bash completion", async () => {
+	await db.update(backgroundTasks).set({ status: "running" }).where(eq(backgroundTasks.id, taskId));
+	spyOn(backgroundTaskService, "getOutputBuffer").mockReturnValue("needle");
+	const consume = spyOn(getRuntimePublicationService(), "consumeAwaitedTerminal");
+	const result = await awaitTool.execute(
+		{ type: "bash", id: taskId, wait_for_text: "needle" },
+		ctx(),
+	);
+	expect(result.metadata?.status).toBe("found");
+	expect(consume).not.toHaveBeenCalled();
+});
+test("Await(agent) returns and consumes the child's terminal result", async () => {
+	commitAgentResult(agentRun, "child final report");
+	const consume = spyOn(getRuntimePublicationService(), "consumeAwaitedTerminal");
+	const result = await awaitTool.execute({ type: "agent", id: child, timeout: 1000 }, ctx());
+	expect(result.output).toContain("child final report");
+	expect(result.metadata).toMatchObject({
+		awaitType: "agent",
+		subagentId: child,
+		status: "completed",
+	});
+	expect(consume).toHaveBeenCalledWith(agentRun);
+});
+
+test("Await(transfer) returns the old paused result by transfer ID", async () => {
+	const now = new Date().toISOString();
+	await db.insert(remoteDevices).values({
+		id: "await-test-device",
+		name: "Test device",
+		slug: "await-test-device",
+		tokenHash: "unused",
+		tokenPrefix: "fixture",
+		createdBy: "fixture",
+		createdAt: now,
+		updatedAt: now,
+	});
+	await db.insert(deviceTransferTasks).values({
+		id: "test-transfer",
+		deviceId: "await-test-device",
+		parentNarratorId: parent,
+		direction: "upload",
+		localPath: "/local/sample",
+		remotePath: "/remote/sample",
+		status: "paused",
+		createdAt: now,
+		updatedAt: now,
+	});
+	await db.insert(backgroundTasks).values({
+		// The projection keeps the durable transfer ID as a separate selector.
+		id: "transfer-projection",
+		type: "transfer",
+		transferTaskId: "test-transfer",
+		parentNarratorId: parent,
+		status: "paused",
+		output: "waiting for device",
+		startedAt: now,
+		createdAt: now,
+		updatedAt: now,
+	});
+	const result = await awaitTool.execute({ type: "transfer", id: "test-transfer" }, ctx());
+	expect(result.output).toContain("waiting for device");
+	expect(result.metadata).toMatchObject({ awaitType: "transfer", status: "paused" });
+});
+
+test("Await restores the live timeout and guidance only interrupts the wait", async () => {
+	await db.update(backgroundTasks).set({ status: "running" }).where(eq(backgroundTasks.id, taskId));
+	const entered = Promise.withResolvers<void>();
+	const waitForCompletion = backgroundTaskService.waitForCompletion.bind(backgroundTaskService);
+	spyOn(backgroundTaskService, "waitForCompletion").mockImplementation((...args) => {
+		entered.resolve();
+		return waitForCompletion(...args);
+	});
+	const guidance = new AbortController();
+	const pending = awaitTool.execute(
+		{ type: "bash", id: taskId, timeout: 60_000 },
+		{
+			...ctx(),
+			currentToolUseId: "live-await",
+			guidanceSignal: guidance.signal,
+		},
+	);
+	try {
+		await entered.promise;
+		expect(updateAwaitTimeout("live-await", 120_000, child)).toBeNull();
+		expect(updateAwaitTimeout("live-await", 120_000, parent)).toBe(120_000);
+		expect(listRunningAwaits()).toMatchObject([{ toolUseId: "live-await", timeoutMs: 120_000 }]);
+	} finally {
+		guidance.abort();
+	}
+	expect((await pending).metadata).toMatchObject({ status: "aborted", endedForGuidance: true });
+	expect(listRunningAwaits()).toEqual([]);
+	expect((await backgroundTaskService.getById(taskId))?.status).toBe("running");
+});
 for (const method of ["completion", "text"] as const) {
 	test(`bash ${method} fast path returns a same-row terminal receipt`, async () => {
 		const result =

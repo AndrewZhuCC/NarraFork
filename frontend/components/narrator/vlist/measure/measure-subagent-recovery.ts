@@ -67,6 +67,7 @@ export interface SubagentRecoveryData {
 	/** Button captions. Height-neutral. */
 	notifyLabel?: string;
 	waitLabel?: string;
+	watchLabel?: string;
 	backgroundBadge?: string;
 	/**
 	 * Close button caption (aria-label + tooltip). Height-neutral: the button sits
@@ -195,6 +196,7 @@ export function measureSubagentRecovery(
 			summary: data.summary,
 			notifyLabel: data.notifyLabel,
 			waitLabel: data.waitLabel,
+			watchLabel: data.watchLabel,
 			backgroundBadge: data.backgroundBadge,
 			dismissLabel: data.dismissLabel,
 			subagents: rows.map((row) => ({

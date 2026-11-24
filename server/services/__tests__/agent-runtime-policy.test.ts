@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { zodToJsonSchema } from "@server/lib/agent/tool-registry";
-import { awaitTool, listRunningAwaits } from "@server/lib/agent/tools/await";
+import { awaitTool } from "@server/lib/agent/tools/await";
 import { sendTool } from "@server/lib/agent/tools/send";
 import { watchTool } from "@server/lib/agent/tools/watch";
 import type { ToolContext } from "@server/lib/agent/types";
@@ -71,7 +71,8 @@ describe("shared capability projections", () => {
 			const filter = input ? resolveToolFilter(input.template, custom) : runtimeToolFilter(policy);
 			expect(filter?.(sendTool)).toBe(true);
 			expect(filter?.(watchTool)).toBe(true);
-			expect(filter?.(awaitTool)).toBe(false);
+			expect(filter?.(awaitTool)).toBe(custom?.toolAccess !== "custom");
+			expect(filter?.(awaitTool)).toBe(isRuntimeToolAllowed(policy, "Await"));
 			for (const name of [
 				"Agent",
 				"Task",
@@ -198,9 +199,6 @@ describe("shared capability projections", () => {
 		expect(awaitTool.parameters.safeParse({ type: "agent", id: "sibling" }).success).toBe(true);
 		const result = await awaitTool.execute({ type: "agent", id: "sibling" }, ctx);
 		expect(result.isError).toBe(true);
-		expect(result.output).toContain("Await is retired");
-		expect(listRunningAwaits().some((entry) => entry.toolUseId === ctx.currentToolUseId)).toBe(
-			false,
-		);
+		expect(result.output).toContain(SUBAGENT_AGENT_AWAIT_FORBIDDEN_ERROR);
 	});
 });

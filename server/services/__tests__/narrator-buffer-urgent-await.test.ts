@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, expect, mock, test } from "bun:test";
+import { afterAll, beforeAll, expect, mock, spyOn, test } from "bun:test";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import { asc, eq } from "drizzle-orm";
 import { Hono } from "hono";
@@ -8,10 +8,12 @@ import {
 	narratorBufferedMessages,
 	narratorMessages,
 	narrators,
+	narratorToolCalls,
 } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
 import type { ToolResult } from "../../lib/agent/types";
 import { AppError, ValidationError } from "../../lib/errors";
+import { getNarraforkHome } from "../../lib/narrafork-home";
 import { updateBufferedMessageModeSchema } from "../../lib/validators/narrators";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
 
@@ -38,6 +40,8 @@ for (const [table, column, type] of [
 const parent = "urgent-await-parent";
 const child = "urgent-await-child";
 const calls: string[] = [];
+const blockingParent = "blocking-bash-parent";
+const blockingCalls: string[] = [];
 const started = Promise.withResolvers<AbortSignal>();
 const returned = Promise.withResolvers<ToolResult>();
 const childStarted = Promise.withResolvers<AbortSignal>();
@@ -50,9 +54,11 @@ const provider: ProviderAdapter = {
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		const input = requestInput(params);
-		calls.push(input.replace(/^<sender kind="human" \/>\n/, ""));
 		params.onRequestStart?.();
 		const narratorId = params.stickySessionKey ?? "";
+		(narratorId === blockingParent ? blockingCalls : calls).push(
+			input.replace(/^<sender kind="human" \/>\n/, ""),
+		);
 		if (pendingWatchFollowups.delete(narratorId)) {
 			providerPauses.add(narratorId);
 			(narratorId === child ? childStarted : started).resolve(params.signal);
@@ -69,6 +75,17 @@ const provider: ProviderAdapter = {
 						toolUseId: "urgent-await-tool",
 						name: "Watch",
 						input: { type: "agent", id: child, timeout: 600_000 },
+						outputIndex: 0,
+					},
+				],
+			};
+		} else if (input.includes("start blocking Bash wait")) {
+			yield {
+				toolUses: [
+					{
+						toolUseId: "blocking-bash-wait",
+						name: "Await",
+						input: { type: "bash", id: "blocking-bash", timeout: 3000 },
 						outputIndex: 0,
 					},
 				],
@@ -90,7 +107,9 @@ const provider: ProviderAdapter = {
 	generateWithMeta: async () => ({ text: "" }),
 	generateWithHistory: async () => "",
 };
+const realProvider = { ...(await import("../../lib/agent/provider")) };
 mock.module("../../lib/agent/provider", () => ({
+	...realProvider,
 	getProvider: () => provider,
 	resolveProviderAndModel: (model = "openai:test-model") => ({
 		requestedProvider: "openai",
@@ -117,6 +136,8 @@ const { getExecutionOwner } = await import("../agent-runtime/ownership");
 const { activeNarrators, withNarratorStartAdmission } = await import("../narrator-session-state");
 const { narratorService } = await import("../narrator-service");
 const { wakeInboxIfEligible } = await import("../agent-runtime/inbox");
+const { activateSqliteRuntimePublication } = await import("../agent-runtime/publication");
+activateSqliteRuntimePublication(db);
 const { getRunControl, getRunHold, setRunHold } = await import("../agent-runtime/ownership");
 const { controlRun, startNarratorRun } = await import("../agent-runtime/run");
 
@@ -156,7 +177,6 @@ actualRoutes.onError((error, c) =>
 	c.json({ error: error.message }, error instanceof AppError ? (error.statusCode as 400) : 500),
 );
 const { toolRegistry } = await import("../../lib/agent/tool-registry");
-const { listRunningAwaits } = await import("../../lib/agent/tools/await");
 const { watchTool } = await import("../../lib/agent/tools/watch");
 const { backgroundTaskService } = await import("../background-task-service");
 
@@ -233,7 +253,7 @@ beforeAll(async () => {
 				permissionMode: "bypassPermissions",
 				autoContinuationOverride: "off",
 				status: "idle",
-				cwd: process.cwd(),
+				cwd: getNarraforkHome(),
 				// Server-side starts without a user resume the session's own identity; a
 				// session nobody owns and no run registered would not start at all.
 				runtimeRegistrationJson: {
@@ -260,7 +280,6 @@ beforeAll(async () => {
 	try {
 		await acceptUserMessage(parent, "start real Watch");
 		await until(() => providerPauses.has(parent), "model paused after Watch registration");
-		expect(listRunningAwaits()).toEqual([]);
 		const signal = await started.promise;
 		const owner = getExecutionOwner(parent);
 		expect(owner).toBeDefined();
@@ -364,7 +383,6 @@ test("interrupt aborts the model turn and releases its owner without cancelling 
 	expect(evidence.watchStatus).toBe("watching");
 	expect(evidence.watchStillRunning).toBe(true);
 	expect(evidence.oldOwnerReleased).toBe(true);
-	expect(listRunningAwaits()).toEqual([]);
 });
 
 test("selected urgent input is materialized instead of stranded in the pending list", () => {
@@ -395,7 +413,7 @@ test("POST retry promotes selected failed urgent A ahead of newer urgent B befor
 		permissionMode: "bypassPermissions",
 		autoContinuationOverride: "off",
 		status: "idle",
-		cwd: process.cwd(),
+		cwd: getNarraforkHome(),
 		// Same as the parent above: an explicitly anonymous registered session.
 		runtimeRegistrationJson: {
 			version: 1,
@@ -526,7 +544,7 @@ test("taken-over child's model turn is interrupted without ending takeover or it
 			permissionMode: "bypassPermissions",
 			autoContinuationOverride: "off",
 			traits: ["standalone"],
-			cwd: process.cwd(),
+			cwd: getNarraforkHome(),
 		})
 		.where(eq(narrators.id, child));
 	sqlite.run(
@@ -571,7 +589,6 @@ test("taken-over child's model turn is interrupted without ending takeover or it
 	expect(handle.started).toBe(true);
 	try {
 		await until(() => providerPauses.has(child), "child model paused after Watch registration");
-		expect(listRunningAwaits()).toEqual([]);
 		const toolSignal = await childStarted.promise;
 		const active = activeNarrators.get(child);
 		const owner = getExecutionOwner(child);
@@ -650,3 +667,50 @@ test("busy wake is retried until the indexed receipt is genuinely materialized",
 	expect(wakes).toBe(2);
 	expect(result).toEqual({ delivered: true, messageId: "receipt-user" });
 });
+
+test("Await keeps the current pass active until background Bash completes", async () => {
+	const now = new Date().toISOString();
+	await db.insert(narrators).values({
+		id: blockingParent,
+		type: "primary",
+		variant: "primary",
+		traits: ["standalone"],
+		model: "openai:test-model",
+		permissionMode: "bypassPermissions",
+		status: "idle",
+		cwd: getNarraforkHome(),
+		runtimeRegistrationJson: {
+			version: 1,
+			run: { logicalRunId: "blocking-parent-run", principal: { userId: null } },
+		},
+		createdAt: now,
+		updatedAt: now,
+	});
+	await backgroundTaskService.createBashTask({
+		id: "blocking-bash",
+		parentNarratorId: blockingParent,
+		command: "echo bash exit marker",
+	});
+	const wait = spyOn(backgroundTaskService, "waitForCompletion");
+	try {
+		await acceptUserMessage(blockingParent, "start blocking Bash wait");
+		await until(() => wait.mock.calls.some(([id]) => id === "blocking-bash"), "Bash Await entered");
+		expect(getExecutionOwner(blockingParent)?.isCurrent()).toBe(true);
+		expect(blockingCalls).toEqual(["start blocking Bash wait"]);
+		expect(await backgroundTaskService.markCompleted("blocking-bash", "bash exit marker", 0)).toBe(
+			true,
+		);
+		await until(() => !getExecutionOwner(blockingParent), "pass completed after Bash settled");
+		const toolCall = db
+			.select()
+			.from(narratorToolCalls)
+			.where(eq(narratorToolCalls.toolUseId, "blocking-bash-wait"))
+			.get();
+		expect(toolCall?.status).toBe("success");
+		expect(JSON.stringify(toolCall?.outputJson)).toContain("bash exit marker");
+		expect(blockingCalls).toEqual(["start blocking Bash wait", ""]);
+	} finally {
+		wait.mockRestore();
+		closeNarrator(blockingParent);
+	}
+}, 10_000);

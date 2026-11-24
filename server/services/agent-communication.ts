@@ -407,7 +407,7 @@ export function formatAgentAwaitResult(
 		case "aborted":
 			return (
 				`${tag}\n\n` +
-				`Observation interrupted; agent ${label} is still running. Register Watch again only if another observation is useful.` +
+				`Wait interrupted; agent ${label} is still running. Await again with the same id.` +
 				(partial ? `\n\nPartial output so far:\n${partial}` : "")
 			);
 		case "running":
@@ -415,7 +415,7 @@ export function formatAgentAwaitResult(
 			return (
 				`${tag}\n\n` +
 				`Agent ${label} is still running — this wait timed out, not the subagent. ` +
-				`Its completion will be delivered automatically; use Watch only to register another observation. ` +
+				`Await again with the same id. ` +
 				`Do not send a progress check or interrupt it merely because this wait expired.` +
 				activitySection +
 				(partial ? `\n\nPartial output so far:\n${partial}` : "")
@@ -429,7 +429,7 @@ export function formatAgentAwaitResult(
 		case "taken_over":
 			return (
 				`${tag}\n\n` +
-				`Agent ${label} is being taken over by the user. This is not a completed result; Watch may be registered after takeover ends.` +
+				`Agent ${label} is being taken over by the user. Await again after takeover ends.` +
 				(partial ? `\n\nOutput so far:\n${partial}` : "")
 			);
 		default:
@@ -726,7 +726,10 @@ export async function waitForSubagentResult(opts: {
 
 		const onAbort = () => {
 			cleanup();
-			resolve({ status: "aborted", output: "Observation cancelled." });
+			resolve({
+				status: "aborted",
+				output: opts.reportTakenOver ? "Observation cancelled." : "Await aborted.",
+			});
 		};
 		const onDeleted = (event: { narratorId: string }) => {
 			if (settled || event.narratorId !== opts.subagentId) return;

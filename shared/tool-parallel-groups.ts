@@ -41,6 +41,7 @@ const PARALLEL_SAFE_TOOL_NAMES = new Set([
 	"StructView",
 	"WebSearch",
 	"WebFetch",
+	"Await",
 	"Watch",
 	"Send",
 	"ContextAsk",
@@ -70,18 +71,17 @@ const ALWAYS_STRICT_SERIAL_TOOL_NAMES = new Set([
  * current parallel batch, these must observe that agent's registered/running state,
  * so they start in a fresh group after the Agent batch settles instead of racing it.
  */
-const AGENT_BARRIER_DEPENDENT_TOOL_NAMES = new Set(["Watch", "Send"]);
+const AGENT_BARRIER_DEPENDENT_TOOL_NAMES = new Set(["Await", "Watch", "Send"]);
 
 const AGENT_TOOL_NAME = "Agent";
 
 /**
- * Send wakes an idle subagent before it returns. An Watch in the same batch would
- * otherwise read the previous run's terminal state and hand back the old report, so
- * Watch after Send starts in a fresh group. Unlike the Agent barrier this waits for
- * the whole Send group, which settles as soon as delivery is accepted.
+ * Send wakes an idle subagent before it returns. Await and Watch in the same batch
+ * could read the previous run's terminal state and hand back the old report. Both
+ * start in a fresh group after Send, which settles when delivery is accepted.
  */
 const SEND_TOOL_NAME = "Send";
-const SEND_BARRIER_DEPENDENT_TOOL_NAMES = new Set(["Watch"]);
+const SEND_BARRIER_DEPENDENT_TOOL_NAMES = new Set(["Await", "Watch"]);
 
 function crossesSendBarrier<T extends ToolExecutionGroupItem>(
 	previousGroup: readonly T[] | undefined,

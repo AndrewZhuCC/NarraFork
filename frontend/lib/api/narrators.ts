@@ -2056,11 +2056,11 @@ export const narratorsApi = {
 		),
 	resumeRecoverySubagents: (
 		narratorId: string,
-		body: { messageId: string; subagentIds: string[]; mode: "notify" | "watch" },
+		body: { messageId: string; subagentIds: string[]; mode: "notify" | "watch" | "await" },
 	) =>
 		request<{
 			ok: boolean;
-			mode: "notify" | "watch";
+			mode: "notify" | "watch" | "await";
 			resumed: number;
 			skipped: Array<{ id: string; reason: string }>;
 		}>(`/narrators/${narratorId}/subagent-recovery`, {

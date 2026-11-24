@@ -213,6 +213,7 @@ const TOOL_FIELD_CONFIG: Record<string, { short: string[]; large: string[] }> = 
 		large: ["prompt"],
 	},
 	Task: { short: ["description", "subagent_type", "model", "reasoning_effort"], large: ["prompt"] },
+	Await: { short: ["type", "id", "timeout", "wait_for_text"], large: [] },
 	Watch: { short: ["type", "id", "pattern", "timeout", "start_at"], large: [] },
 	Send: {
 		short: ["id", "ids", "name", "names", "doInterrupt", "await", "timeout"],
@@ -601,6 +602,7 @@ const RELAXED_PLAN_READ_ONLY_TOOLS = new Set([
 	"StructView",
 	"WebSearch",
 	"WebFetch",
+	"Await",
 	"Watch",
 	"Stop",
 	"ShareFile",
@@ -723,8 +725,9 @@ const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
 	"Edit",
 	"StructSed",
 	"Agent",
-	// Watch/Send may target newly spawned work. Let the post-stream group
+	// Await/Watch/Send may target newly spawned work. Let the post-stream group
 	// barrier see the Agent's registered state before running them.
+	"Await",
 	"Watch",
 	"Send",
 	// Stop can target work launched earlier in the same assistant turn.

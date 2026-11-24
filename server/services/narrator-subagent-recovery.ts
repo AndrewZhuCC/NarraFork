@@ -826,8 +826,7 @@ async function driveRecoveryCandidate(
 			return;
 		}
 
-		// Close a legacy Await slot with an observation receipt, never a hidden waiter.
-		const result = await registerRecoveryAgentWatch({
+		const result = await runRecoveryAgentTool("Await", {
 			narratorId,
 			id: candidate.targetId,
 			toolUseId: candidate.toolUseId,
@@ -1247,7 +1246,7 @@ export async function resumeRecoverySubagents(input: {
 export async function markRecoveryCardResolved(input: {
 	narratorId: string;
 	messageId: string;
-	mode: "notify" | "watch";
+	mode: "notify" | "watch" | "await";
 	resumedAliases: string[];
 	/** Failed starts stay actionable; successful starts must not be restarted twice. */
 	retrySubagentIds?: string[];
@@ -1293,37 +1292,40 @@ export async function markRecoveryCardResolved(input: {
 	});
 }
 
-/** Recovery registers an observation under the same live capability ceiling as tools. */
-export async function registerRecoveryAgentWatch(input: {
-	narratorId: string;
-	id: string;
-	toolUseId: string;
-	signal: AbortSignal;
-	userId?: string | null;
-	timeout?: number;
-}) {
-	const [{ watchTool }, { resolveNarratorRuntimePolicy }, { isRuntimeToolAllowed }] =
-		await Promise.all([
-			import("../lib/agent/tools/watch"),
-			import("./trait-layer-service"),
-			import("./agent-runtime/policy"),
-		]);
+/** Run a recovery wait or observation under the same capability ceiling as tools. */
+async function runRecoveryAgentTool(
+	toolName: "Await" | "Watch",
+	input: {
+		narratorId: string;
+		id: string;
+		toolUseId: string;
+		signal: AbortSignal;
+		userId?: string | null;
+	},
+) {
+	const [{ resolveNarratorRuntimePolicy }, { isRuntimeToolAllowed }, tool] = await Promise.all([
+		import("./trait-layer-service"),
+		import("./agent-runtime/policy"),
+		toolName === "Await"
+			? import("../lib/agent/tools/await").then((m) => m.awaitTool)
+			: import("../lib/agent/tools/watch").then((m) => m.watchTool),
+	]);
 	const owner = await narratorService.getById(input.narratorId);
 	const userId = input.userId !== undefined ? input.userId : executionPrincipalOf(owner)?.userId;
-	if (userId === undefined)
-		throw new Error("Recovery observation requires a registered execution principal");
+	if (userId === undefined) throw new Error("Recovery requires a registered execution principal");
 	const policy = await resolveNarratorRuntimePolicy(input.narratorId, userId);
 	const recheckAuthorization = async () => {
 		const current = await resolveNarratorRuntimePolicy(input.narratorId, userId);
-		if (!isRuntimeToolAllowed(current, "Watch") || !current.capabilities.watchAgent)
-			throw new Error("Watch(agent) is unavailable under the current runtime policy");
+		const allowsAgent =
+			toolName === "Await" ? current.capabilities.awaitAgent : current.capabilities.watchAgent;
+		if (!isRuntimeToolAllowed(current, toolName) || !allowsAgent)
+			throw new Error(`${toolName}(agent) is unavailable under the current runtime policy`);
 	};
 	await recheckAuthorization();
-	return watchTool.execute(
+	return tool.execute(
 		{
 			type: "agent",
 			id: input.id,
-			...(input.timeout !== undefined ? { timeout: input.timeout } : {}),
 		},
 		{
 			narratorId: input.narratorId,
@@ -1351,30 +1353,38 @@ export function buildRecoveryNotifyPrompt(entries: Array<{ alias: string }>): st
 	);
 }
 
-/**
- * "Resume and watch": register one non-blocking observation per restarted agent.
- * The synthetic Watch calls finish at registration; notifications resume the parent.
- */
-export function startRecoveryWatchBatch(
-	input: Parameters<typeof startRecoveryWatchBatchUnlocked>[0],
-): Promise<{ messageId: string; toolUseIds: string[] }> {
+export function startRecoveryWatchBatch(input: Parameters<typeof startRecoveryBatchUnlocked>[0]) {
+	return startRecoveryBatch(input, "Watch");
+}
+
+export function startRecoveryAwaitBatch(input: Parameters<typeof startRecoveryBatchUnlocked>[0]) {
+	return startRecoveryBatch(input, "Await");
+}
+
+function startRecoveryBatch(
+	input: Parameters<typeof startRecoveryBatchUnlocked>[0],
+	toolName: "Await" | "Watch",
+) {
 	const acceptedInput = {
 		...input,
 		humanReplyContext: parseReplyContext(input.humanReplyContext) ?? undefined,
 	};
 	return withNarratorStartAdmission(input.narratorId, () =>
-		startRecoveryWatchBatchUnlocked(acceptedInput),
+		startRecoveryBatchUnlocked(acceptedInput, toolName),
 	);
 }
 
-async function startRecoveryWatchBatchUnlocked(input: {
-	narratorId: string;
-	aliases: string[];
-	locale: Locale;
-	replyInUserLanguage: boolean;
-	userId?: string | null;
-	humanReplyContext?: ReplyContext;
-}): Promise<{ messageId: string; toolUseIds: string[] }> {
+async function startRecoveryBatchUnlocked(
+	input: {
+		narratorId: string;
+		aliases: string[];
+		locale: Locale;
+		replyInUserLanguage: boolean;
+		userId?: string | null;
+		humanReplyContext?: ReplyContext;
+	},
+	toolName: "Await" | "Watch",
+): Promise<{ messageId: string; toolUseIds: string[] }> {
 	if (getExecutionOwner(input.narratorId) || isNarratorRuntimeBusy(input.narratorId)) {
 		throw new ValidationError("Cannot recover subagents while the narrator is already running");
 	}
@@ -1382,7 +1392,7 @@ async function startRecoveryWatchBatchUnlocked(input: {
 	const blocks = input.aliases.map((alias) => ({
 		type: "tool_use",
 		id: `toolu_recover_${generateShortId()}`,
-		name: "Watch",
+		name: toolName,
 		input: { type: "agent", id: alias },
 	}));
 
@@ -1397,7 +1407,10 @@ async function startRecoveryWatchBatchUnlocked(input: {
 			content: [
 				{
 					type: "text",
-					text: `Registering observations for ${input.aliases.length} restarted background agent(s).`,
+					text:
+						toolName === "Await"
+							? `Collecting results from ${input.aliases.length} restarted background agent(s).`
+							: `Registering observations for ${input.aliases.length} restarted background agent(s).`,
 				},
 				...blocks,
 			],
@@ -1426,7 +1439,7 @@ async function startRecoveryWatchBatchUnlocked(input: {
 			narratorId: input.narratorId,
 			toolCallId: toolCallIdByUseId.get(block.id) ?? null,
 			toolUseId: block.id,
-			toolName: "Watch",
+			toolName,
 			input: block.input,
 		});
 	}
@@ -1436,8 +1449,7 @@ async function startRecoveryWatchBatchUnlocked(input: {
 		setTurnStart: true,
 	});
 
-	// Protect the bounded registration stage from concurrent starts. This controller
-	// never owns the observed agents and is released once registration finishes.
+	// The controller owns only the registrations or waits, not the background agents.
 	const { registerPlannedUpdateRecoveryController } = await import("./narrator-session");
 	const controller = new AbortController();
 	const registration = registerPlannedUpdateRecoveryController(
@@ -1455,7 +1467,8 @@ async function startRecoveryWatchBatchUnlocked(input: {
 		throw error;
 	}
 
-	await runRecoveryWatchBatch(
+	const finished = runRecoveryBatch(
+		toolName,
 		{
 			narratorId: input.narratorId,
 			messageId: message.id,
@@ -1471,7 +1484,7 @@ async function startRecoveryWatchBatchUnlocked(input: {
 		controller.signal,
 	)
 		.catch((err) => {
-			logger.error("Recovery Watch registration failed", {
+			logger.error(`Recovery ${toolName} batch failed`, {
 				narratorId: input.narratorId,
 				error: err instanceof Error ? err.message : String(err),
 			});
@@ -1485,11 +1498,14 @@ async function startRecoveryWatchBatchUnlocked(input: {
 				input.replyInUserLanguage,
 			);
 		});
+	// Await leaves the narrator busy after this request; Watch only registers.
+	if (toolName === "Watch") await finished;
 
 	return { messageId: message.id, toolUseIds: blocks.map((block) => block.id) };
 }
 
-async function runRecoveryWatchBatch(
+async function runRecoveryBatch(
+	toolName: "Await" | "Watch",
 	input: {
 		narratorId: string;
 		messageId: string;
@@ -1507,7 +1523,7 @@ async function runRecoveryWatchBatch(
 				let status: "success" | "fail" = "success";
 				let errorMessage: string | undefined;
 				try {
-					const result = await registerRecoveryAgentWatch({
+					const result = await runRecoveryAgentTool(toolName, {
 						narratorId: input.narratorId,
 						id: entry.alias,
 						toolUseId: entry.toolUseId,
@@ -1524,7 +1540,7 @@ async function runRecoveryWatchBatch(
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
 					status = "fail";
-					errorMessage = `Watch registration failed: ${message}`;
+					errorMessage = `${toolName} failed: ${message}`;
 					output = errorMessage;
 				}
 				await narratorService
@@ -1553,16 +1569,39 @@ async function runRecoveryWatchBatch(
 					narratorId: input.narratorId,
 					toolCallId: entry.toolCallId,
 					toolUseId: entry.toolUseId,
-					toolName: "Watch",
+					toolName,
 					status,
 					output,
 				});
 			}),
 		);
 	} finally {
-		// Registration is finished, not the observed work. Release the parent now;
-		// the normal completion/mailbox path will resume it when a result arrives.
-		await narratorService.updateStatus(input.narratorId, "idle", { substatus: [] });
+		if (toolName === "Watch") {
+			// Registration finished; completion notifications resume the parent.
+			await narratorService.updateStatus(input.narratorId, "idle", { substatus: [] });
+		} else {
+			const { continueNarrator } = await import("./narrator-session");
+			const continued = await continueNarrator(
+				input.narratorId,
+				input.locale,
+				input.replyInUserLanguage,
+				input.userId,
+			).catch((error) => {
+				logger.error("continueNarrator after recovery await batch failed", {
+					narratorId: input.narratorId,
+					error: String(error),
+				});
+				return { ok: false };
+			});
+			if (!continued.ok) {
+				await narratorService
+					.updateStatus(input.narratorId, "idle", {
+						substatus: ["error"],
+						errorMessage: "Recovery awaits finished but the narrator could not be continued.",
+					})
+					.catch(() => {});
+			}
+		}
 	}
 }
 

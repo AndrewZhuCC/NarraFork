@@ -1,6 +1,7 @@
 import { type ToolProvider, toolRegistry } from "../tool-registry";
 import type { ToolDefinition } from "../types";
 import { askUserQuestionTool } from "./ask-user-question";
+import { awaitTool } from "./await";
 import { bashTool } from "./bash";
 import { browserTool } from "./browser";
 import { contextAskTool } from "./context-ask";
@@ -138,6 +139,7 @@ const coreProvider: ToolProvider = {
 			exitPlanModeTool,
 			agentTool,
 			stopTool,
+			awaitTool,
 			watchTool,
 			contextAskTool,
 			sendTool,

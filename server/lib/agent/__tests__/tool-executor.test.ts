@@ -484,30 +484,6 @@ describe("executeTool trusted runtime policy", () => {
 });
 
 describe("executeTool update admission gate", () => {
-	test("a stale registered Await definition is rejected before permission or dispatch", async () => {
-		const previous = toolRegistry.get("Await");
-		const execute = mock(async () => ({ output: "must not run" }));
-		const permission = mock(async () => ({ behavior: "allow" as const }));
-		toolRegistry.register({
-			name: "Await",
-			description: "stale epoch",
-			parameters: z.object({}),
-			execute,
-		});
-		try {
-			const result = await executeTool(
-				{ toolUseId: "retired-await", name: "Await", input: {} },
-				makeConfig(permission),
-			);
-			expect(result.isError).toBe(true);
-			expect(result.output).toContain("Await is retired");
-			expect(execute).not.toHaveBeenCalled();
-			expect(permission).not.toHaveBeenCalled();
-		} finally {
-			if (previous) toolRegistry.register(previous);
-			else toolRegistry.unregister("Await");
-		}
-	});
 	test("classifies background Bash and resumable agent routes", () => {
 		expect(
 			classifyToolUpdateExecution({

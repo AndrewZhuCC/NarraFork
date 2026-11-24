@@ -661,7 +661,7 @@ export function useResumeRecoverySubagents() {
 			narratorId: string;
 			messageId: string;
 			subagentIds: string[];
-			mode: "notify" | "watch";
+			mode: "notify" | "watch" | "await";
 		}) => api.resumeRecoverySubagents(narratorId, { messageId, subagentIds, mode }),
 		onSuccess: (data, { narratorId }) => {
 			qc.invalidateQueries({ queryKey: ["narrators", narratorId, "messages"] });
