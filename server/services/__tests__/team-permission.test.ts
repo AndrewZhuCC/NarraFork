@@ -16,12 +16,12 @@ import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb, getFileTestDb } from "../../../tests/setup";
 import { narrators, narratorToolCalls } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import type { RuntimePermissionConstraint } from "../narrator-permission";
 
-const { db, sqlite } = getTestDb();
+const { db, sqlite, dispose } = getFileTestDb();
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const realNarratorService = { ...(await import("../narrator-service")) };
@@ -161,6 +161,7 @@ afterEach(async () => {
 afterAll(() => {
 	mock.module("../../db", () => realDb);
 	mock.restore();
+	dispose();
 });
 
 const cleanup = { action: "cleanup", item: "item" };
@@ -489,7 +490,8 @@ describe("through handlePermission", () => {
 				binding: call.binding,
 				cwd,
 			});
-			if (decidedBy === "user") await expect(check).resolves.toBeDefined();
+			// Settle natively before expect to avoid Bun's reused-Worker .resolves stall.
+			if (decidedBy === "user") expect(await check).toBeDefined();
 			else await expect(check).rejects.toThrow("Team cleanup requires a person's approval");
 		}
 		// Other actions keep their automatic approval.
@@ -498,8 +500,8 @@ describe("through handlePermission", () => {
 			.update(narratorToolCalls)
 			.set({ status: "running", permissionDecidedBy: "auto", permissionDecidedAt: now() })
 			.where(eq(narratorToolCalls.id, call.callId));
-		await expect(
-			recheckFinalToolExecutionPermission({
+		expect(
+			await recheckFinalToolExecutionPermission({
 				narratorId: "n",
 				toolName: "Team",
 				input: { action: "decision", text: "x" },
@@ -507,6 +509,6 @@ describe("through handlePermission", () => {
 				binding: call.binding,
 				cwd,
 			}),
-		).resolves.toBeDefined();
+		).toBeDefined();
 	});
 });

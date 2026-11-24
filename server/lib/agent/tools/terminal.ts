@@ -12,6 +12,7 @@ import {
 	MIN_WATCH_TIMEOUT_MS,
 	normalizeWatchPattern,
 	startTerminalWatch,
+	terminalLifecycleReader,
 	type WatchStart,
 } from "../../../services/terminal-watch-service";
 import { cancelWatchRegistration } from "../../../services/watch-observation";
@@ -524,21 +525,13 @@ async function startWatch(
 		buffer,
 		readLifecycleState:
 			pattern === undefined
-				? async () => {
+				? terminalLifecycleReader(terminalId, buffer, terminalService, async () => {
 						const current = await db.query.terminals.findFirst({
 							where: eq(terminals.id, terminalId),
 							columns: { status: true },
 						});
-						if (current?.status === "exited") return "exited";
-						if (
-							!current ||
-							!terminalService.isAttached(terminalId) ||
-							(buffer && terminalService.getActiveBuffer(terminalId) !== buffer)
-						) {
-							return "disconnected";
-						}
-						return "running";
-					}
+						return current?.status;
+					})
 				: undefined,
 		cursor: point,
 		matchFrame,
@@ -549,13 +542,31 @@ async function startWatch(
 		prefixUnknown: point?.prefixUnknown,
 		start,
 		toolUseId: ctx.currentToolUseId,
+		principal: { userId: ctx.userId ?? null },
 		registrationSignal: ctx.signal,
 	});
 	if (ctx.signal.aborted) {
-		if (started.status === "started") await cancelWatchRegistration(started.observation);
+		if (started.status === "started" && !started.reused)
+			await cancelWatchRegistration(started.observation);
 		return makeAbortedResult(terminalName);
 	}
 	if (started.status === "error") return { output: started.message, isError: true };
+	if (started.reused) {
+		return {
+			output: `Already watching terminal "${terminalName}" until exit or deadline (background task "${started.alias}"); no second watch was added. Its deadline is now in ${Math.round(started.remainingMs / 1000)}s. Stop({ type: "bash", id: "${started.alias}" }) cancels only the observation.`,
+			title: terminalName,
+			metadata: {
+				kind: "watch",
+				type: "terminal",
+				id: terminalId,
+				targetId: terminalId,
+				watchId: started.taskId,
+				watchAlias: started.alias,
+				status: "watching",
+				reused: true,
+			},
+		};
+	}
 	return {
 		output:
 			`Watching terminal "${terminalName}"${pattern ? ` for ${JSON.stringify(normalizeWatchPattern(pattern))}` : " until exit or deadline"} ` +

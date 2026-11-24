@@ -28,6 +28,7 @@ import {
 	resolveEffectiveModelCard,
 } from "../model-catalog";
 import { isNugCachedModelAvailable, resolveNugModelMeta } from "../nug-model-cache";
+import { registerModelListReader } from "../sourcing/model-list-readers";
 import { getTokenDanceCatalogModels, getTokenDanceRuntimeConfig } from "../tokendance-runtime";
 import type {
 	AnthropicProviderConfig,
@@ -163,6 +164,14 @@ registerExtraModelSource("tokendance", {
 // Register codex model checker and lister immediately
 registerCodexModelChecker((model) => getBuiltinCodexModels().includes(model));
 registerCodexModelLister(() => getBuiltinCodexModels().map((m) => `codex:${m}`));
+
+registerModelListReader("codex", () => getBuiltinCodexModels());
+registerModelListReader("tokendance", () => getTokenDanceCatalogModels().map((model) => model.id));
+// Keep Command Code's existing stale-while-revalidate semantics in its catalog owner.
+registerModelListReader("command-code", () => {
+	const config = s().commandCode;
+	return peekCommandCodeModels(config?.apiKey, config?.baseUrl).models;
+});
 
 export function registerOpenaiModelChecker(checker: (model: string) => boolean): void {
 	openaiModelChecker = checker;
@@ -762,6 +771,19 @@ export function resolveAllowedModelCandidateMatch(
 	}
 
 	return null;
+}
+
+/**
+ * List the concrete models a (possibly meta) model reference can reach, in
+ * reference order. Expansion reads settings only and never advances
+ * aggregation routing, so callers can match by provider before selecting.
+ */
+export function listConcreteModelsForReference(model: string | null | undefined): string[] {
+	const result: string[] = [];
+	for (const value of expandModelReferenceForMatching(model)) {
+		if (!isMetaModelReference(value) && !isModelProviderDisabled(value)) result.push(value);
+	}
+	return result;
 }
 
 /**

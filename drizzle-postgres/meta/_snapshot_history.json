@@ -456,6 +456,14 @@
 			"prevId": "660674b9-8038-4065-b5bc-e3ef78b86d31",
 			"version": "7",
 			"snapshotDigest": "8eeca27396bd3462f812c018348f5e29dc3efebbc03fa614958a650ee7b46a97"
+		},
+		{
+			"idx": 57,
+			"tag": "0057_merge_selfuse_0916",
+			"id": "e6ffab4e-031f-4b35-9452-903bc67bb5d7",
+			"prevId": "039291b4-683f-4dbe-a451-e8d57e70b67a",
+			"version": "7",
+			"snapshotDigest": "0ce879c896010331b735ac602499f016fa831ce86816f95e53e6350ed27afd9b"
 		}
 	]
 }

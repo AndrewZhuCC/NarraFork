@@ -440,6 +440,7 @@ export type PermissionResult =
 			behavior: "planReflection";
 			requestId: string;
 			input: Record<string, unknown>;
+			assertStillAllowed?: () => Promise<void>;
 	  }
 	| {
 			behavior: "dangerReflection";
@@ -581,6 +582,7 @@ export type AgentEvent =
 	| {
 			type: "block_complete";
 			block: ContentBlock;
+			sealedReasoningLength?: number;
 			/** Called only after the current message's real tool row is durable. */
 			onToolPersisted?: (binding: ToolCallBinding) => void;
 	  }
@@ -793,7 +795,13 @@ export type AgentEvent =
 	  }
 	| { type: "metering"; unit: string; unitPlural: string; usage: number; credentialId?: string }
 	| { type: "queue_status"; position?: number; queueDepth?: number; queueMessage?: string }
-	| { type: "quota_balance"; quotaBalance: string | null; detailedQuotaBalance?: string | null }
+	| {
+			type: "quota_balance";
+			quotaBalance: string | null;
+			detailedQuotaBalance?: string | null;
+			/** Request-start provider identity; stale events must not write a replacement's cache. */
+			providerIdentity?: string;
+	  }
 	| {
 			type: "invalid_state";
 			reason: string;
@@ -1289,8 +1297,12 @@ export interface AgentConfig {
 	reasoningEffort?: ReasoningEffort;
 	/** Service tier for Codex-mode providers. */
 	serviceTier?: string;
-	/** Current named model reference; an automatic route may change provider but not model. */
-	getUltrafastModel?: () => string | undefined;
+	/** Resolve a fresh tier per attempt; undefined disables the static tier. */
+	resolveServiceTier?: (request: {
+		provider: string;
+		model: string;
+		signal: AbortSignal;
+	}) => string | undefined | Promise<string | undefined>;
 	/** Metadata sent with API requests (e.g. Anthropic metadata.user_id) */
 	metadata?: { user_id: string };
 	/**
@@ -1368,8 +1380,8 @@ export interface AgentConfig {
 	rebuildRequestHistory?: () => Promise<AgentHistoryReplacement>;
 	/** Whether the initial history ends with tool results the model has not answered. */
 	historyEndsWithToolResults?: boolean;
-	/** End a reasoning-only turn quietly when the runtime is waiting for external work. */
-	shouldIdleOnReasoningOnly?: () => boolean | Promise<boolean>;
+	/** Pending input or external work will wake this session; empty/reasoning-only replies may idle. */
+	hasPendingWake?: () => boolean | Promise<boolean>;
 	/** Latest context-window occupancy observed by the caller. */
 	getContextUsagePercentage?: () => number | undefined;
 	/**
@@ -1473,7 +1485,7 @@ export interface AgentConfig {
 	 * the response produced still runs, and the loop ends the turn once the step's tools
 	 * have settled instead of sending the next provider request. One-shot like shouldStop.
 	 */
-	shouldYieldToInput?: () => boolean;
+	shouldYieldToInput?: () => boolean | Promise<boolean>;
 	/** Event-driven immediate guidance: cut the provider response at the next tool-call
 	 * boundary and end the turn after its tools ran. Only Await stops waiting early.
 	 * Supply a fresh signal for each loop invocation. */

@@ -3,7 +3,7 @@ import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
 import { getSubagentType, parseSubstatus } from "@server/lib/narrator-utils";
 import type { Locale } from "@server/lib/prompt-i18n";
-import { runDeliverToOf, teamRootOf } from "@server/lib/runtime-source";
+import { isTeamMember, runDeliverToOf, teamRootOf } from "@server/lib/runtime-source";
 import { isParentSelector, type SendDeliveryTarget } from "@shared/communication-tool";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
@@ -34,6 +34,7 @@ import {
 } from "./subagent-label";
 import {
 	applySubagentModelSwitch,
+	markExplicitSubagentModelPin,
 	planSubagentModelSwitch,
 	type SubagentModelSwitchPlan,
 } from "./subagent-model-switch";
@@ -69,7 +70,7 @@ export interface SendSubagentInput extends ResolveTargetsInput {
 	 * messages alone never restart such a session; this is the one-call opt-in.
 	 */
 	resume?: boolean;
-	/** Switch each direct child's model before delivery (`"parent"` follows the delegator again). */
+	/** Switch each direct child's model for a newly accepted Send (`"parent"` follows the delegator). */
 	model?: string;
 	toolUseId: string;
 	signal: AbortSignal;
@@ -445,11 +446,14 @@ async function buildAwaitAgentResult(
 	knownLabel?: string,
 	receipt?: Pick<AwaitAgentResult, "terminalResultReceived" | "publicationRun" | "sourceResultRef">,
 	knownTitle?: string | null,
+	signal?: AbortSignal,
 ): Promise<AwaitAgentResult> {
 	let recentActivity: string | undefined;
 	if (status === "timeout" || status === "running") {
 		try {
-			recentActivity = formatRecentSubagentActivity(await getRecentSubagentToolActivity(id));
+			recentActivity = formatRecentSubagentActivity(
+				await getRecentSubagentToolActivity(id, undefined, { signal }),
+			);
 		} catch (err) {
 			logger.warn("Failed to load recent subagent activity for Await timeout", {
 				subagentId: id,
@@ -457,7 +461,7 @@ async function buildAwaitAgentResult(
 			});
 		}
 	}
-	const label = knownLabel ?? (await resolveAgentLabel(scopeNarratorId, id));
+	const label = knownLabel ?? (await resolveAgentLabel(scopeNarratorId, id, { signal }));
 	return {
 		id,
 		label,
@@ -516,13 +520,27 @@ type SubagentWaitResult = Pick<
 	"status" | "output" | "terminalResultReceived" | "publicationRun" | "sourceResultRef"
 >;
 
+interface CommittedWatchRead {
+	ownerNarratorId: string;
+	signal?: AbortSignal;
+}
+
 /** Never pair a later run lookup with an earlier assistant result. */
 async function readSubagentTerminal(
 	subagentId: string,
 	recipientId: string,
 	current: Narrator,
 	observedRunningRunId?: string | null,
+	committedObservation?: CommittedWatchRead,
 ): Promise<SubagentWaitResult> {
+	const checkWatchTarget = (target: Narrator) => {
+		if (!committedObservation) return;
+		committedObservation.signal?.throwIfAborted();
+		if (!isTeamMember(target, committedObservation.ownerNarratorId)) {
+			throw new Error("Observation access was revoked.");
+		}
+	};
+	checkWatchTarget(current);
 	const run: PublicationRun | undefined = current.logicalRunId
 		? {
 				producerKind: "agent",
@@ -536,12 +554,16 @@ async function readSubagentTerminal(
 	// Require this run's immutable terminal source, or a post-boundary assistant
 	// after the waiter observed this same run transition from running to settled.
 	const terminalObserved = run !== undefined && observedRunningRunId === run.logicalRunId;
+	const workerRead = current.isBackground ? undefined : committedObservation;
 	const terminal = run
 		? await getRuntimePublicationService()
-				.readAgentTerminalResult(run, {
-					settledRunId: terminalObserved ? run.logicalRunId : undefined,
-				})
+				.readAgentTerminalResult(
+					run,
+					{ settledRunId: terminalObserved ? run.logicalRunId : undefined },
+					workerRead,
+				)
 				.catch((error) => {
+					if (workerRead) throw error;
 					logger.warn("Failed to read run-bound Await result", { run, error: String(error) });
 					return null;
 				})
@@ -554,9 +576,12 @@ async function readSubagentTerminal(
 				? (current.backgroundResult ?? "(no output)")
 				: await getSubagentFinalText(subagentId));
 	const latest = await narratorService.getById(subagentId);
+	checkWatchTarget(latest);
 	if (
 		current.logicalRunId !== latest.logicalRunId ||
-		(observedRunningRunId && current.logicalRunId !== observedRunningRunId)
+		(observedRunningRunId && current.logicalRunId !== observedRunningRunId) ||
+		(committedObservation &&
+			(runDeliverToOf(latest)?.narratorId ?? committedObservation.ownerNarratorId) !== recipientId)
 	) {
 		return {
 			status: "superseded",
@@ -603,8 +628,11 @@ export async function waitForSubagentResult(opts: {
 	/** Watch follows one run, rather than an unrelated later continuation. */
 	expectedRunId?: string;
 	reportTakenOver?: boolean;
+	watchOwnerNarratorId?: string;
 }): Promise<SubagentWaitResult> {
 	const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+	const committedRead = (signal?: AbortSignal): CommittedWatchRead | undefined =>
+		opts.watchOwnerNarratorId ? { ownerNarratorId: opts.watchOwnerNarratorId, signal } : undefined;
 	const current = await narratorService.getById(opts.subagentId);
 	const lifecycleResult = (narrator: Narrator): SubagentWaitResult | undefined => {
 		if (opts.expectedRunId && narrator.logicalRunId !== opts.expectedRunId) {
@@ -623,18 +651,26 @@ export async function waitForSubagentResult(opts: {
 	const initialLifecycle = lifecycleResult(current);
 	if (initialLifecycle) return initialLifecycle;
 	if (current.status !== "working" && current.status !== "waiting") {
-		return readSubagentTerminal(opts.subagentId, opts.recipientId, current);
+		return readSubagentTerminal(
+			opts.subagentId,
+			opts.recipientId,
+			current,
+			undefined,
+			committedRead(opts.signal),
+		);
 	}
 
 	const observedRunningRunId = current.logicalRunId;
-	return new Promise((resolve) => {
+	return new Promise((resolve, reject) => {
 		let settled = false;
 		let timer: ReturnType<typeof setTimeout> | undefined;
+		const observation = opts.watchOwnerNarratorId ? new AbortController() : undefined;
 
 		const cleanup = () => {
 			if (settled) return;
 			settled = true;
 			if (timer) clearTimeout(timer);
+			observation?.abort();
 			eventBus.off("narrator:subagent_completed", onCompleted);
 			eventBus.off("narrator:status_changed", onStatusChanged);
 			eventBus.off("narrator:deleted", onDeleted);
@@ -663,6 +699,7 @@ export async function waitForSubagentResult(opts: {
 					opts.recipientId,
 					current,
 					observedRunningRunId,
+					committedRead(observation?.signal),
 				);
 				if (settled) return; // Interrupt/timeout wins while result reads are in flight.
 				cleanup();
@@ -672,6 +709,12 @@ export async function waitForSubagentResult(opts: {
 					onDeleted({ narratorId: opts.subagentId });
 					return;
 				}
+				if (observation && !settled) {
+					cleanup();
+					reject(err);
+					return;
+				}
+				if (settled) return;
 				logger.warn("Failed to read subagent terminal result", {
 					subagentId: opts.subagentId,
 					error: String(err),
@@ -913,6 +956,7 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 			undefined,
 			background,
 			background.title,
+			opts.signal,
 		);
 	}
 
@@ -940,6 +984,7 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 			label,
 			receipt,
 			target.title,
+			opts.signal,
 		);
 	// Every background run is projected by a task row (creation, detach, recovery and
 	// each later run of the session), handled above; the session row alone never
@@ -974,7 +1019,13 @@ export async function awaitAgentResultDetailed(opts: AwaitAgentInput): Promise<A
 		});
 		return build(relabel(waited.status), waited.output, waited);
 	}
-	const terminal = await readSubagentTerminal(target.id, recipientId, target);
+	const terminal = await readSubagentTerminal(
+		target.id,
+		recipientId,
+		target,
+		undefined,
+		opts.snapshotOnly ? { ownerNarratorId: scope.caller.id, signal: opts.signal } : undefined,
+	);
 	return build(terminal.status, terminal.output, terminal);
 }
 
@@ -1201,14 +1252,6 @@ export async function sendSubagentMessageDetailed(
 				: "";
 			const interruptTarget = input.doInterrupt && !takenOver;
 			const running = fresh.status === "working" || fresh.status === "waiting";
-			const modelPlan = modelPlans.get(fresh.id);
-			let modelNote = "";
-			if (modelPlan) {
-				await applySubagentModelSwitch(fresh.id, modelPlan);
-				modelNote =
-					` Model switched to ${modelPlan.model}` +
-					(running ? " (applies from its next model request)." : ".");
-			}
 
 			// Prefix sibling/child-bound messages with a sender label so the recipient
 			// can tell who sent it (user-typed page messages bypass this path entirely).
@@ -1234,30 +1277,50 @@ export async function sendSubagentMessageDetailed(
 				input.toolCallBinding,
 				input.showToUser ?? false,
 			);
-			let deliveryMessageId = delivery.recipientMessageId;
+			const accepted = await enqueueInboxAgent(delivery, deliveredMessage, {
+				createdBy: input.userId ?? null,
+				...(!running && { userId: input.userId ?? null }),
+			});
+			if (accepted.delivery.state === "cancelled" || accepted.delivery.state === "failed")
+				throw new Error(
+					`Previous delivery is ${accepted.delivery.state}; explicit retry is required`,
+				);
+			const deliveryMessageId = delivery.recipientMessageId;
+			const duplicate = accepted.status === "duplicate";
+			const modelPlan = modelPlans.get(fresh.id);
+			let appliedModel: string | undefined;
+			let modelNote = "";
+			if (modelPlan && !duplicate) {
+				try {
+					await applySubagentModelSwitch(fresh.id, modelPlan);
+					markExplicitSubagentModelPin(fresh.id, modelPlan.model);
+					appliedModel = modelPlan.model;
+					modelNote =
+						` Model switched to ${appliedModel}` +
+						(running ? " (applies from its next model request)." : ".");
+				} catch (error) {
+					// The message is already queued; still wake the recipient and report the switch separately.
+					modelNote = " Could not complete the model switch.";
+					logger.warn("Accepted Send model switch failed", {
+						narratorId: fresh.id,
+						error: String(error),
+					});
+				}
+			}
 
 			if (running) {
-				const enqueued = await enqueueInboxAgent(delivery, deliveredMessage, {
-					createdBy: input.userId ?? null,
-				});
-				if (enqueued.delivery.state === "cancelled" || enqueued.delivery.state === "failed")
-					throw new Error(
-						`Previous delivery is ${enqueued.delivery.state}; explicit retry is required`,
-					);
-				const buffered = { duplicate: enqueued.status === "duplicate" };
 				// The run may have ended while this was being queued; the ordinary wake
 				// rechecks ownership, so a still-live run simply adopts it at its boundary.
-				if (!buffered.duplicate)
+				if (!duplicate)
 					void wakeInboxIfEligible(fresh.id, input.locale as Locale).catch((error) =>
 						logger.warn("Queued Send wake deferred", {
 							narratorId: fresh.id,
 							error: String(error),
 						}),
 					);
-				deliveryMessageId = delivery.recipientMessageId;
-				let interruptNote = modelNote + takeoverNote;
+				let interruptNote = takeoverNote;
 				let interrupted: boolean | undefined;
-				if (interruptTarget && !buffered.duplicate) {
+				if (interruptTarget && !duplicate) {
 					interrupted = await controlRun(fresh.id, { kind: "stop" });
 					interruptNote = interrupted
 						? " Interrupted foreground subagent."
@@ -1265,7 +1328,7 @@ export async function sendSubagentMessageDetailed(
 				} else if (input.doInterrupt && takenOver) {
 					interruptNote += " doInterrupt was ignored because the user is driving this subagent.";
 				}
-				sections.push(`Sent to ${label}; message queued.${interruptNote}`);
+				sections.push(`Sent to ${label}; message queued.${modelNote}${interruptNote}`);
 				targetResults.push({
 					id: fresh.id,
 					label,
@@ -1273,22 +1336,13 @@ export async function sendSubagentMessageDetailed(
 					status: "queued",
 					deliveryMessageId,
 					...stableSendCoordinates(fresh.id, deliveryMessageId, delivery),
-					...(modelPlan && { model: modelPlan.model }),
+					...(appliedModel && { model: appliedModel }),
 					interrupted,
 				});
 				notifyDeliveryResolved(input, fresh.id, deliveryMessageId, fresh.title, delivery);
 				continue;
 			}
 
-			const accepted = await enqueueInboxAgent(delivery, deliveredMessage, {
-				createdBy: input.userId ?? null,
-				userId: input.userId ?? null,
-			});
-			deliveryMessageId = delivery.recipientMessageId;
-			if (accepted.delivery.state === "cancelled" || accepted.delivery.state === "failed")
-				throw new Error(
-					`Previous delivery is ${accepted.delivery.state}; explicit retry is required`,
-				);
 			// Agent messages never restart a failed or user-stopped session by themselves;
 			// `resume` is the explicit opt-in, and only for a failure (the user's stop stands).
 			const stopped = takenOver ? null : blockingStopReason(fresh.lastStopReason);
@@ -1331,7 +1385,7 @@ export async function sendSubagentMessageDetailed(
 				title: fresh.title,
 				status: blockedReason ? "blocked" : wakeFailed ? "queued" : "started",
 				...(blockedReason && { blockedReason }),
-				...(modelPlan && { model: modelPlan.model }),
+				...(appliedModel && { model: appliedModel }),
 				...(resumeRequested && !wakeFailed && { resumed: true }),
 				deliveryMessageId,
 				...stableSendCoordinates(fresh.id, deliveryMessageId, delivery),

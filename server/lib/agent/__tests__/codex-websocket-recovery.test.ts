@@ -169,7 +169,7 @@ async function runStream(
 		apiKey: "sk-test",
 		requestDump: overrides.requestDump,
 		sessionKey: overrides.sessionKey ?? "narrator-1",
-		ephemeral: overrides.exclusive,
+		ephemeralSession: overrides.exclusive,
 		exclusive: overrides.exclusive,
 		conversationId: "conv-1",
 		credentialId: "cred-1",
@@ -1132,7 +1132,10 @@ for (const { code, frame } of recoverableErrors) {
 		expect(server.connectionCount()).toBe(2);
 		expect(server.requests[1]?.connectionIndex).toBe(1);
 		expect(server.requests[1]?.body.previous_response_id).toBeUndefined();
-		expect(server.requests[1]?.body.input).toEqual([...history, userMessage("continue")]);
+		expect(server.requests[1]?.body.input).toEqual([
+			...history,
+			userMessage("continue"),
+		]);
 		expect(requestTurnState(server, 0)).toBeUndefined();
 		expect(requestTurnState(server, 1)).toBe("sticky-1");
 		// WS routing state rides response.create.client_metadata, NOT handshake
@@ -1441,7 +1444,10 @@ test.each([
 		expect(collectText(next.events)).toBe("ok");
 		expect(server.requests).toHaveLength(3);
 		expect(server.requests[2]?.body.previous_response_id).toBeUndefined();
-		expect(server.requests[2]?.body.input).toEqual([...history, userMessage("next")]);
+		expect(server.requests[2]?.body.input).toEqual([
+			...history,
+			userMessage("next"),
+		]);
 		expect(server.requests[2]?.connectionIndex).toBe(1);
 		expect(server.connectionCount()).toBe(2);
 		expect(clientClosedAtInvalidState).toBe(true);
@@ -1483,7 +1489,7 @@ test("a nested request on a busy session runs on an ephemeral socket without tou
 				stream: true,
 				instructions: "base",
 			},
-			ephemeral,
+			ephemeralSession: ephemeral,
 			onResponseFrame: (frame) => {
 				if (ephemeral) privateFrames.push(JSON.parse(frame));
 			},

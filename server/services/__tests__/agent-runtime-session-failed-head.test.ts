@@ -2,17 +2,40 @@ import { afterAll, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { cleanDb } from "../../../tests/setup";
 import { narratorBufferedMessages, narratorMessages, narrators } from "../../db/schema";
-
 // Share the preload-isolated file-backed DB with the real prefix/history workers.
 const { db, sqlite } = await import("../../db");
+const { activateSqliteRuntimePublication, runtimePublication } = await import(
+	"../agent-runtime/publication"
+);
+runtimePublication.stop();
+activateSqliteRuntimePublication(db);
 const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 const ws = { ...(await import("../../websocket/narrator-ws")) };
 mock.module("../../websocket/narrator-ws", () => ({ ...ws, broadcastToNarrator: () => {} }));
-mock.module("../agent-runtime/orchestrator", () => ({
-	runAgentLoopUnlocked: async () => ({ started: true, allowInboxWake: false }),
+const runModule = { ...(await import("../agent-runtime/run")) };
+const idleRun = Promise.resolve({
+	started: true,
+	output: "",
+	finalText: "",
+	hasError: false,
+	interrupted: false,
+	timedOut: false,
+});
+mock.module("../agent-runtime/run", () => ({
+	...runModule,
+	startNarratorRun: async () => ({
+		started: true,
+		foreground: idleRun,
+		terminal: idleRun,
+		completion: idleRun,
+	}),
 }));
-const { resumeNextBufferedMessage, sendMessage, startParentInboundContinuationIfPossible } =
-	await import("../narrator-session");
+const {
+	drainAndPersistPendingInjections,
+	resumeNextBufferedMessage,
+	sendMessage,
+	startParentInboundContinuationIfPossible,
+} = await import("../narrator-session");
 const { enqueueBufferedMessage, getBufferedMessages } = await import("../narrator-buffer");
 const { runtimeInbox, wakeInboxIfEligible } = await import("../agent-runtime/inbox");
 const { specVfsService } = await import("../spec-vfs-service");
@@ -83,9 +106,9 @@ test("real session resume ignores failed UI head and executes the next claimed q
 			.where(eq(narratorBufferedMessages.id, queued.id))
 			.get()?.state,
 	).toBe("materialized");
-	expect(getBufferedMessages("recipient").map((row) => ({ id: row.id, state: row.state }))).toEqual(
-		[{ id: failed.id, state: "failed" }],
-	);
+	expect(
+		(await getBufferedMessages("recipient")).map((row) => ({ id: row.id, state: row.state })),
+	).toEqual([{ id: failed.id, state: "failed" }]);
 	expect(getExecutionOwner("recipient")).toBeUndefined();
 });
 
@@ -123,7 +146,7 @@ test("real ordinary feed reuses the claimed queued input and cannot enqueue it t
 		{ id: expectedId, contentText: "ordinary queued text", createdBy: null },
 	]);
 	expect(db.select().from(narratorBufferedMessages).all()).toHaveLength(2);
-	expect(getBufferedMessages("recipient").map((row) => row.id)).toEqual([failed.id]);
+	expect((await getBufferedMessages("recipient")).map((row) => row.id)).toEqual([failed.id]);
 });
 
 test("real session resume retains an unprojectable agent head before a user command", async () => {
@@ -273,7 +296,7 @@ test("new send cannot report an older queued input as its own success", async ()
 	});
 	const messages = db.select().from(narratorMessages).all();
 	expect(messages[1].contentText).toBe("old input");
-	expect(getBufferedMessages("recipient").map((row) => row.text)).toEqual(["new input"]);
+	expect((await getBufferedMessages("recipient")).map((row) => row.text)).toEqual(["new input"]);
 });
 
 test("failed notification persistence leaves notice and input retryable in order", async () => {
@@ -312,7 +335,7 @@ test("notification byte budget stops before the following user without claiming 
 		projectedByteSize: 256 * 1024,
 	});
 	await enqueueBufferedMessage("recipient", "ordinary input");
-	await resumeNextBufferedMessage(active, "en");
+	await drainAndPersistPendingInjections(active);
 	expect(db.select().from(narratorMessages).all()).toHaveLength(1);
 	const remaining = db.select().from(narratorBufferedMessages).all().slice(1);
 	expect(remaining.map((row) => row.state)).toEqual(["queued", "queued"]);
@@ -320,22 +343,23 @@ test("notification byte budget stops before the following user without claiming 
 });
 
 for (const delivery of ["send", "resume"] as const) {
-	test(`${delivery} processes at most 16 notification rows per admission`, async () => {
+	test(`${delivery} preserves order across notification batches`, async () => {
 		for (let index = 0; index < 17; index++) notice(index);
 		await withIdleSession(async (session) => {
 			if (delivery === "send") {
 				await expect(sendMessage("recipient", "ordinary input")).rejects.toThrow(
 					"queued behind earlier",
 				);
+				expect(db.select().from(narratorMessages).all()).toHaveLength(16);
 			} else {
+				// Explicit resume drains multiple bounded batches before taking the user's input.
 				await enqueueBufferedMessage("recipient", "ordinary input");
-				await resumeNextBufferedMessage(session, "en");
 			}
-			expect(db.select().from(narratorMessages).all()).toHaveLength(16);
 			await resumeNextBufferedMessage(session, "en");
 		});
 		const messages = db.select().from(narratorMessages).all();
 		expect(messages).toHaveLength(18);
+		expect(messages[16].contentText).toContain("bash-16");
 		expect(messages[17].contentText).toBe("ordinary input");
 	});
 }

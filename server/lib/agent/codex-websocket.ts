@@ -195,7 +195,7 @@ export interface StreamCodexResponsesWebSocketOptions {
 	request: CodexResponsesRequestBody;
 	signal: AbortSignal;
 	/** Use a private uncached connection, closed on completion (e.g. remote compaction). */
-	ephemeral?: boolean;
+	ephemeralSession?: boolean;
 	/** Reserve the upstream conversation for remote compaction without changing its wire identity. */
 	exclusive?: boolean;
 	/** An exclusive ephemeral request may take over its idle socket and close it when done. */
@@ -206,6 +206,8 @@ export interface StreamCodexResponsesWebSocketOptions {
 	resetSessionBeforeRequest?: boolean;
 	/** New user work starts fresh routing; absent means a continuation of the cached turn. */
 	workTurnId?: string;
+	/** A diagnostics credential can be revoked while the request is being built. */
+	validateBeforeDispatch?: () => void;
 	turnMetadata?: string;
 	/** Override the User-Agent handshake header. Defaults to the narrafork UA. */
 	userAgent?: string;
@@ -642,7 +644,7 @@ export function buildHandshakeHeaders(
 	options: StreamCodexResponsesWebSocketOptions,
 ): Record<string, string> {
 	// No x-openai-internal-codex-responses-lite here: the lite opt-in is a body
-	// contract (no top-level instructions/tools, additional_tools spliced into
+	// contract (no top-level tools, additional_tools spliced into
 	// input, parallel_tool_calls off) that this transport does not implement, and
 	// upstream rejects the header outright when `tools` carries hosted tools.
 	const headers: Record<string, string> = {
@@ -1202,6 +1204,7 @@ async function ensureConnection(
 	if (options.signal.aborted) {
 		throw createCodexWebSocketAbortError();
 	}
+	options.validateBeforeDispatch?.();
 	if (
 		session.connection?.isOpen() &&
 		!session.connection.isExpiring() &&
@@ -1330,7 +1333,7 @@ async function* streamCodexResponsesWithSocket(
 	// A cancelled background request must not acquire or reset the foreground session.
 	if (options.signal.aborted) throw createCodexWebSocketAbortError();
 	const cacheKey = buildSessionCacheKey(options);
-	const cachedSession = options.ephemeral ? undefined : getOrCreateSession(cacheKey);
+	const cachedSession = options.ephemeralSession ? undefined : getOrCreateSession(cacheKey);
 	if (cachedSession?.disabled) {
 		throw new CodexWebSocketFallbackError("Codex Responses WebSocket is disabled for this session");
 	}
@@ -1340,8 +1343,9 @@ async function* streamCodexResponsesWithSocket(
 	// socket carries one in-flight response, and touching the parent's response chain would
 	// corrupt its `previous_response_id` continuation. Run it on a private, uncached session
 	// instead: a fresh socket, full request, closed when this call ends.
-	const ephemeral = !cachedSession || cachedSession.busy;
-	const session = cachedSession && !ephemeral ? cachedSession : createSessionState();
+	const reusableSession = cachedSession && !cachedSession.busy ? cachedSession : undefined;
+	const ephemeral = !reusableSession;
+	const session = reusableSession ?? createSessionState();
 	if (cachedSession?.busy) {
 		// Keep same-turn routing affinity, never the busy connection or its response chain.
 		session.turnState = cachedSession.turnState;
@@ -1354,7 +1358,7 @@ async function* streamCodexResponsesWithSocket(
 	}
 
 	const handshakeHeaders = buildHandshakeHeaders(options);
-	if (options.exclusive && options.ephemeral && options.reuseIdleConnection) {
+	if (options.exclusive && options.ephemeralSession && options.reuseIdleConnection) {
 		const foreground = sessionCache.get(cacheKey);
 		const socket = foreground?.connection;
 		if (
@@ -1456,6 +1460,7 @@ async function* streamCodexResponsesWithSocket(
 		const dispatchRequest = async (): Promise<void> => {
 			const frame = await buildRequestFrame();
 			options.signal.throwIfAborted();
+			options.validateBeforeDispatch?.();
 			options.requestDump?.setRequest(
 				{
 					transport: "websocket",

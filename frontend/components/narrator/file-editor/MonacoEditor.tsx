@@ -394,6 +394,14 @@ export function MonacoEditor(props: MonacoEditorProps) {
 					: null;
 			const subscriptions = [
 				view.onMouseUp(() => flushDragSelection()),
+				view.onDidChangeConfiguration((event) => {
+					if (!event.hasChanged(api.editor.EditorOption.stopRenderingLineAfter)) return;
+					// The native inline "Show more" changes Monaco options directly. Keep both
+					// controls on the same state before any selection callback re-renders React.
+					renderingFull = view.getOption(api.editor.EditorOption.stopRenderingLineAfter) === -1;
+					fullLongLinesRef.current = renderingFull;
+					setFullLongLineDocumentKey(renderingFull ? documentKey : null);
+				}),
 				view.onDidFocusEditorText(() => {
 					// A focus steal mid-drag must still settle the gesture once.
 					flushDragSelection();

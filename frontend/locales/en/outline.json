@@ -6,6 +6,10 @@
 	"notAtTime": "This block did not exist at that point in the history.",
 	"loadFailed": "Could not load this. Try again in a moment.",
 	"loadMore": "Load more",
+	"planApproval": {
+		"reviewedWithComments_one": "Reviewed · {{count}} comment",
+		"reviewedWithComments_other": "Reviewed · {{count}} comments"
+	},
 	"home": {
 		"searchPlaceholder": "Search all outlines you can read",
 		"noResults": "No matches.",

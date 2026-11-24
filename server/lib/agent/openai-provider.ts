@@ -9,6 +9,10 @@ import {
 	mapGenericReasoningEffort,
 	modelAcceptsReasoningEffort,
 } from "@shared/reasoning-effort-support";
+import {
+	normalizeToolResultImagesMode,
+	type ToolResultImagesMode,
+} from "@shared/tool-result-images";
 import { getInstallationId } from "../installation-id";
 import { logger } from "../logger";
 import { redactSecretPatterns } from "../net/diagnostic-redaction";
@@ -55,7 +59,11 @@ import {
 	type ImageGenerationRequest,
 	type ImageGenerationResponse,
 } from "./image-generation-api";
-import { markRuntimeSystemMessage, reportInputCharacters } from "./input-characters";
+import {
+	isRuntimeSystemMessage,
+	markRuntimeSystemMessage,
+	reportInputCharacters,
+} from "./input-characters";
 import {
 	assertNativeMediaPayload,
 	chatAudioMedia,
@@ -570,7 +578,7 @@ interface ResponsesFunctionCallOutputMessage {
 }
 
 export interface OAIMessage {
-	role: "system" | "user" | "assistant" | "tool";
+	role: "system" | "developer" | "user" | "assistant" | "tool";
 	content?: string | OAIContentPart[] | null;
 	/** Kimi dynamic tool loading: tools a `system` message declares from its position on. */
 	tools?: OAITool[];
@@ -686,6 +694,30 @@ interface OAIStreamChunk {
  *                       Codex-specific instructions, headers, reasoning config,
  *                       and response stream handling.
  */
+export function diagnosticTransportIdentity(params: ChatParams): string {
+	return params.diagnosticFork
+		? (params.transportSessionKey ?? params.conversationId)
+		: params.conversationId;
+}
+
+export function appendDiagnosticOpenAIInput(
+	body: Record<string, unknown>,
+	params: ChatParams,
+	responses: boolean,
+): void {
+	const fork = params.diagnosticFork;
+	if (!fork) return;
+	if (Array.isArray(body.tools) && body.tools.some((tool) => tool?.type !== "function")) {
+		throw new Error("A diagnostic fork cannot replay upstream-hosted tools");
+	}
+	const history = body[responses ? "input" : "messages"];
+	if (!Array.isArray(history)) throw new Error("No projected diagnostic request prefix");
+	history.push({
+		role: "user",
+		content: responses ? [{ type: "input_text", text: fork.suffix }] : fork.suffix,
+	});
+}
+
 export class OpenAIProvider implements ProviderAdapter {
 	/**
 	 * Which API variant to use. Resolved from config on construction.
@@ -696,6 +728,18 @@ export class OpenAIProvider implements ProviderAdapter {
 
 	/** The provider config this instance operates with. */
 	private config: OpenAIProviderConfig;
+
+	/**
+	 * 工具结果图片的去处。
+	 *
+	 * 只有 Chat Completions 需要这个开关：Responses / Codex 已有自己的 `input_image` 展开
+	 * 路径，Anthropic 走 `tool_result` 的图片块，都不受它影响。
+	 */
+	private get toolResultImagesMode(): ToolResultImagesMode {
+		return this.responsesFormat
+			? "off"
+			: normalizeToolResultImagesMode(this.config.toolResultImages);
+	}
 
 	/** Optional proxy URL for all requests (used by Codex). */
 	private proxy?: string;
@@ -784,10 +828,10 @@ export class OpenAIProvider implements ProviderAdapter {
 
 	/** Also used by the official Codex WS path, which bypasses chat() on this delegate. */
 	rememberCompactRequest(
-		params: Pick<ChatParams, "model" | "conversationId" | "reflectionParentTools">,
+		params: Pick<ChatParams, "model" | "conversationId" | "reflectionParentTools" | "diagnostic">,
 		body: Record<string, unknown>,
 	): void {
-		if (this.apiMode !== "codex" || params.reflectionParentTools !== undefined) return;
+		if (this.apiMode !== "codex" || params.diagnostic || params.reflectionParentTools !== undefined) return;
 		rememberCodexCompactPrefix(this.compactRequestKey(params.model, params.conversationId), body);
 	}
 
@@ -1002,7 +1046,7 @@ export class OpenAIProvider implements ProviderAdapter {
 					model,
 					request: body as CodexResponsesRequestBody,
 					signal: options?.signal ?? new AbortController().signal,
-					ephemeral: true,
+					ephemeralSession: true,
 					exclusive: true,
 					reuseIdleConnection: true,
 					userAgent: fingerprint.userAgent,
@@ -1144,7 +1188,10 @@ export class OpenAIProvider implements ProviderAdapter {
 									)
 								: undefined,
 					})
-				: completionsWireHistory(projected.turns, { strict }),
+				: completionsWireHistory(projected.turns, {
+						strict,
+						toolResultImages: this.toolResultImagesMode,
+					}),
 			replayedInjectionMessageIds: projected.replayedInjectionMessageIds,
 		};
 	}
@@ -1162,7 +1209,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		const identity = identityMap[locale] ?? identityMap.en;
 		const content = `${identity}\n\n${systemPrompt}`;
 		const role = this.responsesFormat ? "developer" : "system";
-		h.unshift(markRuntimeSystemMessage({ role, content }) as unknown as OAIMessage);
+		h.unshift(markRuntimeSystemMessage({ role, content }));
 	}
 
 	private assertResponsesMediaInput(model: string, values: unknown): void {
@@ -1278,6 +1325,10 @@ export class OpenAIProvider implements ProviderAdapter {
 		});
 	}
 
+	supportsDiagnosticFork(): boolean {
+		return true;
+	}
+
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
 		this.assertMediaInput(params.model, [params.media, params.history, params.toolResults]);
 		// Use WebSocket mode for codex if enabled
@@ -1313,7 +1364,9 @@ export class OpenAIProvider implements ProviderAdapter {
 				...expandResponsesToolResults(params.toolResults as ResponsesFunctionCallOutputMessage[]),
 			);
 		} else {
-			messages.push(...expandCompletionsToolResults(params.toolResults as OAIToolResult[]));
+			messages.push(
+				...expandChatToolResults(params.toolResults as OAIToolResult[], this.toolResultImagesMode),
+			);
 		}
 
 		// Append current user message (skip "." continuation markers unless images are attached)
@@ -1341,52 +1394,36 @@ export class OpenAIProvider implements ProviderAdapter {
 			// Responses API & Codex: POST /responses
 			endpoint = `${baseUrl}/responses`;
 
-			// Extract instructions from developer/system messages
-			let instructions = "";
-			const inputMessages: OAIMessage[] = [];
-
-			for (const msg of messages) {
-				// biome-ignore lint/suspicious/noExplicitAny: Responses API message shape
-				const m = msg as any;
-				if (!isResponsesInputItem(m) && (m.role === "developer" || m.role === "system")) {
-					// Accumulate instructions from developer/system messages
-					if (typeof m.content === "string") {
-						instructions += (instructions ? "\n\n" : "") + m.content;
-					}
-				} else {
-					inputMessages.push(msg);
-				}
-			}
-
-			const responsesInput = prepareResponsesInput(inputMessages, {
+			const reasoningReplay = {
 				strict: hasCredentialBoundReasoning(model),
 				currentSource: this.getActiveReasoningSource(),
-			});
+			};
 
 			// Codex CLI sets store based on endpoint: false for standard OpenAI/ChatGPT
 			// endpoints, true only for Azure OpenAI. Since we use the ChatGPT backend
 			// (chatgpt.com/backend-api/codex), store must be false.
 			// With store: false the server does not persist responses, so
 			// previous_response_id is unsupported — always send full history.
-			body = { model, input: responsesInput, stream: true, store: false };
-
+			body = { model, input: [], stream: true, store: false };
 			if (this.apiMode === "codex") {
-				applyCodexChatInstructions(body, instructions, messages[0]);
-			} else if (instructions) {
-				body.instructions = instructions;
+				buildCodexResponsesInput(body, messages, reasoningReplay);
+			} else {
+				body.input = buildResponsesInput(messages, reasoningReplay, this.apiMode);
 			}
 			if (tools.length > 0) body.tools = tools;
 
 			// Codex: inject native server-side tools only when the selected model supports them.
 			if (this.apiMode === "codex") {
 				body.tools =
-					params.reflectionParentTools ??
-					withCodexNativeTools(tools, params.model, {
-						webSearch:
-							this.codexWebSearchEnabled &&
-							isNativeSearchChannelFirstEnabled(undefined, this.config.prefix, params.model),
-						imageGeneration: this.codexImageGenerationEnabled,
-					});
+					params.diagnostic && !params.diagnosticFork
+						? []
+						: (params.reflectionParentTools ??
+							withCodexNativeTools(tools, params.model, {
+								webSearch:
+									this.codexWebSearchEnabled &&
+									isNativeSearchChannelFirstEnabled(undefined, this.config.prefix, params.model),
+								imageGeneration: this.codexImageGenerationEnabled,
+							}));
 			}
 
 			const normalizedCodexReasoningEffort =
@@ -1395,7 +1432,10 @@ export class OpenAIProvider implements ProviderAdapter {
 					: params.reasoningEffort;
 			if (this.apiMode === "codex") {
 				applyCodexStableRequestFields(body, {
-					identity: createCodexRequestIdentity(params.conversationId, this.codexInstallationId()),
+					identity: createCodexRequestIdentity(
+						diagnosticTransportIdentity(params),
+						this.codexInstallationId(),
+					),
 					reasoningEffort: normalizedCodexReasoningEffort as string,
 				});
 				applyCodexReflectionTools(body, params);
@@ -1413,8 +1453,6 @@ export class OpenAIProvider implements ProviderAdapter {
 
 			logger.debug("Responses API request body", {
 				model,
-				hasInstructions: !!instructions,
-				instructionsLength: instructions.length,
 				inputMessageCount: (body.input as unknown[]).length,
 				toolCount: (body.tools as unknown[] | undefined)?.length ?? 0,
 				reasoningEffort: normalizedCodexReasoningEffort,
@@ -1445,12 +1483,13 @@ export class OpenAIProvider implements ProviderAdapter {
 			applyGenericReasoningEffort(body, this.apiMode, params.model, params.reasoningEffort);
 		}
 
-		if (this.apiMode !== "codex" && params.conversationId) {
+		appendDiagnosticOpenAIInput(body, params, usesResponsesEndpoint(this.apiMode));
+		if ((params.diagnosticFork || this.apiMode !== "codex") && params.conversationId) {
 			// OpenAI's prompt cache is per-machine; load-balanced relays need a stable routing key (codex sets its own).
 			body.prompt_cache_key = params.conversationId;
 		}
 		applyOpenAIModelMetadata(body, params.model, this.apiMode, params.maxOutputTokens);
-		const requestHeaders = this.buildHeaders(apiKey, params.conversationId);
+		const requestHeaders = this.buildHeaders(apiKey, diagnosticTransportIdentity(params));
 
 		// x-codex-turn-state is per-turn: the server hands it back on the first
 		// response of a turn and expects it replayed on every later request of
@@ -1484,6 +1523,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				bodyText: await encodeDump(body, bodyText, params.signal),
 			});
 
+			params.diagnosticFork?.validateCredential?.();
 			params.onRequestStart?.(
 				this.apiMode === "codex"
 					? {
@@ -1492,7 +1532,7 @@ export class OpenAIProvider implements ProviderAdapter {
 						}
 					: undefined,
 			);
-			this.rememberCompactRequest(params, body);
+			if (!params.diagnostic) this.rememberCompactRequest(params, body);
 			params.streamProgress?.beginAttempt();
 			const response = await this.pfetch(endpoint, {
 				method: "POST",
@@ -1681,7 +1721,7 @@ export class OpenAIProvider implements ProviderAdapter {
 						delete textOptions.format;
 						if (Object.keys(textOptions).length === 0) delete body.text;
 					}
-					body.instructions = fallbackInstruction;
+					body.input = responsesTextInput(text, fallbackInstruction, this.apiMode);
 				} else {
 					delete body.response_format;
 					body.messages = [
@@ -1731,19 +1771,13 @@ export class OpenAIProvider implements ProviderAdapter {
 		if (usesResponsesEndpoint(this.apiMode)) {
 			const body: Record<string, unknown> = {
 				model: bareModel,
-				input: [{ role: "user", content: text }],
+				input: responsesTextInput(text, instruction, this.apiMode),
 				store: false,
 			};
 			const codexIdentity =
 				this.apiMode === "codex"
 					? createCodexRequestIdentity(undefined, this.codexInstallationId())
 					: undefined;
-			if (instruction) {
-				body.instructions = instruction;
-			} else if (this.apiMode === "codex") {
-				// Codex gateway requires non-empty instructions on /responses.
-				body.instructions = CODEX_DEFAULT_INSTRUCTIONS;
-			}
 			// Responses and Codex lightweight generation always use the streaming API.
 			body.stream = true;
 			if (codexIdentity) {
@@ -1845,8 +1879,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		if (usesResponsesEndpoint(this.apiMode)) {
 			const body: Record<string, unknown> = {
 				model: bareModel,
-				instructions: systemInstruction,
-				input: [{ role: "user", content: `${reminder}\n\n${content}` }],
+				input: responsesTextInput(`${reminder}\n\n${content}`, systemInstruction, this.apiMode),
 				store: false,
 			};
 			const codexIdentity =
@@ -2242,7 +2275,8 @@ export class OpenAIProvider implements ProviderAdapter {
 		const request = this.buildCodexWebSocketRequest(params);
 		const sessionKey =
 			params.transportSessionKey ?? params.stickySessionKey ?? params.conversationId;
-		const fingerprint = this.resolveFingerprint(params.conversationId);
+		const conversationId = diagnosticTransportIdentity(params);
+		const fingerprint = this.resolveFingerprint(conversationId);
 
 		try {
 			await reportInputCharacters(params, request);
@@ -2259,14 +2293,16 @@ export class OpenAIProvider implements ProviderAdapter {
 				accountId: this.config.codexAccountId,
 				proxy: this.proxy,
 				sessionKey,
-				conversationId: params.conversationId,
-				narratorId: params.stickySessionKey,
+				conversationId,
+				narratorId: params.diagnosticFork ? sessionKey : params.stickySessionKey,
 				credentialId: this.config.id,
 				model: params.model,
 				request,
 				signal: params.signal,
 				resetSessionBeforeRequest: params.resetUpstreamSession,
 				workTurnId: params.workTurnId,
+				ephemeralSession: params.diagnostic,
+				validateBeforeDispatch: params.diagnosticFork?.validateCredential,
 				userAgent: fingerprint.userAgent,
 				extraHeaders: fingerprint.headers,
 				requestDump: params.requestDump,
@@ -2281,7 +2317,8 @@ export class OpenAIProvider implements ProviderAdapter {
 					status: err.status,
 					error: err.message,
 				});
-				// Disable WebSocket for subsequent calls on this instance
+				// Diagnostics must not change transport selection for the parent.
+				if (params.diagnostic) throw err;
 				this.useWebSocket = false;
 				yield* this.chat(params);
 				return;
@@ -2309,42 +2346,33 @@ export class OpenAIProvider implements ProviderAdapter {
 			messages.push({ role: "user", content: params.content });
 		}
 
-		let instructions = "";
-		const inputMessages: OAIMessage[] = [];
-		for (const msg of messages) {
-			// biome-ignore lint/suspicious/noExplicitAny: Responses API uses "developer" role
-			const role = (msg as any).role;
-			if (!isResponsesInputItem(msg) && (role === "system" || role === "developer")) {
-				if (typeof msg.content === "string") {
-					instructions += (instructions ? "\n\n" : "") + msg.content;
-				}
-				continue;
-			}
-			inputMessages.push(msg);
-		}
-
 		const request: CodexResponsesRequestBody = {
 			model,
-			input: prepareResponsesInput(inputMessages, {
-				strict: hasCredentialBoundReasoning(model),
-				currentSource: this.getActiveReasoningSource(),
-			}),
+			input: [],
 			stream: true,
 			store: false,
 		};
-		applyCodexChatInstructions(request, instructions, messages[0]);
+		buildCodexResponsesInput(request, messages, {
+			strict: hasCredentialBoundReasoning(model),
+			currentSource: this.getActiveReasoningSource(),
+		});
 		const tools =
-			params.reflectionParentTools ??
-			withCodexNativeTools(params.tools, params.model, {
-				webSearch:
-					this.codexWebSearchEnabled &&
-					isNativeSearchChannelFirstEnabled(undefined, this.config.prefix, params.model),
-				imageGeneration: this.codexImageGenerationEnabled,
-			});
+			params.diagnostic && !params.diagnosticFork
+				? []
+				: (params.reflectionParentTools ??
+					withCodexNativeTools(params.tools, params.model, {
+						webSearch:
+							this.codexWebSearchEnabled &&
+							isNativeSearchChannelFirstEnabled(undefined, this.config.prefix, params.model),
+						imageGeneration: this.codexImageGenerationEnabled,
+					}));
 		request.tools = tools;
 
 		applyCodexStableRequestFields(request, {
-			identity: createCodexRequestIdentity(params.conversationId, this.codexInstallationId()),
+			identity: createCodexRequestIdentity(
+				diagnosticTransportIdentity(params),
+				this.codexInstallationId(),
+			),
 			reasoningEffort: resolveCodexRequestReasoningEffort(params.model, params.reasoningEffort),
 		});
 		applyCodexReflectionTools(request, params);
@@ -2353,6 +2381,8 @@ export class OpenAIProvider implements ProviderAdapter {
 		}
 
 		applyOpenAIModelMetadata(request, params.model, "codex", params.maxOutputTokens);
+		appendDiagnosticOpenAIInput(request, params, true);
+		if (params.diagnosticFork) request.prompt_cache_key = params.conversationId;
 		return request;
 	}
 
@@ -2809,6 +2839,78 @@ interface OAIToolResult {
 	_nativeMedia?: readonly NativeMediaInput[];
 }
 
+const toolImageDataUrl = (image: { format: string; base64: string }) =>
+	`data:image/${image.format};base64,${image.base64}`;
+
+/**
+ * Tool images as a standalone user message.
+ *
+ * 这是 OpenAI 官方唯一允许的「工具图片」形状，也是 Command Code CLI / 其第三方适配器
+ * 记录的结构：工具消息保持纯文本，图片紧随其后单独成条。并行调用时带上归属说明，
+ * 否则模型无从知道这些图是谁返回的。
+ */
+function toolImageUserParts(
+	images: readonly ResponsesToolImage[],
+	toolCallId: string,
+	attributed: boolean,
+): OAIContentPart[] {
+	return images.flatMap((image): OAIContentPart[] => {
+		const parts: OAIContentPart[] = [];
+		if (attributed) {
+			parts.push({
+				type: "text",
+				text: `Tool result image source: ${JSON.stringify({ toolCallId })}`,
+			});
+		}
+		parts.push({ type: "image_url", image_url: { url: toolImageDataUrl(image) } });
+		return parts;
+	});
+}
+
+/** Tool images inlined into the tool message itself (DeepSeek's `image_url` extension). */
+function toolMessageContent(
+	text: string,
+	images: readonly ResponsesToolImage[],
+): string | OAIContentPart[] {
+	if (!images.length) return text;
+	return [
+		...(text ? [{ type: "text" as const, text }] : []),
+		...images.map(
+			(image): OAIContentPart => ({
+				type: "image_url",
+				image_url: { url: toolImageDataUrl(image) },
+			}),
+		),
+	];
+}
+
+export function expandChatToolResults(
+	results: OAIToolResult[],
+	mode: ToolResultImagesMode,
+): OAIMessage[] {
+	const inline = mode === "inline";
+	const messages: OAIMessage[] = results.map((result) => {
+		const images = inline ? (result._images ?? []) : [];
+		return {
+			role: "tool",
+			tool_call_id: result.tool_call_id,
+			content: toolMessageContent(result.content, images),
+		};
+	});
+	const media = results.flatMap((result) =>
+		(result._nativeMedia ?? []).flatMap((item) => chatNativeMediaParts(item, result.tool_call_id)),
+	);
+	if (mode === "separate") {
+		for (const result of results) {
+			media.push(
+				...toolImageUserParts(result._images ?? [], result.tool_call_id, results.length > 1),
+			);
+		}
+	}
+	if (media.length) messages.push({ role: "user", content: media });
+	return messages;
+}
+
 // === Helpers ===
 
 /**
@@ -3126,6 +3228,7 @@ export interface ResponsesReasoningAccum {
 	nativeParts?: Map<number, string>;
 	/** Summary bytes are separate from the rendered text and its inserted boundaries. */
 	summaryParts?: Map<number, string>;
+	sealedSummaryParts?: Set<number>;
 	textFormat?: "reasoning_text" | "summary_text" | "mixed";
 	/** Last terminal snapshot, so completed.output may enrich it without duplicating text. */
 	replayMetadata?: ReasoningProviderMetadata["openai"];
@@ -3203,6 +3306,7 @@ function pushReasoningTextEvent(
 		acc.summaryParts ??= new Map();
 		const index = chunk.summary_index ?? 0;
 		const previous = acc.summaryParts.get(index) ?? "";
+		if (!options.emitOnlyIfAccumulatorEmpty) acc.sealedSummaryParts?.delete(index);
 		if (options.emitOnlyIfAccumulatorEmpty) rememberReasoningPart(acc.summaryParts, index, text);
 		else acc.summaryParts.set(index, previous + text);
 		if (options.emitOnlyIfAccumulatorEmpty && acc.emittedParts?.has(partKey)) return;
@@ -3829,10 +3933,29 @@ export function parseResponsesAPIEvent(
 		type === "response.reasoning_summary_part.done"
 	) {
 		const text = chunk.text ?? chunk.part?.text;
+		const initial = resolveReasoningAccum(chunk, reasoningAccum);
+		const index = chunk.summary_index;
+		const seen = index === undefined ? undefined : initial?.summaryParts?.get(index);
 		if (typeof text === "string") {
 			pushReasoningTextEvent(results, chunk, reasoningAccum, text, {
 				emitOnlyIfAccumulatorEmpty: true,
 			});
+		}
+		const acc = resolveReasoningAccum(chunk, reasoningAccum);
+		let reasoningSummaryEnd: number | undefined;
+		if (
+			type !== "response.reasoning_text.done" &&
+			typeof index === "number" &&
+			Number.isSafeInteger(index) &&
+			index >= 0 &&
+			acc?.textFormat === "summary_text" &&
+			acc.summaryParts?.get(index) &&
+			(typeof text !== "string" || !seen || text === seen)
+		) {
+			acc.sealedSummaryParts ??= new Set();
+			acc.sealedSummaryParts.add(index);
+			if (acc.summaryParts.size === acc.sealedSummaryParts.size)
+				reasoningSummaryEnd = acc.emittedText?.length;
 		}
 		// A summary is not an independently replayable reasoning item. Final
 		// encrypted_content arrives only on output_item.done.
@@ -3842,6 +3965,7 @@ export function parseResponsesAPIEvent(
 				phase: "checkpoint",
 				blockId: responsesBlockId(chunk, "reasoning"),
 				outputIndex: chunk.output_index,
+				...(reasoningSummaryEnd ? { reasoningSummaryEnd } : {}),
 			},
 		});
 		return results;
@@ -4682,27 +4806,6 @@ function buildOAIUserMessage(
 	return { role: "user", content };
 }
 
-function expandCompletionsToolResults(results: OAIToolResult[]): OAIMessage[] {
-	// Complete every pending tool call before inserting user-role images or native media.
-	const messages: OAIMessage[] = results.map((result) => ({
-		role: "tool",
-		tool_call_id: result.tool_call_id,
-		content: result.content,
-	}));
-	for (const result of results) {
-		if (!result._images?.length) continue;
-		const message = buildOAIUserMessage(
-			`[Images from tool call ${result.tool_call_id}]`,
-			result._images,
-		);
-		if (message) messages.push(message);
-	}
-	const media = results.flatMap((result) =>
-		(result._nativeMedia ?? []).flatMap((item) => chatNativeMediaParts(item, result.tool_call_id)),
-	);
-	if (media.length) messages.push({ role: "user", content: media });
-	return messages;
-}
 function buildResponsesToolResultMessage(
 	toolUseId: string,
 	output: string,
@@ -5053,8 +5156,48 @@ function additionalToolsItem(change: ToolLoadingChange): OAIMessage {
 }
 
 /** Input items that carry a `role` but are not messages and must stay in `input`. */
-export function isResponsesInputItem(message: unknown): boolean {
+function isResponsesInputItem(message: unknown): boolean {
 	return (message as { type?: unknown }).type === "additional_tools";
+}
+
+function responsesDeveloperMessage(text: string): OAIMessage {
+	return { role: "developer", content: [{ type: "input_text", text }] };
+}
+
+function responsesTextInput(
+	text: string,
+	instruction: string | undefined,
+	mode: OpenAIApiMode,
+): OAIMessage[] {
+	const prefix = instruction || (mode === "codex" ? CODEX_DEFAULT_INSTRUCTIONS : "");
+	const user: OAIMessage = { role: "user", content: text };
+	return prefix ? [responsesDeveloperMessage(prefix), user] : [user];
+}
+
+export function buildResponsesInput(
+	messages: OAIMessage[],
+	options: ReasoningReplayOptions,
+	mode: OpenAIApiMode,
+): OAIMessage[] {
+	// Reusable instructions must be in the input prefix to be eligible for caching.
+	const prefix: OAIMessage[] = [];
+	const history: OAIMessage[] = [];
+	for (const msg of messages) {
+		if (!isResponsesInputItem(msg) && (msg.role === "system" || msg.role === "developer")) {
+			if (typeof msg.content === "string" && msg.content) {
+				const item = responsesDeveloperMessage(msg.content);
+				prefix.push(isRuntimeSystemMessage(msg) ? markRuntimeSystemMessage(item) : item);
+			}
+			continue;
+		}
+		// Responses rejects assistant messages without content or tool calls.
+		if (msg.role === "assistant" && !msg.tool_calls?.length && !msg.content?.length) continue;
+		history.push(msg);
+	}
+	if (prefix.length === 0 && mode === "codex") {
+		prefix.push(markRuntimeSystemMessage(responsesDeveloperMessage(CODEX_DEFAULT_INSTRUCTIONS)));
+	}
+	return prefix.concat(convertHistoryToResponsesApi(history, options));
 }
 
 /**
@@ -5075,8 +5218,7 @@ function responsesWireHistory(
 			for (const item of turn.items) {
 				if (item.toolChange)
 					history.push(additionalToolsItem(item.toolChange as ToolLoadingChange));
-				// Runtime context stays a user item: developer items would be hoisted into
-				// `instructions`, which can leave the input empty and changes the prefix.
+				// Runtime context stays at its original position to preserve the cached prefix.
 				const content: OAIContentPart[] = orderUserContent(item.text, item.images, "before").map(
 					(part) =>
 						part.type === "text"
@@ -5231,9 +5373,9 @@ function systemToolsMessage(change: ToolLoadingChange): OAIMessage {
 }
 
 /** Second projection stage for Chat Completions: neutral turns → messages. */
-function completionsWireHistory(
+export function completionsWireHistory(
 	turns: readonly NeutralTurn[],
-	options: { strict: boolean },
+	options: { strict: boolean; toolResultImages: ToolResultImagesMode },
 ): OAIMessage[] {
 	const history: OAIMessage[] = [];
 	for (const turn of turns) {
@@ -5251,13 +5393,14 @@ function completionsWireHistory(
 		}
 		if (turn.kind === "tool_results") {
 			history.push(
-				...expandCompletionsToolResults(
+				...expandChatToolResults(
 					turn.results.map((result) => ({
 						tool_call_id: result.wireId,
 						content: result.text,
 						_images: result.images,
 						_nativeMedia: result.media,
 					})),
+					options.toolResultImages ?? "separate",
 				),
 			);
 			continue;
@@ -5331,13 +5474,30 @@ function prepareResponsesInput(
 	messages: OAIMessage[],
 	options: ReasoningReplayOptions,
 ): OAIMessage[] {
-	const sanitized = messages.filter((msg) => {
-		if (msg.role !== "assistant") return true;
-		if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) return true;
-		if (typeof msg.content === "string") return msg.content.length > 0;
-		return Array.isArray(msg.content) && msg.content.length > 0;
-	});
-	return convertHistoryToResponsesApi(sanitized, options);
+	return convertHistoryToResponsesApi(
+		messages.filter(
+			(msg) => msg.role !== "assistant" || msg.tool_calls?.length || msg.content?.length,
+		),
+		options,
+	);
+}
+// Keep the Codex relay's short top-level instructions and the single cached developer prefix.
+export function buildCodexResponsesInput(
+	body: Record<string, unknown>,
+	messages: OAIMessage[],
+	options: ReasoningReplayOptions,
+): void {
+	const fixed: string[] = [];
+	const history: OAIMessage[] = [];
+	for (const msg of messages) {
+		if (!isResponsesInputItem(msg) && (msg.role === "system" || msg.role === "developer")) {
+			if (typeof msg.content === "string" && msg.content) fixed.push(msg.content);
+		} else if (msg.role !== "assistant" || msg.tool_calls?.length || msg.content?.length) {
+			history.push(msg);
+		}
+	}
+	body.input = convertHistoryToResponsesApi(history, options);
+	applyCodexChatInstructions(body, fixed.join("\n\n"), messages[0]);
 }
 /**
  * Convert standard Chat Completions history to Responses API format.

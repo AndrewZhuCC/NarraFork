@@ -343,6 +343,16 @@ export const narrators = sqliteTable(
 			.default("fresh"),
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		parentNarratorId: text("parent_narrator_id").references((): any => narrators.id),
+		/** Display group for ask-in-passing forks, independent of their actual fork source. */
+		askInPassingGroupId: text("ask_in_passing_group_id").references(
+			(): AnySQLiteColumn => narrators.id,
+			{ onDelete: "set null" },
+		),
+		/** Only set when a parent archive actually changed this session's status. */
+		archivedWithNarratorId: text("archived_with_narrator_id").references(
+			(): AnySQLiteColumn => narrators.id,
+			{ onDelete: "set null" },
+		),
 		/** Immutable actual Agent tool-call PK; retained even if its history is deleted. */
 		originToolCallId: text("origin_tool_call_id"),
 		/** Explicit creation provenance; NULL means unknown legacy origin. */
@@ -702,6 +712,8 @@ export const narrators = sqliteTable(
 			table.id,
 		),
 		index("idx_narrators_parent").on(table.parentNarratorId),
+		index("idx_narrators_ask_in_passing_group").on(table.askInPassingGroupId),
+		index("idx_narrators_archived_with").on(table.archivedWithNarratorId),
 		index("idx_narrators_origin_tool_call").on(table.originToolCallId),
 		// Startup recovery and legacy backfills look up active/legacy rows by status.
 		index("idx_narrators_status").on(table.status),
@@ -4249,6 +4261,12 @@ export const backgroundTasks = sqliteTable(
 		executionAttempt: integer("execution_attempt"),
 		alias: text("alias"),
 		title: text("title"),
+		/**
+		 * Watch rows: the execution principal that registered the observation. Restart
+		 * re-attachment re-authorizes as this identity; NULL (legacy or unknown) never
+		 * re-attaches.
+		 */
+		principalJson: text("principal_json", { mode: "json" }).$type<{ userId: string | null }>(),
 		output: text("output"),
 		outputBytes: integer("output_bytes").notNull().default(0),
 		outputTruncated: integer("output_truncated", { mode: "boolean" }).notNull().default(false),
@@ -4261,6 +4279,7 @@ export const backgroundTasks = sqliteTable(
 	},
 	(table) => [
 		index("idx_bg_tasks_parent").on(table.parentNarratorId, table.status),
+		index("idx_bg_tasks_active").on(table.status).where(sql`"status" IN ('running','paused')`),
 		index("idx_bg_tasks_subagent").on(table.subagentNarratorId),
 		uniqueIndex("idx_bg_tasks_tool_attempt").on(table.toolCallId, table.executionAttempt),
 		// The transfer runner reaches the projection by the OWNING row's id (it never

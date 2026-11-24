@@ -2,22 +2,25 @@ import { Alert, Box, Button, Group, Loader, Select, Stack, Switch, Text } from "
 import { IconRefresh } from "@tabler/icons-react";
 import {
 	QueryClient,
-	QueryClientProvider,
+	QueryClientContext,
 	useMutation,
 	useQueryClient,
 } from "@tanstack/react-query";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useTranslation } from "react-i18next";
 import {
 	GitLiveUpdatesContext,
 	type GitTarget,
 	gitWorkspaceTarget,
 	invalidateWorkspaceQueries,
+	retainManualGitWorkspace,
 	useGitWorkspace,
 	useGitWorkspaceSubscription,
 } from "../../hooks/useGit";
 import { type ApiError, api } from "../../lib/api";
 import { type GitWorkspace, gitTargetKey } from "../../lib/api/git";
+import { describeApiError } from "../../lib/api-error";
+import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { ConfirmDialogProvider } from "../common/ConfirmDialogProvider";
 import { GitBranchBar } from "./GitBranchBar";
 import { GitChangesTab } from "./GitChangesTab";
@@ -30,20 +33,38 @@ export function GitPanel({ narratorId }: { narratorId?: string }) {
 }
 
 function NarratorGitPanel({ narratorId }: { narratorId: string }) {
-	const { t } = useTranslation("git");
+	const { t } = useTranslation(["git", "errors"]);
 	const qc = useQueryClient();
 	const workspaceQuery = useGitWorkspace(narratorId);
 	const workspace = workspaceQuery.data;
 	const target = workspaceQuery.target;
 	const repositories = workspace?.capabilities.read ? (workspace.repositories ?? []) : [];
-	const errorStatus = (workspaceQuery.error as { status?: number } | null)?.status;
+	const state = workspaceQuery.authorizationState;
+	const described = describeApiError(workspaceQuery.error, t);
+	const denied = workspaceQuery.accessDenied || state === "denied";
 	const errorDetail =
-		workspaceQuery.accessDenied ||
-		errorStatus === 401 ||
-		errorStatus === 403 ||
-		workspace?.capabilities.read === false
+		denied || described.status === 401 || described.status === 403
 			? undefined
-			: workspaceQuery.error?.message || workspace?.reason;
+			: workspaceQuery.error
+				? described.status === 503 && !described.localized
+					? t("workspace.refresh_required")
+					: described.message
+				: workspace?.reason;
+	const getSubject = useCallback(() => manualGitSubject(qc), [qc]);
+	const observeSubject = useCallback(
+		(listener: () => void) => {
+			const unobserveCache = qc.getQueryCache().subscribe(({ query }) => {
+				if (query.queryKey[0] === "auth" && query.queryKey[1] === "me") listener();
+			});
+			const unobserveCredential = narratorWSManager.onCredentialChange(listener);
+			return () => {
+				unobserveCache();
+				unobserveCredential();
+			};
+		},
+		[qc],
+	);
+	const subject = useSyncExternalStore(observeSubject, getSubject, getSubject);
 
 	return (
 		<Stack gap={4} style={{ height: "100%", minHeight: 0 }}>
@@ -57,8 +78,13 @@ function NarratorGitPanel({ narratorId }: { narratorId: string }) {
 				/>
 			</Box>
 			{!workspaceQuery.detectionEnabled ? (
-				<ManualGitPanel key={workspaceQuery.contextKey} narratorId={narratorId} />
-			) : workspaceQuery.isPending && !workspaceQuery.accessDenied ? (
+				<ManualGitPanel
+					key={JSON.stringify([workspaceQuery.contextKey, subject])}
+					narratorId={narratorId}
+					subject={subject}
+					switching={workspaceQuery.workspaceTransitioning}
+				/>
+			) : workspaceQuery.isPending && !denied ? (
 				<Group justify="center" style={{ flex: 1 }}>
 					<Loader size="sm" />
 				</Group>
@@ -92,7 +118,7 @@ function NarratorGitPanel({ narratorId }: { narratorId: string }) {
 									variant="subtle"
 									leftSection={<IconRefresh size={13} />}
 									loading={workspaceQuery.isFetching}
-									onClick={() => workspaceQuery.refetch()}
+									onClick={workspaceQuery.refreshAuthorization}
 								>
 									{t("workspace.retry")}
 								</Button>
@@ -101,11 +127,16 @@ function NarratorGitPanel({ narratorId }: { narratorId: string }) {
 								color="yellow"
 								title={t(
 									`workspace.${
-										workspaceQuery.accessDenied
+										denied
 											? "access_denied"
-											: workspaceQuery.isError
-												? "error"
-												: (workspace?.state ?? "error")
+											: (workspace?.state ??
+												(state === "refresh_required"
+													? "refresh_required"
+													: state === "paused" || state === "workspace_changed"
+														? "recovering"
+														: workspaceQuery.isError
+															? "error"
+															: "loading"))
 									}`,
 								)}
 							>
@@ -129,14 +160,33 @@ function NarratorGitPanel({ narratorId }: { narratorId: string }) {
 	);
 }
 
+function manualGitSubject(qc: QueryClient) {
+	return JSON.stringify([
+		qc.getQueryData<{ id?: unknown }>(["auth", "me"])?.id,
+		narratorWSManager.getCredentialIdentity(),
+	]);
+}
+
 /** A user-triggered read; no detection preference or shared live cache is changed. */
-function ManualGitPanel({ narratorId }: { narratorId: string }) {
+function ManualGitPanel({
+	narratorId,
+	subject,
+	switching,
+}: {
+	narratorId: string;
+	subject: string;
+	switching: boolean;
+}) {
 	const { t } = useTranslation("git");
+	const qc = useQueryClient();
 	const controller = useRef<AbortController | null>(null);
 	const scanId = useRef(0);
 	useEffect(() => () => controller.current?.abort(), []);
 	const scan = useMutation({
+		networkMode: "always",
 		mutationFn: async (workspaceKey?: string) => {
+			if (manualGitSubject(qc) !== subject)
+				throw new DOMException("Git principal superseded", "AbortError");
 			controller.current?.abort();
 			const abort = new AbortController();
 			controller.current = abort;
@@ -145,8 +195,12 @@ function ManualGitPanel({ narratorId }: { narratorId: string }) {
 				workspace = await api.getGitWorkspace(narratorId, abort.signal, workspaceKey, true);
 			} catch (error) {
 				if (!workspaceKey || (error as ApiError)?.status !== 409) throw error;
+				abort.signal.throwIfAborted();
 				workspace = await api.getGitWorkspace(narratorId, abort.signal, undefined, true);
 			}
+			abort.signal.throwIfAborted();
+			if (manualGitSubject(qc) !== subject)
+				throw new DOMException("Git principal superseded", "AbortError");
 			return { workspace, scanId: ++scanId.current };
 		},
 		retry: false,
@@ -163,6 +217,7 @@ function ManualGitPanel({ narratorId }: { narratorId: string }) {
 						variant="light"
 						leftSection={<IconRefresh size={13} />}
 						loading={scan.isPending}
+						disabled={switching}
 						onClick={refresh}
 					>
 						{t("workspace.scanOnce")}
@@ -179,6 +234,7 @@ function ManualGitPanel({ narratorId }: { narratorId: string }) {
 					key={scan.data.scanId}
 					narratorId={narratorId}
 					workspace={scan.data.workspace}
+					principal={qc.getQueryData<{ id?: string }>(["auth", "me"])?.id}
 					onRefresh={refresh}
 					onSelect={(key) => {
 						if (key) scan.mutate(key);
@@ -192,34 +248,46 @@ function ManualGitPanel({ narratorId }: { narratorId: string }) {
 function ManualGitSnapshot({
 	narratorId,
 	workspace,
+	principal,
 	onRefresh,
 	onSelect,
 }: {
 	narratorId: string;
 	workspace: GitWorkspace;
+	principal?: string;
 	onRefresh: () => void;
 	onSelect: (key: string | null) => void;
 }) {
 	const { t } = useTranslation("git");
-	const target = gitWorkspaceTarget(narratorId, workspace);
-	const [client] = useState(() => {
-		const qc = new QueryClient({
-			defaultOptions: {
-				queries: {
-					staleTime: Infinity,
-					refetchOnMount: false,
-					refetchOnWindowFocus: false,
-					refetchOnReconnect: false,
-					refetchInterval: false,
-					retry: false,
+	const target = useMemo(() => gitWorkspaceTarget(narratorId, workspace), [narratorId, workspace]);
+	const [client] = useState(
+		() =>
+			new QueryClient({
+				defaultOptions: {
+					queries: {
+						networkMode: "always",
+						staleTime: Infinity,
+						refetchOnMount: false,
+						refetchOnWindowFocus: false,
+						refetchOnReconnect: false,
+						refetchInterval: false,
+						retry: false,
+					},
+					mutations: { networkMode: "always", retry: false },
 				},
-				mutations: { retry: false },
-			},
-		});
-		if (target) invalidateWorkspaceQueries(qc, target);
-		return qc;
-	});
-	useEffect(() => () => client.clear(), [client]);
+			}),
+	);
+	const [ready, setReady] = useState(false);
+	useEffect(() => {
+		if (!target) return;
+		if (principal) client.setQueryData(["auth", "me"], { id: principal });
+		const release = retainManualGitWorkspace(client, target);
+		setReady(true);
+		return () => {
+			release();
+			client.clear();
+		};
+	}, [client, principal, target]);
 	if (!target) {
 		return (
 			<Alert color="yellow" mx="xs" title={t(`workspace.${workspace.state}`)}>
@@ -227,9 +295,11 @@ function ManualGitSnapshot({
 			</Alert>
 		);
 	}
+	if (!ready) return <Loader size="sm" />;
 	return (
 		<GitLiveUpdatesContext value={false}>
-			<QueryClientProvider client={client}>
+			{/* Unlike QueryClientProvider, this does not register focus/online listeners. */}
+			<QueryClientContext value={client}>
 				{(workspace.repositories?.length ?? 0) > 1 && (
 					<Select
 						mx="xs"
@@ -256,7 +326,7 @@ function ManualGitSnapshot({
 						readOnly={!workspace.capabilities.write}
 					/>
 				</ConfirmDialogProvider>
-			</QueryClientProvider>
+			</QueryClientContext>
 		</GitLiveUpdatesContext>
 	);
 }
@@ -273,12 +343,35 @@ export function GitPanelContent({
 }) {
 	const { t } = useTranslation("git");
 	const qc = useQueryClient();
-	useGitWorkspaceSubscription(target);
+	const subscriptions = useGitWorkspaceSubscription(target);
+	const state = subscriptions.getState(target);
 
 	const refresh = () => {
 		if (onRefresh) onRefresh();
 		else invalidateWorkspaceQueries(qc, target);
 	};
+
+	if (!subscriptions.canRead(target))
+		return (
+			<Stack gap={4} p="xs">
+				<Group justify="flex-end">
+					<Button
+						size="compact-xs"
+						variant="subtle"
+						leftSection={<IconRefresh size={13} />}
+						onClick={refresh}
+					>
+						{t("workspace.retry")}
+					</Button>
+				</Group>
+				<Alert
+					color="yellow"
+					title={t(
+						`workspace.${state === "denied" ? "access_denied" : state === "refresh_required" ? "refresh_required" : state === "waiting" ? "loading" : "recovering"}`,
+					)}
+				/>
+			</Stack>
+		);
 
 	return (
 		<div

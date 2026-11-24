@@ -230,6 +230,13 @@ export const narrators = pgTable(
 		title: text("title"),
 		inheritMode: text("inherit_mode").notNull().default("fresh"),
 		parentNarratorId: text("parent_narrator_id").references((): PgColumn => narrators.id, {}),
+		askInPassingGroupId: text("ask_in_passing_group_id").references((): PgColumn => narrators.id, {
+			onDelete: "set null",
+		}),
+		archivedWithNarratorId: text("archived_with_narrator_id").references(
+			(): PgColumn => narrators.id,
+			{ onDelete: "set null" },
+		),
 		originToolCallId: text("origin_tool_call_id"),
 		subagentOriginKind: text("subagent_origin_kind"),
 		contextSummary: text("context_summary"),
@@ -328,6 +335,8 @@ export const narrators = pgTable(
 			table.id,
 		),
 		index("idx_narrators_parent").on(table.parentNarratorId),
+		index("idx_narrators_ask_in_passing_group").on(table.askInPassingGroupId),
+		index("idx_narrators_archived_with").on(table.archivedWithNarratorId),
 		index("idx_narrators_origin_tool_call").on(table.originToolCallId),
 		index("idx_narrators_status").on(table.status),
 		index("idx_narrators_owner").on(table.ownerUserId),
@@ -2539,6 +2548,7 @@ export const backgroundTasks = pgTable(
 		executionAttempt: integer("execution_attempt"),
 		alias: text("alias"),
 		title: text("title"),
+		principalJson: jsonText("principal_json"),
 		output: text("output"),
 		outputBytes: integer("output_bytes").notNull().default(0),
 		outputTruncated: boolean("output_truncated").notNull().default(false),
@@ -2551,6 +2561,9 @@ export const backgroundTasks = pgTable(
 	},
 	(table) => [
 		index("idx_bg_tasks_parent").on(table.parentNarratorId, table.status),
+		index("idx_bg_tasks_active")
+			.on(table.status)
+			.where(sql.raw("\"status\" IN ('running','paused')")),
 		index("idx_bg_tasks_subagent").on(table.subagentNarratorId),
 		uniqueIndex("idx_bg_tasks_tool_attempt").on(table.toolCallId, table.executionAttempt),
 		index("idx_bg_tasks_transfer").on(table.transferTaskId),
@@ -4589,7 +4602,7 @@ export const teamWorkEvents = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 147,
-  "columnCount": 1960,
+  "columnCount": 1963,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -5723,6 +5736,38 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "emitAsTableConstraint": false
         },
         {
+          "property": "askInPassingGroupId",
+          "name": "ask_in_passing_group_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "set null",
+            "constraintName": "narrators_ask_in_passing_group_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "archivedWithNarratorId",
+          "name": "archived_with_narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "set null",
+            "constraintName": "narrators_archived_with_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
           "property": "originToolCallId",
           "name": "origin_tool_call_id",
           "kind": "text",
@@ -6515,6 +6560,20 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_narrators_parent",
           "columns": [
             "parentNarratorId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_narrators_ask_in_passing_group",
+          "columns": [
+            "askInPassingGroupId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_narrators_archived_with",
+          "columns": [
+            "archivedWithNarratorId"
           ],
           "unique": false
         },
@@ -19305,6 +19364,16 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "principalJson",
+          "name": "principal_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "output",
           "name": "output",
           "kind": "text",
@@ -19405,6 +19474,14 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "status"
           ],
           "unique": false
+        },
+        {
+          "name": "idx_bg_tasks_active",
+          "columns": [
+            "status"
+          ],
+          "unique": false,
+          "predicate": "\"status\" IN ('running','paused')"
         },
         {
           "name": "idx_bg_tasks_subagent",

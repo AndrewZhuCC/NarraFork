@@ -142,6 +142,7 @@ export type AdvancedSessionRow = (typeof ADVANCED_SESSION_ROWS)[number];
 /** The narrator fields the promotion rules read. */
 export interface AdvancedRowInput {
 	fastModeOverride?: unknown;
+	fastModeSource?: unknown;
 	relaxedPlan?: unknown;
 	/** Precomputed by the panel: `planMode` flag OR the `plan` trait. */
 	planMode?: boolean;
@@ -163,8 +164,11 @@ export function shouldPromoteAdvancedRow(
 ): boolean {
 	switch (row) {
 		case "fastMode":
-			// Only "inherit" (or an unrecognized value) counts as untouched.
-			return normalizeFastModeOverride(input.fastModeOverride) !== "inherit";
+			// Explicit choices and an unavailable inheritance source stay visible.
+			return (
+				normalizeFastModeOverride(input.fastModeOverride) !== "inherit" ||
+				input.fastModeSource === "unavailable"
+			);
 		case "relaxedPlan":
 			return !!input.relaxedPlan;
 		case "planMode":

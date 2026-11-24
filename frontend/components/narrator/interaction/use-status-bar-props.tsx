@@ -2,6 +2,7 @@ import type { FastModeOverride } from "@shared/fast-mode";
 import type { ModelCard } from "@shared/model-catalog/card";
 import type { TFunction } from "i18next";
 import type React from "react";
+import type { FastModeSource } from "../../../lib/api/narrators";
 import { FOLLOW_PARENT_MODEL, type ModelOption } from "../../../lib/constants";
 import type { Mutate, PendingMutate } from "./mutate";
 import type { NarratorInteractionStatusBarProps } from "./NarratorInteractionStatusBar";
@@ -69,9 +70,12 @@ export interface UseStatusBarPropsOptions {
 
 	// fast mode
 	narratorFastModeOverride: FastModeOverride | null | undefined;
+	effectiveFastMode: boolean | undefined;
+	fastModeSource: FastModeSource | undefined;
+	isSubagent: boolean;
 	fastModeDefault: boolean;
 	fastModeUsesTapSettings: boolean;
-	fastModeMutation: Mutate<{ id: string; fastModeOverride: "inherit" | "on" | "off" }>;
+	fastModeMutation: Mutate<{ id: string; fastModeOverride: FastModeOverride }>;
 	updateUserPrefs: Mutate<{ fastModeDefault: boolean }>;
 
 	// permission mode + reflection
@@ -127,6 +131,9 @@ export function useStatusBarProps(
 
 	const { renderFastModeControl } = useFastModeControl({
 		fastModeOverride: options.narratorFastModeOverride,
+		effectiveFastMode: options.effectiveFastMode,
+		fastModeSource: options.fastModeSource,
+		isSubagent: options.isSubagent,
 		supportsCodexControls: modelSelection.supportsCodexControls,
 		supportsUltrafast: resolveUltrafastSupport({
 			modelReference: capabilityModelReference(

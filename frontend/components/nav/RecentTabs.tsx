@@ -54,6 +54,7 @@ import {
 	type RecentTabsInfiniteData,
 	recentTabsSectionQueryKey,
 	reconcileRecentTabsRuntimePatches,
+	refreshRecentTabsAfterReconnect,
 	refreshRecentTabsLoadedWindow,
 	selectRecentTabsLiveWindow,
 	snapshotRecentTabRuntimeVersions,
@@ -398,9 +399,12 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				}
 			}
 
+			const existing = pendingTabPatchesRef.current.get(narratorId);
 			if (event.type === "status" && event.status === "working") {
-				const tab = tabsRef.current.find((item) => getRecentTabNarratorId(item) === narratorId);
-				if (tab && tab.status !== "working") {
+				// The pending patch wins before the flush; the cache wins before React commits.
+				const tabs = qc.getQueryData<RecentTab[]>(QUERY_KEY) ?? tabsRef.current;
+				const tab = tabs.find((item) => getRecentTabNarratorId(item) === narratorId);
+				if (tab && (existing?.status ?? tab.status) !== "working") {
 					// A folder member is promoted inside its folder and the folder moves with it;
 					// the server resolves that from the member key.
 					api
@@ -410,7 +414,6 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				}
 			}
 
-			const existing = pendingTabPatchesRef.current.get(narratorId);
 			pendingTabPatchesRef.current.set(narratorId, existing ? { ...existing, ...patch } : patch);
 			scheduleTabPatchFlush();
 		},
@@ -473,7 +476,7 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 		const now = Date.now();
 		if (now - lastReconnectRefreshRef.current < 5000) return;
 		lastReconnectRefreshRef.current = now;
-		void Promise.all([refreshRecentTabsLoadedWindow(qc), refreshRuntime()]).catch(() => {
+		void Promise.all([refreshRecentTabsAfterReconnect(qc), refreshRuntime()]).catch(() => {
 			notifications.show({ color: "red", message: t("recentTabsSyncError") });
 		});
 	}, [qc, refreshRuntime, t]);

@@ -32,6 +32,7 @@ const modules = [
 	"../common/DeviceDirectoryPicker",
 	"../narrator/CreateNarratorLazyModal",
 	"../narrator/composer/NarratorComposer",
+	"../narrator/interaction/DropOverlay",
 	"../narrator/interaction/PermissionModePickerMenu",
 	"../narrator/interaction/UploadProgressBar",
 	"../narrator/model/ModelPickerMenu",
@@ -62,6 +63,7 @@ const modelOptions: ModelOption[] = [
 let codexAvailable = false;
 let codexUltrafastModels: string[] = [];
 let fastModeDefault = false;
+const box = ({ children, ...props }: ComponentProps<"div">) => <div {...props}>{children}</div>;
 const button = ({
 	children,
 	onClick,
@@ -102,7 +104,7 @@ function documentFromProps(): ComposerDocument | undefined {
 }
 replace("@mantine/core", {
 	ActionIcon: button,
-	Box: shell,
+	Box: box,
 	Button: button,
 	Group: shell,
 	Popover: Object.assign(shell, { Target: shell, Dropdown: shell }),
@@ -166,6 +168,10 @@ replace("../../hooks/useWorkspaceContext", {
 });
 replace("../common/DeviceDirectoryPicker", { DeviceDirectoryModal: () => null });
 replace("../narrator/CreateNarratorLazyModal", { CreateNarratorLazyModal: () => null });
+replace("../narrator/interaction/DropOverlay", {
+	DropOverlay: ({ visible }: { visible: boolean }) =>
+		visible ? <div data-drop-overlay="true">dropFilesHere</div> : null,
+});
 replace("../narrator/interaction/PermissionModePickerMenu", {
 	PermissionModePickerMenu: () => null,
 });
@@ -350,6 +356,25 @@ async function submit() {
 		await props.onSendWithMode?.("turn");
 	});
 }
+async function dragFiles(type: "dragenter" | "dragleave") {
+	const zone = host.firstElementChild;
+	if (!zone) throw new Error("Dashboard drop zone not rendered");
+	const event = new window.Event(type, { bubbles: true, cancelable: true });
+	Object.defineProperty(event, "dataTransfer", { value: { types: ["Files"], files: [] } });
+	await act(async () => {
+		zone.dispatchEvent(event);
+	});
+}
+
+test("Dashboard highlights its drop zone while files are dragged over it", async () => {
+	const zone = host.firstElementChild as HTMLElement | null;
+	expect(zone?.style.position).toBe("relative");
+	expect(host.querySelector("[data-drop-overlay]")).toBeNull();
+	await dragFiles("dragenter");
+	expect(host.querySelector("[data-drop-overlay]")).not.toBeNull();
+	await dragFiles("dragleave");
+	expect(host.querySelector("[data-drop-overlay]")).toBeNull();
+});
 
 test("Dashboard offers Fast Mode for Codex and can explicitly turn off the enabled default", async () => {
 	const fastModeButton = () => host.querySelector<HTMLButtonElement>("button[aria-pressed]");
@@ -382,7 +407,9 @@ test("Dashboard applies Ultrafast from the first send for a named model across C
 	};
 	codexAvailable = true;
 	codexUltrafastModels = ["gpt-test"];
+	fastModeDefault = true;
 	await act(async () => root.render(<DashboardComposer />));
+	expect(host.querySelector("button[aria-pressed]")?.getAttribute("aria-label")).toBe("fast_mode");
 	expect(ultrafastOption()?.getAttribute("aria-current")).toBe("false");
 	await pickModel(autoModel);
 	expect(ultrafastOption()).not.toBeUndefined();

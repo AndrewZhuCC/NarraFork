@@ -124,13 +124,25 @@ describe("advanced row promotion", () => {
 	 * The subtle one: "off" is an explicit decision, not a default. Treating it as
 	 * untouched would hide a switch the user deliberately turned off.
 	 */
-	test("fastMode off is an explicit choice and is promoted", () => {
-		expect(shouldPromoteAdvancedRow("fastMode", { fastModeOverride: "off" })).toBe(true);
-		expect(shouldPromoteAdvancedRow("fastMode", { fastModeOverride: "on" })).toBe(true);
+	test("Fast Mode On, Off and Ultrafast are explicit choices and are promoted", () => {
+		for (const fastModeOverride of ["on", "off", "ultrafast"]) {
+			expect(shouldPromoteAdvancedRow("fastMode", { fastModeOverride })).toBe(true);
+		}
 		expect(shouldPromoteAdvancedRow("fastMode", { fastModeOverride: "inherit" })).toBe(false);
 		// Unrecognized values normalize to inherit rather than promoting noise.
 		expect(shouldPromoteAdvancedRow("fastMode", { fastModeOverride: undefined })).toBe(false);
 		expect(shouldPromoteAdvancedRow("fastMode", { fastModeOverride: "bogus" })).toBe(false);
+	});
+
+	test("unavailable fast-mode inheritance stays visible alongside explicit choices", () => {
+		for (const fastModeOverride of ["inherit", "on", "off"]) {
+			expect(
+				shouldPromoteAdvancedRow("fastMode", { fastModeOverride, fastModeSource: "unavailable" }),
+			).toBe(true);
+		}
+		expect(
+			collapsedAdvancedRows({ fastModeOverride: "inherit", fastModeSource: "unavailable" }),
+		).not.toContain("fastMode");
 	});
 
 	test("backgroundStatus promotes on presence, since the column has no none value", () => {

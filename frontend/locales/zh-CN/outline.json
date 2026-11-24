@@ -6,6 +6,9 @@
 	"notAtTime": "历史上的这个时间点还没有这个块。",
 	"loadFailed": "加载失败，请稍后再试。",
 	"loadMore": "加载更多",
+	"planApproval": {
+		"reviewedWithComments_other": "已反思 · {{count}} 条意见"
+	},
 	"home": {
 		"searchPlaceholder": "在你能读的所有大纲中搜索",
 		"noResults": "没有匹配的内容。",

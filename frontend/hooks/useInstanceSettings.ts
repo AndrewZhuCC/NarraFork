@@ -402,7 +402,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				queueDuringCompaction: settings.agent?.queueDuringCompaction ?? true,
 				agentDefaultReasoningEffort: settings.agent?.defaultReasoningEffort ?? "",
 				codexUltrafastModels: [
-					...new Set(
+					...new Set<string>(
 						(settings.agent?.codexUltrafastModels ?? []).map(codexUltrafastModelId).filter(Boolean),
 					),
 				],

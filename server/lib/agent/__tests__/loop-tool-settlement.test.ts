@@ -12,7 +12,7 @@ const modelResultOrder: string[] = [];
 let scenario:
 	| "parallel_reject_middle"
 	| "serial_reject"
-	| "await_send_not_eager"
+	| "watch_send_eager_await_deferred"
 	| "parallel_all_reject"
 	| "bash_barrier" = "parallel_reject_middle";
 let providerAttempts = 0;
@@ -27,7 +27,7 @@ const nextTick = () => new Promise<void>((resolve) => setImmediate(resolve));
 const PARALLEL_TOOL_NAMES = ["Read", "Glob", "Grep"] as const;
 
 const testProvider: ProviderAdapter = {
-	formatTools: (tools) => tools,
+	formatTools: (tools) => tools.map(({ name }) => ({ name })),
 	// The model reads a step's results in call order: record the settled calls of the
 	// latest step in the order its blocks hold them.
 	buildHistory: async (rows) => {
@@ -124,14 +124,14 @@ const testProvider: ProviderAdapter = {
 			};
 			return;
 		}
-		if (scenario === "await_send_not_eager") {
-			// Watch + Send execute while the response is still streaming: the provider only
-			// produces its trailing text (where the test aborts) once both have started, so
-			// the post-stream tool phase never runs.
+		if (scenario === "watch_send_eager_await_deferred") {
+			// Observe and send while the response is still streaming, then abort before
+			// the post-stream phase that would start the blocking Await.
 			yield {
 				toolUses: [
-					{ toolUseId: "tu_await", name: "Watch", input: { type: "bash", id: "x" } },
+					{ toolUseId: "tu_watch", name: "Watch", input: { type: "bash", id: "x" } },
 					{ toolUseId: "tu_send", name: "Send", input: { id: "y", message: "hi" } },
+					{ toolUseId: "tu_await", name: "Await", input: { type: "bash", id: "x" } },
 				],
 			};
 			while (!executionOrder.includes("Watch") || !executionOrder.includes("Send")) {
@@ -203,19 +203,21 @@ toolRegistry.register({
 	},
 });
 
-toolRegistry.register({
-	name: "Watch",
-	description: "Test Watch tool (should never eager-execute)",
-	parameters: z.object({ type: z.string(), id: z.string() }),
-	execute: async () => {
-		executionOrder.push("Watch");
-		return { output: "await-done" };
-	},
-});
+for (const name of ["Watch", "Await"]) {
+	toolRegistry.register({
+		name,
+		description: `Test ${name} tool`,
+		parameters: z.object({ type: z.string(), id: z.string() }),
+		execute: async () => {
+			executionOrder.push(name);
+			return { output: `${name}-done` };
+		},
+	});
+}
 
 toolRegistry.register({
 	name: "Send",
-	description: "Test Send tool (should never eager-execute)",
+	description: "Test Send tool",
 	parameters: z.object({ id: z.string(), message: z.string() }),
 	execute: async () => {
 		executionOrder.push("Send");
@@ -225,7 +227,7 @@ toolRegistry.register({
 
 afterAll(() => {
 	mock.module("../provider", () => realProviderModule);
-	for (const name of [...PARALLEL_TOOL_NAMES, "Bash", "Write", "Watch", "Send"]) {
+	for (const name of [...PARALLEL_TOOL_NAMES, "Bash", "Write", "Watch", "Await", "Send"]) {
 		toolRegistry.unregister(name);
 	}
 	mock.restore();
@@ -378,8 +380,8 @@ describe("agent loop tool-result settlement", () => {
 		expect(events.some((e) => e.type === "turn_complete")).toBe(true);
 	});
 
-	test("Watch and Send execute mid-stream", async () => {
-		scenario = "await_send_not_eager";
+	test("Watch and Send execute mid-stream while Await waits for the stream to finish", async () => {
+		scenario = "watch_send_eager_await_deferred";
 		providerAttempts = 0;
 		executionOrder.length = 0;
 		modelResultOrder.length = 0;
@@ -394,10 +396,9 @@ describe("agent loop tool-result settlement", () => {
 			}
 		}
 
-		// Aborting mid-stream means the post-stream tool phase never runs: both calls ran
-		// while the provider was still streaming.
-		expect(executionOrder).toContain("Watch");
-		expect(executionOrder).toContain("Send");
+		// Aborting mid-stream skips the post-stream tool phase: only the non-blocking
+		// calls ran; Await did not start a waiter on an unfinished provider response.
+		expect(executionOrder).toEqual(["Watch", "Send"]);
 		expect(events.at(-1)).toEqual({ type: "error", message: "Aborted" });
 	});
 });

@@ -1,4 +1,6 @@
+import { codexUltrafastModelId, supportsCodexUltrafast } from "@shared/fast-mode";
 import { resolve } from "node:path";
+import { readQueryFirst } from "@server/db/worker-read";
 import { providerWaitKind, quotaExhaustedCode } from "@shared/agent-protocol/quota-exhausted";
 import { isAutoModelValue } from "@shared/auto-model";
 import { bufferedRowMode, resolveBufferQueueMode } from "@shared/buffer-queue-mode";
@@ -44,8 +46,12 @@ import { normalizeBooleanOverride, resolveBooleanOverride } from "../../lib/bool
 import { queueContextCharacterRefresh } from "../../lib/context-characters";
 import { withDbRetry } from "../../lib/db-resilience";
 import { resolveInjectedDevices } from "../../lib/device-injection-trait";
-import { resolveFastModeForUser } from "../../lib/fast-mode";
+import { stallTimeBetween } from "../../lib/event-loop-monitor";
 import { logger } from "../../lib/logger";
+import {
+	historyPreparationFailure,
+	ModelHistoryPreparation,
+} from "../../lib/model-history-preparation";
 import {
 	formatSubagentModelRestrictionDescription,
 	getBlockedSkills,
@@ -56,7 +62,6 @@ import {
 	isPlanModeTrait,
 	isSubagentVariant,
 	isTeamNarrator,
-	parseSubstatus,
 	redactDraftTraits,
 } from "../../lib/narrator-utils";
 import { nugAvailabilityPoller } from "../../lib/nug-availability-poller";
@@ -107,7 +112,7 @@ import {
 	type RunDeliverTo,
 	readRuntimeRegistrationColumn,
 } from "../../lib/validators/runtime-registration";
-import { broadcastToNarrator } from "../../websocket/narrator-ws";
+import { broadcastToNarrator, getNarratorConnections } from "../../websocket/narrator-ws";
 import { consumeAgentMessageHistory, isLastModelInputMailbox } from "../agent-message-delivery";
 import {
 	claimInboxHead,
@@ -118,9 +123,9 @@ import {
 import { type ExecutionOwner, getRunHold, type RunControl } from "../agent-runtime/ownership";
 import { awaitRunHold } from "../agent-runtime/run";
 import { getRuntimeQueuePort } from "../agent-runtime/runtime-queue-port";
-import { backgroundTaskService } from "../background-task-service";
 import { getAgentFileReferenceContext } from "../file-reference-context";
-import { getStatusSummaryCached, invalidateStatus } from "../git-status-cache";
+import { getStatusSummaryCached, markStatusDirty, peekStatusSummary } from "../git-status-cache";
+import { classifyGitToolRefresh, GitToolRefreshQueue } from "../git-tool-refresh-policy";
 import { injectionKey, knowledgeInjection } from "../knowledge-injection";
 import { knowledgeInjectionReads, knowledgeService } from "../knowledge-service";
 import {
@@ -142,9 +147,10 @@ import {
 	type EventHooks,
 	persistDetachedToolResult,
 	processEvent,
-	retireSubagentOutputCharCount,
+	sealSubagentOutputPass,
 } from "../narrator-event-handler";
 import { type ExecuteLoopResult, executeAgentLoop } from "../narrator-executor";
+import { resolveNarratorFastMode } from "../narrator-fast-mode";
 import { deliverInjection } from "../narrator-injection";
 import { isFirstUserTurn } from "../narrator-message-count";
 import { handlePermission } from "../narrator-permission";
@@ -169,6 +175,7 @@ import {
 } from "../narrator-recovery";
 import { handleBashCommand, narratorService } from "../narrator-service";
 import {
+	abortPendingBufferedGuidance,
 	accountRequestTokenUsage,
 	accountTokenUsageForTurn,
 	applySessionDefaultDevice,
@@ -176,19 +183,18 @@ import {
 	buildSystemPrompt,
 	cleanupPartialMessage,
 	completeOrphanedToolCalls,
+	consumeBufferedSoftStopRequest,
 	consumeQuestionAnswerModelReceipts,
 	decideOutlineTurnEndNote,
 	deliverOutlineTurnEndNote,
 	drainAndPersistPendingInjections,
 	drainInjectionsIntoHistory,
 	ensureSkillCacheFreshForActiveNarrator,
-	evaluateSoftStopRequest,
 	executeQueuedGoalCommand,
 	executeQueuedNewCommand,
 	filterOAuthSessionDevices,
 	finalizeInterruptedRun,
 	finalizeOrCleanupPartialMessage,
-	hasPendingBufferedGuidance,
 	inheritedModelRuntime,
 	maybeStartContinuation,
 	parseQueuedGoalCommand,
@@ -208,6 +214,7 @@ import {
 	clearActiveHistoryCompactPending,
 	clearPlanModePromptRebuild,
 	compactLocks,
+	hasNarratorRuntimeClaim,
 	hasPendingHistoryCompact,
 	isNarratorRevertAdmissionBlocked,
 	knowledgeInjectionCycleStates,
@@ -241,7 +248,7 @@ import { writeTeamStatusAtPass } from "../teams/team-status";
 import { buildFinalToolStartAuthorization } from "../tool-final-start-authorization";
 import { mcpToolMarker, parseMcpServerMarker, parseMcpToolMarker } from "../tool-load-markers";
 import { resolveNarratorCapabilities } from "../trait-layer-service";
-import { buildTreeSnapshotExecutionHooks, FILE_MUTATING_TOOLS } from "../tree-snapshot-loop-hooks";
+import { buildTreeSnapshotExecutionHooks } from "../tree-snapshot-loop-hooks";
 import {
 	computeContinuationStallState,
 	createSpecContinuationState,
@@ -250,12 +257,21 @@ import {
 	shouldResumeAfterCompact,
 	specContinuationStopNote,
 } from "../turn-continuation-decisions";
-import { registerNarratorLoop, waitForRestartBeforeFailure } from "../update-coordinator";
+import {
+	bindCheckpointGateActor,
+	checkpointStopForRun,
+	registerNarratorLoop,
+	waitForRestartBeforeFailure,
+} from "../update-coordinator";
+import { trackCommunicationWork } from "./async-work";
 import { autoForcedSwitchTarget, MAX_AUTO_SWITCHES_PER_RUN } from "./auto-forced-switch";
+import { type CheckpointStop, isCheckpointStop } from "./checkpoint-stop";
 import { createRuntimeEventContext, createRuntimeMessageWriters } from "./context";
+import { createRuntimeFinalizationReads } from "./finalization-reads";
 import { buildRuntimeHistory, questionModelReceipts } from "./history";
 import { createRuntimeRunState, type RuntimeRunOutcome } from "./input";
 import { waitForModelAvailabilityOrChange } from "./model-availability-wait";
+import { hasPendingSessionWake } from "./pending-wake";
 import {
 	applyPlanApproval,
 	dropDeferredPlanApproval,
@@ -439,11 +455,22 @@ export async function runAgentLoopUnlocked(
 	active._runPersonActed = false;
 	const personRun = () => personSpoke || active._runPersonActed === true;
 	/** What the finalizer restarts the session for, and what will wake it when it finishes. */
-	const workPendingAtEnd = async (): Promise<boolean> =>
-		(await hasInboxKind(narratorId, ["user_input", "agent_message", "task_notice"])) ||
-		(await backgroundTaskService.countActiveKindsByParent(narratorId)).activeWorkCount > 0 ||
-		// A question a person has yet to answer: their answer wakes the session.
-		(await (await import("../narrator-question-service")).countOpenAsyncQuestions(narratorId)) > 0;
+	const workPendingAtEnd = (): Promise<boolean> => hasPendingSessionWake(narratorId);
+	let checkpointPause: CheckpointStop | undefined;
+	const checkpointIdentity = run?.logicalRunId
+		? { narratorId, logicalRunId: run.logicalRunId, executionEpoch: owner.epoch }
+		: undefined;
+	const rethrowCheckpointPause = (error: unknown): void => {
+		if (isCheckpointStop(error) && checkpointIdentity && !run?.cancel.signal.aborted) {
+			const own = checkpointStopForRun(checkpointIdentity);
+			if (own?.updateEpoch === error.updateEpoch) {
+				own.cleanupFailure = error.cleanupFailure;
+				checkpointPause = own;
+				if (run) run.checkpointStop = own;
+				throw own;
+			}
+		}
+	};
 	let terminalStatus: RuntimeRunOutcome["terminalStatus"];
 	// A plain run becomes idle only after its terminal transaction. A held boundary
 	// may rest visibly because its durable mirror authorizes recovery without delivery.
@@ -515,10 +542,22 @@ export async function runAgentLoopUnlocked(
 	let deliverTo: RunDeliverTo | undefined;
 	let placement: { parentNarratorId: string; parentToolUseId: string } | undefined;
 	let messageWriters = createRuntimeMessageWriters();
+	const checkpointParentId = () => (run?.waiter ? run.deliverTo?.narratorId : undefined);
 	try {
 		unregisterUpdateLoop = registerNarratorLoop(narratorId, locale, {
 			userId: active._currentUserId,
 			replyInUserLanguage: active._replyInUserLanguage,
+			logicalRunId: run?.logicalRunId,
+			executionEpoch: owner.epoch,
+			get parentNarratorId() {
+				return checkpointParentId();
+			},
+			// A loop-less recovery stage can still own this child's terminal even
+			// after another parent run appears. Its live claim is a consumer fence.
+			canPauseForCheckpoint: () => {
+				const parentId = checkpointParentId();
+				return !parentId || !hasNarratorRuntimeClaim(parentId);
+			},
 		});
 		// A legitimately admitted run is an explicit recovery from a previous stop.
 		if (!active.abortController.signal.aborted)
@@ -527,7 +566,7 @@ export async function runAgentLoopUnlocked(
 				.where(eq(narrators.id, narratorId))
 				.run();
 		const initNarrator = await narratorService.getById(narratorId);
-		deliverTo = runDeliverToOf(initNarrator);
+		deliverTo = run?.deliverTo ?? runDeliverToOf(initNarrator);
 		placement = deliverTo
 			? { parentNarratorId: deliverTo.narratorId, parentToolUseId: deliverTo.toolUseId }
 			: undefined;
@@ -950,9 +989,36 @@ export async function runAgentLoopUnlocked(
 		aborted: true,
 	});
 
+	let historyPreparation: ModelHistoryPreparation | undefined;
+	let historyPreparationStarted = false;
 	// Outline tasks this session set in progress stay its own while it runs (renewed at run start,
 	// at each pass and tool boundary, and on a timer through long tool calls).
 	let outlineLeases: OutlineLeaseKeeper | undefined;
+	const gitRefresh = new GitToolRefreshQueue({
+		state: active,
+		markDirty: markStatusDirty,
+		peek: peekStatusSummary,
+		read: getStatusSummaryCached,
+		hasReaders: () =>
+			[...getNarratorConnections()].some((connection) =>
+				connection.data.subscribedNarrators.has(narratorId),
+			),
+		isCurrent: (path) => gitTrackPathForSession(active) === path,
+		publish: (gitStatus, toolUseId) => {
+			const { files: _files, ...statusWithoutFiles } = gitStatus;
+			broadcastToNarrator(narratorId, {
+				type: "git_status",
+				narratorId,
+				toolUseId,
+				status: statusWithoutFiles as typeof gitStatus,
+				linesAdded: gitStatus.linesAdded,
+				linesRemoved: gitStatus.linesRemoved,
+			});
+		},
+		onError: (error) => {
+			logger.debug("Git status tracking failed", { narratorId, error: String(error) });
+		},
+	});
 	try {
 		outlineLeases = keepOutlineTaskLeases(narratorId);
 		// An outline session moves its old fence text to its behavior page once, before its first
@@ -970,9 +1036,7 @@ export async function runAgentLoopUnlocked(
 			active._guidanceAbortController = new AbortController();
 			const passUrgentGuidance = new AbortController();
 			active._urgentGuidanceAbortController = passUrgentGuidance;
-			if (active._bufferSoftStop && hasPendingBufferedGuidance(narratorId)) {
-				active._guidanceAbortController.abort(new Error("Immediate guidance requested"));
-			}
+			await abortPendingBufferedGuidance(active);
 			if (runState.pendingPrePromptBashCommand && !active.abortController.signal.aborted) {
 				const command = runState.pendingPrePromptBashCommand;
 				runState.pendingPrePromptBashCommand = undefined;
@@ -1024,6 +1088,19 @@ export async function runAgentLoopUnlocked(
 			// request exactly once through normal history adoption (including subagents).
 			if (!active.abortController.signal.aborted)
 				await drainAndPersistPendingInjections(active, placement);
+
+			historyPreparation?.finish();
+			historyPreparation = new ModelHistoryPreparation({
+				narratorId,
+				logicalRunId: run?.logicalRunId,
+				kind: historyPreparationStarted ? "rebuild" : "initial",
+				signal: active.abortController.signal,
+				timeoutMs: null,
+				warn: (message, fields) => logger.warn(message, fields),
+				stallTimeBetween,
+			});
+			historyPreparationStarted = true;
+			historyPreparation.recordPhase("tools");
 
 			// Rebuild system prompt each iteration so AGENTS.md/CLAUDE.md changes are picked up.
 			const modelVersionBeforeLoad = active._modelRefreshVersion;
@@ -1130,11 +1207,18 @@ export async function runAgentLoopUnlocked(
 					)
 						managedOptionalTools.add(tool.name);
 				}
-				const [latestNarrator] = await db
-					.select({ enabledTools: narrators.enabledTools })
-					.from(narrators)
-					.where(eq(narrators.id, narratorId))
-					.limit(1);
+				const latestNarrator = await readQueryFirst(
+					db
+						.select({ enabledTools: narrators.enabledTools })
+						.from(narrators)
+						.where(eq(narrators.id, narratorId))
+						.limit(1),
+					{
+						executionPolicy: "worker-required",
+						maxRows: 1,
+						signal: active.abortController.signal,
+					},
+				);
 				const explicitTools = new Set(latestNarrator?.enabledTools ?? []);
 				const loadedMcpServers = new Set(
 					(latestNarrator?.enabledTools ?? []).flatMap((value) => {
@@ -1305,7 +1389,9 @@ export async function runAgentLoopUnlocked(
 			const buildPrefixPrompt = async (
 				model: RequestModelIdentity,
 				{ locale, replyInUserLanguage }: import("@shared/reply-context").ReplyContext,
+				preparation?: ModelHistoryPreparation,
 			) => {
+				preparation?.recordPhase("systemPrompt");
 				active.abortController.signal.throwIfAborted();
 				// A compact racing this read is retried by the shared request preparer.
 				const compactMessageId = await currentCompactMessageId(narratorId);
@@ -1431,7 +1517,9 @@ export async function runAgentLoopUnlocked(
 					summaryChars: built.usedCompactSummary ? (current.contextSummary?.length ?? 0) : 0,
 				};
 			};
+			historyPreparation.recordPhase("epoch");
 			const preparedPrefix = await preparePrefixRequest({
+				preparation: historyPreparation,
 				narratorId,
 				locale,
 				getReplyContext,
@@ -1448,8 +1536,10 @@ export async function runAgentLoopUnlocked(
 			const { prompt: prefixPrompt, reconciled, sourceMessages: rawMessages } = preparedPrefix;
 			if (!prefixPrompt || !reconciled) throw new Error("Runtime prefix was not prepared");
 			if (reconciled.opened) active._resetUpstreamSessionOnNextRequest = true;
+			historyPreparation.recordPhase("systemPrompt");
 			clearActiveHistoryCompactPending(narratorId);
 			const historyOptions = {
+				preparation: historyPreparation,
 				narratorId,
 				model: preparedPrefix.model,
 				provider: preparedPrefix.provider,
@@ -1476,6 +1566,7 @@ export async function runAgentLoopUnlocked(
 					const hits = await knowledgeInjection.resolveInjections(actingUserId, knowledgeQuery, {
 						already: knowledgeInjectedIds,
 						projectId: active._projectId ?? undefined,
+						signal: active.abortController.signal,
 					});
 					if (hits.length > 0) {
 						const block = knowledgeInjection.formatInjections(
@@ -1530,7 +1621,7 @@ export async function runAgentLoopUnlocked(
 					sourceMessages: await narratorService.getModelHistorySinceLastCompact(
 						narratorId,
 						undefined,
-						{ signal: active.abortController.signal },
+						{ signal: active.abortController.signal, preparation: historyPreparation },
 					),
 				});
 			}
@@ -1539,6 +1630,7 @@ export async function runAgentLoopUnlocked(
 			// won during that work, restart preparation rather than pair it with an old summary.
 			if (prefixPrompt.compactMessageId !== (await currentCompactMessageId(narratorId))) continue;
 
+			historyPreparation.finish();
 			const receipts = questionModelReceipts(preparedHistory.modelMessages);
 			active._questionAnswerModelReceipts = new Map(receipts.map(({ id, text }) => [id, text]));
 			runState.firstPass = false;
@@ -1580,6 +1672,16 @@ export async function runAgentLoopUnlocked(
 				// events to both the parent narrator and the subagent's own page.
 				parentToolUseId: placement?.parentToolUseId,
 				subagentModel: placement ? resolved.model : undefined,
+				subagentOutputIdentity:
+					run?.logicalRunId && deliverTo?.toolCallId && deliverTo.attempt !== undefined
+						? {
+								childNarratorId: narratorId,
+								logicalRunId: run.logicalRunId,
+								toolUseId: deliverTo.toolUseId,
+								toolCallId: deliverTo.toolCallId,
+								attempt: deliverTo.attempt,
+							}
+						: undefined,
 				getContextUsagePct: () => active._contextUsagePct,
 				getMeterUsage: () => active._lastMeterUsage,
 				getMeterUnit: () => active._lastMeterUnit,
@@ -1647,8 +1749,8 @@ export async function runAgentLoopUnlocked(
 				clearCompactDone: () => {
 					compactDoneFlag = false;
 				},
-				buildPrefixPrompt: async (identity, replyContext) => {
-					const result = await buildPrefixPrompt(identity, replyContext);
+				buildPrefixPrompt: async (identity, replyContext, preparation) => {
+					const result = await buildPrefixPrompt(identity, replyContext, preparation);
 					runtimeSummaryChars = result.summaryChars;
 					return result;
 				},
@@ -1668,10 +1770,14 @@ export async function runAgentLoopUnlocked(
 						});
 						return { titleUpdate: false };
 					}
-					const n = await db.query.narrators.findFirst({
-						where: eq(narrators.id, narratorId),
-						columns: { title: true },
-					});
+					const n = await readQueryFirst(
+						db.query.narrators.findMany({
+							limit: 1,
+							where: eq(narrators.id, narratorId),
+							columns: { title: true },
+						}),
+						{ executionPolicy: "worker-required", maxRows: 1 },
+					);
 					// `messageCount` is the real message count, not a turn count, so it is
 					// already > 1 mid-first-turn. Ask the actual question instead.
 					const titleUpdate = !!(
@@ -1845,64 +1951,15 @@ export async function runAgentLoopUnlocked(
 				// gitTrackPathForSession decides per tool call, not per session: a
 				// mid-session cwd switch re-evaluates _isInGitRepo. Without this hook a
 				// standalone narrator's git bar never moved until a foreground refetch.
-				onGitTrack: (toolName, toolUseId, input) => {
-					if (!FILE_MUTATING_TOOLS.has(toolName)) return;
+				onGitTrack: async (toolName, toolUseId, input) => {
 					const worktreePath = gitTrackPathForSession(active);
 					if (!worktreePath) return;
-					// Mark the directory dirty at the tool boundary, not in the narrator's
-					// trailing timer. The directory pool owns throttled live refreshes;
-					// this timer only pushes the session's status line.
-					invalidateStatus(worktreePath);
-					const scheduleRefresh = (delayMs: number) => {
-						// Collapse rapid successive calls into one trailing query. Git commands
-						// use delay 0 so branch/commit-only changes are visible immediately.
-						if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
-						active._gitTrackTimer = setTimeout(() => {
-							active._gitTrackTimer = undefined;
-							// Reuse the directory pool's result (or another narrator's query).
-							// A late timer must not invalidate the same completed write again.
-							getStatusSummaryCached(worktreePath).then(
-								(gitStatus) => {
-									// Strip files array from WS broadcast to avoid
-									// sending huge payloads when many files are changed.
-									// The Git panel fetches the full list via API.
-									const { files: _files, ...statusWithoutFiles } = gitStatus;
-									broadcastToNarrator(narratorId, {
-										type: "git_status",
-										narratorId,
-										toolUseId,
-										status: statusWithoutFiles as typeof gitStatus,
-										linesAdded: gitStatus.linesAdded,
-										linesRemoved: gitStatus.linesRemoved,
-									});
-								},
-								(err) => {
-									logger.debug("Git status tracking failed", {
-										narratorId,
-										error: String(err),
-									});
-								},
-							);
-						}, delayMs);
-					};
-
-					if (toolName !== SHELL_TOOL_NAME) {
-						scheduleRefresh(800);
-						return;
-					}
-
 					const shellCwd =
 						typeof input?.workdir === "string" ? resolve(active.cwd, input.workdir) : active.cwd;
-					void isGitCommandToolResult(toolName, input, shellCwd).then(
-						(hasGitCommand) => scheduleRefresh(hasGitCommand ? 0 : 800),
-						(error) => {
-							logger.debug("Git command detection failed; using normal status tracking", {
-								narratorId,
-								error: String(error),
-							});
-							scheduleRefresh(800);
-						},
+					const intent = await classifyGitToolRefresh(toolName, input, (command) =>
+						analyzeShellCommand(command, shellCwd, detectShell().type),
 					);
+					gitRefresh.track(intent, worktreePath, toolUseId);
 				},
 
 				onContextUsage: ctxMgmt.onContextUsage,
@@ -1974,18 +2031,6 @@ export async function runAgentLoopUnlocked(
 
 			// Restrictions come from the same strict per-pass resolution as the ceiling.
 			runState.stopHooks = runtimePolicy.capabilities.stopHooks;
-			// Resolve ordinary Fast against the acting user's current preference. Ultrafast
-			// is explicit and rechecked against the actual connection before each send.
-			const resolvedFastMode = await resolveFastModeForUser(
-				freshNarrator.fastModeOverride,
-				actingUserId,
-			);
-			let resolvedServiceTier: "ultrafast" | "priority" | undefined;
-			if (freshNarrator.fastModeOverride === "ultrafast") {
-				resolvedServiceTier = "ultrafast";
-			} else if (resolvedFastMode && usesCodexModel(resolved.provider, resolved.model)) {
-				resolvedServiceTier = "priority";
-			}
 
 			const resetUpstreamSessionForThisLoop = active._resetUpstreamSessionOnNextRequest === true;
 			active._resetUpstreamSessionOnNextRequest = false;
@@ -2138,14 +2183,25 @@ export async function runAgentLoopUnlocked(
 				knowledgeInjectedEntryIds: knowledgeInjectedIds,
 				knowledgeInjectionCompactSeq: cycleSeq,
 				reasoningEffort: resolvedReasoningEffort,
-				serviceTier: resolvedServiceTier,
-				getUltrafastModel: () => {
-					const selected = active._modelRef?.trim();
-					const reference =
-						!selected || selected === FOLLOW_DEFAULT_MODEL
-							? settings.agent.defaultModel?.trim()
-							: selected;
-					return parseAggModelValue(reference)?.pinnedModel ?? reference;
+				resolveServiceTier: async ({ provider, model, signal }) => {
+					if (!usesCodexModel(provider, model)) return undefined;
+					const { effectiveFastMode, explicitUltrafast } = await resolveNarratorFastMode(
+						narratorId,
+						{ signal },
+					);
+					if (explicitUltrafast) {
+						const selected = active._modelRef?.trim();
+						const reference =
+							!selected || selected === FOLLOW_DEFAULT_MODEL
+								? settings.agent.defaultModel?.trim()
+								: selected;
+						const named = parseAggModelValue(reference)?.pinnedModel ?? reference;
+						return supportsCodexUltrafast(model, settings.agent.codexUltrafastModels) &&
+							codexUltrafastModelId(named) === codexUltrafastModelId(model)
+							? "ultrafast"
+							: undefined;
+					}
+					return effectiveFastMode ? "priority" : undefined;
 				},
 				maxTransientRetries: getMaxTransientRetries(),
 				silentToolCallThreshold: getSilentToolCallThreshold(),
@@ -2223,13 +2279,7 @@ export async function runAgentLoopUnlocked(
 				historyEndsWithToolResults: preparedHistory.endsWithToolResults,
 				getContextUsagePercentage: () => active._contextUsagePct,
 				onReasoningOnlyHighContext: ctxMgmt.onReasoningOnlyHighContext,
-				shouldIdleOnReasoningOnly: async () => {
-					// Waiting on a mailbox reply or on its own background work, for any session.
-					if (lastModelInputWasMailbox) return true;
-					const { activeWorkCount } =
-						await backgroundTaskService.countActiveKindsByParent(narratorId);
-					return activeWorkCount > 0;
-				},
+				hasPendingWake: async () => lastModelInputWasMailbox || (await workPendingAtEnd()),
 				initialCompletedToolCount: active._todoReminderCompletedToolCount ?? 0,
 				onCompletedToolCount: (count: number) => {
 					active._todoReminderCompletedToolCount = count;
@@ -2240,26 +2290,29 @@ export async function runAgentLoopUnlocked(
 				},
 				getQuestionModelReceipts: () =>
 					Array.from(active._questionAnswerModelReceipts ?? [], ([id, text]) => ({ id, text })),
-				onModelInputConsumed: (history, content, answerEventIds) => {
+				onModelInputConsumed: async (history, content, answerEventIds) => {
 					adoptedInput = { history, content };
 					lastModelInputWasMailbox =
 						afterToolsInput?.history === history && afterToolsInput.content === content
 							? afterToolsInput.mailbox
 							: isLastModelInputMailbox(history, content);
-					consumeAgentMessageHistory(history);
+					void trackCommunicationWork(consumeAgentMessageHistory(history));
 					// DB presence and Await completion are only candidates. The loop
 					// confirms the IDs actually supplied after projection/compaction.
 					active._questionAnswerAdoptedMessageIds = new Set(answerEventIds);
-					consumeQuestionAnswerModelReceipts(narratorId, active._questionAnswerAdoptedMessageIds);
 					for (const id of answerEventIds ?? [])
 						active._questionAnswerFallbackMessageIds?.delete(id);
+					await consumeQuestionAnswerModelReceipts(
+						narratorId,
+						active._questionAnswerAdoptedMessageIds,
+					);
 				},
 				getAfterToolsInjections: async () => {
 					const input = await drainInjectionsIntoHistory(active, locale, placement);
 					return {
 						...input,
-						onConsumed: () => {
-							input.onConsumed();
+						onConsumed: async () => {
+							await input.onConsumed();
 							if (input.parts.length > 0) {
 								lastModelInputWasMailbox = input.lastInputWasMailbox;
 								// onConsumed runs only once, whereas the exact same request can
@@ -2388,7 +2441,7 @@ export async function runAgentLoopUnlocked(
 					return !!active._planApprovedContinue;
 				},
 				// Queued user input never skips a call: the step's tools all run first.
-				shouldYieldToInput: () => {
+				shouldYieldToInput: async () => {
 					// Cancellation is irreversible even when the queued guidance has since
 					// been removed/downgraded. Record the actual pass interruption using
 					// its captured signals, independently of whether input remains. This
@@ -2396,15 +2449,7 @@ export async function runAgentLoopUnlocked(
 					if (config.guidanceSignal?.aborted || config.urgentGuidanceSignal?.aborted) {
 						active._bufferSoftStopTaken = true;
 					}
-					const decision = evaluateSoftStopRequest({
-						feedbackSoftStop: active._feedbackSoftStop,
-						bufferSoftStop: active._bufferSoftStop,
-						hasPendingBufferedWork: hasPendingBufferedGuidance(narratorId),
-					});
-					active._feedbackSoftStop = decision.feedbackSoftStop;
-					active._bufferSoftStop = decision.bufferSoftStop;
-					if (decision.softStopTaken) active._bufferSoftStopTaken = true;
-					return decision.stop;
+					return consumeBufferedSoftStopRequest(active);
 				},
 				// Both primary and child loops can outlive the abort drain. Never reuse
 				// eventContext/hooks here: a new turn may already own their mutable state.
@@ -2417,7 +2462,7 @@ export async function runAgentLoopUnlocked(
 						if (!warnings.length) return;
 						event = { ...event, warnings };
 					}
-					processEvent(event, eventContext, hooks).catch((err) => {
+					trackCommunicationWork(processEvent(event, eventContext, hooks)).catch((err) => {
 						logger.error("Side-channel event processing error", {
 							narratorId,
 							eventType: event.type,
@@ -2704,6 +2749,7 @@ export async function runAgentLoopUnlocked(
 					hooks,
 				);
 			let result: ExecuteLoopResult;
+			if (checkpointIdentity) bindCheckpointGateActor(config.signal, checkpointIdentity);
 			try {
 				result = await executeAgentLoop({
 					config,
@@ -2720,6 +2766,7 @@ export async function runAgentLoopUnlocked(
 					runState.totalTokens += accountTokenUsageForTurn(active);
 				});
 			} catch (error) {
+				if (isCheckpointStop(error)) throw error;
 				// A held run keeps the user's session: a failed turn reports its error and
 				// parks at the hold like any other turn end, instead of ending the run.
 				if (!run || !getRunHold(narratorId) || getRunHold(narratorId)?.released) throw error;
@@ -3463,7 +3510,7 @@ export async function runAgentLoopUnlocked(
 				runState.input.text = fb.feedbackText;
 				// Approving a permission with attached text starts a new pass here, so a
 				// cut-in message queued during the same tool call needs its boundary back.
-				rearmCutInSoftStopBeforeContinuing(active);
+				await rearmCutInSoftStopBeforeContinuing(active);
 				continue;
 			}
 
@@ -3537,7 +3584,7 @@ export async function runAgentLoopUnlocked(
 				runState.input.images = undefined;
 				// This drain starts a fresh pass before the buffer consumer below is
 				// reached, which would strand a cut-in message for the rest of the loop.
-				rearmCutInSoftStopBeforeContinuing(active);
+				await rearmCutInSoftStopBeforeContinuing(active);
 				continue;
 			}
 
@@ -3665,9 +3712,16 @@ export async function runAgentLoopUnlocked(
 			break;
 		}
 	} catch (err) {
+		// A child may unwind its foreground parent, but only the parent's own persisted
+		// identity authorizes releasing this owner. Never inherit the child's identity.
+		historyPreparation?.finish(err);
+		rethrowCheckpointPause(err);
 		// Checkpoint-backed shutdown parks teardown errors at the existing pause gate.
 		// Keep the run active for the next process instead of publishing a false failure.
-		await waitForRestartBeforeFailure(active.abortController.signal);
+		await waitForRestartBeforeFailure(active.abortController.signal).catch((error) => {
+			rethrowCheckpointPause(error);
+			throw error;
+		});
 		if (pendingBufferedDelivery) {
 			try {
 				await restoreBufferedMessage(narratorId, pendingBufferedDelivery);
@@ -3684,6 +3738,7 @@ export async function runAgentLoopUnlocked(
 		} else {
 			const errorMsg = serializeCatalogErrorMessage(err);
 			logger.error("Narrator loop error", {
+				...historyPreparationFailure(err),
 				narratorId,
 				error: err instanceof Error ? err.message : String(err),
 			});
@@ -3708,27 +3763,50 @@ export async function runAgentLoopUnlocked(
 		}
 	} finally {
 		// A coordinator's per-run bookkeeping (files changed this turn) ends with the run.
+		historyPreparation?.finish();
 		forgetCoordinatorRun(narratorId);
 		// The run ended: the session's claims go on the idle lease while it waits for its next
 		// turn, a subagent's pass to its root, and the unfinished team tasks of a run the system
-		// started that ended by itself are given back with a handoff (not waited for).
-		void outlineLeases?.stop({
-			natural:
-				!freshInput &&
-				!runState.hadError &&
-				!runState.wasInterrupted &&
-				!active.abortController.signal.aborted,
-			// A subagent's run is never a person's hour of its own: its claims pass to its root.
-			person: personRun() && !deliverTo,
-			reply: runState.finalText,
-			forTaskId: runForTaskId,
-			pending: workPendingAtEnd,
-		});
-		if (run && !freshInput && (!getRunHold(narratorId) || getRunHold(narratorId)?.released))
+		// started that ended by itself are given back with a handoff. Detached work joins the
+		// database shutdown drain; a checkpoint pause is not a natural run end.
+		if (outlineLeases)
+			void trackCommunicationWork(
+				outlineLeases.stop({
+					natural:
+						!checkpointPause &&
+						!freshInput &&
+						!runState.hadError &&
+						!runState.wasInterrupted &&
+						!active.abortController.signal.aborted,
+					// A subagent's run is never a person's hour of its own: its claims pass to its root.
+					person: personRun() && !deliverTo,
+					reply: runState.finalText,
+					forTaskId: runForTaskId,
+					pending: workPendingAtEnd,
+				}),
+			);
+		if (
+			!checkpointPause &&
+			run &&
+			!freshInput &&
+			(!getRunHold(narratorId) || getRunHold(narratorId)?.released)
+		)
 			run.finalizing = true;
 		unregisterUpdateLoop();
+		// Pausing ends only this process's execution. Retain pending tools, model override,
+		// turn/status and publication reservations for the replacement owner.
+		if (checkpointPause && owner.isCurrent()) {
+			active._loopRunning = false;
+			active.alive = false;
+			active._resumeBufferedAfterLoop = false;
+			if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
+			if (activeNarrators.get(narratorId) === active) activeNarrators.delete(narratorId);
+			clearStreamingSnapshot(narratorId);
+			active.events.removeAllListeners();
+			active._bashBeforeStatus?.clear();
+		}
 		// The one session finalizer; result delivery belongs to the run service.
-		if (owner.isCurrent()) {
+		if (!checkpointPause && owner.isCurrent()) {
 			active._loopRunning = false;
 			active.alive = false;
 
@@ -3757,7 +3835,7 @@ export async function runAgentLoopUnlocked(
 			// hooks. Covers every termination path: normal done, error, and user
 			// interrupt. Hook failures never affect narrator state, but their actual
 			// execution must settle before file-revert admission can be granted.
-			if (runState.stopHooks) {
+			if (runState.stopHooks && !checkpointPause) {
 				await (async () => {
 					try {
 						const stopReason = runState.hadError
@@ -3801,20 +3879,8 @@ export async function runAgentLoopUnlocked(
 				});
 			} else {
 				try {
-					const fresh = await db.query.narrators.findFirst({
-						where: eq(narrators.id, narratorId),
-						columns: { pendingModelRestore: true },
-					});
-					if (fresh?.pendingModelRestore) {
-						const restoreModel = fresh.pendingModelRestore;
-						await db
-							.update(narrators)
-							.set({
-								model: restoreModel,
-								pendingModelRestore: null,
-								updatedAt: new Date().toISOString(),
-							})
-							.where(eq(narrators.id, narratorId));
+					const restoreModel = await createRuntimeFinalizationReads(db).restoreModel(narratorId);
+					if (restoreModel) {
 						updateNarratorModel(narratorId, restoreModel);
 						// The primary active is already marked dead above, so the live
 						// updater only propagates to followers; still publish this DB restore.
@@ -3837,7 +3903,7 @@ export async function runAgentLoopUnlocked(
 			if (activeNarrators.get(narratorId) === active) activeNarrators.delete(narratorId);
 			planModeAskedOnce.delete(narratorId);
 			clearStreamingSnapshot(narratorId);
-			retireSubagentOutputCharCount(narratorId);
+			if (run?.logicalRunId) sealSubagentOutputPass(narratorId, run.logicalRunId);
 			// Finalization cancels leftover resources, not the completed user turn.
 			// Preserve real cancellation before the internal cleanup abort changes the signal.
 			abortedBeforeCleanup = active.abortController.signal.aborted;
@@ -3928,16 +3994,13 @@ export async function runAgentLoopUnlocked(
 				);
 			} else {
 				try {
-					const leftover = await db.query.narrators.findFirst({
-						where: eq(narrators.id, narratorId),
-						columns: { substatus: true },
-					});
-					const tags = parseSubstatus(leftover?.substatus);
-					if (tags.includes("reflecting") || tags.includes("reasoning")) {
-						await narratorService.updateSubstatus(
-							narratorId,
-							tags.filter((t) => t !== "reflecting" && t !== "reasoning"),
-						);
+					const substatus =
+						await createRuntimeFinalizationReads(db).clearTransientSubstatus(narratorId);
+					if (substatus) {
+						(
+							await import("../background-occupancy-store")
+						).backgroundOccupancyStore.refreshNarrator(narratorId);
+						broadcastToNarrator(narratorId, { type: "substatus_change", narratorId, substatus });
 					}
 				} catch (err) {
 					logger.warn("Failed to clear stale transient substatus after narrator loop", {

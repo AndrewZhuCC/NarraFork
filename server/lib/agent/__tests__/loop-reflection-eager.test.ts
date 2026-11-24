@@ -98,7 +98,8 @@ mock.module("@server/services/narrator-permission", () => ({
 		input: { plan: "Reply PLAN_USAGE_OK after approval. No file changes." },
 	}),
 }));
-const { runReflectionLoop, resolveExitPlanModeReflection } = await import("../loop");
+const { createPendingPlanReflectionRunner, runReflectionLoop, resolveExitPlanModeReflection } =
+	await import("../loop");
 
 const planTools = [exitPlanConfirmTool, exitPlanConfirmAndCompactTool];
 const originalPlanTools = planTools.map((tool) => toolRegistry.get(tool.name));
@@ -242,6 +243,36 @@ describe("plan approval waits for reflection usage", () => {
 			});
 			await requestFinished.promise;
 
+			expect(result.decision.action).toBe(
+				tool === exitPlanConfirmAndCompactTool ? "confirm_compact" : "confirm",
+			);
+			expectNaturalCompletion();
+		});
+	}
+});
+
+describe("pending approval card waits for reflection usage", () => {
+	for (const tool of planTools) {
+		test(`${tool.name} completes before the pending permission aborts the review`, async () => {
+			scenario = "plan-approval";
+			planDecisionTool = tool;
+			const permissionAbort = new AbortController();
+			const runner = createPendingPlanReflectionRunner(
+				{
+					...parentConfig(),
+					planReflectionAllowAutoCompact: tool === exitPlanConfirmAndCompactTool,
+				},
+				[],
+				{ toolUseId: "tu-exit-plan", name: "ExitPlanMode", input: {} },
+			);
+			const result = await runner(
+				{ plan: "One step; verify it." },
+				{ signal: permissionAbort.signal },
+			).then((decision) => {
+				permissionAbort.abort();
+				return decision;
+			});
+			await requestFinished.promise;
 			expect(result.decision.action).toBe(
 				tool === exitPlanConfirmAndCompactTool ? "confirm_compact" : "confirm",
 			);

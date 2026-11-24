@@ -1,5 +1,7 @@
 node_modules
 dist/
+/.build-alpha-archive/
+/.build-alpha.lock/
 # Required bundled model metadata, imported directly by the runtime.
 !shared/model-catalog/dist/
 shared/model-catalog/dist/*
@@ -42,8 +44,11 @@ analyze2/
 script/
 scripts/*
 !scripts/check-style-tokens.ts
+!scripts/build-alpha.ts
 !scripts/benchmark-token-repair-bulk.ts
 !scripts/benchmark-token-recalculation.ts
+# Repository knowledge tree tool (knowledge/): find, affected, stale, coverage, check.
+!scripts/knowledge.ts
 !scripts/lib/
 scripts/lib/*
 !scripts/lib/latest-yml.ts
@@ -57,6 +62,7 @@ scripts/lib/*
 !scripts/lib/publication-receipt.ts
 !scripts/lib/local-github-patch-source.ts
 !scripts/lib/mirror-public-github.ts
+!scripts/lib/mirror-patch-proxy.ts
 !scripts/lib/mirror-workflow.ts
 !scripts/lib/mirror-relay-stage.ts
 !scripts/lib/mirror-upload-pool.ts
@@ -77,6 +83,7 @@ scripts/lib/*
 !scripts/lib/compiled-build.ts
 !scripts/lib/runtime-compiler.ts
 !scripts/lib/runtime-build-process.ts
+!scripts/lib/build-profile.ts
 !scripts/lib/update-index*.ts
 # Protected CI update-server bridge and immutable mirror restoration.
 !scripts/lib/update-server-bridge-*.ts
@@ -170,6 +177,10 @@ drizzle-postgres/meta/_generation_pending.json
 # Full application loading/layout smoke is referenced by the browser regression tests.
 !scripts/smoke-narrator-loading.ts
 !scripts/lib/sqlite-generation-lock.ts
+!scripts/repair-file-history.ts
+!scripts/lib/file-history-repair.ts
+!scripts/lib/file-history-repair-data.ts
+!scripts/lib/file-history-repair-data-schema.ts
 !scripts/lib/__tests__/sqlite-generation-lock.test.ts
 !scripts/lib/__tests__/generate-postgres-schema.test.ts
 !scripts/lib/__tests__/check-postgres-schema-parity.test.ts

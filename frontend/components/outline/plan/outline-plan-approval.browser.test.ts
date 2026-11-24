@@ -727,20 +727,17 @@ test("a plan review's comments lead the summary and the diff, left out of its ch
 		},
 	]);
 	const { page, errors } = await openCard(plan.permission, { width: 375, height: 740 });
-	// The count leads the one summary line (its full label for assistive tech and the tooltip);
-	// at a phone's width the counts take their short form and the views are icons.
+	// The review status leads the one summary line and opens the existing changes dialog;
+	// on a phone the summary uses its short form and opening the outline uses an icon.
 	await until(page, "the narrow summary", (f) =>
 		(f.text("[data-testid=outline-plan-summary]") ?? "").startsWith("v1"),
 	);
 	expect(await call(page, (f) => f.text("[data-testid=outline-plan-summary]"))).toBe(
 		"v1 · new · +4",
 	);
-	expect(await call(page, (f) => f.text("[data-testid=outline-plan-review-count]"))).toBe("2");
-	expect(
-		await page.$eval("[data-testid=outline-plan-review-count]", (e) =>
-			e.getAttribute("aria-label"),
-		),
-	).toBe("2 review comments");
+	expect(await call(page, (f) => f.text("[data-testid=outline-plan-view-changes]"))).toBe(
+		"Reviewed · 2 comments",
+	);
 	// One line at a phone's width, as the vlist measure predicts (`outlinePlanSummaryRows`: 1).
 	expect(await call(page, (f) => f.lines("[data-testid=outline-plan-summary-row]"))).toBe(1);
 	expect(await call(page, (f) => f.overflowsX())).toBe(false);

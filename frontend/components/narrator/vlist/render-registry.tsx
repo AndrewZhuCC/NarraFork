@@ -17,6 +17,8 @@ import { normalizeFileReferenceContext } from "@shared/file-reference-context";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import type { PlanTreeAction } from "@shared/outline-plan-tree";
 import type { SubagentDelegation } from "@shared/outline-report-note";
+import type { ReasoningTranslationEvidence } from "@shared/pretext-layout/reasoning-translation-sources";
+import type { ReasoningTranslationVisibilityTarget } from "@shared/reasoning-translation";
 import type { SideCarBody } from "@shared/sidecar-body";
 import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import type { MeasuredElement } from "./prepared-block";
@@ -204,6 +206,9 @@ export function resolveRenderExtra(spec: {
 			break;
 		}
 		case "subagent-card":
+			if ("toolUseId" in data) extra.toolUseId = data.toolUseId;
+			if ("toolCallId" in data) extra.toolCallId = data.toolCallId;
+			if ("executionAttempt" in data) extra.executionAttempt = data.executionAttempt;
 			if ("description" in data) extra.description = data.description;
 			if ("agentType" in data) extra.agentType = data.agentType;
 			if ("model" in data) extra.model = data.model;
@@ -358,6 +363,12 @@ export function renderElement(
 		case "reasoning":
 			return (
 				<RenderReasoning
+					translationEvidence={
+						extra.reasoningTranslationEvidence as ReasoningTranslationEvidence[] | undefined
+					}
+					translationSource={
+						extra.reasoningTranslationSource as ReasoningTranslationVisibilityTarget | undefined
+					}
 					textPreviewLabels={extra.textPreviewLabels as never}
 					onToggleTextExpanded={
 						extra.onToggleTextExpanded as ((bodyKey?: string) => void) | undefined
@@ -518,6 +529,12 @@ export function renderElement(
 		case "reasoning-steps":
 			return (
 				<RenderToolRun
+					translationEvidence={
+						extra.reasoningTranslationEvidence as ReasoningTranslationEvidence[] | undefined
+					}
+					translationSource={
+						extra.reasoningTranslationSource as ReasoningTranslationVisibilityTarget | undefined
+					}
 					onUnknownHeight={extra.onUnknownHeight as ((h: number) => void) | undefined}
 					textPreviewLabels={extra.textPreviewLabels as never}
 					onToggleTextExpanded={
@@ -567,6 +584,10 @@ export function renderElement(
 			return (
 				<RenderSubagent
 					measured={m}
+					narratorId={extra.narratorId as string | undefined}
+					toolUseId={extra.toolUseId as string | undefined}
+					toolCallId={extra.toolCallId as string | undefined}
+					executionAttempt={extra.executionAttempt as number | undefined}
 					description={(extra.description as string) ?? ""}
 					agentType={extra.agentType as string | undefined}
 					isBackground={extra.isBackground as boolean | undefined}

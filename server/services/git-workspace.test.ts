@@ -675,6 +675,18 @@ describe("Git workspace discovery", () => {
 			const status = await request(`status?workspaceKey=${encodeURIComponent(workspaceKey)}`);
 			expect(status.status).toBe(200);
 			expect(((await status.json()) as { hasChanges: boolean }).hasChanges).toBe(true);
+			const stagingSummary = await request(
+				`staging-lists?workspaceKey=${encodeURIComponent(workspaceKey)}`,
+			);
+			expect(stagingSummary.status).toBe(200);
+			expect(await stagingSummary.json()).toMatchObject({
+				workspaceKey,
+				capability: { supported: false },
+				lists: [],
+			});
+			const deniedStaging = await request("staging-lists/action", { action: "init", workspaceKey });
+			expect(deniedStaging.status).toBe(409);
+			expect(await deniedStaging.json()).toMatchObject({ code: "GIT_STAGING_UNAVAILABLE" });
 			const staged = await request("stage", { all: true, workspaceKey });
 			if (staged.status !== 200) throw new Error(`Stage failed: ${await staged.text()}`);
 			expect(staged.status).toBe(200);
@@ -981,7 +993,7 @@ describe("authenticated Git management", () => {
 		await symlink(root, join(repo, "outside"));
 		for (const file of [
 			"../outside",
-			"C:escape",
+			...(process.platform === "win32" ? ["C:escape"] : []),
 			"C:\\escape",
 			"\\\\host\\share",
 			"/etc/passwd",
@@ -997,6 +1009,19 @@ describe("authenticated Git management", () => {
 			(await request("stage", { files: [":(glob)*"], workspaceKey: ws.workspaceKey })).status,
 		).toBe(200);
 		expect(await git(repo, "diff", "--cached", "--name-only")).toBe(":(glob)*");
+		if (process.platform !== "win32") {
+			for (const file of ["a:b.txt", "C:escape"]) {
+				await writeFile(join(repo, file), "colon filename\n");
+				expect(
+					(await request("stage", { files: [file], workspaceKey: ws.workspaceKey })).status,
+				).toBe(200);
+			}
+			expect((await git(repo, "diff", "--cached", "--name-only")).split("\n")).toEqual([
+				":(glob)*",
+				"C:escape",
+				"a:b.txt",
+			]);
+		}
 	});
 	test("remote default uses device cwd, remains device-separated, never falls back locally", async () => {
 		const deviceId = generateId();

@@ -29,6 +29,7 @@ type RuntimeRequest = {
 	keys: string[];
 	signal?: AbortSignal;
 	resolve: (result: RuntimeResult) => void;
+	reject: (error: Error) => void;
 };
 const tab = (id: string): RecentTab => ({
 	type: "narrator",
@@ -121,9 +122,9 @@ beforeEach(() => {
 	notifyManager.setScheduler(queueMicrotask);
 	spyOn(api, "getRecentTabsRuntime").mockImplementation(
 		(keys, signal) =>
-			new Promise<RuntimeResult>((resolve) => {
+			new Promise<RuntimeResult>((resolve, reject) => {
 				// Deliberately allow a response after cancellation.
-				runtimeRequests.push({ keys, signal, resolve });
+				runtimeRequests.push({ keys, signal, resolve, reject });
 			}),
 	);
 	spyOn(api, "getRecentTabsPage").mockImplementation(async (section) =>
@@ -209,6 +210,32 @@ test("membership changes abort and replace the read before a late response can o
 	expect(runtimeRequests).toHaveLength(2);
 });
 
+test("replayed working events do not repeat a tab promotion", async () => {
+	const move = spyOn(api, "moveRecentTab").mockResolvedValue({
+		changed: false,
+		baseRevision: 0,
+		revision: 0,
+		operations: [],
+	});
+	await mount([tab("a")]);
+	const status = (value: "idle" | "working") =>
+		onListEvent({ type: "status_change", narratorId: "a", status: value });
+
+	await act(async () => {
+		status("working");
+		status("working"); // The first patch is still waiting for the frame.
+		frame?.(0);
+		status("working"); // The cache updated, but React has not committed yet.
+	});
+	expect(move.mock.calls).toEqual([["narrator:a", { position: "above_idle" }]]);
+
+	await act(async () => {
+		status("idle");
+		status("working");
+	});
+	expect(move).toHaveBeenCalledTimes(2);
+});
+
 test("repeated reconnects with unchanged membership queue exactly one runtime read", async () => {
 	let now = 100_000;
 	spyOn(Date, "now").mockImplementation(() => now);
@@ -222,5 +249,58 @@ test("repeated reconnects with unchanged membership queue exactly one runtime re
 	expect(runtimeRequests.map(({ keys }) => keys)).toEqual([["narrator:a"], ["narrator:a"]]);
 	await resolveRuntime(1, [{ key: "narrator:a", patch: { title: "reconnected" } }]);
 	expect(cachedTab("a")?.title).toBe("reconnected");
+	expect(runtimeRequests).toHaveLength(2);
+});
+
+test("reordering targets during queued reconnects preserves one shared runtime read", async () => {
+	let now = 100_000;
+	spyOn(Date, "now").mockImplementation(() => now);
+	await mount();
+	for (const tabs of [
+		[tab("b"), tab("a")],
+		[tab("a"), tab("b")],
+	]) {
+		await act(async () => setTabs(tabs));
+		now += 6000;
+		await act(async () => onConnection(true, true));
+	}
+	expect(runtimeRequests).toHaveLength(1);
+	expect(runtimeRequests[0]?.signal?.aborted).toBe(false);
+	await resolveRuntime(0, [{ key: "narrator:a", patch: { title: "obsolete" } }]);
+	expect(cachedTab("a")?.title).toBe("a");
+	expect(runtimeRequests.map(({ keys }) => keys)).toEqual([
+		["narrator:a", "narrator:b"],
+		["narrator:a", "narrator:b"],
+	]);
+	await resolveRuntime(1, [{ key: "narrator:a", patch: { title: "fresh" } }]);
+	expect(cachedTab("a")?.title).toBe("fresh");
+	expect(runtimeRequests).toHaveLength(2);
+});
+
+test("empty membership cancels a queued refresh without starting another runtime read", async () => {
+	let now = 100_000;
+	spyOn(Date, "now").mockImplementation(() => now);
+	await mount([]);
+	await act(async () => onConnection(true, true));
+	expect(runtimeRequests).toHaveLength(0);
+	await act(async () => setTabs([tab("a")]));
+	now += 6000;
+	await act(async () => onConnection(true, true));
+	await act(async () => setTabs([]));
+	expect(runtimeRequests[0]?.signal?.aborted).toBe(true);
+	await resolveRuntime(0);
+	expect(runtimeRequests).toHaveLength(1);
+	await act(async () => setTabs([tab("b")]));
+	expect(runtimeRequests.map(({ keys }) => keys)).toEqual([["narrator:a"], ["narrator:b"]]);
+});
+
+test("a failed runtime read releases the shared slot without retrying until a new trigger", async () => {
+	await mount([tab("a")]);
+	await act(async () => runtimeRequests[0]?.reject(new Error("busy")));
+	expect(runtimeRequests).toHaveLength(1);
+	await act(async () => onConnection(true, true));
+	expect(runtimeRequests.map(({ keys }) => keys)).toEqual([["narrator:a"], ["narrator:a"]]);
+	await resolveRuntime(1, [{ key: "narrator:a", patch: { title: "recovered" } }]);
+	expect(cachedTab("a")?.title).toBe("recovered");
 	expect(runtimeRequests).toHaveLength(2);
 });

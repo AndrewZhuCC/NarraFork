@@ -1,7 +1,6 @@
 import { resolve } from "node:path";
 import type { ContextCharCache } from "@shared/context-composition";
 import type { ContextInputCharacters, ContextUsageSnapshot } from "@shared/context-usage";
-import { codexUltrafastModelId, supportsCodexUltrafast } from "@shared/fast-mode";
 import { GEN_UI_STREAM_FIELDS } from "@shared/gen-ui-tool-policy";
 import {
 	MEDIA_MIME_TO_EXT,
@@ -18,10 +17,17 @@ import {
 	type StreamingEditOrigin,
 	validateStreamingEditOrigin,
 } from "@shared/streaming-edit-origin";
+import {
+	acceptCheckpointStopDrain,
+	isCheckpointStop,
+} from "../../services/agent-runtime/checkpoint-stop";
 import { scanToolOutputForKnowledgeDetailed } from "../../services/knowledge-injection";
 import { type ProtectedTaskMutation, SPEC_TASKS_PATH } from "../../services/spec-task-service";
 import { specVfsService } from "../../services/spec-vfs-service";
-import { beginNarratorResponseActivity } from "../../services/update-coordinator";
+import {
+	beginNarratorResponseActivity,
+	inheritCheckpointGateActor,
+} from "../../services/update-coordinator";
 import { type ApiRequestHandle, finishApiRequest, startApiRequest } from "../api-request-tracker";
 import {
 	type BooleanOverride,
@@ -33,6 +39,7 @@ import { recordCacheDropDiagnostic, resetCacheDropBaseline } from "../cache-drop
 import { matchContextComposition, validInputCharacters } from "../context-usage-snapshot";
 import { logger } from "../logger";
 import { withModelMetadataSnapshotIterator } from "../model-catalog";
+import { historyPreparationFailure } from "../model-history-preparation";
 import { captureReferencePricingSnapshot } from "../model-pricing";
 import { redactSecretPatterns } from "../net/diagnostic-redaction";
 import { noteOpencodeUsageActivity } from "../opencode-usage-cache";
@@ -43,6 +50,7 @@ import {
 	getToolMessage,
 	type Locale,
 } from "../prompt-i18n";
+import { streamQuotaIdentityForPrefix } from "../provider-key-subjects";
 import { resolveProviderQuotaWait } from "../provider-quota-wait";
 import { createRequestRecording } from "../request-recorder";
 import {
@@ -52,7 +60,7 @@ import {
 	SearchExecutionBudgetExceededError,
 } from "../search/execution-scope";
 import { shouldUseNativeSearch } from "../search/native";
-import { getModelContextWindow, settings, usesCodexModel, usesStatefulModel } from "../settings";
+import { getModelContextWindow, settings, usesStatefulModel } from "../settings";
 import { sideCarBodyWithText } from "../sidecar-templates";
 import { StreamStaleError } from "../stream-timeout";
 import { buildUsageDataFromSnapshot } from "../usage-tracking";
@@ -78,6 +86,11 @@ import { isMalformedRequestBodyError, summarizeRequestBody } from "./malformed-r
 import { rememberModelTraceRequest } from "./modeltrace-request";
 import { assertNativeMediaPayload, splitNativeMediaReferences } from "./native-media";
 import { type ContentLane, OutputContentAccumulator } from "./output-content";
+import {
+	type PendingPlanReflectionGateResult,
+	type PendingPlanReflectionRunner,
+	registerPendingPlanReflectionRunner,
+} from "./pending-plan-reflection";
 import {
 	type ChatParams,
 	type DbMessage,
@@ -135,6 +148,7 @@ import {
 	cancelExitPlanReflection,
 	cleanupExitPlanReflection,
 	createExitPlanReflectionDecision,
+	discardExitPlanReflection,
 	EXIT_PLAN_CONFIRM_COMPACT_TOOL_NAME,
 	EXIT_PLAN_REFLECTION_TOOLS,
 	type ExitPlanReflectionDecision,
@@ -374,7 +388,7 @@ function isQuietFinish(kind: EmptyResponseKind, signals: EmptyResponseSignals): 
 	if (kind === "empty_response_usage_only") return true;
 	return (
 		kind === "empty_response_stop_without_content" &&
-		QUIET_STOP_REASONS.has(signals.stopReason ?? "")
+		QUIET_STOP_REASONS.has(signals.stopReason?.toLowerCase() ?? "")
 	);
 }
 
@@ -725,11 +739,8 @@ const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
 	"Edit",
 	"StructSed",
 	"Agent",
-	// Await/Watch/Send may target newly spawned work. Let the post-stream group
-	// barrier see the Agent's registered state before running them.
+	// Explicit Await suspension starts only after the provider finishes publishing the call.
 	"Await",
-	"Watch",
-	"Send",
 	// Stop can target work launched earlier in the same assistant turn.
 	"Stop",
 	"Browser",
@@ -1468,7 +1479,7 @@ export async function runReflectionLoop(
 			// A reflection extends the parent's request rows in memory; it writes no rows of its own.
 			rebuildRequestHistory: undefined,
 			historyEndsWithToolResults: undefined,
-			shouldIdleOnReasoningOnly: undefined,
+			hasPendingWake: undefined,
 			// A reflection is an auxiliary call inside the parent's turn. It must not deliver
 			// injections: the reminders belong to the parent conversation, and writing rows
 			// from here would put them in the transcript twice (once now, once when the parent
@@ -1937,6 +1948,7 @@ export async function resolveExitPlanModeReflection(
 	toolUse: AgentToolUse,
 	recoveryGate?: PersistedRecoveryGate,
 	sourceToolCallId?: string,
+	assertStillAllowed?: () => Promise<void>,
 ): Promise<ExitPlanReflectionGateResult> {
 	const locale = (config.locale as Locale) ?? "en";
 	const { loadPlanFileReadPolicy, resolveExitPlanModeInputWithBackend } = await import(
@@ -2059,6 +2071,7 @@ export async function resolveExitPlanModeReflection(
 		inputJson: resolvedInput.input,
 		toolCallId: toolCallId ?? undefined,
 		restoredStartedAt: restoredReflection?.startedAt,
+		assertStillAllowed,
 		abortController: reflectionAbort,
 	});
 	const onPreparationAbort = () => {
@@ -2186,6 +2199,140 @@ export async function resolveExitPlanModeReflection(
 		// await resumes. Derive the outcome from the winning decision, not timing.
 		checkFailed: decision.action === "revise" && decision.feedback === failedCheckFeedback,
 	};
+}
+
+/**
+ * Run plan reflection for an ExitPlanMode whose approval is ALREADY waiting for a person.
+ *
+ * The run is started from outside the agent loop (the manual 计划反思 button, or the switch
+ * being turned on while the plan waits), so the loop is suspended inside its permission handler;
+ * `config`/`rows` are captured by the runner's closure and stay valid for the whole wait.
+ *
+ * Deliberately not `resolveExitPlanModeReflection`:
+ *  - the input is the pending request's resolved input — the text the card shows — instead of a
+ *    second resolution of the raw model input, which could read a plan file that changed since;
+ *  - there is nothing to restore: the wait belongs to the real permission, not to a synthetic gate;
+ *  - a review that cannot decide HANDS THE PLAN BACK (handover) instead of failing closed. The
+ *    approver is already in front of the card, so a provider failure must never deny a plan they
+ *    were about to read. `cancelExitPlanReflection` would additionally mark the row `fail` and
+ *    drop the card from the pending list while the loop stays blocked;
+ *  - when the wait ends under the review (decided first, or the pass aborted), the gate is
+ *    discarded without persisting: the real row then belongs to whoever ended the wait.
+ */
+async function runPendingExitPlanReflection(args: {
+	config: AgentConfig;
+	rows: readonly DbMessage[];
+	toolUse: AgentToolUse;
+	input: Record<string, unknown>;
+	toolCallId: string | null;
+	signal?: AbortSignal;
+}): Promise<PendingPlanReflectionGateResult> {
+	const { rows, toolUse, input, toolCallId } = args;
+	// A review whose request was decided meanwhile has nothing left to answer, so the gate's
+	// caller can cut it short. `config.signal` still belongs to the parent pass.
+	const config: AgentConfig = args.signal
+		? { ...args.config, signal: AbortSignal.any([args.config.signal, args.signal]) }
+		: args.config;
+	const requestId = `exit_plan_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+	const reflectionAbort = new AbortController();
+	const decisionPromise = createExitPlanReflectionDecision(requestId, {
+		narratorId: config.narratorId,
+		broadcastTargetId: config.parentNarratorId ?? config.narratorId,
+		parentToolUseId: config.parentToolUseId,
+		toolUseId: toolUse.toolUseId,
+		toolName: toolUse.name,
+		inputJson: input,
+		toolCallId: toolCallId ?? undefined,
+		abortController: reflectionAbort,
+		onDemand: true,
+	});
+	// The wait this review answers can end under it: the person decides first (`args.signal`) or
+	// the pass is aborted. The real tool-call row then belongs to whoever ended the wait, so the
+	// gate is discarded WITHOUT persisting a status over that decision — unlike the pre-permission
+	// gate, which owns the row while it runs (`cancelExitPlanReflection` would write `fail`).
+	const onWaitEnded = () => {
+		discardExitPlanReflection(requestId, "Plan approval ended before the reflection finished");
+		reflectionAbort.abort(config.signal.reason);
+	};
+	if (config.signal.aborted) onWaitEnded();
+	else config.signal.addEventListener("abort", onWaitEnded, { once: true });
+	await markExitPlanReflectionStarted(requestId);
+	let reflectionDone = false;
+	const reflectionPromise = runExitPlanModeReflectionLoop(
+		config,
+		rows,
+		requestId,
+		toolUse,
+		input,
+		reflectionAbort,
+	).finally(() => {
+		reflectionDone = true;
+	});
+	const decision = await Promise.race([
+		decisionPromise.finally(() => reflectionAbort.abort()),
+		reflectionPromise
+			.catch((err) => {
+				const crashMessage = extractErrorMessage(err);
+				logger.warn("Pending ExitPlanMode reflection loop ended unexpectedly", {
+					err: crashMessage,
+				});
+				return crashMessage;
+			})
+			.then(async (outcome) => {
+				if (isExitPlanReflectionWaitingForUser(requestId)) {
+					return { action: "manual" as const };
+				}
+				const failureSummary =
+					typeof outcome === "string"
+						? `the reflection loop crashed before producing a decision: ${outcome}`
+						: outcome.failureSummary;
+				const reason = `Plan reflection could not finish (${failureSummary ?? "no decision"}); awaiting user decision`;
+				// A review never holds a plan back: the waiting approval keeps its card.
+				if (await handOverExitPlanReflection(requestId, { reason })) return decisionPromise;
+				const alreadySettled = await Promise.race<ExitPlanReflectionDecision | null>([
+					decisionPromise,
+					Promise.resolve(null),
+				]);
+				return alreadySettled ?? { action: "human" as const, reason };
+			}),
+	]);
+	if (!reflectionDone) {
+		const reflectionCleanup = reflectionPromise.catch((err) => {
+			logger.warn("Pending ExitPlanMode reflection loop cleanup failed", { err: String(err) });
+		});
+		// The approval restarts the parent, which aborts this review's signal.
+		// Let the bounded usage tail finish before returning a successful approval.
+		if (decision.action === "confirm" || decision.action === "confirm_compact") {
+			await reflectionCleanup;
+		}
+	}
+	config.signal.removeEventListener("abort", onWaitEnded);
+	cleanupExitPlanReflection(requestId);
+	return { decision, input };
+}
+
+/**
+ * Build the on-demand runner for one ExitPlanMode call. Registered for the length of its
+ * approval wait (see `pending-plan-reflection.ts`), then dropped — the closure holds `config`
+ * and `rows`, so it must not outlive the wait.
+ */
+export function createPendingPlanReflectionRunner(
+	config: AgentConfig,
+	rows: readonly DbMessage[],
+	toolUse: AgentToolUse,
+): PendingPlanReflectionRunner {
+	// Resolved at call time: the tool-call binding is assigned by `executeTool`, which has not
+	// run yet when the runner is registered.
+	const toolCallId = () => config.toolExecutionBindings?.get(toolUse)?.toolCallId ?? null;
+	return (input, options) =>
+		runPendingExitPlanReflection({
+			config,
+			rows,
+			toolUse,
+			input,
+			toolCallId: toolCallId(),
+			signal: options?.signal,
+		});
 }
 
 function resolvePlanReflectionAutoApprove(
@@ -2932,6 +3079,7 @@ async function executeToolAfterReflections(
 						}
 					}
 				} catch (err) {
+					if (isCheckpointStop(err)) throw err;
 					if (recoveryReflection(options.recoveryGate)?.type === "task_reflection") {
 						return {
 							output: `Task reflection recovery failed: ${extractErrorMessage(err)}`,
@@ -2944,6 +3092,22 @@ async function executeToolAfterReflections(
 						error: err instanceof Error ? err.message : String(err),
 					});
 				}
+			}
+		}
+		// A plan that reaches here blocks on its approval card, and the gate above already
+		// declined the review. Publish a runner for exactly that wait so the request can still
+		// be reflected on demand (the 计划反思 button, or the switch turned on while it waits).
+		// Unregistered once the wait ends — the closure holds this pass's `config` and `rows`.
+		if (tu.name === "ExitPlanMode" && !config.reflectionLoop) {
+			const unregister = registerPendingPlanReflectionRunner(
+				config.narratorId,
+				tu.toolUseId,
+				createPendingPlanReflectionRunner(config, rows, tu),
+			);
+			try {
+				return await executeAfterPreAdmission();
+			} finally {
+				unregister();
 			}
 		}
 		return executeAfterPreAdmission();
@@ -3091,6 +3255,7 @@ async function* agentLoopInMetadataSnapshot(
 			},
 			undefined,
 			result.requestId,
+			result.assertStillAllowed,
 		);
 		if (reflected.decision.action === "manual" || reflected.decision.action === "human") {
 			// A stopped reflection returns silently; an outline review with concerns
@@ -3460,6 +3625,7 @@ async function* agentLoopInMetadataSnapshot(
 					knowledgeInjectedEntryIds,
 					{
 						projectId: config.projectId ?? undefined,
+						signal: config.signal,
 					},
 				);
 				if (scan) {
@@ -3517,7 +3683,7 @@ async function* agentLoopInMetadataSnapshot(
 	 */
 	const pendingInputParts: AgentInputPart[] = [];
 	let replayedInjectionMessageIds = new Set<string>();
-	const pendingInputConsumptions: Array<() => void> = [];
+	const pendingInputConsumptions: Array<() => void | Promise<void>> = [];
 	async function collectAfterToolsInjections(): Promise<void> {
 		if (!config.getAfterToolsInjections) return;
 		try {
@@ -3797,7 +3963,7 @@ async function* agentLoopInMetadataSnapshot(
 		if (guidanceSignal?.aborted) {
 			// FIFO guidance may intentionally enter a pass already stopped. Consume the
 			// host flag and preserve pending input without activating provider/preflight IO.
-			config.shouldYieldToInput?.();
+			await config.shouldYieldToInput?.();
 			yield { type: "turn_complete", turnIndex };
 			return;
 		}
@@ -3810,6 +3976,8 @@ async function* agentLoopInMetadataSnapshot(
 		// responses are classified afterwards. Keep the unfinished handle for that verdict,
 		// while this turn's outer finally covers consumer return and unexpected exits.
 		let activeRequestDump: ApiRequestDumpCollector | undefined;
+		let pendingGuidanceYield: Promise<boolean> | undefined;
+		let drainCheckpointTools: (() => AsyncGenerator<AgentEvent>) | undefined;
 		try {
 			// Delivery is de-duplicated only within one model turn. If persistence failed,
 			// the still-pending state may be attached again on the next turn.
@@ -3843,7 +4011,10 @@ async function* agentLoopInMetadataSnapshot(
 								replacement.systemPrompt === config.systemPrompt,
 						});
 					} catch (error) {
-						if (config.signal.aborted) {
+						if (
+							config.signal.aborted ||
+							historyPreparationFailure(error)?.outcome === "cancelled"
+						) {
 							yield { type: "error", message: "Aborted" };
 							return;
 						}
@@ -3853,7 +4024,8 @@ async function* agentLoopInMetadataSnapshot(
 						logger.warn("Request history rebuild failed; projecting the loop's transcript", {
 							narratorId: config.narratorId,
 							turnIndex,
-							error: String(error),
+							...historyPreparationFailure(error),
+							outcome: historyPreparationFailure(error)?.outcome ?? "failed",
 						});
 					}
 				}
@@ -3901,6 +4073,7 @@ async function* agentLoopInMetadataSnapshot(
 				toolAbort.signal,
 				...(config.urgentGuidanceSignal ? [config.urgentGuidanceSignal] : []),
 			]);
+			inheritCheckpointGateActor(config.signal, toolSignal, config.narratorId);
 			const toolConfig = new Proxy(config, {
 				get(target, key, receiver) {
 					return key === "signal" ? toolSignal : Reflect.get(target, key, receiver);
@@ -4000,23 +4173,38 @@ async function* agentLoopInMetadataSnapshot(
 			 * the turn the caller already agreed to end. A host stop skips the calls that
 			 * have not started yet.
 			 */
-			const observeSoftStopForTurn = (): boolean => {
-				if (!gracefulStopRequested && config.shouldStop?.()) gracefulStopRequested = true;
-				return gracefulStopRequested;
+			let softStopObservation: Promise<boolean> | undefined;
+			const observeSoftStopForTurn = (): Promise<boolean> => {
+				if (gracefulStopRequested) return Promise.resolve(true);
+				// Concurrent host observations share the same one-shot stop decision.
+				softStopObservation ??= (async () => {
+					const requested = await config.shouldStop?.();
+					if (requested) gracefulStopRequested = true;
+					return gracefulStopRequested;
+				})().finally(() => {
+					softStopObservation = undefined;
+				});
+				return softStopObservation;
 			};
 			/** Same one-shot contract for queued user input, which never skips a call. */
 			let inputStopRequested = false;
-			const observeInputStopForTurn = (): boolean => {
-				if (!inputStopRequested && guidanceSignal?.aborted) {
-					// Consume the host's one-shot flag too, so the next pass is not stopped again.
-					config.shouldYieldToInput?.();
-					inputStopRequested = true;
-				}
-				if (!inputStopRequested && config.shouldYieldToInput?.()) inputStopRequested = true;
-				return inputStopRequested;
+			let inputStopObservation: Promise<boolean> | undefined;
+			const observeInputStopForTurn = (): Promise<boolean> => {
+				if (inputStopRequested) return Promise.resolve(true);
+				// Share in-flight worker reads so the host's one-shot flag is consumed once.
+				inputStopObservation ??= (async () => {
+					const requested = await config.shouldYieldToInput?.();
+					if (requested || guidanceSignal?.aborted) inputStopRequested = true;
+					return inputStopRequested;
+				})().finally(() => {
+					inputStopObservation = undefined;
+				});
+				return inputStopObservation;
 			};
 			// Map of tool executions started during streaming (toolUseId → Promise)
 			const earlyExecMap = new Map<string, Promise<ToolExecResult>>();
+			const ownedToolExecutions = new Set<Promise<ToolExecResult>>();
+			let checkpointToolStop: unknown;
 			// Raised when a started tool settles, so the stream consumer can publish its
 			// result (and release successors) while the provider stream is idle.
 			const toolSettledWake = new WakeSignal();
@@ -4027,6 +4215,7 @@ async function* agentLoopInMetadataSnapshot(
 			const streamReadyTools = new Set<string>();
 			let streamExecutionOpen = false;
 			const startToolExecution = (tu: AgentToolUse): Promise<ToolExecResult> => {
+				if (checkpointToolStop) throw checkpointToolStop;
 				const existing = earlyExecMap.get(tu.toolUseId);
 				if (existing) return existing;
 				// Queued guidance never cancels a produced call, not even while it waits for
@@ -4049,14 +4238,18 @@ async function* agentLoopInMetadataSnapshot(
 					),
 				);
 				earlyExecMap.set(tu.toolUseId, execution);
-				void execution.then((result) => {
-					settledResults.set(tu.toolUseId, result);
-					// Successors wait for this result to be consumed, not merely settled (see
-					// pumpStreamingTools). Wake the stream consumer so it publishes the result
-					// now instead of at the provider's next event, which may be long after the
-					// model stopped producing output.
-					toolSettledWake.notify();
-				});
+				ownedToolExecutions.add(execution);
+				void execution.then(
+					(result) => {
+						settledResults.set(tu.toolUseId, result);
+						// Successors wait for consumed, rather than merely settled, results.
+						toolSettledWake.notify();
+					},
+					(error) => {
+						if (isCheckpointStop(error)) checkpointToolStop = error;
+						toolSettledWake.notify();
+					},
+				);
 				return execution;
 			};
 			async function waitForToolOrAbort<T>(
@@ -4077,14 +4270,15 @@ async function* agentLoopInMetadataSnapshot(
 					signal.removeEventListener("abort", onAbort);
 				}
 			}
-			const pumpStreamingTools = (): void => {
+			const pumpStreamingTools = async (): Promise<void> => {
 				if (
 					!streamExecutionOpen ||
 					config.signal.aborted ||
 					config.deferEagerToolsForSafeStop === true ||
-					observeSoftStopForTurn()
+					(await observeSoftStopForTurn())
 				)
 					return;
+				if (!streamExecutionOpen || config.signal.aborted || gracefulStopRequested) return;
 				const completed = new Map(toolUses.map((tu) => [tu.toolUseId, tu]));
 				const candidates = selectStreamingToolExecutions(
 					[...toolOrderIdentities.values()].sort(compareToolOrder).map((identity) => {
@@ -4267,6 +4461,14 @@ async function* agentLoopInMetadataSnapshot(
 				}
 			}
 
+			drainCheckpointTools = async function* () {
+				streamExecutionOpen = false;
+				// A paused sibling is not permission to abandon actual IO. Keep this run's
+				// completion pending until all started tools and their result persistence settle.
+				await Promise.allSettled([...ownedToolExecutions]);
+				yield* drainSettledEarlyToolResults();
+			};
+
 			const detachedToolResults = new Set<string>();
 			function detachStartedEarlyToolResults(): void {
 				const persist = config.onDetachedToolResult;
@@ -4430,6 +4632,7 @@ async function* agentLoopInMetadataSnapshot(
 			let malformedRetryCount = 0;
 			const requestUserId = config.userId ?? null;
 			let requestStarted = false;
+			let requestQuotaProviderIdentity: string | undefined;
 			let requestFinished = false;
 			let requestStartPending = false;
 			let startFirstTokenTimerForAttempt: (() => void) | undefined;
@@ -4450,6 +4653,7 @@ async function* agentLoopInMetadataSnapshot(
 				if (info?.credentialId) {
 					credentialId = info.credentialId;
 				}
+				requestQuotaProviderIdentity ??= streamQuotaIdentityForPrefix(effectiveProvider);
 				if (requestStarted) return;
 				requestStarted = true;
 				requestStartPending = true;
@@ -5131,6 +5335,7 @@ async function* agentLoopInMetadataSnapshot(
 				nextToolArrivalOrder = 0;
 				messageId = undefined;
 				credentialId = undefined;
+				requestQuotaProviderIdentity = undefined;
 				earlyExecMap.clear();
 				settledResults.clear();
 				streamReadyTools.clear();
@@ -5176,6 +5381,13 @@ async function* agentLoopInMetadataSnapshot(
 				// Every attempt still needs durable identity before dispatch. Keep this
 				// outside transport retry handling: a failed admission is not an API error.
 				await config.beforeProviderRequest?.();
+				const requestServiceTier = config.resolveServiceTier
+					? await config.resolveServiceTier({
+							provider: effectiveProvider,
+							model: effectiveModel,
+							signal: config.signal,
+						})
+					: config.serviceTier;
 
 				// Generate unique request ID for this provider attempt (reset on each retry).
 				// The actual request start time is set by markRequestStarted() after the
@@ -5230,7 +5442,9 @@ async function* agentLoopInMetadataSnapshot(
 					config.urgentGuidanceSignal?.aborted === true || !attemptStreamedContent;
 				// Calls already complete keep their eager start; the turn ends after its tools.
 				const onGuidanceAbort = () => {
-					observeInputStopForTurn();
+					pendingGuidanceYield ??= observeInputStopForTurn();
+					// Observe rejection now and propagate it at the turn's finally boundary.
+					void pendingGuidanceYield.catch(() => {});
 					if (guidanceCutsNow()) attemptAbort.abort(guidanceStop);
 				};
 				// Urgent guidance can follow live guidance whose combined signal already fired.
@@ -5431,7 +5645,7 @@ async function* agentLoopInMetadataSnapshot(
 						);
 						for (const callback of callbacks) {
 							try {
-								callback();
+								await callback();
 							} catch (error) {
 								logger.warn("Failed to acknowledge adopted model input", {
 									narratorId: config.narratorId,
@@ -5492,16 +5706,7 @@ async function* agentLoopInMetadataSnapshot(
 						stickySessionKey: config.narratorId,
 						workTurnId: config.getWorkTurnId?.(),
 						reasoningEffort: config.reasoningEffort,
-						serviceTier:
-							config.serviceTier === "ultrafast" &&
-							!(
-								supportsCodexUltrafast(effectiveModel, settings.agent.codexUltrafastModels) &&
-								codexUltrafastModelId(config.getUltrafastModel?.()) ===
-									codexUltrafastModelId(effectiveModel) &&
-								usesCodexModel(effectiveProvider, effectiveModel)
-							)
-								? undefined
-								: config.serviceTier,
+						serviceTier: requestServiceTier,
 						metadata: config.metadata,
 						requestDump,
 						streamProgress,
@@ -5513,6 +5718,8 @@ async function* agentLoopInMetadataSnapshot(
 									provider,
 									requestParams,
 									effectiveProvider,
+									info?.credentialId,
+									info?.validateDiagnosticCredential,
 								);
 							}
 							markRequestStarted(info);
@@ -5550,7 +5757,7 @@ async function* agentLoopInMetadataSnapshot(
 								yield { type: "error", message: fatal.output };
 								return;
 							}
-							pumpStreamingTools();
+							await pumpStreamingTools();
 							continue;
 						}
 						const parsed = streamItem;
@@ -5871,7 +6078,7 @@ async function* agentLoopInMetadataSnapshot(
 								};
 								throwIfUserAborted();
 								streamReadyTools.add(tu.toolUseId);
-								pumpStreamingTools();
+								await pumpStreamingTools();
 							}
 						}
 
@@ -6060,7 +6267,7 @@ async function* agentLoopInMetadataSnapshot(
 											yield { type: "error", message: fatal.output };
 											return;
 										}
-										pumpStreamingTools();
+										await pumpStreamingTools();
 									}
 								}
 							}
@@ -6155,6 +6362,7 @@ async function* agentLoopInMetadataSnapshot(
 								type: "quota_balance",
 								quotaBalance: parsed.quotaBalance,
 								detailedQuotaBalance: parsed.detailedQuotaBalance,
+								providerIdentity: requestQuotaProviderIdentity,
 							};
 						}
 						// Billing updates can be output-only; occupancy still requires a real prompt.
@@ -6663,6 +6871,7 @@ async function* agentLoopInMetadataSnapshot(
 					yield* flushRequestStart();
 				} catch (err) {
 					streamExecutionOpen = false;
+					if (isCheckpointStop(err)) throw err;
 					if (toolLimitState.exceeded) {
 						const message =
 							locale === "zh-CN"
@@ -6716,7 +6925,7 @@ async function* agentLoopInMetadataSnapshot(
 						continue;
 					}
 					if (guidanceSignal?.aborted) {
-						observeInputStopForTurn();
+						await observeInputStopForTurn();
 						// Guidance is not a transport fault. Finalize this partial turn below,
 						// without replay/retry or cancelling tools whose bodies already began.
 						break;
@@ -7147,7 +7356,7 @@ async function* agentLoopInMetadataSnapshot(
 				}
 
 				if (guidanceSignal?.aborted) {
-					observeInputStopForTurn();
+					await observeInputStopForTurn();
 					break;
 				}
 				if (firstTokenTimeoutTriggered) {
@@ -7365,14 +7574,23 @@ async function* agentLoopInMetadataSnapshot(
 						namelessToolUseIds: [...namelessToolUseIds],
 					};
 					const emptyKind = classifyEmptyResponse(emptySignals);
-					if (
-						quietFinishAllowed &&
+					const pendingWake =
 						requestStarted &&
 						!lastRetryErrorMessage &&
-						isQuietFinish(emptyKind, emptySignals)
+						isQuietFinish(emptyKind, emptySignals) &&
+						(await config.hasPendingWake?.());
+					if (
+						requestStarted &&
+						!lastRetryErrorMessage &&
+						isQuietFinish(emptyKind, emptySignals) &&
+						(quietFinishAllowed || pendingWake)
 					) {
 						yield* finishRequest();
-						yield { type: "done" };
+						if (config.signal.aborted) {
+							yield { type: "error", message: "Aborted" };
+							return;
+						}
+						yield pendingWake ? { type: "done", reason: "reasoning_only_idle" } : { type: "done" };
 						return;
 					}
 					const emptyEvidence = emptyResponseEvidence(emptySignals);
@@ -7610,7 +7828,7 @@ async function* agentLoopInMetadataSnapshot(
 
 					// Keep the ordinary cleanup above, but do not retry or compact a model
 					// that has nothing to say while waiting for a background result / Send.
-					if (await config.shouldIdleOnReasoningOnly?.()) {
+					if (await config.hasPendingWake?.()) {
 						if (config.signal.aborted) {
 							yield { type: "error", message: "Aborted" };
 							return;
@@ -7895,7 +8113,7 @@ async function* agentLoopInMetadataSnapshot(
 				guidanceSignal?.aborted &&
 				(toolUses.length === 0 || config.urgentGuidanceSignal?.aborted === true)
 			) {
-				observeInputStopForTurn();
+				await observeInputStopForTurn();
 				yield* drainStartedEarlyToolResults();
 				if (config.signal.aborted) {
 					yield { type: "error", message: "Aborted" };
@@ -8043,7 +8261,7 @@ async function* agentLoopInMetadataSnapshot(
 						yield* drainEarlyToolResultsAfterAbort();
 						if (config.signal.aborted) yield { type: "error", message: "Aborted" };
 						else {
-							observeInputStopForTurn();
+							await observeInputStopForTurn();
 							yield { type: "turn_complete", turnIndex };
 						}
 						return;
@@ -8138,7 +8356,7 @@ async function* agentLoopInMetadataSnapshot(
 							yield* drainEarlyToolResultsAfterAbort();
 							if (config.signal.aborted) yield { type: "error", message: "Aborted" };
 							else {
-								observeInputStopForTurn();
+								await observeInputStopForTurn();
 								yield { type: "turn_complete", turnIndex };
 							}
 							return;
@@ -8192,7 +8410,7 @@ async function* agentLoopInMetadataSnapshot(
 				// stop is observed, never start another tool: only await promises that were
 				// already registered in earlyExecMap and mark every other remaining call skipped.
 				// Queued user input is not a host stop; it waits for the step boundary below.
-				if (observeSoftStopForTurn()) {
+				if (await observeSoftStopForTurn()) {
 					const skippedOutput = getToolMessage("skippedForPassEnd", locale);
 					let fatalOutput: string | undefined;
 					for (const remainingTool of toolUses.slice(toolIndex)) {
@@ -8221,7 +8439,7 @@ async function* agentLoopInMetadataSnapshot(
 							yield* drainEarlyToolResultsAfterAbort();
 							if (config.signal.aborted) yield { type: "error", message: "Aborted" };
 							else {
-								observeInputStopForTurn();
+								await observeInputStopForTurn();
 								yield { type: "turn_complete", turnIndex };
 							}
 							return;
@@ -8280,8 +8498,8 @@ async function* agentLoopInMetadataSnapshot(
 
 			// Every call of the step has run: queued user input takes the next turn. This also
 			// closes the race with feedback arriving while after-tools injections are drained.
-			const hostStop = observeSoftStopForTurn();
-			if (observeInputStopForTurn() || hostStop) {
+			const hostStop = await observeSoftStopForTurn();
+			if ((await observeInputStopForTurn()) || hostStop) {
 				yield { type: "turn_complete", turnIndex };
 				return;
 			}
@@ -8299,17 +8517,30 @@ async function* agentLoopInMetadataSnapshot(
 			quietFinishAllowed = !!config.bot || toolUses.some(handsOffWork);
 			turnIndex++;
 		} catch (error) {
+			if (isCheckpointStop(error)) {
+				acceptCheckpointStopDrain(config.signal, config.narratorId, error);
+				try {
+					if (drainCheckpointTools) yield* drainCheckpointTools();
+				} catch (cleanupError) {
+					error.cleanupFailure ??= cleanupError;
+				}
+				throw error;
+			}
 			activeRequestDump?.finish({ status: "error", error: extractErrorMessage(error) });
 			activeRequestDump = undefined;
 			throw error;
 		} finally {
-			activeRequestDump?.finish({
-				status: config.signal.aborted ? "cancelled" : "interrupted",
-				error: config.signal.aborted
-					? String(config.signal.reason ?? "Aborted")
-					: "Attempt exited before final response classification",
-			});
-			responseActivity.release();
+			try {
+				await pendingGuidanceYield;
+			} finally {
+				activeRequestDump?.finish({
+					status: config.signal.aborted ? "cancelled" : "interrupted",
+					error: config.signal.aborted
+						? String(config.signal.reason ?? "Aborted")
+						: "Attempt exited before final response classification",
+				});
+				responseActivity.release();
+			}
 		}
 	}
 

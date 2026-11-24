@@ -16,14 +16,16 @@ import { useState } from "react";
 export interface FastModeControlProps {
 	/** Popover placement — desktop uses top-end, the mobile toolbar bottom-end. */
 	position: "top-end" | "bottom-end";
-	/** Session-level override; "inherit" follows the user default. */
+	/** Explicit session choice; inherit follows its upstream source. */
 	fastModeOverride: FastModeOverride;
-	/** The user-level default fast-mode state (what "inherit" resolves to). */
+	/** The viewing user's editable default, only displayed for primary sessions. */
 	fastModeDefault: boolean;
-	/** Effective state after resolving inherit — drives the icon colour. */
+	/** Effective session or draft state — drives the icon colour and shortcut. */
 	fastModeEnabled: boolean;
 	supportsCodexControls: boolean;
 	supportsUltrafast: boolean;
+	sourceUnavailable: boolean;
+	isSubagent: boolean;
 	/**
 	 * Coarse-pointer / mobile viewports open the settings by long-press instead of
 	 * hover, so hover handlers are suppressed when true.
@@ -45,11 +47,7 @@ export interface FastModeControlProps {
 	t: (key: string, opts?: Record<string, unknown>) => string;
 }
 
-/**
- * Fast-mode toggle button + its settings popover (session override segmented
- * control + user-default switch). The caller supplies the save handlers so existing
- * narrators and the dashboard draft use the same UI.
- */
+/** Shared Fast Mode toggle and settings for saved sessions and the Dashboard draft. */
 export function FastModeControl(props: FastModeControlProps) {
 	const {
 		position,
@@ -58,6 +56,8 @@ export function FastModeControl(props: FastModeControlProps) {
 		fastModeEnabled,
 		supportsCodexControls,
 		supportsUltrafast,
+		sourceUnavailable,
+		isSubagent,
 		fastModeUsesTapSettings,
 		settingsOpened,
 		setSettingsOpened,
@@ -76,9 +76,10 @@ export function FastModeControl(props: FastModeControlProps) {
 	const closeOnMouseLeave =
 		fastModeUsesTapSettings || keyboardOpened ? undefined : scheduleSettingsClose;
 	const ultrafastSelected = fastModeOverride === "ultrafast";
+	// The server projects the saved choice; the current model may still lack Ultrafast.
 	const ultrafastUnavailable = ultrafastSelected && !supportsUltrafast;
-	const ultrafastActive = ultrafastSelected && supportsUltrafast;
-	const defaultState = fastModeDefault ? t("fast_mode_on") : t("fast_mode_off");
+	const enabled = fastModeEnabled && !ultrafastUnavailable;
+	const ultrafastActive = ultrafastSelected && enabled;
 	let tooltip = t("fast_mode_tooltip");
 	let buttonLabel = t("fast_mode");
 	if (ultrafastUnavailable) {
@@ -88,7 +89,11 @@ export function FastModeControl(props: FastModeControlProps) {
 		tooltip = t("fast_mode_ultrafast_hint");
 		buttonLabel = t("fast_mode_ultrafast");
 	} else if (fastModeOverride === "inherit") {
-		tooltip = t("fast_mode_inherit_tooltip", { state: defaultState });
+		tooltip = sourceUnavailable
+			? t("fast_mode_source_unavailable")
+			: t(isSubagent ? "fast_mode_primary_tooltip" : "fast_mode_inherit_tooltip", {
+					state: enabled ? t("fast_mode_on") : t("fast_mode_off"),
+				});
 	}
 
 	return (
@@ -121,10 +126,10 @@ export function FastModeControl(props: FastModeControlProps) {
 					>
 						<ActionIcon
 							variant="subtle"
-							color={ultrafastActive ? "orange" : fastModeEnabled ? "yellow" : "gray"}
+							color={ultrafastActive ? "orange" : enabled ? "yellow" : "gray"}
 							size="sm"
 							aria-label={buttonLabel}
-							aria-pressed={fastModeEnabled}
+							aria-pressed={enabled}
 							disabled={disabled}
 							aria-haspopup="dialog"
 							aria-expanded={settingsOpened}
@@ -147,9 +152,8 @@ export function FastModeControl(props: FastModeControlProps) {
 									longPressFiredRef.current = false;
 									return;
 								}
-								// Clicking pins this session against its current effective
-								// state; the popover restores "follow default".
-								onOverrideChange(fastModeEnabled || !supportsCodexControls ? "off" : "on");
+								// Clicking pins only this session; the popover restores inheritance.
+								onOverrideChange(enabled || !supportsCodexControls ? "off" : "on");
 							}}
 						>
 							{ultrafastActive ? <IconBoltFilled size={16} /> : <IconBolt size={16} />}
@@ -173,7 +177,10 @@ export function FastModeControl(props: FastModeControlProps) {
 						disabled={disabled}
 						onChange={(value) => onOverrideChange(normalizeFastModeOverride(value))}
 						data={[
-							{ value: "inherit", label: t("fast_mode_session_inherit", { state: defaultState }) },
+							{
+								value: "inherit",
+								label: t(isSubagent ? "fast_mode_session_primary" : "fast_mode_session_inherit"),
+							},
 							...(supportsCodexControls ? [{ value: "on", label: t("fast_mode_on") }] : []),
 							{ value: "off", label: t("fast_mode_off") },
 							...(supportsUltrafast
@@ -181,26 +188,32 @@ export function FastModeControl(props: FastModeControlProps) {
 								: []),
 						]}
 					/>
-					<Text size="xs" c="dimmed">
+					<Text size="xs" c={sourceUnavailable || ultrafastUnavailable ? "orange" : "dimmed"}>
 						{ultrafastUnavailable
 							? t("fast_mode_ultrafast_unavailable")
-							: t("fast_mode_session_desc")}
+							: sourceUnavailable
+								? t("fast_mode_source_unavailable")
+								: t(isSubagent ? "fast_mode_primary_desc" : "fast_mode_session_desc")}
 					</Text>
 					{supportsUltrafast && (
 						<Text size="xs" c="dimmed">
 							{t("fast_mode_ultrafast_hint")}
 						</Text>
 					)}
-					<Switch
-						size="sm"
-						checked={fastModeDefault}
-						disabled={disabled}
-						onChange={(event) => onDefaultChange(event.currentTarget.checked)}
-						label={t("fast_mode_default_switch")}
-					/>
-					<Text size="xs" c="dimmed">
-						{fastModeDefault ? t("fast_mode_default_on_desc") : t("fast_mode_default_off_desc")}
-					</Text>
+					{!isSubagent && (
+						<>
+							<Switch
+								size="sm"
+								checked={fastModeDefault}
+								disabled={disabled}
+								onChange={(event) => onDefaultChange(event.currentTarget.checked)}
+								label={t("fast_mode_default_switch")}
+							/>
+							<Text size="xs" c="dimmed">
+								{fastModeDefault ? t("fast_mode_default_on_desc") : t("fast_mode_default_off_desc")}
+							</Text>
+						</>
+					)}
 					<Text size="xs" c="dimmed">
 						{fastModeUsesTapSettings ? t("fast_mode_mobile_hint") : t("fast_mode_desktop_hint")}
 					</Text>

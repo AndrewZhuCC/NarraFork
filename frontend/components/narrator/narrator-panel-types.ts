@@ -99,8 +99,9 @@ export interface PermissionCallbacks {
 	) => void;
 	onQuestionSubmit: (requestId: string, answers: Record<string, string>) => void;
 	onQuestionReflect: (requestId: string) => Promise<void> | void;
-	onPlanReflect: (requestId: string) => Promise<void> | void;
 	onQuestionDeny: (requestId: string) => void;
+	/** Run one plan reflection for a plan that is already waiting for approval. */
+	onPlanReflect?: (requestId: string) => Promise<void> | void;
 	/** Release the blocked loop and move the question to the async inbox. */
 	onQuestionDefer?: (requestId: string) => Promise<void> | void;
 	/**
@@ -130,6 +131,11 @@ export interface NarratorPanelSnapshot {
 	reasoningEffort?: string | null;
 	fastMode?: boolean;
 	fastModeOverride?: FastModeOverride;
+	effectiveFastMode?: boolean;
+	fastModeSource?: import("../../lib/api/narrators").FastModeSource;
+	fastModeSourceNarratorId?: string | null;
+	variant?: string | null;
+	type?: string | null;
 	turnStartedAt?: string | null;
 }
 
@@ -159,7 +165,6 @@ export interface NarratorPanelProps {
 	highlightRequestId?: string;
 	/** Text that picks which row of a multi-row message the jump lands on. */
 	highlightNeedle?: string;
-	onSendToTerminal?: (text: string) => void;
 	appendInputRef?: React.MutableRefObject<((text: string) => void) | null>;
 	terminalOpen?: boolean;
 	onToggleTerminal?: () => void;

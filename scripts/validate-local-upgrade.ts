@@ -8,6 +8,8 @@ import { ensureColumns } from "../server/db/ensure-columns";
 import { dropRetiredFtsObjects } from "../server/db/fts";
 import { runMigrations } from "../server/db/run-migrations";
 
+const MERGE_0916_TAG = "0232_merge_selfuse_0916";
+const MERGE_0916_HASH = "c6ab80e557e166dc136e69e773989ddd22c87d504f06eb7e2e44eb9bbe5a28dd";
 const ALLOWED_TARGET_TAGS = new Set([
 	"0012_curved_bloodstorm",
 	"0013_omniscient_dormammu",
@@ -26,6 +28,7 @@ const ALLOWED_TARGET_TAGS = new Set([
 	"0229_merge_selfuse_0912",
 	"0230_merge_selfuse_0914",
 	"0231_merge_selfuse_0915",
+	MERGE_0916_TAG,
 ]);
 const JOURNAL_TAIL_TAGS = new Set([
 	"0013_omniscient_dormammu",
@@ -44,8 +47,21 @@ const JOURNAL_TAIL_TAGS = new Set([
 	"0229_merge_selfuse_0912",
 	"0230_merge_selfuse_0914",
 	"0231_merge_selfuse_0915",
+	MERGE_0916_TAG,
 ]);
 const MAX_REPORT_BYTES = 64 * 1024;
+const MERGE_0916_ADDED_COLUMNS = {
+	background_tasks: ["principal_json"],
+	narrators: ["ask_in_passing_group_id", "archived_with_narrator_id"],
+};
+const MERGE_0916_INDEX_SQL = {
+	idx_bg_tasks_active:
+		"CREATE INDEX `idx_bg_tasks_active` ON `background_tasks` (`status`) WHERE \"status\" IN ('running','paused')",
+	idx_narrators_ask_in_passing_group:
+		"CREATE INDEX `idx_narrators_ask_in_passing_group` ON `narrators` (`ask_in_passing_group_id`)",
+	idx_narrators_archived_with:
+		"CREATE INDEX `idx_narrators_archived_with` ON `narrators` (`archived_with_narrator_id`)",
+};
 const MERGE_0915_NEW_TABLES = [
 	"outline_spec_imports",
 	"outline_spec_loss_findings",
@@ -350,6 +366,21 @@ function affectedSummary(
 	excludeNew: boolean,
 	missingLaterColumns: Readonly<Record<string, string[]>> = {},
 ): Record<string, unknown> {
+	const digestWith0916 = (
+		table: string,
+		reviewed: readonly string[] = [],
+		key = "id",
+	) => {
+		const missing = Object.hasOwn(MERGE_0916_ADDED_COLUMNS, table)
+			? (missingLaterColumns[table] ?? [])
+			: [];
+		return tableDigest(db, table, new Set(excludeNew ? [...reviewed, ...missing] : []), key);
+	};
+	if (targetTag === MERGE_0916_TAG) {
+		return Object.fromEntries(
+			Object.keys(MERGE_0916_ADDED_COLUMNS).map((table) => [table, digestWith0916(table)]),
+		);
+	}
 	if (
 		targetTag === "0231_merge_selfuse_0915" ||
 		targetTag === "0230_merge_selfuse_0914" ||
@@ -380,7 +411,7 @@ function affectedSummary(
 		return Object.fromEntries(
 			Object.entries(MERGE_098_CHANGED_COLUMNS).map(([table, changed]) => [
 				table,
-				tableDigest(db, table, excludeNew ? new Set(changed) : new Set(), table === "port_allocations" ? "port" : "id"),
+				digestWith0916(table, changed, table === "port_allocations" ? "port" : "id"),
 			]),
 		);
 	}
@@ -388,7 +419,7 @@ function affectedSummary(
 		return Object.fromEntries(
 			Object.entries(MERGE_095_ADDED_COLUMNS).map(([table, added]) => [
 				table,
-				tableDigest(db, table, excludeNew ? new Set(added) : new Set()),
+				digestWith0916(table, added),
 			]),
 		);
 	}
@@ -405,7 +436,7 @@ function affectedSummary(
 	}
 	if (targetTag === "0204_merge_selfuse_092") {
 		return {
-			narrators: tableDigest(db, "narrators", excludeNew ? new Set(["model_history_revision"]) : new Set()),
+			narrators: digestWith0916("narrators", ["model_history_revision"]),
 			scheduled_tasks: tableDigest(db, "scheduled_tasks"),
 			file_attributions: tableDigest(db, "file_attributions"),
 			knowledge_injection_events: tableDigest(db, "knowledge_injection_events", excludeNew ? new Set(["personal_entry_id"]) : new Set()),
@@ -414,11 +445,7 @@ function affectedSummary(
 	if (targetTag === "0018_merge_upstream_090") {
 		return {
 			users: tableDigest(db, "users"),
-			background_tasks: tableDigest(
-				db,
-				"background_tasks",
-				excludeNew ? new Set(["background_kind"]) : new Set(),
-			),
+			background_tasks: digestWith0916("background_tasks", ["background_kind"]),
 			...(excludeNew
 				? {}
 				: Object.fromEntries(MERGE_090_NEW_TABLES.map((table) => [table, tableDigest(db, table)]))),
@@ -428,12 +455,7 @@ function affectedSummary(
 		return Object.fromEntries(
 			Object.entries(MERGE_083_ADDED_COLUMNS).map(([table, added]) => [
 				table,
-				tableDigest(
-					db,
-					table,
-					excludeNew ? new Set(added) : new Set(),
-					table === "port_allocations" ? "port" : "id",
-				),
+				digestWith0916(table, added, table === "port_allocations" ? "port" : "id"),
 			]),
 		);
 	}
@@ -442,12 +464,12 @@ function affectedSummary(
 	}
 	if (targetTag === "0015_nifty_magma") {
 		return {
-			narrators: tableDigest(db, "narrators", excludeNew ? new Set(["turn_ended_at"]) : new Set()),
+			narrators: digestWith0916("narrators", ["turn_ended_at"]),
 		};
 	}
 	const is0014 = targetTag === "0014_blue_tomorrow_man";
 	const summary: Record<string, unknown> = {
-		narrators: tableDigest(db, "narrators", excludeNew ? new Set(["next_seq"]) : new Set()),
+		narrators: digestWith0916("narrators", ["next_seq"]),
 		narrator_tool_calls: tableDigest(
 			db,
 			"narrator_tool_calls",
@@ -538,7 +560,48 @@ function narratorRefsIndexShape(db: Database) {
 	return { name: index.name, unique: index.unique, partial: index.partial, columns: indexColumns };
 }
 
+function merge0916SchemaShape(db: Database): Record<string, unknown> {
+	const shape: Record<string, unknown> = {};
+	const narratorKeys = db.query("PRAGMA foreign_key_list(narrators)").all() as Array<{
+		id: number;
+		from: string;
+	}>;
+	for (const [table, added] of Object.entries(MERGE_0916_ADDED_COLUMNS)) {
+		for (const column of added) {
+			const name = `${table}.${column}`;
+			const definition = columnShape(db, table, column);
+			const expected = [{ name: column, type: "TEXT", notnull: 0, dflt_value: null, pk: 0 }];
+			if (canonical(definition) !== canonical(expected)) {
+				throw new Error(`${name} must be nullable TEXT without a default`);
+			}
+			shape[name] = definition;
+			if (table !== "narrators") continue;
+
+			const matches = narratorKeys.filter((key) => key.from === column);
+			const parts = narratorKeys
+				.filter((key) => key.id === matches[0]?.id)
+				.map(({ id: _id, ...key }) => key);
+			const expectedKey = [{
+				seq: 0, table: "narrators", from: column, to: "id",
+				on_update: "NO ACTION", on_delete: "SET NULL", match: "NONE",
+			}];
+			if (matches.length !== 1 || canonical(parts) !== canonical(expectedKey)) {
+				throw new Error(`${name} must reference narrators.id ON DELETE SET NULL`);
+			}
+			shape[`${name}.fk`] = parts;
+		}
+	}
+	for (const [name, expectedSql] of Object.entries(MERGE_0916_INDEX_SQL)) {
+		const index = db.query("SELECT sql FROM sqlite_master WHERE type='index' AND name=?")
+			.get(name) as { sql: string } | null;
+		if (index?.sql !== expectedSql) throw new Error(`Unexpected index definition: ${name}`);
+		shape[name] = index.sql;
+	}
+	return shape;
+}
+
 function schemaShape(db: Database, targetTag?: string): Record<string, unknown> {
+	if (targetTag === MERGE_0916_TAG) return merge0916SchemaShape(db);
 	const merge0915 = targetTag === "0231_merge_selfuse_0915";
 	const merge0914 = targetTag === "0230_merge_selfuse_0914";
 	const merge0912 = targetTag === "0229_merge_selfuse_0912";
@@ -790,8 +853,12 @@ async function main() {
 		entries?: Array<{ tag?: string }>;
 	};
 	const tags = journal.entries?.map((entry) => entry.tag) ?? [];
-	if (tags.length !== migrationFiles.length || !JOURNAL_TAIL_TAGS.has(tags.at(-1) ?? "")) {
+	const journalTail = tags.at(-1) ?? "";
+	if (tags.length !== migrationFiles.length || !JOURNAL_TAIL_TAGS.has(journalTail)) {
 		throw new Error("Unexpected migration journal tail");
+	}
+	if (journalTail === MERGE_0916_TAG && migrationFiles.at(-1)?.hash !== MERGE_0916_HASH) {
+		throw new Error("0.9.16 validation requires the exact generated migration SQL");
 	}
 	const migrationsWithTags = migrationFiles.map((migration, index) => ({
 		...migration,
@@ -821,16 +888,18 @@ async function main() {
 			!ALLOWED_TARGET_TAGS.has(target.tag) ||
 			(target.tag === "0204_merge_selfuse_092" && !merge092Chain) ||
 			(target.tag === "0212_file_write_redesign" && !merge095Chain) ||
-			(MERGE_098_TARGETS.has(target.tag) && !merge098Chain)
+			(MERGE_098_TARGETS.has(target.tag) && !merge098Chain) ||
+			(target.tag === MERGE_0916_TAG && (pending.length !== 1 || journalTail !== MERGE_0916_TAG))
 		) {
 			throw new Error(
 				"Validation requires a reviewed migration, pair, or complete migration chain",
 			);
 		}
-		// ensureColumns can add 0.9.15 fields while validating a reviewed older SQL tail.
+		const merge0916 = target.tag === MERGE_0916_TAG;
+		// ensureColumns can add later fields while validating a reviewed older SQL tail.
 		// Ignore only the fields that did not exist before this upgrade.
 		const missingLaterColumns = Object.fromEntries(
-			Object.entries(MERGE_0915_ADDED_COLUMNS).map(([table, added]) => {
+			Object.entries({ ...MERGE_0915_ADDED_COLUMNS, ...MERGE_0916_ADDED_COLUMNS }).map(([table, added]) => {
 				const existing = columns(db, table);
 				return [table, added.filter((column) => !existing.includes(column))];
 			}),
@@ -862,6 +931,11 @@ async function main() {
 		const applied = new Set(ledger(db));
 		if (!pending.every((migration) => applied.has(migration.hash))) {
 			throw new Error("Target migration hash was not applied");
+		}
+		if (merge0916 && (
+			applied.size !== beforeLedger.size + 1 || [...beforeLedger].some((hash) => !applied.has(hash))
+		)) {
+			throw new Error("0.9.16 validation changed the ledger beyond the reviewed migration");
 		}
 		const expectedCounts = { ...beforeCounts };
 		const newTables = target.tag === "0231_merge_selfuse_0915" ? MERGE_0915_NEW_TABLES :
@@ -924,6 +998,16 @@ async function main() {
 				(table) => canonical(beforeAffected[table]) !== canonical(afterAffected[table]),
 			);
 			throw new Error(`Existing affected-table fields changed: ${changed.join(", ")}`);
+		}
+		if (merge0916) {
+			for (const table of Object.keys(MERGE_0916_ADDED_COLUMNS)) {
+				for (const column of missingLaterColumns[table]) {
+					const populated = db.query(
+						`SELECT 1 FROM ${quoteIdentifier(table)} AS t WHERE t.${quoteIdentifier(column)} IS NOT NULL LIMIT 1`,
+					).get();
+					if (populated) throw new Error(`Existing rows gained ${table}.${column} values`);
+				}
+			}
 		}
 		if (target.tag === "0015_nifty_magma") {
 			const populatedTurnEnds = db

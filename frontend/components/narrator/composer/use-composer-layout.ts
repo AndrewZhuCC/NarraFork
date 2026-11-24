@@ -56,11 +56,17 @@ export function useComposerLayout({
 			// same 8px above them so single-line gaps around the buttons are symmetric.
 			const compactHeight = Math.max(singleHeight, controlsHeight + 16) + 2;
 			const available = root.clientWidth - 24 - leadingSpace - trailingSpace;
-			const oneLine = editable.scrollHeight <= Math.ceil(singleHeight) + 1;
-			const expanded = available < MIN_INPUT_WIDTH || !oneLine;
+			// An empty document stays compact even if its placeholder inflates scrollHeight.
+			const empty =
+				editor.state.doc.childCount === 1 && editor.state.doc.firstChild?.content.size === 0;
+			const expanded =
+				!empty &&
+				(available < MIN_INPUT_WIDTH || editable.scrollHeight > Math.ceil(singleHeight) + 1);
 			if (expanded) root.dataset.layout = "expanded";
-			const naturalHeight = editable.scrollHeight;
-			setVariable("--composer-content-height", expanded ? naturalHeight : compactHeight - 2);
+			setVariable(
+				"--composer-content-height",
+				expanded ? editable.scrollHeight : compactHeight - 2,
+			);
 			// Let CSS resolve dvh/min()/custom limits, including a keyboard-shortened viewport.
 			const contentHeight = scroll.getBoundingClientRect().height;
 			const toolbarHeight =

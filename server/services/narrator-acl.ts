@@ -44,9 +44,10 @@
  */
 
 import { type NarratorWriteAudience, widestWriteAudienceFor } from "@shared/narrator-access";
-import { and, eq, inArray, or, type SQL, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, or, type SQL, type SQLWrapper, sql } from "drizzle-orm";
 import { db } from "../db";
 import { aclGrants, narrators, projects } from "../db/schema";
+import { type ReadQueryOptions, readQuery, readQueryFirst } from "../db/worker-read";
 import { NotFoundError } from "../lib/errors";
 import type { AclPrincipal, GrantRow } from "./acl/acl-core";
 import { applyGrant, resolveCaps } from "./acl/acl-core";
@@ -194,11 +195,16 @@ function isOwner(row: NarratorAclRow, principal: NarratorPrincipal): boolean {
 async function ownGrants(
 	narratorId: string,
 	principal: NarratorPrincipal,
+	readOptions?: ReadQueryOptions,
 ): Promise<{ read: boolean; write: boolean; manage: boolean }> {
-	const caps = await resolveCaps(toAclPrincipal(principal), {
-		type: "narrator",
-		id: narratorId,
-	});
+	const caps = await resolveCaps(
+		toAclPrincipal(principal),
+		{
+			type: "narrator",
+			id: narratorId,
+		},
+		readOptions,
+	);
 	return caps.own;
 }
 
@@ -213,14 +219,19 @@ async function ownGrants(
 async function gateAndProjectFor(
 	row: NarratorAclRow,
 	principal: NarratorPrincipal,
+	readOptions?: ReadQueryOptions,
 ): Promise<{ gate: { read: boolean; write: boolean }; projectId: string | null }> {
-	const projectId = await resolveProjectIdForNarratorId(row.id);
+	const projectId = await resolveProjectIdForNarratorId(row.id, readOptions);
 	// A standalone narrator has no project, hence no gate to pass. That is "no gate
 	// here", not "unrestricted": the checks below still decide.
-	const gate = await resolveProjectGate(projectId, {
-		userId: principal.userId,
-		isAdmin: principal.isAdmin,
-	});
+	const gate = await resolveProjectGate(
+		projectId,
+		{
+			userId: principal.userId,
+			isAdmin: principal.isAdmin,
+		},
+		readOptions,
+	);
 	return { gate, projectId };
 }
 
@@ -244,13 +255,21 @@ async function gateAndProjectFor(
  * "has a parent": keying on the parent link would make every fork permanently follow
  * whatever it was forked from.
  */
-async function resolveJudgedRow(row: NarratorAclRow): Promise<NarratorAclRow | null> {
+async function resolveJudgedRow(
+	row: NarratorAclRow,
+	readOptions?: ReadQueryOptions,
+): Promise<NarratorAclRow | null> {
+	readOptions?.signal?.throwIfAborted();
 	if (row.type !== "subagent") return row;
 	if (!row.aclRootNarratorId) return null;
-	const root = await db.query.narrators.findFirst({
-		where: eq(narrators.id, row.aclRootNarratorId),
-		columns: NARRATOR_ACL_COLUMNS,
-	});
+	const root = await readQueryFirst(
+		db.query.narrators.findMany({
+			limit: 1,
+			where: eq(narrators.id, row.aclRootNarratorId),
+			columns: NARRATOR_ACL_COLUMNS,
+		}),
+		{ timeoutMs: 30_000, ...readOptions, executionPolicy: "worker-required", maxRows: 1 },
+	);
 	return root ?? null;
 }
 
@@ -290,12 +309,14 @@ export async function resolveAclRootId(row: NarratorAclRow): Promise<string | nu
 export async function canReadNarrator(
 	row: NarratorAclRow,
 	principal: NarratorPrincipal,
+	readOptions?: ReadQueryOptions,
 ): Promise<boolean> {
+	readOptions?.signal?.throwIfAborted();
 	if (principal.isAdmin) return true;
 	// A subagent is judged entirely on its root; an undeterminable root denies.
-	const judged = await resolveJudgedRow(row);
+	const judged = await resolveJudgedRow(row, readOptions);
 	if (!judged) return false;
-	return await readVerdict(judged, principal, singleFacts(judged, principal));
+	return await readVerdict(judged, principal, singleFacts(judged, principal, readOptions));
 }
 
 /**
@@ -309,10 +330,14 @@ interface NarratorAccessFacts {
 	own(): Promise<{ read: boolean; write: boolean }>;
 }
 
-function singleFacts(judged: NarratorAclRow, principal: NarratorPrincipal): NarratorAccessFacts {
+function singleFacts(
+	judged: NarratorAclRow,
+	principal: NarratorPrincipal,
+	readOptions?: ReadQueryOptions,
+): NarratorAccessFacts {
 	return {
-		gateAndProject: () => gateAndProjectFor(judged, principal),
-		own: () => ownGrants(judged.id, principal),
+		gateAndProject: () => gateAndProjectFor(judged, principal, readOptions),
+		own: () => ownGrants(judged.id, principal, readOptions),
 	};
 }
 
@@ -351,11 +376,13 @@ async function readVerdict(
 export async function canWriteNarrator(
 	row: NarratorAclRow,
 	principal: NarratorPrincipal,
+	readOptions?: ReadQueryOptions,
 ): Promise<boolean> {
+	readOptions?.signal?.throwIfAborted();
 	if (principal.isAdmin) return true;
-	const judged = await resolveJudgedRow(row);
+	const judged = await resolveJudgedRow(row, readOptions);
 	if (!judged) return false;
-	return await writeVerdict(judged, principal, singleFacts(judged, principal));
+	return await writeVerdict(judged, principal, singleFacts(judged, principal, readOptions));
 }
 
 /** The write rule of {@link canWriteNarrator} on the judged row. */
@@ -403,10 +430,14 @@ export async function judgeNarratorAccessBatch(
 	}
 	const projectId = await resolveProjectIdForNarratorId(judged.id);
 	const project = projectId
-		? ((await db.query.projects.findFirst({
-				where: eq(projects.id, projectId),
-				columns: { id: true, ownerUserId: true, visibility: true },
-			})) ?? null)
+		? ((await readQueryFirst(
+				db.query.projects.findMany({
+					limit: 1,
+					where: eq(projects.id, projectId),
+					columns: { id: true, ownerUserId: true, visibility: true },
+				}),
+				{ executionPolicy: "worker-required", maxRows: 1, timeoutMs: 30_000 },
+			)) ?? null)
 		: null;
 
 	const scopes = [
@@ -419,29 +450,31 @@ export async function judgeNarratorAccessBatch(
 	const rows: Array<GrantRow & { principalType: string; principalId: string }> = [];
 	for (let start = 0; start < userIds.length; start += BATCH_PRINCIPAL_CHUNK) {
 		const chunk = userIds.slice(start, start + BATCH_PRINCIPAL_CHUNK);
-		// Awaited, never `.all()`: the same statement runs on either backend (dialect-neutral,
-		// like the single-principal path).
-		const chunkRows = await db
-			.select({
-				principalType: aclGrants.principalType,
-				principalId: aclGrants.principalId,
-				scopeType: aclGrants.scopeType,
-				scopeId: aclGrants.scopeId,
-				capability: aclGrants.capability,
-				domainKind: aclGrants.domainKind,
-				domainValue: aclGrants.domainValue,
-			})
-			.from(aclGrants)
-			.where(
-				and(
-					or(
-						and(eq(aclGrants.principalType, "user"), inArray(aclGrants.principalId, chunk)),
-						// Role grants apply to everyone holding the role; read once per chunk.
-						eq(aclGrants.principalType, "role"),
+		// Worker-backed on SQLite; PostgreSQL retains its async driver.
+		const chunkRows = await readQuery(
+			db
+				.select({
+					principalType: aclGrants.principalType,
+					principalId: aclGrants.principalId,
+					scopeType: aclGrants.scopeType,
+					scopeId: aclGrants.scopeId,
+					capability: aclGrants.capability,
+					domainKind: aclGrants.domainKind,
+					domainValue: aclGrants.domainValue,
+				})
+				.from(aclGrants)
+				.where(
+					and(
+						or(
+							and(eq(aclGrants.principalType, "user"), inArray(aclGrants.principalId, chunk)),
+							// Role grants apply to everyone holding the role; read once per chunk.
+							eq(aclGrants.principalType, "role"),
+						),
+						or(...scopes),
 					),
-					or(...scopes),
 				),
-			);
+			{ executionPolicy: "worker-required", timeoutMs: 30_000 },
+		);
 		rows.push(...chunkRows);
 	}
 	// Grants by scope and holder, so each principal's caps are two map lookups.
@@ -527,10 +560,11 @@ export async function hasNarratorAccess(
 	row: NarratorAclRow,
 	principal: NarratorPrincipal,
 	need: NarratorAccessNeed,
+	readOptions?: ReadQueryOptions,
 ): Promise<boolean> {
 	return need === "write"
-		? await canWriteNarrator(row, principal)
-		: await canReadNarrator(row, principal);
+		? await canWriteNarrator(row, principal, readOptions)
+		: await canReadNarrator(row, principal, readOptions);
 }
 
 /**
@@ -544,8 +578,9 @@ export async function assertNarratorAccess(
 	row: NarratorAclRow,
 	principal: NarratorPrincipal,
 	need: NarratorAccessNeed,
+	readOptions?: ReadQueryOptions,
 ): Promise<void> {
-	if (await hasNarratorAccess(row, principal, need)) return;
+	if (await hasNarratorAccess(row, principal, need, readOptions)) return;
 	throw new NotFoundError("Narrator", row.id);
 }
 
@@ -554,10 +589,15 @@ export async function loadNarratorForAccess(
 	narratorId: string,
 	principal: NarratorPrincipal,
 	need: NarratorAccessNeed,
+	readOptions?: ReadQueryOptions,
 ) {
-	const row = await db.query.narrators.findFirst({ where: eq(narrators.id, narratorId) });
+	readOptions?.signal?.throwIfAborted();
+	const row = await readQueryFirst(
+		db.query.narrators.findMany({ limit: 1, where: eq(narrators.id, narratorId) }),
+		{ timeoutMs: 30_000, ...readOptions, executionPolicy: "worker-required", maxRows: 1 },
+	);
 	if (!row) throw new NotFoundError("Narrator", narratorId);
-	await assertNarratorAccess(row, principal, need);
+	await assertNarratorAccess(row, principal, need, readOptions);
 	return row;
 }
 
@@ -710,13 +750,16 @@ function bindUserId(text: string, userId: string): SQL {
  * `acl_grants.scope_id` into `narrators.scope_id` and made the story graph fail to
  * prepare.
  */
-export function narratorReadableWhere(principal: NarratorPrincipal) {
+export function narratorReadableWhere(
+	principal: NarratorPrincipal,
+	table: Record<"id" | "type" | "aclRootNarratorId", SQLWrapper> = narrators,
+) {
 	if (principal.isAdmin) return undefined;
 	return sql`exists (
 		select 1 from narrators jn
 		where jn.id = case
-				when ${narrators.type} = 'subagent' then ${narrators.aclRootNarratorId}
-				else ${narrators.id}
+				when ${table.type} = 'subagent' then ${table.aclRootNarratorId}
+				else ${table.id}
 			end
 			and ${bindUserId(judgedReadableSql("jn"), principal.userId)}
 	)`;
@@ -790,10 +833,18 @@ export async function filterReadableNarrators<T extends NarratorAclRow>(
 	const readableIds = new Set<string>();
 	for (let offset = 0; offset < rows.length; offset += READABLE_FILTER_CHUNK_SIZE) {
 		const ids = rows.slice(offset, offset + READABLE_FILTER_CHUNK_SIZE).map((row) => row.id);
-		const readable = await db
-			.select({ id: narrators.id })
-			.from(narrators)
-			.where(and(sql`${narrators.id} IN ${ids}`, narratorReadableWhere(principal)));
+		const readable = await readQuery(
+			db
+				.select({ id: narrators.id })
+				.from(narrators)
+				.where(and(sql`${narrators.id} IN ${ids}`, narratorReadableWhere(principal)))
+				.limit(READABLE_FILTER_CHUNK_SIZE),
+			{
+				executionPolicy: "worker-required",
+				maxRows: READABLE_FILTER_CHUNK_SIZE,
+				timeoutMs: 30_000,
+			},
+		);
 		for (const row of readable) readableIds.add(row.id);
 	}
 
@@ -826,6 +877,8 @@ export async function listNarratorAudience(
 	row: NarratorAclRow,
 	/** Optional hard candidate budget for notification fan-out; ACL broadcasts omit it. */
 	limit?: number,
+	/** Optional intersection avoids expanding unrelated grantees for notifications. */
+	candidateUserIds?: readonly string[],
 ): Promise<{ everyone: true } | { everyone: false; userIds: string[] }> {
 	const judged = await resolveJudgedRow(row);
 	if (!judged) return { everyone: false, userIds: [] };
@@ -836,20 +889,47 @@ export async function listNarratorAudience(
 	) {
 		return { everyone: true };
 	}
-	const grantQuery = db
-		.select({ principalId: aclGrants.principalId })
-		.from(aclGrants)
-		.where(
-			and(
-				eq(aclGrants.scopeType, "narrator"),
-				eq(aclGrants.scopeId, judged.id),
-				eq(aclGrants.principalType, "user"),
-				sql`${aclGrants.domainKind} is null`,
-			),
-		);
-	const grants = await (limit === undefined ? grantQuery : grantQuery.limit(limit));
-	const userIds = new Set<string>(judged.ownerUserId ? [judged.ownerUserId] : []);
-	for (const grant of grants) userIds.add(grant.principalId);
+	const owner = judged.ownerUserId;
+	const userIds = new Set<string>(
+		owner && (candidateUserIds === undefined || candidateUserIds.includes(owner)) ? [owner] : [],
+	);
+	const signal = AbortSignal.timeout(30_000);
+	const candidateLimit = limit === undefined || limit < 0 ? Infinity : limit;
+	const groups: (readonly string[] | undefined)[] =
+		candidateUserIds === undefined
+			? [undefined]
+			: Array.from({ length: Math.ceil(candidateUserIds.length / 128) }, (_, index) =>
+					candidateUserIds.slice(index * 128, (index + 1) * 128),
+				);
+	let consumed = 0;
+	for (const group of groups) {
+		let cursor: string | undefined;
+		while (consumed < candidateLimit) {
+			const pageSize = Math.min(500, candidateLimit - consumed);
+			const grants = await readQuery(
+				db
+					.select({ id: aclGrants.id, principalId: aclGrants.principalId })
+					.from(aclGrants)
+					.where(
+						and(
+							eq(aclGrants.scopeType, "narrator"),
+							eq(aclGrants.scopeId, judged.id),
+							eq(aclGrants.principalType, "user"),
+							sql`${aclGrants.domainKind} is null`,
+							group === undefined ? undefined : inArray(aclGrants.principalId, group),
+							cursor === undefined ? undefined : gt(aclGrants.id, cursor),
+						),
+					)
+					.orderBy(asc(aclGrants.id))
+					.limit(pageSize),
+				{ executionPolicy: "worker-required", maxRows: pageSize, timeoutMs: 30_000, signal },
+			);
+			for (const grant of grants) userIds.add(grant.principalId);
+			consumed += grants.length;
+			if (grants.length < pageSize) break;
+			cursor = grants[grants.length - 1].id;
+		}
+	}
 	return { everyone: false, userIds: [...userIds].slice(0, limit) };
 }
 

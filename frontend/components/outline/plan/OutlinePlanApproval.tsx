@@ -9,11 +9,9 @@
  * resolves the request: a plan someone else changed since the version on screen is refused (409)
  * and the diff opens again; the request disappears through the usual `permission_resolved`.
  *
- * A plan review's comments (PR 8b, `_planReview`) lead the summary line as an orange count (its
- * full 「审查意见 N 条」 in the tooltip; the card's height is unchanged) and the diff, which leaves
- * them out of the changes and shows them above. On a narrow card (review round 1 U1) the two
- * views become icons and the counts their short form, so the version and its changes stay on
- * the one line.
+ * If plan review left comments (`_planReview`), the summary links to them in the existing diff.
+ * The diff shows them above, not among the plan's changes. On narrow cards the other views
+ * become icons and the counts use their short form to keep the summary on one line.
  */
 
 import { REMOTE_BUILD } from "@frontend/lib/build-target";
@@ -34,7 +32,7 @@ import {
 } from "@mantine/core";
 import { useElementSize } from "@mantine/hooks";
 import { outlinePlanSubmissionOf } from "@shared/outline-plan-submission";
-import { IconExternalLink, IconListDetails, IconMessageCircle } from "@tabler/icons-react";
+import { IconExternalLink, IconListDetails } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import {
 	useCallback,
@@ -104,6 +102,8 @@ export function OutlinePlanApproval({
 	planReflectionFailed?: boolean;
 }) {
 	const { t } = useTranslation("narrator");
+	// The global inbox can open from routes that have not preloaded the outline locale.
+	const { t: tOutline } = useTranslation("outline", { useSuspense: false });
 	const submission = useMemo(
 		() => outlinePlanSubmissionOf(permission.inputJson as Record<string, unknown> | undefined),
 		[permission.inputJson],
@@ -241,7 +241,41 @@ export function OutlinePlanApproval({
 					changed,
 					removed: counts.removed,
 				});
-	const reviewLabel = t("outlinePlan.reviewCount", { count: reviewCount });
+	const reviewLabel =
+		reviewCount > 0
+			? tOutline("planApproval.reviewedWithComments", {
+					count: reviewCount,
+					defaultValue: t("outlinePlan.reviewCount", { count: reviewCount }),
+				})
+			: null;
+	const changesLabel = t("outlinePlan.viewChanges");
+	const viewChanges = REMOTE_BUILD ? null : narrow && !reviewLabel ? (
+		<Tooltip label={changesLabel} withinPortal>
+			<ActionIcon
+				size="xs"
+				variant="subtle"
+				aria-label={changesLabel}
+				onClick={() => setDiffOpen(true)}
+				data-testid="outline-plan-view-changes"
+			>
+				<IconListDetails size={14} />
+			</ActionIcon>
+		</Tooltip>
+	) : (
+		<Anchor
+			component="button"
+			type="button"
+			size="xs"
+			c={reviewLabel ? "orange" : undefined}
+			fw={reviewLabel ? 600 : undefined}
+			onClick={() => setDiffOpen(true)}
+			title={reviewLabel ? changesLabel : undefined}
+			style={{ flexShrink: 0 }}
+			data-testid="outline-plan-view-changes"
+		>
+			{reviewLabel ?? changesLabel}
+		</Anchor>
+	);
 
 	// Keep "Return" last, including when reflection is available: Enter with feedback returns it.
 	const buttons: PermButton[] = readOnly
@@ -323,22 +357,12 @@ export function OutlinePlanApproval({
 				data-testid="outline-plan-summary-row"
 				data-narrow={narrow ? "" : undefined}
 			>
-				{reviewCount > 0 && (
-					<Tooltip label={reviewLabel} withinPortal>
-						<Text
-							span
-							size="xs"
-							c="orange"
-							fw={600}
-							aria-label={reviewLabel}
-							style={{ flexShrink: 0, display: "inline-flex", alignItems: "center", gap: 2 }}
-							data-testid="outline-plan-review-count"
-						>
-							<IconMessageCircle size="1.1em" aria-hidden />
-							{reviewCount}
+				{reviewLabel &&
+					(viewChanges ?? (
+						<Text span size="xs" c="orange" fw={600} style={{ flexShrink: 0 }}>
+							{reviewLabel}
 						</Text>
-					</Tooltip>
-				)}
+					))}
 				<Text
 					size="xs"
 					c="dimmed"
@@ -349,55 +373,31 @@ export function OutlinePlanApproval({
 				>
 					{narrow ? shortSummary : fullSummary}
 				</Text>
+				{!reviewLabel && viewChanges}
 				{!REMOTE_BUILD &&
 					(narrow ? (
-						<>
-							<Tooltip label={t("outlinePlan.viewChanges")} withinPortal>
-								<ActionIcon
-									size="xs"
-									variant="subtle"
-									aria-label={t("outlinePlan.viewChanges")}
-									onClick={() => setDiffOpen(true)}
-									data-testid="outline-plan-view-changes"
-								>
-									<IconListDetails size={14} />
-								</ActionIcon>
-							</Tooltip>
-							<Tooltip label={t("outlinePlan.openInOutline")} withinPortal>
-								<ActionIcon
-									size="xs"
-									variant="subtle"
-									aria-label={t("outlinePlan.openInOutline")}
-									onClick={openInOutline}
-									data-testid="outline-plan-open"
-								>
-									<IconExternalLink size={14} />
-								</ActionIcon>
-							</Tooltip>
-						</>
-					) : (
-						<>
-							<Anchor
-								component="button"
-								type="button"
+						<Tooltip label={t("outlinePlan.openInOutline")} withinPortal>
+							<ActionIcon
 								size="xs"
-								onClick={() => setDiffOpen(true)}
-								style={{ flexShrink: 0 }}
-								data-testid="outline-plan-view-changes"
-							>
-								{t("outlinePlan.viewChanges")}
-							</Anchor>
-							<Anchor
-								component="button"
-								type="button"
-								size="xs"
+								variant="subtle"
+								aria-label={t("outlinePlan.openInOutline")}
 								onClick={openInOutline}
-								style={{ flexShrink: 0 }}
 								data-testid="outline-plan-open"
 							>
-								{t("outlinePlan.openInOutline")}
-							</Anchor>
-						</>
+								<IconExternalLink size={14} />
+							</ActionIcon>
+						</Tooltip>
+					) : (
+						<Anchor
+							component="button"
+							type="button"
+							size="xs"
+							onClick={openInOutline}
+							style={{ flexShrink: 0 }}
+							data-testid="outline-plan-open"
+						>
+							{t("outlinePlan.openInOutline")}
+						</Anchor>
 					))}
 			</Group>
 			{submission.summary && (

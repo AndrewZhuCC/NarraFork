@@ -34,6 +34,17 @@ const { createAsyncQuestion, answerAsyncQuestion } = await import("../narrator-q
 const { backgroundTaskService } = await import("../background-task-service");
 const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 
+async function expectRejectedMessage(work: PromiseLike<unknown>, message: string): Promise<void> {
+	let rejected = false;
+	try {
+		await work;
+	} catch (error) {
+		rejected = true;
+		expect(String(error)).toContain(message);
+	}
+	expect(rejected).toBe(true);
+}
+
 const recipient = "reply-context-recipient";
 const sender = "reply-context-sender";
 const model = "replycontextfixture:model";
@@ -102,20 +113,20 @@ function languageUpdates(request: CapturedRequest) {
 		.map(([text]) => text)
 		.filter((text) => text.includes("[language]\n"));
 }
-async function waitUntil(check: () => boolean, label: string) {
+async function waitUntil(check: () => boolean | Promise<boolean>, label: string) {
 	const deadline = Date.now() + 8_000;
-	while (!check()) {
+	while (!(await check())) {
 		if (Date.now() >= deadline) throw new Error(`Timed out: ${label}; requests=${requests.length}`);
 		await Bun.sleep(10);
 	}
 }
 async function idle(count: number) {
 	await waitUntil(
-		() =>
+		async () =>
 			requests.length === count &&
 			recipientRow().status === "idle" &&
 			!getExecutionOwner(recipient) &&
-			!hasPendingBufferedWork(recipient),
+			!(await hasPendingBufferedWork(recipient)),
 		"recipient idle",
 	);
 }
@@ -500,7 +511,8 @@ test("recovery without candidates or with a live owner never adopts the human pa
 	const owner = tryClaimExecution(recipient, "run");
 	if (!owner) throw new Error("Could not claim fixture owner");
 	try {
-		await expect(startRecoveryWatchBatch({ ...input, aliases: ["missing"] })).rejects.toThrow(
+		await expectRejectedMessage(
+			startRecoveryWatchBatch({ ...input, aliases: ["missing"] }),
 			"already running",
 		);
 		expect(recipientRow().replyContext).toEqual(zh);
@@ -652,7 +664,8 @@ test("manual restart Continue adopts only after registrations succeed and only f
 		const owner = tryClaimExecution(recipient, "run");
 		if (!owner) throw new Error("Could not claim recovery fixture owner");
 		try {
-			await expect(restart.manuallyResumeRestartRecovery(recipient, en)).rejects.toThrow(
+			await expectRejectedMessage(
+				restart.manuallyResumeRestartRecovery(recipient, en),
 				"already running",
 			);
 			expect(recipientRow().replyContext).toEqual(zh);
@@ -666,7 +679,8 @@ test("manual restart Continue adopts only after registrations succeed and only f
 			throw new Error("fixture registration failed");
 		});
 		try {
-			await expect(restart.manuallyResumeRestartRecovery(recipient, en)).rejects.toThrow(
+			await expectRejectedMessage(
+				restart.manuallyResumeRestartRecovery(recipient, en),
 				"fixture registration failed",
 			);
 			expect(recipientRow().replyContext).toEqual(zh);

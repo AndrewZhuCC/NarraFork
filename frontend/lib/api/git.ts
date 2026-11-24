@@ -1,6 +1,21 @@
 import type { GitBranches } from "@shared/git-branches";
 import type { GitCommitDetail, GitCommitPatch } from "@shared/git-commit-preview";
 import type { GitLineStats } from "@shared/git-line-stats";
+import type {
+	GitStagingAction,
+	GitStagingActionResult,
+	GitStagingDiff,
+	GitStagingFilesPage,
+	GitStagingSummary,
+} from "@shared/git-staging-lists";
+import type {
+	GitStatusFilterChar,
+	GitStatusPageQuery,
+	GitStatusPageResult,
+	GitStatusPageScopeProof,
+	GitStatusPageStatsQuery,
+	GitStatusPageStatsResponse,
+} from "@shared/git-status-page";
 import type { GitWorkspace } from "@shared/git-workspace";
 import type {
 	WorktreeCreateRequest,
@@ -32,6 +47,9 @@ export interface GitLogEntry {
 	parents?: string[];
 }
 
+/** Existing explicit-file mutation ceiling; all:true uses its separate Git semantics. */
+export const GIT_FILE_ACTION_MAX_FILES = 1000;
+
 /** A narrator's resolved Git workspace. */
 export type GitTarget = {
 	narratorId: string;
@@ -39,6 +57,7 @@ export type GitTarget = {
 	repositoryKey?: string | null;
 	canWrite: boolean;
 	rootPath?: string | null;
+	nestedRepository?: boolean;
 };
 
 export function gitTargetKey(target: GitTarget | null | undefined): string | undefined {
@@ -132,11 +151,93 @@ export const gitApi = {
 			`/narrators/${encodeURIComponent(id)}/git/worktrees/removal`,
 			{ method: "POST", body: JSON.stringify(input) },
 		),
+	getGitStagingLists: (target: GitTarget, signal?: AbortSignal): Promise<GitStagingSummary> => {
+		if (target.nestedRepository) {
+			// Authoritative workspace discovery already marked this a nested selection.
+			// Do not enter the current-worktree metadata chain for an ineligible target.
+			return Promise.resolve({
+				capability: { supported: false },
+				workspaceKey: target.workspaceKey,
+				initialized: false,
+				generation: 0,
+				observationId: null,
+				activeListId: null,
+				scannedAt: null,
+				state: "uninitialized",
+				lists: [],
+				stats: {},
+			});
+		}
+		return gitRequest<GitStagingSummary>(gitReadPath(target, "/staging-lists"), { signal });
+	},
+	gitStagingAction: (target: GitTarget, action: GitStagingAction) =>
+		gitRequest<GitStagingActionResult>(`${gitBasePath(target)}/staging-lists/action`, {
+			method: "POST",
+			body: writeBody(target, action),
+		}),
+	getGitStagingFiles: (
+		target: GitTarget,
+		listId: string,
+		query: { cursor?: string; limit?: number; filter?: GitStatusFilterChar[] } = {},
+		signal?: AbortSignal,
+	) => {
+		const params = new URLSearchParams();
+		if (query.cursor !== undefined) params.set("cursor", query.cursor);
+		if (query.limit !== undefined) params.set("limit", String(query.limit));
+		if (query.filter?.length) params.set("filter", query.filter.join(","));
+		return gitRequest<GitStagingFilesPage>(
+			gitReadPath(target, `/staging-lists/${encodeURIComponent(listId)}/files?${params}`),
+			{ signal },
+		);
+	},
+	getGitStagingDiff: (
+		target: GitTarget,
+		listId: string,
+		query: { path: string; oldPath?: string },
+		signal?: AbortSignal,
+	) => {
+		const params = new URLSearchParams({ path: query.path });
+		if (query.oldPath !== undefined) params.set("oldPath", query.oldPath);
+		return gitRequest<GitStagingDiff>(
+			gitReadPath(target, `/staging-lists/${encodeURIComponent(listId)}/diff?${params}`),
+			{ signal },
+		);
+	},
 	getGitStatus: (target: GitTarget, signal?: AbortSignal, fresh = false) =>
 		gitRequest<ApiEntity>(gitReadPath(target, fresh ? "/status?fresh=1" : "/status"), { signal }),
 	/** Full branch listing: local, remote-tracking, upstream tracking and worktrees. */
 	getGitBranches: (target: GitTarget, signal?: AbortSignal) =>
 		gitRequest<GitBranches>(gitReadPath(target, "/branches"), { signal }),
+	getGitStatusPage: (
+		target: GitTarget,
+		query: GitStatusPageQuery = {},
+		signal?: AbortSignal,
+		scan = false,
+	) => {
+		const params = new URLSearchParams();
+		if (scan && query.cursor === undefined) params.set("scan", "1");
+		if (query.cursor !== undefined) params.set("cursor", query.cursor);
+		if (query.limit !== undefined) params.set("limit", String(query.limit));
+		if (query.filter?.length) params.set("filter", query.filter.join(","));
+		return gitRequest<GitStatusPageResult>(gitReadPath(target, `/status-files?${params}`), {
+			signal,
+		});
+	},
+	getGitStatusPageStats: (
+		target: GitTarget,
+		query: GitStatusPageStatsQuery,
+		signal?: AbortSignal,
+	) => {
+		const params = new URLSearchParams({
+			snapshotId: query.snapshotId,
+			rows: JSON.stringify(query.rows),
+		});
+		if (query.filter?.length) params.set("filter", query.filter.join(","));
+		return gitRequest<GitStatusPageStatsResponse>(
+			gitReadPath(target, `/status-page-stats?${params}`),
+			{ signal },
+		);
+	},
 	getGitLineStats: (target: GitTarget, signal?: AbortSignal, fresh = false) =>
 		gitRequest<GitLineStats>(gitReadPath(target, fresh ? "/line-stats?fresh=1" : "/line-stats"), {
 			signal,
@@ -167,12 +268,18 @@ export const gitApi = {
 			signal,
 		});
 	},
-	gitStage: (target: GitTarget, body: { files?: string[]; all?: boolean }) =>
+	gitStage: (
+		target: GitTarget,
+		body: { files?: string[]; all?: boolean; snapshotScope?: GitStatusPageScopeProof },
+	) =>
 		gitRequest<ApiEntity>(`${gitBasePath(target)}/stage`, {
 			method: "POST",
 			body: writeBody(target, body),
 		}),
-	gitUnstage: (target: GitTarget, body: { files?: string[]; all?: boolean }) =>
+	gitUnstage: (
+		target: GitTarget,
+		body: { files?: string[]; all?: boolean; snapshotScope?: GitStatusPageScopeProof },
+	) =>
 		gitRequest<ApiEntity>(`${gitBasePath(target)}/unstage`, {
 			method: "POST",
 			body: writeBody(target, body),
@@ -182,7 +289,10 @@ export const gitApi = {
 			method: "POST",
 			body: writeBody(target, { message }),
 		}),
-	gitDiscard: (target: GitTarget, body: { files?: string[]; all?: boolean }) =>
+	gitDiscard: (
+		target: GitTarget,
+		body: { files?: string[]; all?: boolean; snapshotScope?: GitStatusPageScopeProof },
+	) =>
 		gitRequest<ApiEntity>(`${gitBasePath(target)}/discard`, {
 			method: "POST",
 			body: writeBody(target, body),

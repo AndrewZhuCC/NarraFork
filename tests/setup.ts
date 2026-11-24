@@ -12,6 +12,8 @@
  */
 
 import { Database } from "bun:sqlite";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { ensureColumns } from "../server/db/ensure-columns";
@@ -30,8 +32,9 @@ const DRIZZLE_DIR = join(import.meta.dir, "..", "drizzle");
 export function applyMigrations(sqlite: Database): void {
 	applyPendingMigrationsByHash(sqlite, DRIZZLE_DIR);
 }
-export function getTestDb() {
-	const sqlite = new Database(":memory:");
+
+export function getTestDb(filename = ":memory:") {
+	const sqlite = new Database(filename);
 	sqlite.run("PRAGMA foreign_keys = OFF");
 	applyPendingMigrationsByHash(sqlite, DRIZZLE_DIR);
 	ensureColumns(sqlite);
@@ -59,6 +62,19 @@ export function getTestDb() {
 	initializeAbsentReceiptProtectionSource(sqlite, getNarraforkPath("worktree-requests"));
 	const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
 	return { db, sqlite };
+}
+
+export function getFileTestDb() {
+	const directory = mkdtempSync(join(tmpdir(), "narrafork-fixture-db-"));
+	const fixture = getTestDb(join(directory, "fixture.sqlite"));
+	fixture.sqlite.run("PRAGMA journal_mode = WAL");
+	return {
+		...fixture,
+		dispose() {
+			fixture.sqlite.close();
+			rmSync(directory, { recursive: true, force: true });
+		},
+	};
 }
 
 /** Read the logical SDK body, not the optional content_json storage projection. */

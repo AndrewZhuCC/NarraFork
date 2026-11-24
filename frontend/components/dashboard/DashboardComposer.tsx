@@ -45,6 +45,7 @@ import {
 	NarratorComposer,
 	type NarratorComposerHandle,
 } from "../narrator/composer/NarratorComposer";
+import { DropOverlay } from "../narrator/interaction/DropOverlay";
 import { PermissionModePickerMenu } from "../narrator/interaction/PermissionModePickerMenu";
 import { UploadProgressBar } from "../narrator/interaction/UploadProgressBar";
 import { useComposerAttachments } from "../narrator/interaction/use-composer-attachments";
@@ -243,6 +244,7 @@ export function DashboardComposer() {
 		attachmentsRestoreFailed,
 		retryAttachmentRestore,
 		restoredAttachmentResources,
+		isDragging,
 		setIsDragging,
 		dragCounterRef,
 		updateAttachedImages,
@@ -482,6 +484,13 @@ export function DashboardComposer() {
 	const sending = sendingState != null;
 	const { renderFastModeControl } = useFastModeControl({
 		fastModeOverride: availableFastModeOverride,
+		// No session exists yet; the draft starts with the creating user's ordinary default.
+		effectiveFastMode:
+			availableFastModeOverride === "inherit"
+				? fastModeDefault
+				: availableFastModeOverride !== "off",
+		fastModeSource: availableFastModeOverride === "inherit" ? "user-default" : "override",
+		isSubagent: false,
 		supportsCodexControls: draftReasoning.supportsCodexControls,
 		supportsUltrafast: draftReasoning.supportsUltrafast,
 		fastModeDefault,
@@ -493,7 +502,8 @@ export function DashboardComposer() {
 	});
 
 	return (
-		<Box {...dropZoneProps}>
+		<Box {...dropZoneProps} style={{ position: "relative" }}>
+			<DropOverlay visible={isDragging} />
 			<UploadProgressBar
 				sendingState={sendingState}
 				cancelSending={() => sendAbortRef.current?.abort()}

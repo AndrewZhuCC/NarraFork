@@ -1168,7 +1168,7 @@ function HumanAttentionForm({
 					<InlinePermission
 						permission={{ ...permission, id: item.requestId }}
 						onPlanPreviewChange={preview}
-						onPlanReflect={() => run(() => api.reflectPlan(item.requestId), true)}
+						onPlanReflect={(requestId) => run(() => api.reflectPlan(requestId), true)}
 						onDecision={(_id, decision, feedbackText, compactAfter, updatedPlan) =>
 							void run(() =>
 								decision === "allow"

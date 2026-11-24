@@ -1,15 +1,21 @@
-import { type FastModeOverride, normalizeFastModeOverride } from "@shared/fast-mode";
+import type { FastModeOverride } from "@shared/fast-mode";
 import type React from "react";
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { FastModeSource } from "../../../lib/api/narrators";
 import { FastModeControl } from "./FastModeControl";
+import { fastModePresentation } from "./fast-mode-state";
 
 export interface UseFastModeControlOptions {
-	/** Session or draft override; "inherit" follows the user default. */
+	/** Session or draft choice; children inherit from the primary. */
 	fastModeOverride: FastModeOverride | null | undefined;
+	/** Projected by the server for sessions, or derived from the Dashboard draft. */
+	effectiveFastMode: boolean | undefined;
+	fastModeSource: FastModeSource | undefined;
+	isSubagent: boolean;
 	supportsCodexControls: boolean;
 	supportsUltrafast: boolean;
-	/** User-level default fast-mode state (what "inherit" resolves to). */
+	/** Editable viewer preference, not used to resolve an existing session. */
 	fastModeDefault: boolean;
 	/** Coarse-pointer / mobile viewports open settings by long-press, not hover. */
 	fastModeUsesTapSettings: boolean;
@@ -40,6 +46,7 @@ export function useFastModeControl(options: UseFastModeControlOptions): UseFastM
 	const {
 		supportsCodexControls,
 		supportsUltrafast,
+		isSubagent,
 		fastModeDefault,
 		fastModeUsesTapSettings,
 		onOverrideChange,
@@ -48,14 +55,11 @@ export function useFastModeControl(options: UseFastModeControlOptions): UseFastM
 		t,
 	} = options;
 
-	const fastModeOverride = normalizeFastModeOverride(options.fastModeOverride);
-	// An unsupported Ultrafast override falls back to Standard, not the user default.
-	const fastModeEnabled =
-		fastModeOverride === "ultrafast"
-			? supportsUltrafast
-			: fastModeOverride === "inherit"
-				? fastModeDefault
-				: fastModeOverride === "on";
+	const {
+		override: fastModeOverride,
+		enabled: fastModeEnabled,
+		sourceUnavailable,
+	} = fastModePresentation(options);
 
 	const [fastModeSettingsOpened, setFastModeSettingsOpened] = useState(false);
 	const fastModeSettingsCloseTimerRef = useRef<number | null>(null);
@@ -128,6 +132,8 @@ export function useFastModeControl(options: UseFastModeControlOptions): UseFastM
 					fastModeEnabled={fastModeEnabled}
 					supportsCodexControls={supportsCodexControls}
 					supportsUltrafast={supportsUltrafast}
+					sourceUnavailable={sourceUnavailable}
+					isSubagent={isSubagent}
 					fastModeUsesTapSettings={fastModeUsesTapSettings}
 					settingsOpened={fastModeSettingsOpened}
 					setSettingsOpened={setFastModeSettingsOpened}
@@ -150,6 +156,8 @@ export function useFastModeControl(options: UseFastModeControlOptions): UseFastM
 			fastModeOverride,
 			fastModeDefault,
 			fastModeEnabled,
+			sourceUnavailable,
+			isSubagent,
 			fastModeUsesTapSettings,
 			fastModeSettingsOpened,
 			openFastModeSettings,

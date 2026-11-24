@@ -3,10 +3,11 @@ import { MantineProvider } from "@mantine/core";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createInstance } from "i18next";
 import { parseHTML } from "linkedom";
-import { act } from "react";
+import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
 import en from "../../../locales/en/narrator.json";
+import outlineEn from "../../../locales/en/outline.json";
 import type { PendingPermission } from "../../../types/narrator";
 
 mock.module("@frontend/lib/build-target", () => ({ REMOTE_BUILD: true }));
@@ -21,10 +22,11 @@ mock.module("@frontend/lib/business-transport", () => ({
 	},
 }));
 const { OutlinePlanApproval } = await import("../../outline/plan/OutlinePlanApproval");
+const { InlinePermission } = await import("./InlinePermission");
 const instance = createInstance();
 await instance.init({
 	lng: "en",
-	resources: { en: { narrator: en } },
+	resources: { en: { narrator: en, outline: outlineEn } },
 	interpolation: { escapeValue: false },
 });
 const originalFetch = globalThis.fetch;
@@ -158,7 +160,7 @@ afterEach(async () => {
 	}
 	globals.clear();
 });
-async function render(readOnly = false) {
+async function renderApproval(node: ReactNode) {
 	await act(async () => {
 		root.render(
 			<QueryClientProvider client={client}>
@@ -178,12 +180,15 @@ async function render(readOnly = false) {
 							},
 						}}
 					>
-						<OutlinePlanApproval permission={permission} readOnly={readOnly} />
+						{node}
 					</MantineProvider>
 				</I18nextProvider>
 			</QueryClientProvider>,
 		);
 	});
+}
+function render(readOnly = false) {
+	return renderApproval(<OutlinePlanApproval permission={permission} readOnly={readOnly} />);
 }
 async function click(label: string) {
 	const button = [...container.querySelectorAll("button")].find(
@@ -248,6 +253,54 @@ test("a version conflict stays visible without fetching a diff or opening the ou
 	});
 	expect(requests).toHaveLength(1);
 });
+test("outline reflection starts once without the standard runner flag and preserves manual fallback", async () => {
+	const launch = Promise.withResolvers<void>();
+	const onPlanReflect = mock((_requestId: string) => launch.promise);
+	await renderApproval(
+		<InlinePermission
+			permission={{ ...permission, planReflectionAvailable: false }}
+			onPlanReflect={onPlanReflect}
+		/>,
+	);
+	const buttons = [...container.querySelectorAll("button")].filter(
+		(button) => button.textContent === en.planReflect,
+	);
+	expect(buttons).toHaveLength(1);
+	await act(async () => {
+		buttons[0]?.click();
+		buttons[0]?.click();
+	});
+	expect(onPlanReflect.mock.calls).toEqual([[permission.id]]);
+	const reflecting = [...container.querySelectorAll("button")].find(
+		(button) => button.textContent === en.planReflecting,
+	);
+	expect(reflecting?.hasAttribute("disabled")).toBe(true);
+	await act(async () => launch.reject(new Error("could not start")));
+	expect(container.textContent).toContain(en.planReflectionStartFailed);
+	await click(en.outlinePlan.draft);
+	expectDecision("draft");
+});
+
+test("reviewed outline status does not add a remote diff entry point or settle approval", async () => {
+	await renderApproval(
+		<OutlinePlanApproval
+			permission={{
+				...permission,
+				inputJson: {
+					...permission.inputJson,
+					_planReview: { blockId: "review", address: "space/plan/review", round: 3, count: 2 },
+				},
+			}}
+			readOnly={false}
+		/>,
+	);
+	expect(container.textContent).toContain("Reviewed · 2 comments");
+	expectNoOutlineEntrypoints();
+	expect(requests).toHaveLength(0);
+	await click(en.outlinePlan.return);
+	expectDecision("return");
+});
+
 test("read-only approval remains a record and performs no reads or decisions", async () => {
 	await render(true);
 	expect(container.querySelector('[data-testid="outline-plan-approval"]')).not.toBeNull();

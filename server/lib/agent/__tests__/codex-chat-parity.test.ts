@@ -11,7 +11,11 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { ORIGINATOR, ORIGINATOR_CODEX } from "../../user-agent";
 import { CodexProvider } from "../codex-provider";
 import * as codexWebSocket from "../codex-websocket";
-import { applyCodexReflectionTools, OpenAIProvider } from "../openai-provider";
+import {
+	applyCodexReflectionTools,
+	CODEX_DEFAULT_INSTRUCTIONS,
+	OpenAIProvider,
+} from "../openai-provider";
 import type { ChatParams } from "../provider";
 import { resolveToolJsonSchema } from "../tool-registry";
 import { dangerCancelTool, dangerConfirmTool } from "../tools/danger-reflection";
@@ -166,19 +170,17 @@ describe("codex HTTP chat request parity", () => {
 		expect(req.headers["x-codex-installation-id"]).toBeUndefined();
 	});
 
-	/**
-	 * Parity here means matching a real non-lite Codex request: top-level
-	 * instructions + tools. The lite header is the opt-in for the *other* contract
-	 * (instructions/tools removed, additional_tools spliced into input,
-	 * parallel_tool_calls off), so sending it alongside this body matches no real
-	 * client and upstream rejects the pairing outright.
-	 */
 	test("does not claim the responses-lite contract while sending a non-lite body", async () => {
-		const req = await captureChat();
+		const fixedPrompt = "This is the fixed developer prompt for the test.";
+		const req = await captureChat({ history: [{ role: "system", content: fixedPrompt }] });
 
 		expect(req.headers["x-openai-internal-codex-responses-lite"]).toBeUndefined();
 		expect(req.body.tools).toBeDefined();
-		expect(req.body.instructions).toBeTruthy();
+		expect(req.body.instructions).toBe(CODEX_DEFAULT_INSTRUCTIONS);
+		const input = req.body.input as Array<Record<string, unknown>>;
+		expect(input.filter((item) => item.role === "developer")).toEqual([
+			{ type: "message", role: "developer", content: [{ type: "input_text", text: fixedPrompt }] },
+		]);
 	});
 
 	test("correlates the conversation identity across headers and body", async () => {
@@ -568,7 +570,7 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 		}) as typeof fetch;
 		const ws = spyOn(codexWebSocket, "streamCodexResponsesWebSocket").mockImplementation(
 			async function* (options) {
-				expect(options.ephemeral).toBe(true);
+				expect(options.ephemeralSession).toBe(true);
 				expect(options.conversationId).toBe(conversationId);
 				requests.push(structuredClone(options.request));
 				options.onResponseFrame?.(

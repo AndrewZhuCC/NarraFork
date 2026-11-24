@@ -1,7 +1,7 @@
 {
 	"name": "narrafork",
 	"type": "module",
-	"version": "0.9.15",
+	"version": "0.9.16",
 	"private": true,
 	"license": "MPL-2.0",
 	"packageManager": "bun@1.4.3",
@@ -63,6 +63,7 @@
 		"lang-map": "^0.4.0",
 		"ldapts": "^9.2.0",
 		"linkedom": "^0.18.12",
+		"lmfpd-sdk": "0.2.0",
 		"marked": "^18.0.7",
 		"mermaid": "^11.16.0",
 		"monaco-editor": "0.56.0",

@@ -58,7 +58,7 @@ test("SQLite import stays inert; early registrations survive startup activation 
 			tx,
 		);
 	});
-	expect(runtimePublication.flushRecipient(run.recipientId)).toBe(1);
+	expect(await runtimePublication.flushRecipient(run.recipientId)).toBe(1);
 	expect(wakes).toBe(1);
 	runtimePublication.setWake(undefined);
 });

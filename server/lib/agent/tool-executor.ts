@@ -1,3 +1,4 @@
+import { isCheckpointStop } from "@server/services/agent-runtime/checkpoint-stop";
 import {
 	isAdminToolExecutionAllowed,
 	mcpServerMarker,
@@ -5,6 +6,7 @@ import {
 } from "@server/services/tool-load-markers";
 import {
 	beginToolStartAdmission,
+	checkpointStopForSignal,
 	convertToolStartGrantToExecution,
 	getUpdateCoordinationStatus,
 	inertUpdateExecutionLease,
@@ -838,6 +840,7 @@ async function executeToolUntraced(
 			config.toolExecutionBindings?.get(tu),
 	);
 	admissionState.toolCallBinding = toolCallBinding;
+	let permissionRuleCheckpointPaused = false;
 	let permissionRuleTerminationReason =
 		"Permission rule request finished without consuming its approval";
 	// A direct persisted recovery uses the exact same path as a loop receipt.
@@ -853,7 +856,9 @@ async function executeToolUntraced(
 	const fileToolName = ["Write", "Edit", "StructSed"].includes(tu.name)
 		? (tu.name as "Write" | "Edit" | "StructSed")
 		: undefined;
-	let preparedNoDispatch: ReturnType<NonNullable<AgentConfig["prepareToolNoDispatch"]>> | undefined;
+	let preparedNoDispatch:
+		| Awaited<ReturnType<NonNullable<AgentConfig["prepareToolNoDispatch"]>>>
+		| undefined;
 	const proofContext = (): ToolContext => ({
 		narratorId: config.narratorId,
 		cwd: config.cwd,
@@ -879,12 +884,12 @@ async function executeToolUntraced(
 		)
 			return;
 		if (config.prepareToolNoDispatch) {
-			preparedNoDispatch = config.prepareToolNoDispatch(proofContext(), fileToolName);
+			preparedNoDispatch = await config.prepareToolNoDispatch(proofContext(), fileToolName);
 		} else if (!config.recordToolNoDispatch) {
 			const { getDefaultLocalFileChangeRuntime } = await import(
 				"@server/services/file-change-runtime"
 			);
-			preparedNoDispatch = (await getDefaultLocalFileChangeRuntime()).prepareHostNoDispatch(
+			preparedNoDispatch = await (await getDefaultLocalFileChangeRuntime()).prepareHostNoDispatch(
 				proofContext(),
 				fileToolName,
 			);
@@ -1192,6 +1197,14 @@ async function executeToolUntraced(
 						: undefined,
 				}));
 		} catch (err) {
+			if (isCheckpointStop(err) && !config.signal.aborted) {
+				const own = checkpointStopForSignal(config.signal, config.narratorId);
+				if (own?.updateEpoch === err.updateEpoch) {
+					own.cleanupFailure = err.cleanupFailure;
+					permissionRuleCheckpointPaused = true;
+					throw own;
+				}
+			}
 			return {
 				output: `Tool routing error: ${err instanceof Error ? err.message : String(err)}`,
 				isError: true,
@@ -1864,6 +1877,14 @@ async function executeToolUntraced(
 				pipelineExitConfirmationStateId,
 			};
 		} catch (err) {
+			if (isCheckpointStop(err) && !config.signal.aborted) {
+				const own = checkpointStopForSignal(config.signal, config.narratorId);
+				if (own?.updateEpoch === err.updateEpoch) {
+					own.cleanupFailure = err.cleanupFailure;
+					permissionRuleCheckpointPaused = true;
+					throw own;
+				}
+			}
 			permissionRuleTerminationReason = err instanceof Error ? err.message : String(err);
 			// A failed durable claim must still reject (not become a normal tool result).
 			if (claimingExecution) throw err;
@@ -1895,11 +1916,19 @@ async function executeToolUntraced(
 			}
 		}
 	} catch (error) {
+		if (isCheckpointStop(error) && !config.signal.aborted) {
+			const own = checkpointStopForSignal(config.signal, config.narratorId);
+			if (own?.updateEpoch === error.updateEpoch) {
+				own.cleanupFailure = error.cleanupFailure;
+				permissionRuleCheckpointPaused = true;
+				throw own;
+			}
+		}
 		permissionRuleTerminationReason = error instanceof Error ? error.message : String(error);
 		throw error;
 	} finally {
 		releaseToolAdmissionState(admissionState);
-		if (tu.name === "RequestPermissionRule" && toolCallBinding) {
+		if (tu.name === "RequestPermissionRule" && toolCallBinding && !permissionRuleCheckpointPaused) {
 			// Final deny, abort, routing failures and every early return must close an
 			// unconsumed approval. The service CAS protects applied/existing/denied receipts.
 			const { terminatePermissionRuleRequest } = await import(

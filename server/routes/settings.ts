@@ -25,6 +25,7 @@ import { normalizeBrandingSettings } from "../lib/branding";
 import { isValidTrustedProxyCidr } from "../lib/client-ip";
 import { getCodexManager } from "../lib/codex-manager";
 import { peekCommandCodeModels } from "../lib/commandcode-models";
+import { getCredentialMigrationConflicts } from "../lib/credential-migration";
 import {
 	getAllCustomApiCachedQuotas,
 	purgeCustomApiQuotaCache,
@@ -165,6 +166,9 @@ const userAgentModeSchema = z.enum(["narrafork", "claude-code", "codex", "custom
 const customUserAgentSchema = z.string().max(500).optional();
 const extraHeadersSchema = z.record(z.string(), z.string().max(2048)).optional();
 
+/** 工具结果图片的去处（Chat Completions 通道），见 shared/tool-result-images.ts。 */
+const toolResultImagesSchema = z.enum(["off", "inline", "separate"]).optional();
+
 const customApiProviderSchema = z.object({
 	id: z.string().min(1),
 	name: z.string(),
@@ -189,6 +193,7 @@ const customApiProviderSchema = z.object({
 	codexRemoteCompact: z.boolean().optional(),
 	codexComposerEnabled: z.boolean().optional(),
 	codexComposerPrompt: z.string().max(16_000).optional(),
+	toolResultImages: toolResultImagesSchema,
 	userAgentMode: userAgentModeSchema,
 	customUserAgent: customUserAgentSchema,
 	extraHeaders: extraHeadersSchema,
@@ -214,6 +219,7 @@ const openaiProviderSchema = z.object({
 	codexRemoteCompact: z.boolean().optional(),
 	codexComposerEnabled: z.boolean().optional(),
 	codexComposerPrompt: z.string().max(16_000).optional(),
+	toolResultImages: toolResultImagesSchema,
 	defaultContextWindow: z.number().int().min(1).optional(),
 	proxy: proxyOverrideSchema,
 	userAgentMode: userAgentModeSchema,
@@ -244,6 +250,7 @@ const anthropicProviderSchema = z.object({
 });
 
 const nugProviderSchema = z.object({
+	toolResultImages: toolResultImagesSchema,
 	id: z.string().min(1),
 	name: z.string(),
 	prefix: z.string().min(1),
@@ -780,6 +787,7 @@ export const updateSettingsSchema = z
 				userAgentMode: userAgentModeSchema,
 				customUserAgent: customUserAgentSchema,
 				extraHeaders: extraHeadersSchema,
+				toolResultImages: toolResultImagesSchema,
 			})
 			.partial()
 			.optional(),
@@ -1034,8 +1042,9 @@ function publicAuthSettings(auth: NarraForkSettings["auth"]) {
 
 async function buildSettingsResponse(
 	source: NarraForkSettings,
-	extra?: { serverRestarting?: boolean; newUrl?: string },
+	extra?: { serverRestarting?: boolean; newUrl?: string; admin?: boolean },
 ) {
+	const admin = extra?.admin === true;
 	const codexManager = getCodexManager();
 	const safeSource = { ...source } as NarraForkSettings & Record<string, unknown>;
 	stripObsoleteSettingsKeys(safeSource);
@@ -1053,6 +1062,9 @@ async function buildSettingsResponse(
 		// The capability itself is owned by the apikey-quota plugin, so the provider page needs to
 		// know whether it is on before rendering the site-quota inputs and the balance row.
 		providerBalanceCapability: { enabled: await isApikeyQuotaCapabilityEnabled() },
+		// Credentials that stopped the move to credentials.json; the providers page lists them.
+		// Labels can be account emails, so only admins see them.
+		...(admin ? { credentialMigrationConflicts: getCredentialMigrationConflicts() } : {}),
 		// Mask TLS passphrase
 		server: {
 			...source.server,
@@ -1305,8 +1317,6 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 			logger.info("Purged provider model cache", { type, removedIds: ids });
 		}
 	}
-	// A deleted provider takes all of its keys with it, not just the one settings showed.
-	for (const id of removedCustomApiIds) getProviderKeyStore().removeProvider(id);
 	const staleCustomApiQuotaIds = uniqueIds([
 		...removedCustomApiIds,
 		...getCustomApiProviderIdsWithQuotaIdentityChanges(
@@ -1318,6 +1328,8 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 		purgeCustomApiQuotaCache(staleCustomApiQuotaIds);
 		logger.info("Purged custom API quota cache", { providerIds: staleCustomApiQuotaIds });
 	}
+	// Quota purge resolves the first credential id before a deleted provider loses its keys.
+	for (const id of removedCustomApiIds) getProviderKeyStore().removeProvider(id);
 	// Kimi usage keys off (baseUrl, apiKey) only, so it uses its OWN staleness test
 	// rather than the quota one: that set also fires on `protocol`,
 	// `geminiTransport` and `codexAccountId`, none of which changes what the usage
@@ -1363,7 +1375,7 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 }
 
 settingsRoutes.get("/", async (c) => {
-	return c.json(await buildSettingsResponse(settings));
+	return c.json(await buildSettingsResponse(settings, { admin: c.get("user").role === "admin" }));
 });
 
 settingsRoutes.get("/context-thresholds", (c) => {
@@ -2041,6 +2053,7 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 			await buildSettingsResponse(merged, {
 				serverRestarting: needsRestart,
 				newUrl,
+				admin: true,
 			}),
 		);
 		const finishedAt = performance.now();

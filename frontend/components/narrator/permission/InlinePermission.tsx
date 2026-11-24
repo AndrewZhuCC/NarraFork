@@ -24,6 +24,7 @@ import {
 	Text,
 	Textarea,
 } from "@mantine/core";
+import { getPermissionReflectionSuggestion } from "@shared/pretext-layout/reflection";
 import { useContext, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNarratorPermissionsCapability } from "../../../hooks/usePlatform";
@@ -37,6 +38,24 @@ import { PermissionRuleRequestDetails } from "./PermissionRuleRequestDetails";
 import { usePermissionTextareaStyle } from "./permission-textarea-typography";
 
 const noop = () => {};
+
+/**
+ * Whether a standard plan approval offers on-demand reflection. OutlinePlanApproval has its
+ * own review button and does not use planReflectionAvailable. A restored request without a
+ * runner stays manual, as does an edited draft: reflection would approve the original plan.
+ */
+export function shouldShowPlanReflectButton(args: {
+	permission: PendingPermission;
+	hasHandler: boolean;
+	editing: boolean;
+	planEdited?: boolean;
+}): boolean {
+	const { permission, hasHandler, editing, planEdited } = args;
+	if (editing || planEdited || !hasHandler) return false;
+	if (permission.toolName !== "ExitPlanMode") return false;
+	if (permission.planReflectionAvailable !== true) return false;
+	return !isOutlinePlanApproval(permission);
+}
 
 // --- StructSed change preview ---
 
@@ -163,9 +182,9 @@ export function InlinePermission({
 	onDecision,
 	onQuestionSubmit,
 	onQuestionReflect,
-	onPlanReflect,
 	onQuestionDeny,
 	onQuestionDefer,
+	onPlanReflect,
 	onPlanPreviewChange,
 }: {
 	permission: PendingPermission;
@@ -179,10 +198,11 @@ export function InlinePermission({
 	) => void;
 	onQuestionSubmit?: (requestId: string, answers: Record<string, string>) => void;
 	onQuestionReflect?: (requestId: string) => Promise<void> | void;
-	onPlanReflect?: (requestId: string) => Promise<void> | void;
 	onQuestionDeny?: (requestId: string) => void;
 	/** Release the blocked loop and move the question to the async inbox. */
 	onQuestionDefer?: (requestId: string) => Promise<void> | void;
+	/** Start a reflection for a waiting plan approval. */
+	onPlanReflect?: (requestId: string) => Promise<void> | void;
 	onPlanPreviewChange?: (requestId: string, previewPlan: string | null) => void;
 }) {
 	const { t } = useTranslation("narrator");
@@ -256,18 +276,25 @@ export function InlinePermission({
 	// Feedback confirmation dialog state (must be before early returns)
 	const [feedbackConfirmOpen, setFeedbackConfirmOpen] = useState(false);
 	const [pendingCompactAfter, setPendingCompactAfter] = useState<boolean | undefined>();
-	const [planReflecting, setPlanReflecting] = useState(false);
+	const planReflectionLock = useRef(false);
+	const [startingPlanReflection, setStartingPlanReflection] = useState(false);
 	const [planReflectionFailed, setPlanReflectionFailed] = useState(false);
+	const reflection = getPermissionReflectionSuggestion(permission);
+	const planReflecting =
+		startingPlanReflection ||
+		(reflection?.kind === "plan_reflection" && reflection.status === "running");
 	const handlePlanReflect = async () => {
-		if (!onPlanReflect || planReflecting) return;
-		setPlanReflecting(true);
+		if (!onPlanReflect || effectiveReadOnly || planReflecting || planReflectionLock.current) return;
+		planReflectionLock.current = true;
+		setStartingPlanReflection(true);
 		setPlanReflectionFailed(false);
 		try {
 			await onPlanReflect(permission.id);
 		} catch {
 			setPlanReflectionFailed(true);
 		} finally {
-			setPlanReflecting(false);
+			planReflectionLock.current = false;
+			setStartingPlanReflection(false);
 		}
 	};
 
@@ -526,12 +553,18 @@ export function InlinePermission({
 								},
 							});
 						}
-						if (!editing && isExitPlan && onPlanReflect) {
+						if (
+							shouldShowPlanReflectButton({
+								permission,
+								hasHandler: !!onPlanReflect,
+								editing,
+								planEdited,
+							})
+						) {
 							btns.push({
 								label: planReflecting ? t("planReflecting") : t("planReflect"),
-								color: "violet",
+								color: "indigo",
 								variant: "light",
-								tooltip: t("planReflectTooltip"),
 								loading: planReflecting,
 								disabled: planReflecting,
 								onClick: () => void handlePlanReflect(),

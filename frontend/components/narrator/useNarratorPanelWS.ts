@@ -3,6 +3,7 @@ import { notifications } from "@mantine/notifications";
 import { providerWaitKind, quotaProviderLabel } from "@shared/agent-protocol/quota-exhausted";
 import { type ContextUsageSnapshot, parseContextUsageSnapshot } from "@shared/context-usage";
 import { messageBody } from "@shared/narrator-blocks/message-blocks";
+import { isOutlinePlanInput } from "@shared/outline-plan-submission";
 import type { ProgressSnapshot } from "@shared/progress-phase";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
@@ -12,7 +13,7 @@ import { useCurrentUser } from "../../hooks/useAuth";
 import { invalidateGitStatusPushQueries } from "../../hooks/useGit";
 import { type NarratorWarningInfo, useNarratorWS } from "../../hooks/useNarratorWS";
 import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
-import { api, type BufferMessageSummary } from "../../lib/api";
+import { ApiError, api, type BufferMessageSummary } from "../../lib/api";
 import { formatFullLocaleDateTime } from "../../lib/format";
 import {
 	createPanelReconcileRestartScheduler,
@@ -844,24 +845,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		[permissionDecisionsSupported, resolveAndRemovePerm, t, updatedPermissionInputSupported],
 	);
 
-	const handlePlanReflect = useCallback(
-		async (requestId: string) => {
-			if (!permissionDecisionsSupported) return;
-			try {
-				await api.reflectPlan(requestId);
-				qc.invalidateQueries({ queryKey: ["permissions", narratorId] });
-			} catch (error) {
-				notifications.show({
-					message: t("planReflectionStartFailed"),
-					color: "red",
-					autoClose: 3000,
-				});
-				throw error;
-			}
-		},
-		[narratorId, permissionDecisionsSupported, qc, t],
-	);
-
 	const handleQuestionDeny = useCallback(
 		(requestId: string) => {
 			if (!permissionDecisionsSupported) return;
@@ -904,6 +887,41 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		[permissionDecisionsSupported, resolveAndRemovePerm, t],
 	);
 
+	/** Only the standard plan's reflection button uses the runner availability flag. */
+	const handlePlanReflect = useCallback(
+		async (requestId: string) => {
+			if (!permissionDecisionsSupported) return;
+			const permission = pendingPermsByRequestIdRef.current.get(requestId);
+			if (permission?.toolName !== "ExitPlanMode") return;
+			const outline = isOutlinePlanInput(permission.inputJson);
+			if (!outline && permission.planReflectionAvailable !== true) return;
+			// While the standard review starts, hide its button without settling the approval.
+			// The running gate owns the row until WS hands it back or reports a decision.
+			if (!outline) upsertPendingPermission({ ...permission, planReflectionAvailable: false });
+			try {
+				await api.reflectPlan(requestId);
+				void qc.invalidateQueries({ queryKey: ["permissions", narratorId] });
+				if (outline && pendingPermsByRequestIdRef.current.get(requestId) === permission) {
+					// Keep the button busy until the accepted launch hides this approval, even if
+					// the start frame is late. A fast handover may already provide a new snapshot.
+					await reconcilePanelStateRef.current(true);
+				}
+			} catch (error) {
+				if (error instanceof ApiError && error.status === 409) {
+					// Another surface may already have started the review. Read the server state.
+					requestPanelReconcileRef.current();
+				} else if (!outline) {
+					const current = pendingPermsByRequestIdRef.current.get(requestId);
+					if (current && current.inputJson === permission.inputJson) {
+						upsertPendingPermission({ ...current, planReflectionAvailable: true });
+					}
+				}
+				throw error;
+			}
+		},
+		[narratorId, permissionDecisionsSupported, qc, upsertPendingPermission],
+	);
+
 	// --- Stable permission callbacks ---
 	const permCbRef = useRef<PermissionCallbacks | null>(null);
 	permCbRef.current = {
@@ -912,9 +930,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		onPermissionDecision: handlePermissionDecision,
 		onQuestionSubmit: handleQuestionSubmit,
 		onQuestionReflect: handleQuestionReflect,
-		onPlanReflect: handlePlanReflect,
 		onQuestionDeny: handleQuestionDeny,
 		onQuestionDefer: handleQuestionDefer,
+		onPlanReflect: handlePlanReflect,
 	};
 	const stablePermCb = useMemo<PermissionCallbacks>(
 		() => ({
@@ -923,9 +941,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onPermissionDecision: (...args) => permCbRef.current?.onPermissionDecision(...args),
 			onQuestionSubmit: (...args) => permCbRef.current?.onQuestionSubmit(...args),
 			onQuestionReflect: (...args) => permCbRef.current?.onQuestionReflect(...args),
-			onPlanReflect: (...args) => permCbRef.current?.onPlanReflect(...args),
 			onQuestionDeny: (...args) => permCbRef.current?.onQuestionDeny(...args),
 			onQuestionDefer: (...args) => permCbRef.current?.onQuestionDefer?.(...args),
+			onPlanReflect: (...args) => permCbRef.current?.onPlanReflect?.(...args),
 		}),
 		[],
 	);

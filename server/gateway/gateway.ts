@@ -1,3 +1,11 @@
+import { readQuery, readQueryFirst } from "@server/db/worker-read";
+import { DbReadError } from "@server/lib/db-worker/errors";
+import {
+	DbReadTaskExecutionError,
+	DbReadTaskTimeoutError,
+	WorkersUnavailableError,
+} from "@server/lib/db-worker/pool";
+import { DrizzleQueryError } from "drizzle-orm/errors";
 /**
  * IM Gateway core.
  *
@@ -19,7 +27,7 @@ import {
 	projectTeams,
 	users,
 } from "../db/schema";
-import { eventBus } from "../lib/event-bus";
+import { eventBus, type NarraForkEvent, type NarraForkEventType } from "../lib/event-bus";
 import type { Locale } from "../lib/i18n";
 import { getUserLanguage, t } from "../lib/i18n";
 import { generateId } from "../lib/id";
@@ -75,11 +83,10 @@ import type {
  * account on the mapping) rather than reusing this one.
  */
 export async function resolveGatewayAppUserId(): Promise<string | null> {
-	const allUsers = await db
-		.select({ id: users.id, role: users.role })
-		.from(users)
-		.orderBy(users.createdAt)
-		.limit(5);
+	const allUsers = await readQuery(
+		db.select({ id: users.id, role: users.role }).from(users).orderBy(users.createdAt).limit(5),
+		{ executionPolicy: "worker-required", maxRows: 5 },
+	);
 	if (allUsers.length === 0) return null;
 	if (allUsers.length === 1) return allUsers[0].id;
 	// Multi-user: prefer admin
@@ -95,6 +102,36 @@ class Gateway {
 	private config: GatewayConfig | null = null;
 	private adapters = new Map<GatewayPlatform, PlatformAdapter>();
 	private started = false;
+	private stopping = false;
+	private shutdownRequested = false;
+	private pendingWork = new Set<Promise<void>>();
+	private unsubscribeEvents: Array<() => void> = [];
+
+	private trackWork(run: () => Promise<void>): Promise<void> {
+		if (this.stopping || this.shutdownRequested) return Promise.resolve();
+		const task = Promise.resolve().then(run);
+		this.pendingWork.add(task);
+		void task.then(
+			() => this.pendingWork.delete(task),
+			() => this.pendingWork.delete(task),
+		);
+		return task;
+	}
+
+	private onEvent<T extends NarraForkEventType>(
+		type: T,
+		handler: (event: Extract<NarraForkEvent, { type: T }>) => Promise<void>,
+	): void {
+		const tracked = (event: Extract<NarraForkEvent, { type: T }>) =>
+			this.trackWork(() => handler(event));
+		eventBus.on(type, tracked);
+		this.unsubscribeEvents.push(() => eventBus.off(type, tracked));
+	}
+
+	async shutdown(): Promise<void> {
+		this.shutdownRequested = true;
+		await this.stop();
+	}
 	private rateLimiter: RateLimiter | null = null;
 	private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -125,9 +162,10 @@ class Gateway {
 	// -----------------------------------------------------------------------
 
 	async start(): Promise<void> {
-		if (this.started) return;
-
+		if (this.started || this.shutdownRequested) return;
+		this.stopping = false;
 		this.config = await loadGatewayConfig();
+		if (this.stopping || this.shutdownRequested) return;
 		if (!this.config.enabled) {
 			logger.info("[gateway] Gateway disabled by configuration");
 			return;
@@ -155,9 +193,13 @@ class Gateway {
 				const adapter = await this.createAdapter(pConfig);
 				if (!adapter) continue;
 
-				adapter.onMessage((msg) => this.handleInboundMessage(msg));
+				adapter.onMessage((msg) => this.trackWork(() => this.handleInboundMessage(msg)));
 
 				const ok = await adapter.connect();
+				if (this.stopping || this.shutdownRequested) {
+					await adapter.disconnect();
+					return;
+				}
 				if (ok) {
 					this.adapters.set(pConfig.platform, adapter);
 					logger.info(`[gateway] ${pConfig.platform} connected`);
@@ -179,7 +221,8 @@ class Gateway {
 	}
 
 	async stop(): Promise<void> {
-		if (!this.started) return;
+		this.stopping = true;
+		for (const unsubscribe of this.unsubscribeEvents.splice(0)) unsubscribe();
 
 		// Abort all active stream consumers
 		for (const [, consumer] of this.streamConsumers) {
@@ -203,6 +246,7 @@ class Gateway {
 			}
 		}
 
+		while (this.pendingWork.size) await Promise.allSettled([...this.pendingWork]);
 		this.adapters.clear();
 		this.started = false;
 		logger.info("[gateway] Stopped");
@@ -267,7 +311,7 @@ class Gateway {
 			try {
 				const adapter = await this.createAdapter(pConfig);
 				if (adapter) {
-					adapter.onMessage((msg) => this.handleInboundMessage(msg));
+					adapter.onMessage((msg) => this.trackWork(() => this.handleInboundMessage(msg)));
 					const ok = await adapter.connect();
 					if (ok) {
 						this.adapters.set(p, adapter);
@@ -488,13 +532,16 @@ class Gateway {
 		const now = new Date().toISOString();
 
 		// Look up existing mapping
-		const existing = await db.query.gatewaySessionMappings.findFirst({
-			where: and(
-				eq(gatewaySessionMappings.platform, msg.platform),
-				eq(gatewaySessionMappings.chatId, msg.chatId),
-				eq(gatewaySessionMappings.userId, msg.userId),
-			),
-		});
+		const existing = await readQuery(
+			db.query.gatewaySessionMappings.findFirst({
+				where: and(
+					eq(gatewaySessionMappings.platform, msg.platform),
+					eq(gatewaySessionMappings.chatId, msg.chatId),
+					eq(gatewaySessionMappings.userId, msg.userId),
+				),
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
 
 		if (existing) {
 			// Check session idle timeout
@@ -634,10 +681,13 @@ class Gateway {
 
 		// Validate project exists if specified
 		if (projectId) {
-			const project = await db.query.projects.findFirst({
-				where: eq(projects.id, projectId),
-				columns: { id: true },
-			});
+			const project = await readQuery(
+				db.query.projects.findFirst({
+					where: eq(projects.id, projectId),
+					columns: { id: true },
+				}),
+				{ executionPolicy: "worker-required", maxRows: 1 },
+			);
 			if (!project) {
 				logger.warn(`[gateway] Default project ${projectId} not found, creating unbound narrator`);
 				projectId = null;
@@ -996,7 +1046,7 @@ class Gateway {
 	private subscribeToEvents(): void {
 		// Listen for narrator status changes — deliver the final assistant
 		// message only when the narrator becomes idle (turn complete).
-		eventBus.on("narrator:status_changed", async (event) => {
+		this.onEvent("narrator:status_changed", async (event) => {
 			// Handle the directly-bound narrator (deliver response on idle)
 			if (event.status === "idle") {
 				const consumer = this.streamConsumers.get(event.narratorId);
@@ -1018,7 +1068,7 @@ class Gateway {
 		// their currently-bound narrator). Driven by the semantic attention intent
 		// rather than re-derived from status/substatus, so reflection mid-states
 		// and takeover fallbacks never trigger a spurious IM ping.
-		eventBus.on("narrator:attention", async (event) => {
+		this.onEvent("narrator:attention", async (event) => {
 			// Done with background work still running: the session is not actually
 			// finished, so the recent-tab IM ping is suppressed. The wake-up turn
 			// after the last background task emits a fresh unflagged "done".
@@ -1028,7 +1078,7 @@ class Gateway {
 		});
 
 		// Listen for all narrator broadcasts — tool calls, permission requests, stream deltas
-		eventBus.on("narrator:message_broadcast", async (event) => {
+		this.onEvent("narrator:message_broadcast", async (event) => {
 			const msg = event.message;
 
 			// --- Stream consumer: text deltas ---
@@ -1139,7 +1189,7 @@ class Gateway {
 		});
 
 		// Listen for errors
-		eventBus.on("narrator:error", async (event) => {
+		this.onEvent("narrator:error", async (event) => {
 			// Clean up stream consumer
 			this.cleanupStreamConsumer(event.narratorId);
 
@@ -1170,26 +1220,31 @@ class Gateway {
 		if (!adapter) return;
 
 		// Get the latest assistant message from DB via message refs
-		const latestRef = await db
-			.select({ messageId: narratorMessageRefs.messageId })
-			.from(narratorMessageRefs)
-			.where(eq(narratorMessageRefs.narratorId, narratorId))
-			.orderBy(desc(narratorMessageRefs.seq))
-			.limit(1)
-			.get();
+		const latestRef = await readQueryFirst(
+			db
+				.select({ messageId: narratorMessageRefs.messageId })
+				.from(narratorMessageRefs)
+				.where(eq(narratorMessageRefs.narratorId, narratorId))
+				.orderBy(desc(narratorMessageRefs.seq))
+				.limit(1),
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
 
 		if (!latestRef) return;
 
-		const msg = await db
-			.select({
-				contentText: narratorMessages.contentText,
-				role: narratorMessages.role,
-			})
-			.from(narratorMessages)
-			.where(
-				and(eq(narratorMessages.id, latestRef.messageId), eq(narratorMessages.role, "assistant")),
-			)
-			.get();
+		const msg = await readQueryFirst(
+			db
+				.select({
+					contentText: narratorMessages.contentText,
+					role: narratorMessages.role,
+				})
+				.from(narratorMessages)
+				.where(
+					and(eq(narratorMessages.id, latestRef.messageId), eq(narratorMessages.role, "assistant")),
+				)
+				.limit(1),
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
 
 		if (!msg?.contentText) return;
 
@@ -1203,9 +1258,12 @@ class Gateway {
 	}
 
 	private async findMappingByNarrator(narratorId: string) {
-		return db.query.gatewaySessionMappings.findFirst({
-			where: eq(gatewaySessionMappings.narratorId, narratorId),
-		});
+		return readQuery(
+			db.query.gatewaySessionMappings.findFirst({
+				where: eq(gatewaySessionMappings.narratorId, narratorId),
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
 	}
 
 	// -----------------------------------------------------------------------
@@ -1235,31 +1293,37 @@ class Gateway {
 		}> = [];
 		for (let offset = 0; offset < relevantUserIds.length; offset += 500) {
 			mappings.push(
-				...(await db
-					.select({
-						platform: gatewaySessionMappings.platform,
-						chatId: gatewaySessionMappings.chatId,
-						narratorId: gatewaySessionMappings.narratorId,
-						appUserId: gatewaySessionMappings.appUserId,
-					})
-					.from(gatewaySessionMappings)
-					.where(
-						and(
-							ne(gatewaySessionMappings.narratorId, narratorId),
-							inArray(
-								gatewaySessionMappings.appUserId,
-								relevantUserIds.slice(offset, offset + 500),
+				...(await readQuery(
+					db
+						.select({
+							platform: gatewaySessionMappings.platform,
+							chatId: gatewaySessionMappings.chatId,
+							narratorId: gatewaySessionMappings.narratorId,
+							appUserId: gatewaySessionMappings.appUserId,
+						})
+						.from(gatewaySessionMappings)
+						.where(
+							and(
+								ne(gatewaySessionMappings.narratorId, narratorId),
+								inArray(
+									gatewaySessionMappings.appUserId,
+									relevantUserIds.slice(offset, offset + 500),
+								),
 							),
 						),
-					)),
+					{ executionPolicy: "worker-required", maxRows: 10000 },
+				)),
 			);
 		}
 		if (mappings.length === 0) return;
 
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { id: true, title: true },
-		});
+		const narrator = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { id: true, title: true },
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
 		if (!narrator) return;
 
 		const shortId = narratorId.slice(0, 8);
@@ -1297,20 +1361,36 @@ class Gateway {
 		let locale: Locale = "en";
 		try {
 			// Try to find appUserId from existing mapping
-			const mapping = await db.query.gatewaySessionMappings.findFirst({
-				where: and(
-					eq(gatewaySessionMappings.platform, msg.platform),
-					eq(gatewaySessionMappings.chatId, msg.chatId),
-					eq(gatewaySessionMappings.userId, msg.userId),
-				),
-				columns: { appUserId: true },
-			});
+			const mapping = await readQuery(
+				db.query.gatewaySessionMappings.findFirst({
+					where: and(
+						eq(gatewaySessionMappings.platform, msg.platform),
+						eq(gatewaySessionMappings.chatId, msg.chatId),
+						eq(gatewaySessionMappings.userId, msg.userId),
+					),
+					columns: { appUserId: true },
+				}),
+				{ executionPolicy: "worker-required", maxRows: 1 },
+			);
 
 			const appUserId = mapping?.appUserId ?? (await this.resolveAppUserId());
 			if (appUserId) {
 				locale = await getUserLanguage(appUserId);
 			}
-		} catch {
+		} catch (readError) {
+			if (
+				readError instanceof DbReadError ||
+				readError instanceof DbReadTaskExecutionError ||
+				readError instanceof WorkersUnavailableError ||
+				readError instanceof DbReadTaskTimeoutError ||
+				(typeof readError === "object" &&
+					readError !== null &&
+					"code" in readError &&
+					typeof readError.code === "string" &&
+					readError.code.startsWith("DB_READ_")) ||
+				readError instanceof DrizzleQueryError
+			)
+				throw readError;
 			// Non-fatal — default to "en"
 		}
 
@@ -1373,13 +1453,16 @@ class Gateway {
 			}
 
 			case "/model": {
-				const mapping = await db.query.gatewaySessionMappings.findFirst({
-					where: and(
-						eq(gatewaySessionMappings.platform, msg.platform),
-						eq(gatewaySessionMappings.chatId, msg.chatId),
-						eq(gatewaySessionMappings.userId, msg.userId),
-					),
-				});
+				const mapping = await readQuery(
+					db.query.gatewaySessionMappings.findFirst({
+						where: and(
+							eq(gatewaySessionMappings.platform, msg.platform),
+							eq(gatewaySessionMappings.chatId, msg.chatId),
+							eq(gatewaySessionMappings.userId, msg.userId),
+						),
+					}),
+					{ executionPolicy: "worker-required", maxRows: 1 },
+				);
 
 				if (!mapping) {
 					await adapter.send(msg.chatId, t("gateway.noActiveSession", locale));
@@ -1389,10 +1472,13 @@ class Gateway {
 
 				if (!command.args) {
 					// Show current model
-					const narrator = await db.query.narrators.findFirst({
-						where: eq(narrators.id, mapping.narratorId),
-						columns: { model: true },
-					});
+					const narrator = await readQuery(
+						db.query.narrators.findFirst({
+							where: eq(narrators.id, mapping.narratorId),
+							columns: { model: true },
+						}),
+						{ executionPolicy: "worker-required", maxRows: 1 },
+					);
 					await adapter.send(
 						msg.chatId,
 						t("gateway.currentModel", locale, { model: narrator?.model ?? "default" }),
@@ -1410,28 +1496,34 @@ class Gateway {
 			}
 
 			case "/status": {
-				const mapping = await db.query.gatewaySessionMappings.findFirst({
-					where: and(
-						eq(gatewaySessionMappings.platform, msg.platform),
-						eq(gatewaySessionMappings.chatId, msg.chatId),
-						eq(gatewaySessionMappings.userId, msg.userId),
-					),
-				});
+				const mapping = await readQuery(
+					db.query.gatewaySessionMappings.findFirst({
+						where: and(
+							eq(gatewaySessionMappings.platform, msg.platform),
+							eq(gatewaySessionMappings.chatId, msg.chatId),
+							eq(gatewaySessionMappings.userId, msg.userId),
+						),
+					}),
+					{ executionPolicy: "worker-required", maxRows: 1 },
+				);
 				if (!mapping) {
 					await adapter.send(msg.chatId, t("gateway.noActiveSession", locale));
 				} else if (await this.refuseTeamSession(mapping.narratorId, msg, adapter)) {
 					// A team session reveals nothing to IM (M1).
 				} else {
-					const narrator = await db.query.narrators.findFirst({
-						where: eq(narrators.id, mapping.narratorId),
-						columns: {
-							id: true,
-							status: true,
-							model: true,
-							messageCount: true,
-							totalCostUsd: true,
-						},
-					});
+					const narrator = await readQuery(
+						db.query.narrators.findFirst({
+							where: eq(narrators.id, mapping.narratorId),
+							columns: {
+								id: true,
+								status: true,
+								model: true,
+								messageCount: true,
+								totalCostUsd: true,
+							},
+						}),
+						{ executionPolicy: "worker-required", maxRows: 1 },
+					);
 					const lines = [
 						t("gateway.sessionStatusHeader", locale),
 						t("gateway.statusNarrator", locale, {
@@ -1456,13 +1548,16 @@ class Gateway {
 			}
 
 			case "/stop": {
-				const mapping = await db.query.gatewaySessionMappings.findFirst({
-					where: and(
-						eq(gatewaySessionMappings.platform, msg.platform),
-						eq(gatewaySessionMappings.chatId, msg.chatId),
-						eq(gatewaySessionMappings.userId, msg.userId),
-					),
-				});
+				const mapping = await readQuery(
+					db.query.gatewaySessionMappings.findFirst({
+						where: and(
+							eq(gatewaySessionMappings.platform, msg.platform),
+							eq(gatewaySessionMappings.chatId, msg.chatId),
+							eq(gatewaySessionMappings.userId, msg.userId),
+						),
+					}),
+					{ executionPolicy: "worker-required", maxRows: 1 },
+				);
 				if (mapping && (await this.refuseTeamSession(mapping.narratorId, msg, adapter))) break;
 				if (mapping) {
 					// Clean up stream consumer
@@ -1493,13 +1588,16 @@ class Gateway {
 			}
 
 			case "/approve": {
-				const mapping = await db.query.gatewaySessionMappings.findFirst({
-					where: and(
-						eq(gatewaySessionMappings.platform, msg.platform),
-						eq(gatewaySessionMappings.chatId, msg.chatId),
-						eq(gatewaySessionMappings.userId, msg.userId),
-					),
-				});
+				const mapping = await readQuery(
+					db.query.gatewaySessionMappings.findFirst({
+						where: and(
+							eq(gatewaySessionMappings.platform, msg.platform),
+							eq(gatewaySessionMappings.chatId, msg.chatId),
+							eq(gatewaySessionMappings.userId, msg.userId),
+						),
+					}),
+					{ executionPolicy: "worker-required", maxRows: 1 },
+				);
 				if (!mapping) {
 					await adapter.send(msg.chatId, t("gateway.noActiveSession", locale));
 					break;
@@ -1518,13 +1616,16 @@ class Gateway {
 			}
 
 			case "/deny": {
-				const mapping = await db.query.gatewaySessionMappings.findFirst({
-					where: and(
-						eq(gatewaySessionMappings.platform, msg.platform),
-						eq(gatewaySessionMappings.chatId, msg.chatId),
-						eq(gatewaySessionMappings.userId, msg.userId),
-					),
-				});
+				const mapping = await readQuery(
+					db.query.gatewaySessionMappings.findFirst({
+						where: and(
+							eq(gatewaySessionMappings.platform, msg.platform),
+							eq(gatewaySessionMappings.chatId, msg.chatId),
+							eq(gatewaySessionMappings.userId, msg.userId),
+						),
+					}),
+					{ executionPolicy: "worker-required", maxRows: 1 },
+				);
 				if (!mapping) {
 					await adapter.send(msg.chatId, t("gateway.noActiveSession", locale));
 					break;
@@ -1580,13 +1681,16 @@ class Gateway {
 		locale: Locale,
 	): Promise<void> {
 		// Get the current mapping to find appUserId and active narrator
-		const mapping = await db.query.gatewaySessionMappings.findFirst({
-			where: and(
-				eq(gatewaySessionMappings.platform, msg.platform),
-				eq(gatewaySessionMappings.chatId, msg.chatId),
-				eq(gatewaySessionMappings.userId, msg.userId),
-			),
-		});
+		const mapping = await readQuery(
+			db.query.gatewaySessionMappings.findFirst({
+				where: and(
+					eq(gatewaySessionMappings.platform, msg.platform),
+					eq(gatewaySessionMappings.chatId, msg.chatId),
+					eq(gatewaySessionMappings.userId, msg.userId),
+				),
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
 		const activeNarratorId = mapping?.narratorId ?? null;
 		const appUserId = mapping?.appUserId ?? (await this.resolveAppUserId());
 
@@ -1616,15 +1720,18 @@ class Gateway {
 		const statusMap = new Map<string, string>();
 		const teamTree = new Set<string>();
 		if (narratorIds.length > 0) {
-			const rows = await db
-				.select({
-					id: narrators.id,
-					status: narrators.status,
-					type: narrators.type,
-					aclRootNarratorId: narrators.aclRootNarratorId,
-				})
-				.from(narrators)
-				.where(inArray(narrators.id, narratorIds));
+			const rows = await readQuery(
+				db
+					.select({
+						id: narrators.id,
+						status: narrators.status,
+						type: narrators.type,
+						aclRootNarratorId: narrators.aclRootNarratorId,
+					})
+					.from(narrators)
+					.where(inArray(narrators.id, narratorIds)),
+				{ executionPolicy: "worker-required", maxRows: 10000 },
+			);
 			for (const r of rows) statusMap.set(r.id, r.status);
 			const rootOf = (r: (typeof rows)[number]) =>
 				r.type === "subagent" ? r.aclRootNarratorId : r.id;
@@ -1632,10 +1739,13 @@ class Gateway {
 			const teams = roots.length
 				? new Set(
 						(
-							await db
-								.select({ id: projectTeams.narratorId })
-								.from(projectTeams)
-								.where(inArray(projectTeams.narratorId, roots))
+							await readQuery(
+								db
+									.select({ id: projectTeams.narratorId })
+									.from(projectTeams)
+									.where(inArray(projectTeams.narratorId, roots)),
+								{ executionPolicy: "worker-required", maxRows: roots.length },
+							)
 						).map((row) => row.id),
 					)
 				: new Set<string>();
@@ -1804,19 +1914,25 @@ class Gateway {
 			| undefined;
 
 		// Try exact match first
-		narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, trimmed),
-			columns: { id: true, title: true, status: true, model: true, contextProjectId: true },
-		});
+		narrator = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, trimmed),
+				columns: { id: true, title: true, status: true, model: true, contextProjectId: true },
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
 
 		// If not found, try prefix match (LIKE)
 		if (!narrator && trimmed.length >= 4) {
 			// Escape LIKE wildcards to prevent matching unintended rows
 			const escaped = trimmed.replace(/[%_]/g, "\\$&");
-			narrator = await db.query.narrators.findFirst({
-				where: like(narrators.id, `${escaped}%`),
-				columns: { id: true, title: true, status: true, model: true, contextProjectId: true },
-			});
+			narrator = await readQuery(
+				db.query.narrators.findFirst({
+					where: like(narrators.id, `${escaped}%`),
+					columns: { id: true, title: true, status: true, model: true, contextProjectId: true },
+				}),
+				{ executionPolicy: "worker-required", maxRows: 1 },
+			);
 		}
 
 		if (!narrator) {
@@ -1844,13 +1960,16 @@ class Gateway {
 
 		// Find or create the session mapping
 		const now = new Date().toISOString();
-		const existing = await db.query.gatewaySessionMappings.findFirst({
-			where: and(
-				eq(gatewaySessionMappings.platform, msg.platform),
-				eq(gatewaySessionMappings.chatId, msg.chatId),
-				eq(gatewaySessionMappings.userId, msg.userId),
-			),
-		});
+		const existing = await readQuery(
+			db.query.gatewaySessionMappings.findFirst({
+				where: and(
+					eq(gatewaySessionMappings.platform, msg.platform),
+					eq(gatewaySessionMappings.chatId, msg.chatId),
+					eq(gatewaySessionMappings.userId, msg.userId),
+				),
+			}),
+			{ executionPolicy: "worker-required", maxRows: 1 },
+		);
 
 		if (existing) {
 			// Clean up stream consumer for old narrator

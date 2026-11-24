@@ -137,6 +137,7 @@ export {
 	asyncQuestionListQuerySchema,
 	asyncQuestionSupplementSchema,
 	browserInteractSchema,
+	bufferEditLeaseSchema,
 	bufferQueueModeSchema,
 	codexBrowserCallbackSchema,
 	codexFingerprintSchema,
@@ -259,6 +260,7 @@ export {
 } from "./skills";
 export { specFileQuerySchema, updateSpecFileSchema } from "./spec";
 export { createTerminalSchema, updateTerminalViewStateSchema } from "./terminals";
+export { unattendedOptionsSchema } from "./unattended";
 export { narratorWsMessageSchema, terminalWsMessageSchema } from "./websocket";
 
 export {
