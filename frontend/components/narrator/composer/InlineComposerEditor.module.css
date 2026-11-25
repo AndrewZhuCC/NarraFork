@@ -84,6 +84,8 @@
 .root[data-adaptive] .content {
 	min-height: 0;
 	height: var(--composer-content-height, 42px);
+	/* Keep the measured text width stable when a scrollbar appears. */
+	scrollbar-gutter: stable;
 }
 
 .root[data-adaptive] .editable {
