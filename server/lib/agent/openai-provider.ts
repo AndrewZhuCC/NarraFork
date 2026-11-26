@@ -511,6 +511,8 @@ const CODEX_IDENTITY: Record<string, string> = {
     * If asked to make a commit or code edits and there are unrelated changes to your work or changes that you didn't make in those files, don't revert those changes.
     * If the changes are in files you've touched recently, you should read carefully and understand how you can work with the changes rather than reverting them.
     * If the changes are in unrelated files, just ignore them and don't revert them.
+    * If the user asks you to work in the current directory, preserve existing changes and continue there. Ask only if those changes block the task; do not create or switch worktrees without the user's approval.
+    * If the user asks you to switch branches in the current directory and uncommitted changes would block the switch or carry over to the target branch, explain which changes are involved. Ask how to preserve them or whether you may discard them before switching. Do not discard changes on your own or create a worktree instead of switching branches.
 - Do not amend commits unless explicitly requested.
 - **NEVER** use destructive commands like \`git reset --hard\` or \`git checkout --\` unless specifically requested or approved by the user.
 
@@ -538,6 +540,8 @@ const CODEX_IDENTITY: Record<string, string> = {
     * 如果被要求提交或编辑代码，而文件中存在与你的工作无关的更改或你未做的更改，不要还原这些更改。
     * 如果更改在你最近接触过的文件中，你应该仔细阅读并理解如何与这些更改协作，而不是还原它们。
     * 如果更改在无关文件中，直接忽略它们，不要还原。
+    * 用户指定在当前目录开发时，保留已有改动并在原地继续；只有改动确实阻塞任务时才询问，不要擅自新建或切换 worktree。
+    * 用户要求在当前目录切换分支时，如果未提交改动会阻止切换或被带到目标分支，先说明涉及哪些改动，再询问用户如何保留，或是否允许清理后切换。不要自行清理，也不要用新建 worktree 代替切换分支。
 - 除非明确要求，否则不要修改提交。
 - **永远不要**使用破坏性命令如 \`git reset --hard\` 或 \`git checkout --\`，除非用户明确要求或批准。
 
